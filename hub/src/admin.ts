@@ -49,6 +49,11 @@ import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } fro
 import { queryHostGapRadar } from './gap-radar';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
 import { stripInvisibleSmugglingChars } from './scrape';
+import {
+  EASYPRIVACY_LICENCE_URL,
+  EASYPRIVACY_SOURCE_URL,
+  type TrackerListAdminStatus,
+} from './tracker-list';
 import type { UpdateCheckStatus } from './update-check';
 import {
   ADMIN_COOKIE_NAME,
@@ -137,6 +142,7 @@ export interface AdminPortalDeps {
   clearEvents?: () => Promise<void>;
   revokeGrant: (grantId: string, userId?: string) => Promise<boolean>;
   getUpdateStatus?: (agents: AgentAttachment[]) => Promise<UpdateCheckStatus>;
+  getTrackerListStatus?: () => Promise<TrackerListAdminStatus | undefined>;
   getTelemetrySettings?: () => Promise<DevTelemetrySettingsView>;
   setTelemetryOptIn?: (enabled: boolean) => Promise<DevTelemetrySettingsView>;
   getHubSetting?: (key: string) => Promise<string | null>;
@@ -594,6 +600,23 @@ function renderDashboardHtml(params: {
       <div id="mcp-reg-grid" class="grid-3"><div class="muted">Click "Search Registry" to browse live remote MCP connectors from registry.modelcontextprotocol.io and glama.ai.</div></div>
     </section>
 
+    ${
+      (params.principal?.role ?? 'owner') === 'owner'
+        ? `<section class="card" id="tracker-list-card">
+      <h2>
+        <span>Headless Chromium Third-Party Tracker Blocking (EasyPrivacy)</span>
+        <span class="badge cat" id="tracker-list-badge">Pending daily fetch</span>
+      </h2>
+      <p class="muted" style="margin:0 0 8px">Hub-fetched once daily at runtime and distributed over <code>/agent/ws</code> to browser workers (set <code>EDGEFETCH_TRACKER_LIST=off</code> to disable; pass <code>blockTrackers: false</code> per <code>scrape</code>/<code>interact</code> request to bypass). Source: <a href="${escapeHtml(EASYPRIVACY_SOURCE_URL)}" target="_blank" rel="noopener noreferrer"><code>${escapeHtml(EASYPRIVACY_SOURCE_URL)}</code></a> &middot; <a href="${escapeHtml(EASYPRIVACY_LICENCE_URL)}" target="_blank" rel="noopener noreferrer">EasyPrivacy Licence</a>.</p>
+      <div class="chips" style="margin-top:6px">
+        <code class="chip" id="tracker-list-version">version: none</code>
+        <code class="chip" id="tracker-list-count">hostCount: 0</code>
+        <code class="chip" id="tracker-list-fetched">fetchedAt: never</code>
+      </div>
+    </section>`
+        : ''
+    }
+
     <section class="card">
       <h2>
         <span>Auto-Updates &amp; Opt-In Dev Error Telemetry</span>
@@ -734,6 +757,32 @@ function renderDashboardHtml(params: {
       } else {
         updPill.style.display = 'none';
         if (updHint) updHint.style.display = 'none';
+      }
+
+      const trk = data.trackerList;
+      const trkCard = el('tracker-list-card');
+      if (trkCard && data.viewer && data.viewer.role === 'owner' && trk) {
+        const trkBadge = el('tracker-list-badge');
+        const trkVer = el('tracker-list-version');
+        const trkCnt = el('tracker-list-count');
+        const trkFet = el('tracker-list-fetched');
+        if (trkBadge) {
+          if (!trk.enabled) {
+            trkBadge.className = 'badge lvl-warn';
+            trkBadge.textContent = 'OFF (EDGEFETCH_TRACKER_LIST=off)';
+          } else if (trk.version) {
+            trkBadge.className = 'badge lvl-info';
+            trkBadge.textContent = 'ACTIVE (v' + trk.version + ')';
+          } else {
+            trkBadge.className = 'badge cat';
+            trkBadge.textContent = 'Awaiting daily fetch';
+          }
+        }
+        if (trkVer) trkVer.textContent = 'version: ' + (trk.version || 'none');
+        if (trkCnt) trkCnt.textContent = 'hostCount: ' + Number(trk.hostCount || 0);
+        if (trkFet) trkFet.textContent = 'fetchedAt: ' + (trk.fetchedAt ? new Date(trk.fetchedAt).toISOString() : 'never');
+      } else if (trkCard && (!data.viewer || data.viewer.role !== 'owner')) {
+        trkCard.style.display = 'none';
       }
 
       const tel = data.devTelemetry;
@@ -1719,11 +1768,12 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         200,
       );
     }
-    const [rawUsers, updateStatus, devTelemetry, gapRadar] = await Promise.all([
+    const [rawUsers, updateStatus, devTelemetry, gapRadar, trackerList] = await Promise.all([
       state.users ? Promise.resolve(state.users) : Promise.resolve(deps.oauthStore.listUsers?.() ?? []),
       deps.getUpdateStatus ? deps.getUpdateStatus(state.agents).catch(() => undefined) : Promise.resolve(undefined),
       deps.getTelemetrySettings ? deps.getTelemetrySettings().catch(() => undefined) : Promise.resolve(undefined),
       deps.metaDb ? queryHostGapRadar({ metaDb: deps.metaDb, days: 7, limit: 10 }).catch(() => undefined) : Promise.resolve(undefined),
+      deps.getTrackerListStatus ? deps.getTrackerListStatus().catch(() => undefined) : Promise.resolve(undefined),
     ]);
     const users = rawUsers.map(({ encryptedGhToken: _omitGhSecret, ...u }) => {
       const storedTokenCount = Number(u.storedTokenCount ?? u.tokenCount ?? 0);
@@ -1749,6 +1799,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         ...(gapRadar ? { hostGaps: gapRadar.hosts } : {}),
         ...(updateStatus ? { updateStatus } : {}),
         ...(devTelemetry ? { devTelemetry } : {}),
+        ...(trackerList ? { trackerList } : {}),
       },
       200,
     );

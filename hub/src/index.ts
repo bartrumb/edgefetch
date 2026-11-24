@@ -34,6 +34,15 @@ import {
 } from './dev-telemetry';
 import { checkHubUpdateStatus, HUB_VERSION } from './update-check';
 import {
+  buildTrackerListWsFrames,
+  getTrackerListAdminStatus,
+  isTrackerListDisabled,
+  loadStoredTrackerList,
+  refreshHubTrackerList,
+  resolveExtraNeverBlockHosts,
+  type TrackerBucketLike,
+} from './tracker-list';
+import {
   AgentHubEngine,
   computeNextHostHealth,
   MAX_CALL_UTF8_BYTES,
@@ -204,7 +213,10 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
   WEBHOOK_SECRET?: string;
+  EDGEFETCH_PUBLIC_ORIGIN?: string;
   EDGEFETCH_DISABLE_UPDATE_CHECK?: string;
+  EDGEFETCH_TRACKER_LIST?: string;
+  TRACKER_BUCKET?: TrackerBucketLike;
   EDGEFETCH_DEV_TELEMETRY?: string;
   EDGEFETCH_DEV_TELEMETRY_ENDPOINT?: string;
   EDGEFETCH_DEV_TELEMETRY_URL?: string;
@@ -259,6 +271,8 @@ export class AgentHubDO extends DurableObject<Env> {
   private readonly settings: HubSettingsStore;
   private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
+  private trackerHydrated = false;
+  private trackerHydrateRetryAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -545,10 +559,40 @@ export class AgentHubDO extends DurableObject<Env> {
     this.alarmScheduled = true;
   }
 
+  private async ensureTrackerListHydrated(): Promise<void> {
+    const now = Date.now();
+    if (this.trackerHydrated || now < this.trackerHydrateRetryAt) return;
+    const settingVal = await this.settings.getSetting('tracker_list').catch(() => null);
+    if (isTrackerListDisabled(this.env, settingVal)) {
+      this.trackerHydrated = true;
+      return;
+    }
+    const bucket = this.env.ARTIFACTS ?? this.env.TRACKER_BUCKET;
+    if (!bucket) {
+      this.trackerHydrated = true;
+      return;
+    }
+    const stored = await loadStoredTrackerList(bucket);
+    if (!stored) {
+      this.trackerHydrateRetryAt = now + 60_000;
+      return;
+    }
+    this.trackerHydrated = true;
+    const extraAllow = resolveExtraNeverBlockHosts({ publicOrigin: this.env.EDGEFETCH_PUBLIC_ORIGIN });
+    this.engine.setTrackerListBroadcast(stored.meta.version, buildTrackerListWsFrames(stored, extraAllow));
+  }
+
+  async syncTrackerList(version: string | null, frames: string[]): Promise<void> {
+    this.trackerHydrated = true;
+    this.trackerHydrateRetryAt = 0;
+    this.engine.setTrackerListBroadcast(version, frames);
+  }
+
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       return Response.json({ error: 'upgrade_required' }, { status: 426 });
     }
+    await this.ensureTrackerListHydrated();
     const siteId = (request.headers.get('x-verified-site') ?? '').trim().toLowerCase();
     const arch = request.headers.get('x-agent-arch');
     const version = request.headers.get('x-agent-version');
@@ -568,6 +612,7 @@ export class AgentHubDO extends DurableObject<Env> {
       capabilities,
     });
     server.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
+    this.engine.sendCurrentTrackerListToSocket(server as unknown as HubSocketLike);
     await this.activity.recordEvent({
       level: 'info',
       category: 'agent',
@@ -586,7 +631,13 @@ export class AgentHubDO extends DurableObject<Env> {
     });
   }
 
-  async listAgents(): Promise<{ connected: number; distinctPublicIps: number; agents: AgentAttachment[] }> {
+  async listAgents(): Promise<{
+    connected: number;
+    distinctPublicIps: number;
+    trackerListVersion: string | null;
+    agents: AgentAttachment[];
+  }> {
+    await this.ensureTrackerListHydrated();
     return this.engine.listAgents();
   }
 
@@ -647,6 +698,7 @@ export class AgentHubDO extends DurableObject<Env> {
   async getPortalState(now: number): Promise<{
     connected: number;
     distinctPublicIps: number;
+    trackerListVersion: string | null;
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
@@ -654,6 +706,7 @@ export class AgentHubDO extends DurableObject<Env> {
     events: HubEventRecord[];
     users: HubUserRecord[];
   }> {
+    await this.ensureTrackerListHydrated();
     const fleet = this.engine.listAgents();
     return {
       ...fleet,
@@ -881,6 +934,8 @@ export class AgentHubDO extends DurableObject<Env> {
             details: sanitizeDetails({ ...msg, siteId: att?.siteId }),
           });
         }
+      } else if (msg.type === 'tracker_list_ack') {
+        this.engine.noteTrackerListAck(ws as unknown as HubSocketLike, msg.version);
       }
     } catch {
       // ignore malformed frames
@@ -1683,7 +1738,12 @@ export default {
             if (getActiveCallerAuthContext()?.role === 'member') {
               return { connected: state.connected, agents: [], affinities: [] };
             }
-            return { connected: state.connected, agents: state.agents, affinities: state.affinities };
+            return {
+              connected: state.connected,
+              trackerListVersion: state.trackerListVersion,
+              agents: state.agents,
+              affinities: state.affinities,
+            };
           },
           executeFetch: async ({ target, site, body, principal }) => {
             const effectiveUserId = getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
@@ -2193,6 +2253,18 @@ export default {
             agents,
             env,
           }),
+        getTrackerListStatus: async () => {
+          const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
+          const settingVal =
+            typeof stub.getHubSetting === 'function'
+              ? await stub.getHubSetting('tracker_list').catch(() => null)
+              : null;
+          return getTrackerListAdminStatus({
+            bucket: env.ARTIFACTS ?? env.TRACKER_BUCKET,
+            env,
+            hubSettingValue: settingVal,
+          });
+        },
         getTelemetrySettings: async () => {
           const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
           const dbSettingValue =
@@ -3991,9 +4063,53 @@ export default {
     return injectTraceHeaders(response, rootTracer);
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  async scheduled(_controller: ScheduledController, env: Env, _ctx?: ExecutionContext): Promise<void> {
     if (env.META) {
       await pruneExpiredFetchHistory(env.META).catch(() => undefined);
+    }
+    const trackerBucket = env.ARTIFACTS ?? env.TRACKER_BUCKET;
+    if (trackerBucket && !isTrackerListDisabled(env)) {
+      const shardNames = (env.HUB_SHARDS ?? 'global')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^[a-z0-9_-]{1,32}$/i.test(s));
+      if (shardNames.length === 0) shardNames.push('global');
+      let settingVal: string | null = null;
+      if (env.AGENT_HUB) {
+        try {
+          const primaryStub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName(shardNames[0]!)) as unknown as {
+            getHubSetting?: (k: string) => Promise<string | null>;
+          };
+          if (typeof primaryStub.getHubSetting === 'function') {
+            settingVal = await primaryStub.getHubSetting('tracker_list');
+          }
+        } catch {
+          settingVal = null;
+        }
+      }
+      if (!isTrackerListDisabled(env, settingVal)) {
+        const refreshed = await refreshHubTrackerList({
+          bucket: trackerBucket,
+          fetchFn: env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch,
+          env,
+          hubSettingValue: settingVal,
+          publicOrigin: env.EDGEFETCH_PUBLIC_ORIGIN,
+        }).catch(() => null);
+        if (refreshed?.updated && refreshed.current && env.AGENT_HUB) {
+          const extraAllow = resolveExtraNeverBlockHosts({ publicOrigin: env.EDGEFETCH_PUBLIC_ORIGIN });
+          const frames = buildTrackerListWsFrames(refreshed.current, extraAllow);
+          await Promise.allSettled(
+            shardNames.map((sName) => {
+              const stub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName(sName)) as unknown as {
+                syncTrackerList?: (v: string | null, f: string[]) => Promise<void>;
+              };
+              return typeof stub.syncTrackerList === 'function'
+                ? stub.syncTrackerList(refreshed.current!.meta.version, frames)
+                : Promise.resolve();
+            }),
+          );
+        }
+      }
     }
   },
 };

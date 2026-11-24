@@ -4472,6 +4472,7 @@ export interface PrivateCachedScrapeRecord {
   wordCount?: number;
   rendered?: boolean;
   renderedVia?: string;
+  blockedTrackers?: number;
   contentState?: string;
   extractorId?: string;
   detected?: Record<string, unknown>;
@@ -4805,6 +4806,7 @@ export interface ScrapeRequestPayload {
   jsonFilter?: unknown;
   headers?: unknown;
   renderMode?: unknown;
+  blockTrackers?: unknown;
   mobile?: unknown;
   location?: unknown;
   actions?: unknown;
@@ -9326,6 +9328,7 @@ export async function executeScrapeCall(params: {
   };
 
   const preferOriginMarkdown = payload.preferOriginMarkdown !== false;
+  const blockTrackersOpt = typeof payload.blockTrackers === 'boolean' ? payload.blockTrackers : undefined;
   const rawRenderModeStrEarly = typeof payload.renderMode === 'string' ? payload.renderMode.trim().toLowerCase() : '';
   const requestedRenderModeEarly: 'always' | 'auto' | 'off' =
     inlineActions.length > 0 || mobileEmulation || Boolean(screenshotSpec) || stringFormats.has('screenshot')
@@ -9339,10 +9342,11 @@ export async function executeScrapeCall(params: {
   const locationCacheKey = locationObj
     ? `${typeof locationObj.country === 'string' ? locationObj.country.trim().toUpperCase() : ''}|${locationLanguages.join(',')}`
     : '';
-  const hasNonDefaultCacheOptions =
+  const hasNonDefaultCacheOptionsWithoutRedact =
     !onlyMainContent ||
     requestedRenderModeEarly === 'always' ||
     (rawRenderModeStrEarly !== '' && rawRenderModeStrEarly !== 'auto') ||
+    blockTrackersOpt === false ||
     Boolean(mobileEmulation) ||
     Boolean(locationCacheKey) ||
     includeTags.length > 0 ||
@@ -9350,13 +9354,14 @@ export async function executeScrapeCall(params: {
     waitForMsOpt !== undefined ||
     Boolean(waitSelectorOpt) ||
     !includeImages ||
-    Boolean(redactPii) ||
     sortedFormatsForCache.join(',') !== 'markdown';
+  const hasNonDefaultCacheOptions = hasNonDefaultCacheOptionsWithoutRedact || Boolean(redactPii);
   const scrapeOptionsHash = await sha256HexString(
     JSON.stringify({
       v: SCRAPE_PIPELINE_VERSION,
       onlyMainContent,
       renderMode: rawRenderModeStrEarly || requestedRenderModeEarly,
+      ...(blockTrackersOpt === false ? { blockTrackers: false } : {}),
       mobile: Boolean(mobileEmulation),
       location: locationCacheKey,
       formats: sortedFormatsForCache,
@@ -9499,7 +9504,7 @@ export async function executeScrapeCall(params: {
     });
     const hit: (PrivateCachedScrapeRecord | Awaited<ReturnType<typeof lookupCachedScrape>>) =
       optHit ??
-      (!needsLiveHtml && (!hasNonDefaultCacheOptions || redactPii)
+      (!needsLiveHtml && !hasNonDefaultCacheOptionsWithoutRedact
         ? isPrivateScrape
           ? await lookupPrivateCachedScrape({
               bucket: env.ARTIFACTS,
@@ -9511,7 +9516,7 @@ export async function executeScrapeCall(params: {
             }).then((privHit) =>
               privHit && (!privHit.optionsHash || privHit.optionsHash === scrapeOptionsHash) ? privHit : null,
             )
-          : env.META && (!hasNonDefaultCacheOptions || redactPii)
+          : env.META && !hasNonDefaultCacheOptionsWithoutRedact
             ? await lookupCachedScrape({
                 bucket: env.ARTIFACTS,
                 metaDb: env.META,
@@ -9524,6 +9529,7 @@ export async function executeScrapeCall(params: {
         : null);
     if (hit) {
       const cacheVia = isPrivateScrape ? 'cache:private-r2' : 'cache:r2-d1';
+      const richHitEarly = hit as Partial<PrivateCachedScrapeRecord>;
       if (activeTracer) {
         const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
           kind: 1,
@@ -9541,6 +9547,9 @@ export async function executeScrapeCall(params: {
         cacheSpan.end();
         activeTracer.setAttribute('edgefetch.via', cacheVia);
         activeTracer.setAttribute('edgefetch.cached', true);
+        if (Boolean(richHitEarly.rendered) && typeof richHitEarly.blockedTrackers === 'number') {
+          activeTracer.setAttribute('browser.blocked_trackers', Math.max(0, Math.floor(richHitEarly.blockedTrackers)));
+        }
       }
       const rawHitMd = parsedWikiArticle ? cleanMediaWikiMarkdownLinear(hit.markdown) : hit.markdown;
       const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(rawHitMd) : rawHitMd, {
@@ -9635,6 +9644,9 @@ export async function executeScrapeCall(params: {
             canonicalUrl: richHit.canonicalUrl ?? cachedFinalUrl,
             contentType: cachedContentType,
             lastFetchedAt: hit.lastFetchedAt,
+            ...(cachedRendered && typeof richHit.blockedTrackers === 'number'
+              ? { blockedTrackers: richHit.blockedTrackers }
+              : {}),
           },
         },
       };
@@ -9742,7 +9754,7 @@ export async function executeScrapeCall(params: {
   const retentionMode: ArtifactRetention | 'off' | undefined =
     payload.ephemeral === true || isPrivateScrape
       ? 'off'
-      : env.ARTIFACTS && env.META
+      : env.ARTIFACTS && env.META && blockTrackersOpt !== false
         ? 'stored'
         : env.ARTIFACTS
           ? 'transient'
@@ -9765,7 +9777,15 @@ export async function executeScrapeCall(params: {
 
   // R5: Look up stored ETag / Last-Modified validators in META D1 (or options-scoped R2 cache on Wikipedia refresh) when a verified derived document already exists.
   const d1RevalCandidate =
-    !isPrivateScrape && !needsLiveHtml && ocrMode !== 'always' && renderMode !== 'always' && !scopedUserCollectionId && env.ARTIFACTS && env.META
+    !isPrivateScrape &&
+    !needsLiveHtml &&
+    !hasNonDefaultCacheOptionsWithoutRedact &&
+    !Boolean(payload.noCache) &&
+    ocrMode !== 'always' &&
+    renderMode !== 'always' &&
+    !scopedUserCollectionId &&
+    env.ARTIFACTS &&
+    env.META
       ? await lookupRevalidationCandidate({
           bucket: env.ARTIFACTS,
           metaDb: env.META,
@@ -9827,6 +9847,7 @@ export async function executeScrapeCall(params: {
         ...(revalCandidate?.etag ? { ifNoneMatch: revalCandidate.etag } : {}),
         ...(revalCandidate?.lastModified ? { ifModifiedSince: revalCandidate.lastModified } : {}),
         renderMode: renderMode === 'always' ? 'always' : 'off',
+        ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
         ...(mobileEmulation ? { mobile: true } : {}),
         ...(screenshotSpec?.fullPage ? { screenshotFullPage: true } : {}),
         ...(screenshotSpec?.quality ? { screenshotQuality: screenshotSpec.quality } : {}),
@@ -11381,6 +11402,7 @@ export async function executeScrapeCall(params: {
                 url: wdStub.redirectUrl,
                 kind: 'render',
                 renderMode: 'always',
+                ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
                 formats: agentFormats,
                 onlyMainContent,
                 waitSelector: '[data-automation-id="jobTitle"], [data-automation-id="jobFoundText"]',
@@ -11815,6 +11837,7 @@ export async function executeScrapeCall(params: {
               url: finalUrl,
               kind: 'render',
               renderMode: 'always',
+              ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
               formats: agentFormats,
               onlyMainContent,
               redactPii,
@@ -12907,6 +12930,9 @@ export async function executeScrapeCall(params: {
         ...(resolvedWordCount !== undefined ? { wordCount: resolvedWordCount } : {}),
         rendered: resolvedRendered,
         ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
+        ...(resolvedRendered && typeof item.blockedTrackers === 'number'
+          ? { blockedTrackers: item.blockedTrackers }
+          : {}),
         contentState: contentStateCheck.state,
         ...(extractorIdOut ? { extractorId: extractorIdOut } : {}),
         ...(hasDetectedOut && detectedWithAdapter ? { detected: detectedWithAdapter } : {}),
@@ -13066,8 +13092,21 @@ export async function executeScrapeCall(params: {
       ...(alternateMarkdownUrl ? { alternateMarkdownUrl } : {}),
       ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
       ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
+      ...(resolvedRendered || typeof item.blockedTrackers === 'number'
+        ? { blockedTrackers: typeof item.blockedTrackers === 'number' ? item.blockedTrackers : 0 }
+        : {}),
     },
   };
+
+  if ((resolvedRendered || typeof item.blockedTrackers === 'number') && activeTracer) {
+    setActiveSpanAttribute(
+      'browser.blocked_trackers',
+      typeof item.blockedTrackers === 'number' && Number.isFinite(item.blockedTrackers)
+        ? Math.max(0, Math.floor(item.blockedTrackers))
+        : 0,
+      activeTracer,
+    );
+  }
 
   return { status: 200, via: viaOut, body: out };
   };
@@ -13133,6 +13172,7 @@ export interface InteractRequestPayload {
   closeSession?: unknown;
   actions?: unknown;
   formats?: unknown;
+  blockTrackers?: unknown;
   waitForMs?: unknown;
   waitSelector?: unknown;
   maxChars?: unknown;
@@ -13398,6 +13438,7 @@ export async function executeInteractCall(params: {
         url: normalizedUrl,
         kind: 'render',
         renderMode: 'always',
+        ...(typeof payload.blockTrackers === 'boolean' ? { blockTrackers: payload.blockTrackers } : {}),
         formats: formats.length > 0 ? formats : ['markdown'],
         ...(topWaitForMs !== undefined ? { waitForMs: topWaitForMs } : {}),
         ...(topWaitSelector ? { waitSelector: topWaitSelector } : {}),
@@ -13593,7 +13634,14 @@ export async function executeInteractCall(params: {
         ...(partialMd && formats.includes('markdown') ? { markdown: partialMd, partial: true } : {}),
         ...(partialTranscript && formats.includes('transcript') ? { transcript: partialTranscript, partial: true } : {}),
         ...(partialHtml && (formats.includes('html') || formats.includes('rawHtml')) ? { html: partialHtml } : {}),
-        ...(partialDoc?.title ? { metadata: { title: partialDoc.title } } : {}),
+        ...(partialDoc?.title || typeof item.blockedTrackers === 'number'
+          ? {
+              metadata: {
+                ...(partialDoc?.title ? { title: partialDoc.title } : {}),
+                ...(typeof item.blockedTrackers === 'number' ? { blockedTrackers: item.blockedTrackers } : {}),
+              },
+            }
+          : {}),
         ...(blockedInfo ? { blocked: blockedInfo } : {}),
       },
     };
@@ -13734,6 +13782,14 @@ export async function executeInteractCall(params: {
         })
       : undefined;
 
+  const interactBlockedTrackers =
+    typeof item.blockedTrackers === 'number' && Number.isFinite(item.blockedTrackers)
+      ? Math.max(0, Math.floor(item.blockedTrackers))
+      : 0;
+  if (activeTracer) {
+    setActiveSpanAttribute('browser.blocked_trackers', interactBlockedTrackers, activeTracer);
+  }
+
   return {
     status: 200,
     via: fetchRes.via,
@@ -13772,6 +13828,7 @@ export async function executeInteractCall(params: {
           extracted?.title || (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined) || fallbackTitle,
           512,
         ),
+        blockedTrackers: interactBlockedTrackers,
       },
     },
   };

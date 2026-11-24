@@ -133,6 +133,9 @@ try {
   const universalScaleOutfile = join(dir, 'universal-extraction-scale.test.mjs');
   buildNodeTestBundle('test/universal-extraction-scale.test.ts', universalScaleOutfile);
   nodeTestFiles.push(universalScaleOutfile);
+  const trackerBlockingOutfile = join(dir, 'tracker-blocking.test.mjs');
+  buildNodeTestBundle('test/tracker-blocking.test.ts', trackerBlockingOutfile);
+  nodeTestFiles.push(trackerBlockingOutfile);
   const r11Stream1Outfile = join(dir, 'round11-stream1-sanitizer.test.mjs');
   buildNodeTestBundle('test/round11-stream1-sanitizer.test.ts', r11Stream1Outfile);
   nodeTestFiles.push(r11Stream1Outfile);

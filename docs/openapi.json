@@ -4132,6 +4132,11 @@
             "default": "auto",
             "description": "Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges)."
           },
+          "blockTrackers": {
+            "type": "boolean",
+            "default": true,
+            "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
+          },
           "target": {
             "type": "string",
             "enum": [
@@ -4233,6 +4238,11 @@
             ],
             "default": "auto",
             "description": "Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges)."
+          },
+          "blockTrackers": {
+            "type": "boolean",
+            "default": true,
+            "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
           },
           "target": {
             "type": "string",
@@ -4354,6 +4364,11 @@
             "minimum": 0,
             "default": 0,
             "description": "Character offset into the rendered Markdown for paging large pages."
+          },
+          "blockTrackers": {
+            "type": "boolean",
+            "default": true,
+            "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
           },
           "site": {
             "type": "string",
@@ -5820,6 +5835,9 @@
           },
           "screenshotBytes": {
             "type": "integer"
+          },
+          "metadata": {
+            "type": "object"
           }
         }
       },
@@ -5931,6 +5949,12 @@
           },
           "distinctPublicIps": {
             "type": "integer"
+          },
+          "trackerListVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "agents": {
             "type": "array",
@@ -6444,6 +6468,11 @@
             "default": "auto",
             "description": "Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges)."
           },
+          "blockTrackers": {
+            "type": "boolean",
+            "default": true,
+            "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
+          },
           "target": {
             "type": "string",
             "enum": [
@@ -6547,6 +6576,11 @@
             ],
             "default": "auto",
             "description": "Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges)."
+          },
+          "blockTrackers": {
+            "type": "boolean",
+            "default": true,
+            "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
           },
           "target": {
             "type": "string",
@@ -6905,6 +6939,11 @@
             "minimum": 0,
             "default": 0,
             "description": "Character offset into the rendered Markdown for paging large pages."
+          },
+          "blockTrackers": {
+            "type": "boolean",
+            "default": true,
+            "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
           },
           "site": {
             "type": "string",

@@ -1225,6 +1225,7 @@ export interface ExtractRequestPayload {
   query?: unknown;
   jsonFilter?: unknown;
   renderMode?: unknown;
+  blockTrackers?: unknown;
   chunksPerSource?: unknown;
   includeRawContent?: unknown;
   include_raw_content?: unknown;
@@ -1297,6 +1298,7 @@ export async function executeExtractCall(params: {
         ? rawRenderModeStr
         : undefined;
   const effectiveRenderMode: 'always' | 'auto' | 'off' = explicitRenderMode ?? 'auto';
+  const blockTrackersOpt = typeof payload.blockTrackers === 'boolean' ? payload.blockTrackers : undefined;
   const chunksPerSource =
     typeof payload.chunksPerSource === 'number' && Number.isFinite(payload.chunksPerSource)
       ? Math.min(10, Math.max(1, Math.floor(payload.chunksPerSource)))
@@ -1365,7 +1367,14 @@ export async function executeExtractCall(params: {
   const toFetch: Array<{ idx: number; url: string }> = [];
   for (let i = 0; i < normalizedUrls.length; i++) {
     const u = normalizedUrls[i]!;
-    if (maxAgeMs > 0 && env.ARTIFACTS && (isPrivateExtract || env.META) && !jsonFilterStr) {
+    if (
+      maxAgeMs > 0 &&
+      !payload.noCache &&
+      blockTrackersOpt !== false &&
+      env.ARTIFACTS &&
+      (isPrivateExtract || env.META) &&
+      !jsonFilterStr
+    ) {
       const cacheStartMs = Date.now();
       const hit = isPrivateExtract
         ? await lookupPrivateCachedScrape({
@@ -1426,7 +1435,7 @@ export async function executeExtractCall(params: {
     const retentionMode: ArtifactRetention | 'off' | undefined =
       isEphemeral || isPrivateExtract
         ? 'off'
-        : env.ARTIFACTS && env.META
+        : env.ARTIFACTS && env.META && blockTrackersOpt !== false
           ? 'stored'
           : env.ARTIFACTS
             ? 'transient'
@@ -1484,6 +1493,7 @@ export async function executeExtractCall(params: {
           url: item.url,
           kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
           renderMode: explicitRenderMode === 'always' ? 'always' : 'off',
+          ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -1556,6 +1566,7 @@ export async function executeExtractCall(params: {
           url: item.url,
           kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
           ...(explicitRenderMode ? { renderMode: explicitRenderMode } : {}),
+          ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -2024,6 +2035,7 @@ export async function executeExtractCall(params: {
                     url: finalUrl,
                     kind: 'render',
                     renderMode: 'always',
+                    ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
                     formats: ['markdown'],
                     onlyMainContent: true,
                     redactPii,

@@ -543,56 +543,20 @@ func looksLikeSecretTokenValue(tok string) bool {
 	return hasDigit || (hasUpper && hasSym) || len(tok) >= 20
 }
 
-var unquotedQueryStopByte = [256]uint8{
-	' ':  1,
-	'\t': 1,
-	'\r': 1,
-	'\n': 1,
-	'<':  1,
-	'>':  1,
-	'\'': 1,
-	')':  1,
-	']':  1,
-	'}':  1,
-	'%':  1,
-	0xc2: 1, // UTF-8 lead byte for U+0085 NEL (C2 85)
-	0xe2: 1, // UTF-8 lead byte for U+2028 / U+2029 (E2 80 A8 / A9)
-}
-
-func indexUnquotedQueryStopByte(s string) int {
-	i := 0
-	for i+8 <= len(s) {
-		if (unquotedQueryStopByte[s[i]] |
-			unquotedQueryStopByte[s[i+1]] |
-			unquotedQueryStopByte[s[i+2]] |
-			unquotedQueryStopByte[s[i+3]] |
-			unquotedQueryStopByte[s[i+4]] |
-			unquotedQueryStopByte[s[i+5]] |
-			unquotedQueryStopByte[s[i+6]] |
-			unquotedQueryStopByte[s[i+7]]) != 0 {
-			break
-		}
-		i += 8
-	}
-	for ; i < len(s); i++ {
-		if unquotedQueryStopByte[s[i]] != 0 {
-			return i
-		}
-	}
-	return -1
-}
-
-const bareURLStopChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>)]}\\%\u0085\u2028\u2029"
+const unquotedQueryStopASCII = " \t\r\n<>')]}%"
+const bareURLStopASCII = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>)]}\\%"
 
 func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	sawQuery := false
 	j := start
 	for j < len(s) {
 		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
-			if rel := indexUnquotedQueryStopByte(s[j:]); rel >= 0 {
-				j += rel
-			} else {
-				j = len(s)
+			stop := len(s)
+			if rel := strings.IndexAny(s[j:], unquotedQueryStopASCII); rel >= 0 {
+				stop = j + rel
+			}
+			j = clampAtUTF8LineBreak(s, j, stop)
+			if j >= len(s) {
 				break
 			}
 		}
@@ -787,15 +751,17 @@ func tryMatchBareHostURLAt(s string, i int) (endIdx int, scrubbed string, scanSk
 		return 0, "", afterAuth, false
 	}
 
-	// Scan remainder of bare URL up to whitespace / quote / bracket / paren / %22 using SIMD IndexAny
+	// Scan remainder of bare URL up to whitespace / quote / bracket / paren / %22 using pure-ASCII asciiSet + SIMD UTF-8 line-break clamp
 	j := afterAuth
 	for j < n {
-		rel := strings.IndexAny(s[j:], bareURLStopChars)
-		if rel < 0 {
-			j = n
+		stop := n
+		if rel := strings.IndexAny(s[j:], bareURLStopASCII); rel >= 0 {
+			stop = j + rel
+		}
+		j = clampAtUTF8LineBreak(s, j, stop)
+		if j >= n {
 			break
 		}
-		j += rel
 		c := s[j]
 		if c == '%' {
 			if hasPrefixFoldASCII(s[j:], "%22") || hasPrefixFoldASCII(s[j:], "%27") || hasPrefixFoldASCII(s[j:], "%3e") {
@@ -1182,6 +1148,7 @@ func RedactEmbeddedURLs(s string) string {
 	hasBare := (hasColon || hasSlash) &&
 		(hasDotOrBracket || strings.Contains(s, "localhost") || strings.ContainsAny(s, "LOCALHOST"))
 	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '\t') >= 0 || strings.IndexByte(s, '=') >= 0) &&
+		strings.ContainsAny(s, "rRcCkK") &&
 		(strings.Contains(s, "bearer") ||
 			strings.Contains(s, "basic") ||
 			strings.Contains(s, "token") ||

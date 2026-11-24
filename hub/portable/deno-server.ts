@@ -6,7 +6,7 @@
  * optional `TursoHttpD1Database` + `S3ArtifactBucket` storage bindings.
  */
 import dns from 'node:dns';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -71,7 +71,58 @@ import {
   type LookupResolverFn,
 } from './safe-fetch.ts';
 import { S3ArtifactBucket } from './s3-bucket.ts';
+import {
+  buildTrackerListWsFrames,
+  DAILY_TRACKER_POLL_INTERVAL_MS,
+  INITIAL_PORTABLE_TRACKER_DELAY_MS,
+  isTrackerListDisabled,
+  loadStoredTrackerList,
+  refreshHubTrackerList,
+  resolveExtraNeverBlockHosts,
+  type RefreshTrackerListOutcome,
+  type TrackerBucketLike,
+} from '../src/tracker-list.ts';
 import { TursoHttpD1Database } from './turso-d1.ts';
+
+function createDenoFsTrackerBucket(rootDir: string): TrackerBucketLike {
+  mkdirSync(rootDir, { recursive: true });
+  const resolveSafeKeyPath = (key: string): string => {
+    const clean = key.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!clean || clean.includes('..') || clean.includes('\0')) {
+      throw new Error('invalid tracker storage key');
+    }
+    return join(rootDir, ...clean.split('/'));
+  };
+  return {
+    async get(key: string) {
+      const filePath = resolveSafeKeyPath(key);
+      if (!existsSync(filePath)) return null;
+      const raw = readFileSync(filePath);
+      const bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+      const copy = new Uint8Array(bytes.byteLength);
+      copy.set(bytes);
+      return {
+        async arrayBuffer() {
+          return copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength);
+        },
+        async text() {
+          return new TextDecoder().decode(copy);
+        },
+      };
+    },
+    async put(key: string, value: Uint8Array | ArrayBuffer | string) {
+      const filePath = resolveSafeKeyPath(key);
+      mkdirSync(dirname(filePath), { recursive: true });
+      const data =
+        typeof value === 'string'
+          ? new TextEncoder().encode(value)
+          : value instanceof Uint8Array
+            ? value
+            : new Uint8Array(value);
+      writeFileSync(filePath, data);
+    },
+  };
+}
 
 interface DenoServerHandle {
   addr?: { port?: number; hostname?: string };
@@ -181,6 +232,7 @@ const KNOWN_DENO_ENV_KEYS = [
   'S3_SECRET_ACCESS_KEY',
   'S3_REGION',
   'EDGEFETCH_DISABLE_UPDATE_CHECK',
+  'EDGEFETCH_TRACKER_LIST',
   'EDGEFETCH_DEV_TELEMETRY',
   'EDGEFETCH_DEV_TELEMETRY_ENDPOINT',
   'EDGEFETCH_DEV_TELEMETRY_URL',
@@ -1082,9 +1134,13 @@ export interface DenoHubOptions {
   port?: number;
   hostname?: string;
   dataDir?: string;
+  env?: Record<string, string | undefined>;
   envOverrides?: Record<string, string | undefined>;
   ephemeralStores?: boolean;
   fetchImpl?: typeof fetch;
+  safeFetchImpl?: typeof fetch;
+  trackerFetchImpl?: typeof fetch;
+  initialTrackerDelayMs?: number;
   resolveDns?: (query: string, recordType: 'A' | 'AAAA') => Promise<string[]>;
   maxInflightPerIp?: number;
   maxInflightTotal?: number;
@@ -1098,6 +1154,7 @@ export interface DenoHubHandlerHandle {
   getBoundPort: () => number;
   setBoundPort: (port: number) => void;
   canonicalOrigin: () => string;
+  refreshTrackerListNow?: (opts?: { forceAfter6hOverrideForTest?: boolean }) => Promise<RefreshTrackerListOutcome>;
   flushPending: () => Promise<void>;
   close: () => Promise<void>;
 }
@@ -1112,7 +1169,7 @@ export interface DenoHubInstance {
 }
 
 export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandlerHandle {
-  const envMap = readDenoEnvMap(options.envOverrides);
+  const envMap = readDenoEnvMap({ ...options.env, ...options.envOverrides });
   const trustProxy = isTruthyDenoFlag(envMap.EDGEFETCH_TRUST_PROXY);
   const trustFlyClientIp =
     trustProxy &&
@@ -1188,11 +1245,27 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     ...(options.resolveDns ? { resolveDns: options.resolveDns } : {}),
   });
-  const safePublicFetch = createDenoSafeFetch(selfHost, {
-    allowExplicitLoopbackUrls: false,
-    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
-    ...(options.resolveDns ? { resolveDns: options.resolveDns } : {}),
-  });
+  const safePublicFetch =
+    options.safeFetchImpl ??
+    createDenoSafeFetch(selfHost, {
+      allowExplicitLoopbackUrls: false,
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.resolveDns ? { resolveDns: options.resolveDns } : {}),
+    });
+
+  const resolvedDataDir = options.dataDir ?? envMap.EDGEFETCH_DATA_DIR ?? './.edgefetch-deno-data';
+  const trackerStorageBucket =
+    s3Bucket ??
+    (() => {
+      if (options.ephemeralStores || resolvedDataDir.trim() === '' || resolvedDataDir.trim() === ':memory:') {
+        return undefined;
+      }
+      try {
+        return createDenoFsTrackerBucket(join(resolve(resolvedDataDir), 'tracker-store'));
+      } catch {
+        return undefined;
+      }
+    })();
 
   const callerTokenSecret =
     envMap.CALLER_TOKEN ?? envMap.EDGEFETCH_CALLER_TOKEN ?? envMap.EDGEFETCH_SERVER_TOKEN;
@@ -1203,6 +1276,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
   const stub = {
     fetch: async () => new Response('use deno upgrade handler', { status: 426 }),
     listAgents: async () => engine.listAgents(),
+    syncTrackerList: async (version: string | null, frames: string[]) => engine.setTrackerListBroadcast(version, frames),
     listAffinities: async () => engine.listAffinities(),
     clearAffinities: async (siteId?: string) => engine.clearAffinities(siteId),
     listHostHealth: async (limit = 100) => engine.listHostHealth(limit),
@@ -1296,6 +1370,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     ...(metaDb ? { META: metaDb } : {}),
     ...(searchDb ? { SEARCH: searchDb } : {}),
     ...(s3Bucket ? { ARTIFACTS: s3Bucket } : {}),
+    ...(trackerStorageBucket ? { TRACKER_BUCKET: trackerStorageBucket } : {}),
   };
 
   const sessionSecret = resolveSessionSecret(workerEnv as {
@@ -1537,6 +1612,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
             capabilities: cleanReq.headers.get('x-agent-capabilities') || null,
           });
           hubSock.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
+          engine.sendCurrentTrackerListToSocket(hubSock);
         };
         socket.onmessage = (ev) => {
           const byteLen =
@@ -1587,6 +1663,8 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
                     }),
                   });
                 }
+              } else if (msg.type === 'tracker_list_ack') {
+                engine.noteTrackerListAck(hubSock, msg.version);
               }
             } catch {
               // ignore malformed frame
@@ -1641,6 +1719,64 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     }
   };
 
+  const runDenoTrackerRefresh = async (overrideOpts?: {
+    forceAfter6hOverrideForTest?: boolean;
+  }): Promise<RefreshTrackerListOutcome> => {
+    const settingVal = await settings.getSetting('tracker_list').catch(() => null);
+    let currentSelfHost = selfHost;
+    if (!currentSelfHost) {
+      try {
+        currentSelfHost = new URL(canonicalOrigin()).hostname;
+      } catch {
+        currentSelfHost = undefined;
+      }
+    }
+    const out = await refreshHubTrackerList({
+      bucket: trackerStorageBucket,
+      fetchFn: options.trackerFetchImpl ?? safePublicFetch,
+      env: envMap,
+      hubSettingValue: settingVal,
+      selfHost: currentSelfHost,
+      publicOrigin: explicitPublicOrigin ?? undefined,
+      ...(overrideOpts?.forceAfter6hOverrideForTest ? { forceAfter6hOverrideForTest: true } : {}),
+    });
+    if (out.current) {
+      const extraAllow = resolveExtraNeverBlockHosts({
+        selfHost: currentSelfHost,
+        publicOrigin: explicitPublicOrigin ?? undefined,
+      });
+      engine.setTrackerListBroadcast(out.current.meta.version, buildTrackerListWsFrames(out.current, extraAllow));
+    }
+    return out;
+  };
+
+  let initialTrackerTimer: ReturnType<typeof setTimeout> | undefined;
+  let dailyTrackerTimer: ReturnType<typeof setInterval> | undefined;
+  if (trackerStorageBucket && !isTrackerListDisabled(envMap)) {
+    void loadStoredTrackerList(trackerStorageBucket)
+      .then((stored) => {
+        if (!stored) return;
+        const extraAllow = resolveExtraNeverBlockHosts({
+          selfHost,
+          publicOrigin: explicitPublicOrigin ?? undefined,
+        });
+        engine.setTrackerListBroadcast(stored.meta.version, buildTrackerListWsFrames(stored, extraAllow));
+      })
+      .catch(() => undefined);
+
+    initialTrackerTimer = setTimeout(() => {
+      void runDenoTrackerRefresh().catch(() => undefined);
+    }, options.initialTrackerDelayMs ?? INITIAL_PORTABLE_TRACKER_DELAY_MS);
+    (initialTrackerTimer as { unref?: () => void }).unref?.();
+    getDenoRuntime()?.unrefTimer?.(initialTrackerTimer as unknown as number);
+
+    dailyTrackerTimer = setInterval(() => {
+      void runDenoTrackerRefresh().catch(() => undefined);
+    }, DAILY_TRACKER_POLL_INTERVAL_MS);
+    (dailyTrackerTimer as { unref?: () => void }).unref?.();
+    getDenoRuntime()?.unrefTimer?.(dailyTrackerTimer as unknown as number);
+  }
+
   const flushPending = async (): Promise<void> => {
     while (pendingWaitUntil.size > 0) {
       await Promise.allSettled([...pendingWaitUntil]);
@@ -1648,6 +1784,8 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
   };
 
   const close = async (): Promise<void> => {
+    if (initialTrackerTimer) clearTimeout(initialTrackerTimer);
+    if (dailyTrackerTimer) clearInterval(dailyTrackerTimer);
     await flushPending();
     for (const sock of sockets) {
       sock.close(1001, 'shutdown');
@@ -1670,6 +1808,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
       if (Number.isFinite(p) && p > 0) boundPort = p;
     },
     canonicalOrigin,
+    refreshTrackerListNow: runDenoTrackerRefresh,
     flushPending,
     close,
   };

@@ -472,6 +472,7 @@ export function buildCrawlChildSpans(params: {
         outcome?: unknown;
         durationMs?: unknown;
         rendered?: boolean;
+        blockedTrackers?: unknown;
         waf?: { vendor?: unknown };
         timing?: {
           dnsMs?: unknown;
@@ -516,6 +517,9 @@ export function buildCrawlChildSpans(params: {
           'crawler.via': params.via,
           'crawler.outcome': safeOutcome,
           'crawler.rendered': Boolean(r.rendered),
+          ...(typeof r.blockedTrackers === 'number' && Number.isFinite(r.blockedTrackers)
+            ? { 'browser.blocked_trackers': Math.max(0, Math.floor(r.blockedTrackers)) }
+            : {}),
           ...(typeof r.waf?.vendor === 'string' && r.waf.vendor ? { 'edgefetch.waf.vendor': r.waf.vendor } : {}),
           'net.dns_ms': Number.isFinite(dnsMs) ? Math.max(0, Math.floor(dnsMs)) : 0,
           'net.connect_ms': Number.isFinite(connectMs) ? Math.max(0, Math.floor(connectMs)) : 0,

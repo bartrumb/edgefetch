@@ -136,3 +136,111 @@ func HasPrivateSharedHostingSuffix(host string) bool {
 	}
 	return loadPSL().wildcards[strings.Join(labels, ".")]
 }
+
+func normalizeCleanPSLHost(rawHost string) (string, bool) {
+	start := 0
+	end := len(rawHost)
+	for start < end && (rawHost[start] == ' ' || rawHost[start] == '\t' || rawHost[start] == '\r' || rawHost[start] == '\n') {
+		start++
+	}
+	for end > start && (rawHost[end-1] == ' ' || rawHost[end-1] == '\t' || rawHost[end-1] == '\r' || rawHost[end-1] == '\n') {
+		end--
+	}
+	if start >= end || rawHost[start] == '.' {
+		return "", false
+	}
+	for end > start && rawHost[end-1] == '.' {
+		end--
+	}
+	if start >= end || end-start > 253 {
+		return "", false
+	}
+	sub := rawHost[start:end]
+	for i := 0; i < len(sub); i++ {
+		if sub[i] >= 'A' && sub[i] <= 'Z' {
+			return strings.ToLower(sub), true
+		}
+	}
+	return sub, true
+}
+
+// LookupKnownRegistrableDomain resolves the eTLD+1 registrable domain ONLY when the host's public suffix
+// is explicitly recognized in the Mozilla Public Suffix List (or RFC 2606 reserved `.test` / `.example` TLDs)
+// and is NOT a PSL PRIVATE DOMAINS shared-hosting suffix.
+// When `ok` is false (shared-hosting suffix, unknown/unlisted TLD suffix, IP literal, dotless host, or bare suffix),
+// third-party subresource tracker blocking must fail open and not block.
+func LookupKnownRegistrableDomain(host string) (string, bool) {
+	clean, ok := normalizeCleanPSLHost(host)
+	if !ok {
+		return "", false
+	}
+	var starts [128]int
+	numLabels := 0
+	labelStart := 0
+	for i := 0; i <= len(clean); i++ {
+		if i == len(clean) || clean[i] == '.' {
+			lLen := i - labelStart
+			if lLen == 0 || lLen > 63 || clean[labelStart] == '-' || clean[i-1] == '-' || numLabels >= len(starts) {
+				return "", false
+			}
+			starts[numLabels] = labelStart
+			numLabels++
+			labelStart = i + 1
+			continue
+		}
+		c := clean[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return "", false
+		}
+	}
+	if numLabels < 2 {
+		return "", false
+	}
+	tld := clean[starts[numLabels-1]:]
+	if tld[0] >= '0' && tld[0] <= '9' {
+		return "", false
+	}
+
+	t := loadPSL()
+	if t.wildcards[clean] {
+		return "", false
+	}
+	suffixLen := 0
+	isPrivate := false
+	recognized := false
+	for i := 0; i < numLabels; i++ {
+		cand := clean[starts[i]:]
+		rem := numLabels - i
+		if excPriv, hasExc := t.exception[cand]; hasExc {
+			if excPriv {
+				return "", false
+			}
+			suffixLen = rem - 1
+			recognized = true
+			isPrivate = false
+			break
+		}
+		if exactPriv, hasExact := t.exact[cand]; hasExact && rem >= suffixLen {
+			suffixLen = rem
+			isPrivate = exactPriv
+			recognized = true
+		}
+		if i > 0 {
+			if wildPriv, hasWild := t.wildcards[cand]; hasWild && rem+1 >= suffixLen {
+				suffixLen = rem + 1
+				isPrivate = wildPriv
+				recognized = true
+			}
+		}
+	}
+	if !recognized {
+		if tld == "test" || tld == "example" {
+			suffixLen = 1
+			recognized = true
+		}
+	}
+	if !recognized || isPrivate || suffixLen <= 0 || numLabels <= suffixLen {
+		return "", false
+	}
+	return clean[starts[numLabels-suffixLen-1]:], true
+}

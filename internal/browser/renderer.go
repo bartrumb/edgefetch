@@ -128,6 +128,7 @@ type Task struct {
 	Screenshot         bool
 	ScreenshotFullPage bool
 	ScreenshotQuality  int
+	BlockTrackers      *bool // nil defaults to true when a tracker list is loaded on Renderer; false disables for this Task
 	Actions            []InteractAction
 	SessionID          string // Optional existing session to resume
 	KeepSession        bool   // Retain tab open for follow-up `interact` calls
@@ -148,6 +149,7 @@ type Output struct {
 	CapturedJSON      []CapturedJSONResponse
 	PDFBase64         string
 	SessionID         string
+	BlockedTrackers   int
 }
 
 type fetchHeaderEntry struct {
@@ -202,6 +204,10 @@ type retainedSession struct {
 	hasExtraHeaders             bool
 	everHadExtraHeaders         bool
 	extraHeaders                map[string]string
+	renderer                    *Renderer
+	blockTrackersStep           bool
+	stepTargetURL               string
+	stepBlockedTrackers         int
 	observerStarted             bool
 	fetchEnabled                bool
 	stopFetchOnce               sync.Once
@@ -330,6 +336,33 @@ func sameHeaderMap(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func (s *retainedSession) ensureFetchInterceptionEnabled(ctx context.Context, cdp *cdpConn) error {
+	if s == nil || cdp == nil {
+		return nil
+	}
+	s.startEventObserver(cdp)
+	s.mu.Lock()
+	needEnable := !s.fetchEnabled
+	if needEnable {
+		s.fetchEnabled = true
+	}
+	cdpSID := s.cdpSessionID
+	s.mu.Unlock()
+	if !needEnable {
+		return nil
+	}
+	if err := cdp.call(ctx, cdpSID, "Fetch.enable", map[string]any{
+		"patterns": []map[string]any{{"urlPattern": "*"}},
+	}, nil); err != nil {
+		s.mu.Lock()
+		s.fetchEnabled = false
+		s.mu.Unlock()
+		return fmt.Errorf("enable CDP Fetch domain: %w", err)
+	}
+	s.seedFrameTree(ctx, cdp)
+	return nil
 }
 
 func (s *retainedSession) startEventObserver(cdp *cdpConn) {
@@ -478,6 +511,15 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 	}
 	s.seedFrameTree(ctx, cdp)
 	return nil
+}
+
+func (s *retainedSession) snapshotBlockedTrackers() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stepBlockedTrackers
 }
 
 // hasPositiveSameOriginProof requires at least one of Origin or Referer to be explicitly present and match initOrigin,
@@ -1196,6 +1238,44 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	if isChildFrame {
 		s.setFrameTaintedLocked(paused.FrameID, true)
 	}
+
+	// Third-party tracker blocking: subresources ONLY (never Document navigations on main or child frames).
+	if s.blockTrackersStep && !isDocReq && paused.ResourceType != "" && s.renderer != nil {
+		pageDocURL := s.committedDocURL
+		targetURL := ""
+		if pageDocURL == "" || s.awaitingHarnessCommit {
+			targetURL = s.stepTargetURL
+			if targetURL == "" {
+				targetURL = s.lastCheckedURL
+			}
+		}
+		if s.renderer.shouldBlockTrackerSubresource(paused.Request.URL, pageDocURL, targetURL) {
+			s.stepBlockedTrackers++
+			s.mu.Unlock()
+			go func() {
+				cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				_ = cdp.call(cctx, cdpSID, "Fetch.failRequest", map[string]any{
+					"requestId":   paused.RequestID,
+					"errorReason": "BlockedByClient",
+				}, nil)
+			}()
+			return
+		}
+	}
+
+	// Fast-path for non-Document subresources ONLY when Fetch interception is active purely for tracker blocking
+	// (Document navigations must still run lines 974-1033 so retained sessions track cross-origin redirect bounces).
+	if !isDocReq && paused.ResourceType != "" && !s.hasExtraHeaders && len(extra) == 0 && len(pendingExtra) == 0 {
+		s.mu.Unlock()
+		go func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = cdp.call(cctx, cdpSID, "Fetch.continueRequest", map[string]any{"requestId": paused.RequestID}, nil)
+		}()
+		return
+	}
+
 	isMainDoc := (isDocReq || paused.ResourceType == "") && !isChildFrame &&
 		(s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
 
@@ -1349,7 +1429,7 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		}
 	}
 
-	if allowInject && len(extra) > 0 && paused.RequestID != "" {
+	if allowInject && (len(extra) > 0 || isMainDoc) && paused.RequestID != "" {
 		if s.injectedReqs == nil {
 			s.injectedReqs = make(map[string]bool)
 		}
@@ -1590,6 +1670,264 @@ type Renderer struct {
 	lastUsedAt       time.Time
 	closed           bool
 	otelExp          *otel.Exporter
+
+	trackerSnap atomic.Pointer[trackerSnapshot]
+}
+
+type trackerSnapshot struct {
+	version    string
+	hosts      map[string]struct{}
+	extraAllow map[string]struct{}
+}
+
+// hardcodedNeverBlockHostSuffixes holds bot-challenge/WAF providers and feature-flag/A-B SDK domains
+// that must never be blocked during headless Chromium rendering even if present in an upstream filter list.
+var hardcodedNeverBlockHostSuffixes = map[string]struct{}{
+	// Bot-challenge & WAF hosts
+	"challenges.cloudflare.com": {},
+	"datadome.co":               {},
+	"captcha-delivery.com":      {},
+	"perimeterx.net":            {},
+	"px-cdn.net":                {},
+	"px-cloud.net":              {},
+	"pxchk.net":                 {},
+	"humansecurity.com":         {},
+	"hsprotect.net":             {},
+	"akamaihd.net":              {},
+	"akamaized.net":             {},
+	"akstat.io":                 {},
+	"go-mpulse.net":             {},
+	"arkoselabs.com":            {},
+	"funcaptcha.com":            {},
+	"recaptcha.net":             {},
+	"google.com":                {},
+	"gstatic.com":               {},
+	"hcaptcha.com":              {},
+	// Feature-flag / A-B SDKs
+	"launchdarkly.com":  {},
+	"optimizely.com":    {},
+	"statsig.com":       {},
+	"statsigapi.net":    {},
+	"featureassets.org": {},
+	"split.io":          {},
+	"growthbook.io":     {},
+}
+
+func hostMatchesSetLinear(host string, set map[string]struct{}) bool {
+	if len(set) == 0 || host == "" {
+		return false
+	}
+	for cur := host; ; {
+		if _, ok := set[cur]; ok {
+			return true
+		}
+		dot := strings.IndexByte(cur, '.')
+		if dot < 0 {
+			return false
+		}
+		cur = cur[dot+1:]
+	}
+}
+
+func isSameOrSubdomainOrParentHost(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) && a[len(a)-len(b)-1] == '.' && strings.HasSuffix(a, b) {
+		return true
+	}
+	if len(b) > len(a) && b[len(b)-len(a)-1] == '.' && strings.HasSuffix(b, a) {
+		return true
+	}
+	return false
+}
+
+func canonicalNonIPDotHost(rawHost string) string {
+	h := politeness.CanonicalHost(rawHost)
+	if h == "" || strings.IndexByte(h, '.') < 0 {
+		return ""
+	}
+	last := h[len(h)-1]
+	// Fast path: standard DNS hostnames ending in an ASCII letter (`a..z`) cannot be IPv4 or IPv6 literals.
+	if last >= 'a' && last <= 'z' && strings.IndexByte(h, ':') < 0 {
+		return h
+	}
+	if net.ParseIP(h) != nil {
+		return ""
+	}
+	return h
+}
+
+func hostFromHTTPURL(rawURL string) string {
+	if len(rawURL) < 8 {
+		return ""
+	}
+	// Zero-allocation ASCII fast path for standard `https://host[:port][/...]` and `http://host[:port][/...]` URLs:
+	var rest string
+	if len(rawURL) >= 8 && strings.EqualFold(rawURL[:8], "https://") {
+		rest = rawURL[8:]
+	} else if strings.EqualFold(rawURL[:7], "http://") {
+		rest = rawURL[7:]
+	}
+	if rest != "" {
+		end := len(rest)
+		for i := 0; i < len(rest); i++ {
+			c := rest[i]
+			if c == '/' || c == '?' || c == '#' {
+				end = i
+				break
+			}
+		}
+		auth := rest[:end]
+		if auth != "" && strings.IndexByte(auth, '@') < 0 && auth[0] != '[' && strings.IndexByte(auth, '%') < 0 {
+			hostPart := auth
+			if colon := strings.IndexByte(hostPart, ':'); colon >= 0 {
+				hostPart = hostPart[:colon]
+			}
+			isCleanLower := len(hostPart) > 0 && len(hostPart) <= 253 && hostPart[0] != '.' && hostPart[len(hostPart)-1] != '.'
+			hasDot := false
+			for i := 0; isCleanLower && i < len(hostPart); i++ {
+				c := hostPart[i]
+				if c == '.' {
+					hasDot = true
+				} else if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+					isCleanLower = false
+				}
+			}
+			if isCleanLower && hasDot {
+				last := hostPart[len(hostPart)-1]
+				if last >= 'a' && last <= 'z' {
+					return hostPart
+				}
+				if net.ParseIP(hostPart) == nil {
+					return hostPart
+				}
+				return ""
+			}
+		}
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "https" && scheme != "http" {
+		return ""
+	}
+	return canonicalNonIPDotHost(u.Hostname())
+}
+
+// SetTrackerList atomically updates the in-memory EasyPrivacy host set on Renderer.
+// Hosts are kept strictly in memory; passing an empty version or empty host list disables blocking.
+func (r *Renderer) SetTrackerList(version string, hosts []string, extraNeverBlockHosts ...string) {
+	if r == nil {
+		return
+	}
+	ver := strings.TrimSpace(version)
+	if ver == "" || len(hosts) == 0 {
+		r.trackerSnap.Store(nil)
+		return
+	}
+	var extraAllow map[string]struct{}
+	for _, rawAllow := range extraNeverBlockHosts {
+		if h := canonicalNonIPDotHost(rawAllow); h != "" {
+			if extraAllow == nil {
+				extraAllow = make(map[string]struct{}, len(extraNeverBlockHosts))
+			}
+			extraAllow[h] = struct{}{}
+		}
+	}
+	set := make(map[string]struct{}, len(hosts))
+	for _, rawH := range hosts {
+		h := canonicalNonIPDotHost(rawH)
+		if h == "" {
+			continue
+		}
+		if hostMatchesSetLinear(h, hardcodedNeverBlockHostSuffixes) || hostMatchesSetLinear(h, extraAllow) {
+			continue
+		}
+		if extract.IsPublicOrPrivateSuffix(h) {
+			continue
+		}
+		set[h] = struct{}{}
+	}
+	if len(set) == 0 {
+		r.trackerSnap.Store(nil)
+		return
+	}
+	r.trackerSnap.Store(&trackerSnapshot{
+		version:    ver,
+		hosts:      set,
+		extraAllow: extraAllow,
+	})
+}
+
+// TrackerListVersion returns the currently loaded in-memory tracker list version (or "" if none is loaded).
+func (r *Renderer) TrackerListVersion() string {
+	if r == nil {
+		return ""
+	}
+	snap := r.trackerSnap.Load()
+	if snap == nil {
+		return ""
+	}
+	return snap.version
+}
+
+func (r *Renderer) hasTrackerList() bool {
+	if r == nil {
+		return false
+	}
+	snap := r.trackerSnap.Load()
+	return snap != nil && len(snap.hosts) > 0
+}
+
+func (r *Renderer) shouldBlockTrackerSubresource(rawReqURL, pageDocURL, targetURL string) bool {
+	if r == nil {
+		return false
+	}
+	snap := r.trackerSnap.Load()
+	if snap == nil || len(snap.hosts) == 0 {
+		return false
+	}
+	reqHost := hostFromHTTPURL(rawReqURL)
+	if reqHost == "" {
+		return false
+	}
+	if hostMatchesSetLinear(reqHost, hardcodedNeverBlockHostSuffixes) || hostMatchesSetLinear(reqHost, snap.extraAllow) {
+		return false
+	}
+	if !hostMatchesSetLinear(reqHost, snap.hosts) {
+		return false
+	}
+	pageHost := hostFromHTTPURL(pageDocURL)
+	targetHost := hostFromHTTPURL(targetURL)
+	if pageHost == "" && targetHost == "" {
+		return false
+	}
+	if isSameOrSubdomainOrParentHost(reqHost, pageHost) || isSameOrSubdomainOrParentHost(reqHost, targetHost) {
+		return false
+	}
+	reqReg, reqOK := extract.LookupKnownRegistrableDomain(reqHost)
+	if !reqOK {
+		return false
+	}
+	if pageHost != "" {
+		pageReg, pageOK := extract.LookupKnownRegistrableDomain(pageHost)
+		if !pageOK || reqReg == pageReg {
+			return false
+		}
+	}
+	if targetHost != "" {
+		targetReg, targetOK := extract.LookupKnownRegistrableDomain(targetHost)
+		if !targetOK || reqReg == targetReg {
+			return false
+		}
+	}
+	return true
 }
 
 func isSandboxRequiredByEnv() bool {
@@ -1802,12 +2140,13 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				StatusOK:     retErr == nil,
 				ErrorMessage: errMsg,
 				Attributes: map[string]any{
-					"url.full":                otel.SanitizeURL(task.URL),
-					"browser.status":          out.Status,
-					"browser.rendered_bytes":  len(out.HTML),
-					"browser.actions_count":   len(task.Actions),
-					"browser.session_resumed": task.SessionID != "",
-					"browser.screenshot":      task.Screenshot,
+					"url.full":                 otel.SanitizeURL(task.URL),
+					"browser.status":           out.Status,
+					"browser.rendered_bytes":   len(out.HTML),
+					"browser.actions_count":    len(task.Actions),
+					"browser.session_resumed":  task.SessionID != "",
+					"browser.screenshot":       task.Screenshot,
+					"browser.blocked_trackers": out.BlockedTrackers,
 				},
 			})
 		}()
@@ -1850,6 +2189,8 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 	}
 	r.reapExpiredSessions(ctx, cdp)
 
+	wantBlockTrackers := r.hasTrackerList() && (task.BlockTrackers == nil || *task.BlockTrackers)
+
 	var (
 		sess    *retainedSession
 		resumed bool
@@ -1869,11 +2210,6 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		// Always inspect live Page.getFrameTree on session resume so in-document pushState/replaceState or frame mutations
 		// since the previous step are reconciled (failing closed if Page.getFrameTree errors or frame state drifted).
 		sess.seedFrameTree(ctx, cdp, true)
-		sess.mu.Lock()
-		if sess.lastCheckedURL != "" || sess.committedDocURL != "" {
-			sess.hasCommittedDoc = true
-		}
-		sess.mu.Unlock()
 		navTarget := strings.TrimSpace(task.URL)
 		if navTarget == "" {
 			for _, a := range task.Actions {
@@ -1883,6 +2219,19 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				}
 			}
 		}
+		sess.mu.Lock()
+		if sess.lastCheckedURL != "" || sess.committedDocURL != "" {
+			sess.hasCommittedDoc = true
+		}
+		sess.renderer = r
+		sess.blockTrackersStep = wantBlockTrackers
+		if navTarget != "" {
+			sess.stepTargetURL = navTarget
+		} else {
+			sess.stepTargetURL = sess.lastCheckedURL
+		}
+		sess.stepBlockedTrackers = 0
+		sess.mu.Unlock()
 		clonedTaskHeaders := cloneTrimmedHeaders(task.Headers)
 		if len(clonedTaskHeaders) > 0 {
 			if navTarget != "" {
@@ -1939,6 +2288,11 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				}
 			}
 			sess.mu.Unlock()
+		}
+		if wantBlockTrackers && !sess.isFetchEnabled() {
+			if err := sess.ensureFetchInterceptionEnabled(ctx, cdp); err != nil {
+				return Output{}, err
+			}
 		}
 	}
 
@@ -2020,6 +2374,15 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": bcOut.BrowserContextID}, nil)
 			return Output{}, errors.New("cannot scope request headers: navigation target has no canonical http(s) origin")
 		}
+		initTargetURL := task.URL
+		if initTargetURL == "" {
+			for _, a := range task.Actions {
+				if strings.EqualFold(strings.TrimSpace(a.Type), "navigate") {
+					initTargetURL = strings.TrimSpace(a.URL)
+					break
+				}
+			}
+		}
 		sess = &retainedSession{
 			id:                  sid,
 			browserContextID:    bcOut.BrowserContextID,
@@ -2031,6 +2394,9 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			initialOrigin:       initOrigin,
 			hasExtraHeaders:     len(clonedInitHeaders) > 0,
 			everHadExtraHeaders: len(clonedInitHeaders) > 0,
+			renderer:            r,
+			blockTrackersStep:   wantBlockTrackers,
+			stepTargetURL:       initTargetURL,
 			lastUsed:            time.Now(),
 			lastStatus:          http.StatusOK,
 			lastHeaders:         make(http.Header),
@@ -2068,6 +2434,12 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		if len(clonedInitHeaders) > 0 {
 			if err := sess.enableOriginScopedHeaders(ctx, cdp, clonedInitHeaders); err != nil {
 				sess.stopFetch()
+				_ = cdp.call(context.Background(), "", "Target.closeTarget", map[string]any{"targetId": sess.targetID}, nil)
+				_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": sess.browserContextID}, nil)
+				return Output{}, err
+			}
+		} else if wantBlockTrackers {
+			if err := sess.ensureFetchInterceptionEnabled(ctx, cdp); err != nil {
 				_ = cdp.call(context.Background(), "", "Target.closeTarget", map[string]any{"targetId": sess.targetID}, nil)
 				_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": sess.browserContextID}, nil)
 				return Output{}, err
@@ -2163,7 +2535,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			}
 			if why := extract.DetectRenderedChallenge(preHTML); why != "" {
 				st, hClone := sess.snapshotResponseMeta()
-				return Output{Status: st, Headers: hClone}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+				return Output{Status: st, Headers: hClone, BlockedTrackers: sess.snapshotBlockedTrackers()}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 			}
 		}
 	}
@@ -2182,26 +2554,26 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		ar, err := r.runActionStep(ctx, cdp, sess, events, i, act, &actionScreenshots, &actionScrapes, &jsReturns, &pdfBase64)
 		if err != nil {
 			stErr, hErr := sess.snapshotResponseMeta()
-			return Output{Status: stErr, Headers: hErr, ActionResults: actionResults}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
+			return Output{Status: stErr, Headers: hErr, ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
 		}
 		actionResults = append(actionResults, ar)
 	}
 
 	htmlStr, finalURL, err := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
 	if err != nil {
-		return Output{ActionResults: actionResults}, err
+		return Output{ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, err
 	}
 	if vErr := r.validateFinalURL(ctx, sess, finalURL, task.URL); vErr != nil {
-		return Output{ActionResults: actionResults}, vErr
+		return Output{ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, vErr
 	}
 	for i := range actionScrapes {
 		if vErr := r.validateFinalURL(ctx, sess, actionScrapes[i].URL, task.URL); vErr != nil {
-			return Output{ActionResults: actionResults}, vErr
+			return Output{ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, vErr
 		}
 	}
 	st, hClone := sess.snapshotResponseMeta()
 	if why := extract.DetectRenderedChallenge(htmlStr); why != "" {
-		return Output{Status: st, Headers: hClone, FinalURL: finalURL, ActionResults: actionResults}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+		return Output{Status: st, Headers: hClone, FinalURL: finalURL, ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 	}
 
 	stopAndDrainHarvester()
@@ -2239,6 +2611,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		ActionResults:     actionResults,
 		CapturedJSON:      capturedJSON,
 		PDFBase64:         pdfBase64,
+		BlockedTrackers:   sess.snapshotBlockedTrackers(),
 	}
 	if task.KeepSession && !task.CloseSession {
 		out.SessionID = sess.id
@@ -2984,6 +3357,7 @@ func (r *Renderer) runActionStep(
 		sess.setLastCheckedURL(u.String())
 		navOrigin := canonicalURLOrigin(u.String())
 		sess.mu.Lock()
+		sess.stepTargetURL = u.String()
 		if sess.initialOrigin == "" {
 			sess.initialOrigin = navOrigin
 		}

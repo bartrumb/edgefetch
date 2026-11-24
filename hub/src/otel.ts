@@ -504,7 +504,12 @@ export function buildCrawlChildSpans(params: {
         kind: 3,
         startTimeMs: Math.max(0, safeEndMs - dur),
         endTimeMs: safeEndMs,
-        statusOk: safeOutcome === 'ok' || safeOutcome === 'gone' || safeOutcome === 'skip',
+        statusOk:
+          safeOutcome === 'ok' ||
+          safeOutcome === 'gone' ||
+          safeOutcome === 'not_found' ||
+          safeOutcome === 'skip' ||
+          (safeStatus === 404 && !r.waf?.vendor),
         attributes: sanitizeSpanAttributes({
           'url.full': safeUrl,
           'http.response.status_code': safeStatus,

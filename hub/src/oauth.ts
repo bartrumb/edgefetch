@@ -398,24 +398,38 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     if (multiUserMigrated) return;
     try {
       sql.exec(OAUTH_SQLITE_SCHEMA);
-      const alterStatements = [
-        "ALTER TABLE oauth_codes ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
-        "ALTER TABLE oauth_codes ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
-        "ALTER TABLE oauth_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
-        "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
-        'ALTER TABLE oauth_tokens ADD COLUMN used_at INTEGER',
-        'ALTER TABLE oauth_tokens ADD COLUMN rotation_counter INTEGER NOT NULL DEFAULT 0',
-        'ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT',
-        'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1',
-        'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0',
-        'ALTER TABLE users ADD COLUMN admitted_via TEXT',
-        'ALTER TABLE users ADD COLUMN admitted_org TEXT',
-        'ALTER TABLE users ADD COLUMN encrypted_gh_token TEXT',
-        'ALTER TABLE users ADD COLUMN org_verified_at INTEGER',
-      ];
-      for (const ddl of alterStatements) {
+      const readExistingCols = (tbl: string): Set<string> => {
         try {
-          sql.exec(ddl);
+          const rows = sql.exec<{ name?: string }>(`PRAGMA table_info(${tbl})`).toArray();
+          return new Set(rows.map((r) => (typeof r?.name === 'string' ? r.name : '')).filter(Boolean));
+        } catch {
+          return new Set();
+        }
+      };
+      const existingByTable: Record<string, Set<string>> = {
+        oauth_codes: readExistingCols('oauth_codes'),
+        oauth_tokens: readExistingCols('oauth_tokens'),
+        users: readExistingCols('users'),
+      };
+      const alterSpecs: Array<{ table: 'oauth_codes' | 'oauth_tokens' | 'users'; col: string; ddl: string }> = [
+        { table: 'oauth_codes', col: 'user_id', ddl: "ALTER TABLE oauth_codes ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'" },
+        { table: 'oauth_codes', col: 'user_role', ddl: "ALTER TABLE oauth_codes ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'" },
+        { table: 'oauth_tokens', col: 'user_id', ddl: "ALTER TABLE oauth_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'" },
+        { table: 'oauth_tokens', col: 'user_role', ddl: "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'" },
+        { table: 'oauth_tokens', col: 'used_at', ddl: 'ALTER TABLE oauth_tokens ADD COLUMN used_at INTEGER' },
+        { table: 'oauth_tokens', col: 'rotation_counter', ddl: 'ALTER TABLE oauth_tokens ADD COLUMN rotation_counter INTEGER NOT NULL DEFAULT 0' },
+        { table: 'users', col: 'promoted_by_owner_id', ddl: 'ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT' },
+        { table: 'users', col: 'session_epoch', ddl: 'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1' },
+        { table: 'users', col: 'disabled', ddl: 'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0' },
+        { table: 'users', col: 'admitted_via', ddl: 'ALTER TABLE users ADD COLUMN admitted_via TEXT' },
+        { table: 'users', col: 'admitted_org', ddl: 'ALTER TABLE users ADD COLUMN admitted_org TEXT' },
+        { table: 'users', col: 'encrypted_gh_token', ddl: 'ALTER TABLE users ADD COLUMN encrypted_gh_token TEXT' },
+        { table: 'users', col: 'org_verified_at', ddl: 'ALTER TABLE users ADD COLUMN org_verified_at INTEGER' },
+      ];
+      for (const spec of alterSpecs) {
+        if (existingByTable[spec.table]?.has(spec.col)) continue;
+        try {
+          sql.exec(spec.ddl);
         } catch {
           // Column already exists
         }

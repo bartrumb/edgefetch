@@ -396,6 +396,13 @@ export function sanitizeFleetForMcp(fleet: {
           .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '[redacted-ip]')
           .replace(/\[[0-9a-fA-F:]+\](?::\d+)?/g, '[redacted-ip]');
       }
+      if (
+        rest.browserSandbox === 'off' &&
+        Array.isArray(rest.capabilities) &&
+        rest.capabilities.includes('browser-v1')
+      ) {
+        rest.browserConfinement = 'container-mac+loopback-proxy';
+      }
       return rest as Omit<AgentAttachment, 'publicIp'> & Record<string, unknown>;
     }),
     affinities: safeAffinities,

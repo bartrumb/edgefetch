@@ -828,6 +828,9 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
   }
   if (u.protocol !== 'https:') return null;
   const host = u.hostname.toLowerCase();
+  if (host.endsWith('.greenhouse.io') && u.searchParams.get('error')?.toLowerCase() === 'true') {
+    return null;
+  }
   const parts = u.pathname.split('/').filter(Boolean);
 
   // P1: Ashby (`jobs.ashbyhq.com/{org}[/{jobId}[/application]]`)
@@ -3568,6 +3571,9 @@ export function parseAtsPostingIdentity(urlStr: string): AtsPostingIdentity | nu
   }
   if (u.protocol !== 'https:') return null;
   const host = u.hostname.toLowerCase();
+  if (host.endsWith('.greenhouse.io') && u.searchParams.get('error')?.toLowerCase() === 'true') {
+    return null;
+  }
   const parts = u.pathname.split('/').filter(Boolean);
 
   // 1. Greenhouse (`boards.greenhouse.io/<org>/jobs/<id>`, `job-boards.[eu.]greenhouse.io/<org>/jobs/<id>`, or `?gh_jid=<id>`)
@@ -4095,7 +4101,20 @@ function matchesJobQueryRelevance(
     return 'all_tokens';
   }
   const distinctiveQ = qTokens.filter((qt) => !GENERIC_ROLE_TOKENS.has(qt));
-  if (distinctiveQ.length > 0 && distinctiveQ.every((qt) => titleWords.some((tw) => jobWordTokensMatch(tw, qt)))) {
+  const queryHasIcRole = qTokens.some((qt) =>
+    /^(?:engineers?|developers?|scientists?|designers?|researchers?|architects?|analysts?)$/.test(qt),
+  );
+  const queryHasMgmtRole = qTokens.some((qt) =>
+    /^(?:managers?|management|directors?|vp|presidents?|chief|head)$/.test(qt),
+  );
+  const titleHasMgmtWithoutIc =
+    queryHasIcRole &&
+    !queryHasMgmtRole &&
+    titleWords.some((tw) => /^(?:managers?|management|directors?|vp|presidents?|chief|head)$/.test(tw)) &&
+    !qTokens
+      .filter((qt) => /^(?:engineers?|developers?|scientists?|designers?|researchers?|architects?|analysts?)$/.test(qt))
+      .some((icTok) => titleWords.some((tw) => jobWordTokensMatch(tw, icTok)));
+  if (!titleHasMgmtWithoutIc && distinctiveQ.length > 0 && distinctiveQ.every((qt) => titleWords.some((tw) => jobWordTokensMatch(tw, qt)))) {
     const cappedSnippet = snippet ? (snippet.length > 2048 ? snippet.slice(0, 2048) : snippet) : '';
     const fullWords = [...titleWords, ...extractJobWordTokens(cappedSnippet.toLowerCase())];
     if (qTokens.every((qt) => fullWords.some((fw) => jobWordTokensMatch(fw, qt)))) {
@@ -5649,7 +5668,7 @@ export async function executeJobsCall(params: {
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runJobs = async (): Promise<{ status: number; body: Record<string, unknown> }> => {
-  const { payload } = params;
+  const { payload, env } = params;
   const rawExecuteSearch = params.executeSearch;
   const executeSearch = (args: Record<string, unknown>) =>
     activeTracer ? activeTracer.run(() => rawExecuteSearch(args)) : rawExecuteSearch(args);
@@ -5864,9 +5883,9 @@ export async function executeJobsCall(params: {
   const resolvedAdapterIds = new Set<string>();
 
   // 1. Company Domain -> ATS Board Auto-Discovery (`domains: ["stripe.com", "nvidia.com", "f5.com"]`)
+  // Process at most 4 domains per wave (and cap `maxChars`) so multi-domain `rawHtml` discovery never spikes Worker heap memory.
   if (domainsInput.length > 0) {
-    await Promise.all(
-      domainsInput.map(async (dom) => {
+    const discoverSingleDomain = async (dom: string): Promise<void> => {
         const tried: string[] = [];
         const foundForDom: DiscoveredAtsBoard[] = [];
         let domHitBudgetCap = false;
@@ -5879,6 +5898,7 @@ export async function executeJobsCall(params: {
             discoverLlmsTxt: false,
             preferOriginMarkdown: false,
             onlyMainContent: false,
+            maxChars: 24_000,
             formats: ['markdown', 'rawHtml', 'links'],
             ...(payload.target ? { target: payload.target } : {}),
             ...(payload.site ? { site: payload.site } : {}),
@@ -5992,6 +6012,7 @@ export async function executeJobsCall(params: {
             const sr = await executeSearch({
               query: `(site:myworkdayjobs.com OR site:job-boards.greenhouse.io OR site:boards.greenhouse.io OR site:jobs.ashbyhq.com OR site:jobs.lever.co OR site:apply.workable.com OR site:jobs.smartrecruiters.com OR site:icims.com) "${baseSlug}"`,
               maxResults: 10,
+              ...(env?.SERPER_API_KEY ? { mode: 'serper' } : {}),
             }).catch(() => null);
             const srHits = Array.isArray(sr?.body?.results) ? (sr!.body.results as Array<Record<string, unknown>>) : [];
             const hitLinks = srHits
@@ -6033,8 +6054,11 @@ export async function executeJobsCall(params: {
               : `No ATS job board discovered for "${dom}" after probing ${tried.length} candidates.`,
           );
         }
-      }),
-    );
+    };
+    const DOMAIN_DISCOVERY_CONCURRENCY = 4;
+    for (let di = 0; di < domainsInput.length; di += DOMAIN_DISCOVERY_CONCURRENCY) {
+      await Promise.all(domainsInput.slice(di, di + DOMAIN_DISCOVERY_CONCURRENCY).map((d) => discoverSingleDomain(d)));
+    }
   }
 
   const companyTokensForSearch = companyFilter ? expandCompanyFilterTokens(companyFilter) : [];
@@ -6067,6 +6091,7 @@ export async function executeJobsCall(params: {
         executeSearch({
           query: sq,
           maxResults: searchMaxResults,
+          ...(env?.SERPER_API_KEY ? { mode: 'serper' } : {}),
         }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
       ),
     );

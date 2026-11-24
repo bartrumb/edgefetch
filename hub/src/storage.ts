@@ -408,6 +408,17 @@ function rememberUploadedArtifact(key: string, uploadedAtMs: number): void {
  * atomic `sha256` verification and half-retention deduplication refresh (avoiding 404 `r2_head` OTEL error spans
  * on brand-new uploads when `metaDb` is bound).
  */
+async function headR2ObjectWithoutMissingSpan(bucket: R2Bucket, targetKey: string): Promise<R2Object | null> {
+  if (typeof (bucket as { list?: unknown }).list === 'function') {
+    const listed = await bucket.list({ prefix: targetKey, limit: 4 }).catch(() => null);
+    if (listed && Array.isArray(listed.objects)) {
+      const exact = listed.objects.find((o) => o.key === targetKey);
+      return exact ?? null;
+    }
+  }
+  return bucket.head(targetKey).catch(() => null);
+}
+
 export async function handleAgentArtifactUpload(params: {
   request: Request;
   blobSha256: string;
@@ -597,7 +608,7 @@ export async function handleAgentArtifactUpload(params: {
     const canSatisfyRetention = metaRow?.retention === rawRetention || (rawRetention === 'transient' && metaRow?.retention === 'stored');
     if (canSatisfyRetention && metaRow?.last_seen_at && !shouldRefreshDedupedObject(metaRow.last_seen_at, metaRet, now)) {
       const checkKey = metaRet === 'stored' ? r2ArtifactKey('stored', blobSha256) : key;
-      existing = await bucket.head(checkKey);
+      existing = await headR2ObjectWithoutMissingSpan(bucket, checkKey);
       if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), metaRet, now)) {
         rememberUploadedArtifact(key, existing.uploaded.getTime());
         return Response.json({ ok: true, stored: false, deduplicated: true, key: checkKey }, { status: 200 });
@@ -610,14 +621,14 @@ export async function handleAgentArtifactUpload(params: {
       // emits `r2_head ERROR: The specified key does not exist.` on every new page crawl.
       knownNewInMeta = true;
     } else {
-      existing = await bucket.head(key);
+      existing = await headR2ObjectWithoutMissingSpan(bucket, key);
       if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
         rememberUploadedArtifact(key, existing.uploaded.getTime());
         return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
       }
     }
   } else {
-    existing = await bucket.head(key);
+    existing = await headR2ObjectWithoutMissingSpan(bucket, key);
     if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
       rememberUploadedArtifact(key, existing.uploaded.getTime());
       return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
@@ -644,8 +655,8 @@ export async function handleAgentArtifactUpload(params: {
     const msg = e instanceof Error ? e.message : String(e);
     const isBadDigest = /sha-?256|checksum|digest/i.test(msg);
     if (!isBadDigest) {
-      // On a concurrent same-key write collision, check head() to see if another writer succeeded; otherwise let agent retry.
-      const afterErr = await bucket.head(key).catch(() => null);
+      // On a concurrent same-key write collision, check existence without `r2_head ERROR` span; otherwise let agent retry.
+      const afterErr = await headR2ObjectWithoutMissingSpan(bucket, key);
       if (afterErr) {
         rememberUploadedArtifact(key, afterErr.uploaded.getTime());
         return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });

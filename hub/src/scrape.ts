@@ -5120,17 +5120,26 @@ export async function deriveMarkdownDocument(params: {
           markdown: cachedMd,
         };
       }
-    } else if ((await bucket.head(existingDoc.r2_key)) !== null) {
-      return {
-        status: 'cached',
-        documentId: existingDoc.id,
-        contentSha256,
-        pipelineVersion,
-        r2Key: existingDoc.r2_key,
-        bytes: existingDoc.bytes,
-        ...(existingDoc.title ? { title: existingDoc.title } : {}),
-        ...(existingDoc.language ? { language: existingDoc.language } : {}),
-      };
+    } else {
+      const existsInR2 =
+        typeof (bucket as { list?: unknown }).list === 'function'
+          ? await bucket
+              .list({ prefix: existingDoc.r2_key, limit: 4 })
+              .then((l) => l.objects.some((o) => o.key === existingDoc.r2_key))
+              .catch(() => false)
+          : (await bucket.head(existingDoc.r2_key)) !== null;
+      if (existsInR2) {
+        return {
+          status: 'cached',
+          documentId: existingDoc.id,
+          contentSha256,
+          pipelineVersion,
+          r2Key: existingDoc.r2_key,
+          bytes: existingDoc.bytes,
+          ...(existingDoc.title ? { title: existingDoc.title } : {}),
+          ...(existingDoc.language ? { language: existingDoc.language } : {}),
+        };
+      }
     }
   }
 
@@ -10719,6 +10728,39 @@ export async function executeScrapeCall(params: {
               },
             };
           }
+        } else if (
+          atsItem &&
+          (atsItem.status === 404 || atsItem.status === 410) &&
+          isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, atsItem, selfHost) &&
+          /^(?:greenhouse(?:-eu)?|ashby|lever(?:-eu)?|workable|gem)-(?:board|job)$/.test(atsSpec.id)
+        ) {
+          // Authoritative hosted ATS API returned 404/410: return immediately instead of triple-fetching
+          // (`ats-*` -> `twin-*` -> HTML `scrape-1` -> 14s headless Chromium `auto-render-1` on `?error=true`)!
+          const isSingleJobSpec = atsSpec.id.endsWith('-job');
+          const statusOut = Number(atsItem.status);
+          setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
+          setActiveSpanAttribute('edgefetch.outcome', 'not_found', activeTracer ?? undefined);
+          return {
+            status: statusOut,
+            via: atsRes.via,
+            body: {
+              ok: false,
+              url: normalizedUrl,
+              finalUrl: normalizedUrl,
+              outcome: 'not_found',
+              error: 'not_found',
+              retryable: false,
+              status: statusOut,
+              extractorId: atsSpec.id,
+              ...(isSingleJobSpec
+                ? {
+                    contentState: 'closed_posting' as const,
+                    contentStateReason: `ATS posting API returned HTTP ${statusOut} (closed or unpublished)`,
+                  }
+                : {}),
+              problem: `HTTP ${statusOut}`,
+            },
+          };
         }
       }
     } catch {
@@ -10935,7 +10977,13 @@ export async function executeScrapeCall(params: {
 
   // Modular Site Extractor Registry 1-hop JSON / raw / patch twin upgrade (`npm`, `crates.io`, `huggingface.co`,
   // `gitlab.com`, `codeberg.org`, Discourse `/t/<slug>/<id>.json`, `lobste.rs`, Bluesky ATProto, Mastodon, `dev.to`, etc.).
-  const registryTwin = !needsDomForTwin && renderMode !== 'always' ? resolveSiteExtractorTwin(normalizedUrl) : null;
+  // Skip when `atsSpec` already queried the ATS API above (or on Greenhouse `?error=true` closed-job redirects)
+  // so non-existent boards and closed redirects never double-fetch the JSON endpoint!
+  const isGreenhouseErrorRedirect = /\.greenhouse\.io\//i.test(normalizedUrl) && /[?&]error=true(?:&|#|$)/i.test(normalizedUrl);
+  const registryTwin =
+    !atsSpec && !isGreenhouseErrorRedirect && !needsDomForTwin && renderMode !== 'always'
+      ? resolveSiteExtractorTwin(normalizedUrl)
+      : null;
   if (registryTwin) {
     try {
       const twinRes = await executeHubFetch(
@@ -12234,13 +12282,27 @@ export async function executeScrapeCall(params: {
   }
 
   // P3: Automatic browser switch when a `<script>`-bearing or thin external/widget `<iframe>` (e.g. `#icims_content_iframe`) HTML page yields < 80 words.
+  // Never waste headless Chromium on URLs already identifiable as closed ATS job postings (e.g. Greenhouse `?error=true` redirects)!
   let autoBrowserUnavailable = false;
+  const preRenderClosedCheck = isHtmlBody
+    ? classifyContentState({
+        status: typeof item.status === 'number' ? item.status : 200,
+        url: normalizedUrl,
+        finalUrl,
+        title: extracted?.title,
+        markdown: extracted?.markdown ?? '',
+        rawHtml: rawBodyStr,
+        rendered: false,
+        nowMs: now,
+      })
+    : null;
   const hasThinExternalIframe =
     isHtmlBody && !customShopifyDoc && countTextWords(extracted?.markdown ?? '') < 50 && hasExternalOrWidgetIframeLinear(rawBodyStr).found;
   if (
     isHtmlBody &&
     !customShopifyDoc &&
     !ssrHydrated &&
+    preRenderClosedCheck?.state !== 'closed_posting' &&
     effectiveRenderMode === 'auto' &&
     item.rendered !== true &&
     target !== 'container' &&

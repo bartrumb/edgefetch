@@ -1509,3 +1509,170 @@ test('Wikipedia Spec Acceptance Suite (#1..#7): mediawiki cleanup, detected.adap
   assert.ok(String((bulkBlocked.body.bulkChannels as { wikimediaEnterprise: string })?.wikimediaEnterprise).includes('enterprise.wikimedia.com'));
   resetWikipediaStateForTests();
 });
+
+test('Live Trace Remediation Suite: ATS 404 fast-return, closed ?error=true Chromium suppression, IC vs Manager role matching, & list_agents browserConfinement', async () => {
+  resetJobsCacheForTests();
+
+  // 1. Non-existent hosted ATS board (`boards.greenhouse.io/nonexistent`) makes 1 fetch (not 3) and returns 404 immediately
+  let ghBoardFetches = 0;
+  const gh404Board = await executeScrapeCall({
+    payload: { url: 'https://boards.greenhouse.io/nonexistent' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      ghBoardFetches++;
+      const parsed = JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> };
+      assert.equal(parsed.requests[0]?.id, 'ats-greenhouse-board');
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [{ id: 'ats-greenhouse-board', url: parsed.requests[0]!.url, status: 404, outcome: 'error', problem: 'HTTP 404' }],
+        }),
+      };
+    },
+  });
+  assert.equal(gh404Board.status, 404);
+  assert.equal(gh404Board.body.outcome, 'not_found');
+  assert.equal(ghBoardFetches, 1, 'Authoritative Greenhouse 404 must NOT fall through to twin-greenhouse-board or HTML scrape-1');
+
+  // 2. Closed Greenhouse job (`job-boards.greenhouse.io/devrev/jobs/6174459004`) returning 404 on boards-api returns `closed_posting` in 1 fetch (0 Chromium renders!)
+  let ghJobFetches = 0;
+  const ghClosedJob = await executeScrapeCall({
+    payload: { url: 'https://job-boards.greenhouse.io/devrev/jobs/6174459004' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      ghJobFetches++;
+      const parsed = JSON.parse(rawBody) as { requests: Array<{ id: string; url: string; kind?: string }> };
+      assert.notEqual(parsed.requests[0]?.kind, 'render', 'Closed Greenhouse job must NEVER launch headless Chromium!');
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [{ id: 'ats-greenhouse-job', url: parsed.requests[0]!.url, status: 404, outcome: 'error', problem: 'HTTP 404' }],
+        }),
+      };
+    },
+  });
+  assert.equal(ghClosedJob.status, 404);
+  assert.equal(ghClosedJob.body.contentState, 'closed_posting');
+  assert.equal(ghJobFetches, 1);
+
+  // 3. Direct thin SPA redirect to `?error=true` skips `auto-render-1` Chromium
+  let errRedirectCalls = 0;
+  const directErrRedirect = await executeScrapeCall({
+    payload: { url: 'https://job-boards.greenhouse.io/devrev?error=true' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      errRedirectCalls++;
+      const parsed = JSON.parse(rawBody) as { requests: Array<{ id: string; kind?: string }> };
+      assert.notEqual(parsed.requests[0]?.id, 'auto-render-1', 'Must not trigger auto-render-1 on ?error=true closed_posting');
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://job-boards.greenhouse.io/devrev?error=true',
+              finalUrl: 'https://job-boards.greenhouse.io/devrev?error=true',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              body: '<!doctype html><html><head><script src="/app.js"></script></head><body><div id="root">Current Openings</div></body></html>',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(directErrRedirect.status, 200);
+  assert.equal(directErrRedirect.body.contentState, 'closed_posting');
+  assert.equal(errRedirectCalls, 1);
+
+  // 4. IC role query ("Security Engineer") does NOT match "Security Engineering Manager" via snippet fallback
+  const icFilterRes = await executeJobsCall({
+    payload: { query: 'Security Engineer', includeBuiltIn: false },
+    env: { SERPER_API_KEY: 'serper-test' },
+    executeSearch: async (sArgs) => {
+      assert.equal(sArgs.mode, 'serper', 'Speculative ATS queries must pass mode=serper when SERPER_API_KEY is set');
+      return { status: 200, body: { results: [{ url: 'https://jobs.ashbyhq.com/acme' }] } };
+    },
+    executeScrape: async () => ({
+      status: 200,
+      body: {
+        ok: true,
+        extractorId: 'ashby-board',
+        jobs: [
+          {
+            title: 'Security Engineering Manager',
+            company: 'Acme',
+            url: 'https://jobs.ashbyhq.com/acme/mgr-1',
+            applyUrl: 'https://jobs.ashbyhq.com/acme/mgr-1/application',
+            workplaceType: 'remote',
+            locations: ['Remote - US'],
+            pay: null,
+            postedAt: new Date().toISOString(),
+            source: 'ashby',
+            snippet: 'Lead a distributed team of Security Engineers building cloud infrastructure.',
+          },
+          {
+            title: 'Senior Security Engineer',
+            company: 'Acme',
+            url: 'https://jobs.ashbyhq.com/acme/ic-1',
+            applyUrl: 'https://jobs.ashbyhq.com/acme/ic-1/application',
+            workplaceType: 'remote',
+            locations: ['Remote - US'],
+            pay: null,
+            postedAt: new Date().toISOString(),
+            source: 'ashby',
+            snippet: 'Hands-on security engineering role.',
+          },
+        ],
+      },
+    }),
+  });
+  const icTitles = (icFilterRes.body.jobs as Array<{ title: string }>).map((j) => j.title);
+  assert.deepEqual(icTitles, ['Senior Security Engineer']);
+
+  // 5. `list_agents` surfaces `browserConfinement: "container-mac+loopback-proxy"` when `browser-v1` + `browserSandbox: "off"`
+  const listAgentsResp = await handleMcpRequest(
+    new Request('https://hub.example/mcp', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-caller-secret-0123456789abcdef',
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2025-03-26',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'list_agents', arguments: {} } }),
+    }),
+    new URL('https://hub.example/mcp'),
+    {
+      ownerSecret: 'test-caller-secret-0123456789abcdef',
+      allowedTargets: ['auto', 'agent', 'container'],
+      defaultTarget: 'auto',
+      executeFetch: async () => ({ status: 200, via: 'hub', bodyText: '{}' }),
+      listFleet: async () => ({
+        connected: 1,
+        agents: [
+          {
+            siteId: 'site-x86',
+            arch: 'amd64',
+            version: '2.7.7',
+            browserSandbox: 'off',
+            capabilities: ['artifacts-v1', 'browser-v1', 'pdf-v1'],
+            connectedAt: 1000,
+            jobsOk: 10,
+            jobsErr: 0,
+          },
+        ],
+        affinities: [],
+      }),
+    },
+  );
+  const fleetOut = JSON.parse(((await listAgentsResp.json()) as { result: { content: Array<{ text: string }> } }).result.content[0]!.text) as {
+    agents: Array<{ browserSandbox?: string; browserConfinement?: string }>;
+  };
+  assert.equal(fleetOut.agents[0]?.browserSandbox, 'off');
+  assert.equal(fleetOut.agents[0]?.browserConfinement, 'container-mac+loopback-proxy');
+});

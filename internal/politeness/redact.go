@@ -543,31 +543,18 @@ func looksLikeSecretTokenValue(tok string) bool {
 	return hasDigit || (hasUpper && hasSym) || len(tok) >= 20
 }
 
-var unquotedQueryStopByte = [256]bool{
-	' ':  true,
-	'\t': true,
-	'\r': true,
-	'\n': true,
-	'<':  true,
-	'>':  true,
-	'\'': true,
-	')':  true,
-	']':  true,
-	'}':  true,
-	'%':  true,
-	0xc2: true, // UTF-8 lead byte of U+0085 (NEL)
-	0xe2: true, // UTF-8 lead byte of U+2028 / U+2029 (LS / PS)
-}
+const unquotedQueryStopChars = " \t\r\n<>')]}%\xc2\xe2"
+const bareURLStopChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>)]}\\%\xc2\xe2"
 
 func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	sawQuery := false
 	j := start
 	for j < len(s) {
 		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
-			for j < len(s) && !unquotedQueryStopByte[s[j]] {
-				j++
-			}
-			if j >= len(s) {
+			if rel := strings.IndexAny(s[j:], unquotedQueryStopChars); rel >= 0 {
+				j += rel
+			} else {
+				j = len(s)
 				break
 			}
 		}
@@ -762,23 +749,38 @@ func tryMatchBareHostURLAt(s string, i int) (endIdx int, scrubbed string, scanSk
 		return 0, "", afterAuth, false
 	}
 
-	// Scan remainder of bare URL up to whitespace / quote / bracket / paren / %22
+	// Scan remainder of bare URL up to whitespace / quote / bracket / paren / %22 using SIMD IndexAny
 	j := afterAuth
 	for j < n {
+		rel := strings.IndexAny(s[j:], bareURLStopChars)
+		if rel < 0 {
+			j = n
+			break
+		}
+		j += rel
 		c := s[j]
-		if c <= ' ' || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ']' || c == '}' || c == '\\' {
-			break
+		if c == '%' {
+			if hasPrefixFoldASCII(s[j:], "%22") || hasPrefixFoldASCII(s[j:], "%27") || hasPrefixFoldASCII(s[j:], "%3e") {
+				break
+			}
+			j++
+			continue
 		}
-		if hasPrefixFoldASCII(s[j:], "%22") || hasPrefixFoldASCII(s[j:], "%27") || hasPrefixFoldASCII(s[j:], "%3e") {
-			break
+		if c == 0xc2 {
+			if j+1 < n && s[j+1] == 0x85 {
+				break
+			}
+			j++
+			continue
 		}
-		if c == 0xc2 && j+1 < n && s[j+1] == 0x85 {
-			break
+		if c == 0xe2 {
+			if j+2 < n && s[j+1] == 0x80 && (s[j+2] == 0xa8 || s[j+2] == 0xa9) {
+				break
+			}
+			j++
+			continue
 		}
-		if c == 0xe2 && j+2 < n && s[j+1] == 0x80 && (s[j+2] == 0xa8 || s[j+2] == 0xa9) {
-			break
-		}
-		j++
+		break
 	}
 	for j > afterAuth && (s[j-1] == ',' || s[j-1] == '.' || s[j-1] == ';') {
 		j--
@@ -1197,27 +1199,37 @@ func RedactEmbeddedURLs(s string) string {
 					// Power-of-two modulus for recursive %q / JSON quote escaping (`openBS` in {0, 1, 3, 7, ...}).
 					step := (openBS + 1) * 2
 					foundClose := false
-					for j := afterSep; j < len(s); j++ {
-						if s[j] == '"' {
-							bs := countPrecedingBackslashes(s, j)
-							if (openBS == 0 && bs%2 == 0) || (openBS > 0 && bs >= openBS && bs%step == openBS) {
-								endIdx = j - openBS
-								foundClose = true
-								break
-							}
+					for searchFrom := afterSep; searchFrom < len(s); {
+						relQ := strings.IndexByte(s[searchFrom:], '"')
+						if relQ < 0 {
+							break
 						}
+						j := searchFrom + relQ
+						bs := countPrecedingBackslashes(s, j)
+						if (openBS == 0 && bs%2 == 0) || (openBS > 0 && bs >= openBS && bs%step == openBS) {
+							endIdx = j - openBS
+							foundClose = true
+							break
+						}
+						searchFrom = j + 1
 					}
 					if !foundClose {
 						endIdx = len(s)
 					}
 				} else if quotePos >= 0 && s[quotePos] == '\'' {
 					foundClose := false
-					for j := afterSep; j < len(s); j++ {
-						if s[j] == '\'' && countPrecedingBackslashes(s, j)%2 == 0 {
+					for searchFrom := afterSep; searchFrom < len(s); {
+						relQ := strings.IndexByte(s[searchFrom:], '\'')
+						if relQ < 0 {
+							break
+						}
+						j := searchFrom + relQ
+						if countPrecedingBackslashes(s, j)%2 == 0 {
 							endIdx = j
 							foundClose = true
 							break
 						}
+						searchFrom = j + 1
 					}
 					if !foundClose {
 						endIdx = len(s)

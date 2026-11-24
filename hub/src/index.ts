@@ -1388,6 +1388,10 @@ export default {
                 const totalHubMs = Date.now() - startedAtMs;
                 const stageTimingsMs = { dispatchMs, hydrateR2Ms, totalHubMs };
                 span.setAttribute('edgefetch.via', via);
+                span.setAttribute('edgefetch.source', source.slice(0, 64));
+                span.setAttribute('edgefetch.target', target);
+                span.setAttribute('edgefetch.dispatch_ms', dispatchMs);
+                span.setAttribute('http.response.status_code', res.status);
                 return { status: res.status, via, bodyText, stageTimingsMs, ...(retryAfter ? { retryAfter } : {}) };
               },
             ),

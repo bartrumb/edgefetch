@@ -3,7 +3,6 @@ package extract
 import (
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"

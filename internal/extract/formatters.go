@@ -749,6 +749,62 @@ func ExtractStructuredJSONFromPageWithDiagnostics(
 	}
 	mdScanSlice := truncateUTF8SafeFullDocGo(doc.Markdown, 65536)
 
+	var lazyProduct map[string]any
+	lazyProductComputed := false
+	getProductData := func() map[string]any {
+		if !lazyProductComputed {
+			lazyProductComputed = true
+			if rawHTML != "" {
+				lazyProduct = ExtractStructuredProduct(rawHTML, doc.CanonicalURL, doc.Title, doc.Description)
+			}
+			if len(doc.Records) > 0 && doc.Records[0] != nil {
+				rec := doc.Records[0]
+				if lazyProduct == nil {
+					lazyProduct = make(map[string]any)
+				}
+				for _, pair := range [][2]string{
+					{"title", "title"},
+					{"brand", "vendor"},
+					{"brand", "brand"},
+					{"currency", "currency"},
+					{"sku", "sku"},
+					{"availability", "availability"},
+				} {
+					if lazyProduct[pair[0]] == nil {
+						if s, ok := rec[pair[1]].(string); ok && strings.TrimSpace(s) != "" {
+							lazyProduct[pair[0]] = strings.TrimSpace(s)
+						}
+					}
+				}
+				if lazyProduct["price"] == nil && rec["price"] != nil {
+					lazyProduct["price"] = rec["price"]
+				}
+				if variants, ok := rec["variants"].([]any); ok && len(variants) > 0 {
+					if v0, okV := variants[0].(map[string]any); okV && v0 != nil {
+						if lazyProduct["price"] == nil && v0["price"] != nil {
+							lazyProduct["price"] = v0["price"]
+						}
+						if lazyProduct["sku"] == nil {
+							if s, okS := v0["sku"].(string); okS && strings.TrimSpace(s) != "" {
+								lazyProduct["sku"] = strings.TrimSpace(s)
+							}
+						}
+						if lazyProduct["availability"] == nil {
+							if av, okA := v0["available"].(bool); okA {
+								if av {
+									lazyProduct["availability"] = "InStock"
+								} else {
+									lazyProduct["availability"] = "OutOfStock"
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		return lazyProduct
+	}
+
 	propNames := sortedMapKeys(props)
 	for _, propName := range propNames {
 		propSpec := props[propName]
@@ -761,13 +817,35 @@ func ExtractStructuredJSONFromPageWithDiagnostics(
 		for _, ld := range jsonLdObjects {
 			for _, k := range sortedMapKeys(ld) {
 				if strings.EqualFold(k, propName) && ld[k] != nil {
-					val = ld[k]
+					cand := ld[k]
+					if propType == "string" {
+						if cm, isMap := cand.(map[string]any); isMap {
+							if nm, ok := cm["name"].(string); ok && strings.TrimSpace(nm) != "" {
+								cand = strings.TrimSpace(nm)
+							} else if u, ok := cm["url"].(string); ok && strings.TrimSpace(u) != "" {
+								cand = strings.TrimSpace(u)
+							} else if id, ok := cm["@id"].(string); ok && strings.TrimSpace(id) != "" {
+								cand = strings.TrimSpace(id)
+							} else {
+								continue
+							}
+						}
+					}
+					val = cand
 					found = true
 					break
 				}
 			}
 			if found {
 				break
+			}
+		}
+
+		// 1b. Commerce / Schema.org Product `offers` + OpenGraph product meta + twin records fallback
+		if !found {
+			if prodVal, prodOk := lookupSchemaProductFieldFmtGo(lowerProp, getProductData); prodOk {
+				val = prodVal
+				found = true
 			}
 		}
 
@@ -904,6 +982,50 @@ func isNumericTypeFmtGo(v any) bool {
 		return true
 	}
 	return false
+}
+
+func lookupSchemaProductFieldFmtGo(lowerProp string, getProduct func() map[string]any) (any, bool) {
+	var prodKey string
+	isInStockBool := false
+	switch lowerProp {
+	case "price", "lowprice", "highprice", "saleprice", "currentprice", "amount":
+		prodKey = "price"
+	case "currency", "pricecurrency":
+		prodKey = "currency"
+	case "availability", "stockstatus":
+		prodKey = "availability"
+	case "instock", "available", "in_stock":
+		prodKey = "availability"
+		isInStockBool = true
+	case "brand", "vendor", "manufacturer":
+		prodKey = "brand"
+	case "sku", "productid":
+		prodKey = "sku"
+	case "gtin", "gtin13", "ean", "upc":
+		prodKey = "gtin"
+	case "rating", "ratingvalue", "averagerating":
+		prodKey = "rating"
+	case "reviewcount", "reviews_count", "ratingcount":
+		prodKey = "reviewCount"
+	default:
+		return nil, false
+	}
+	prod := getProduct()
+	if len(prod) == 0 {
+		return nil, false
+	}
+	v, exists := prod[prodKey]
+	if !exists || v == nil {
+		return nil, false
+	}
+	if isInStockBool {
+		s := strings.ToLower(strings.TrimSpace(jsonScalarToString(v)))
+		if s == "" {
+			return nil, false
+		}
+		return strings.Contains(s, "instock") || s == "true" || s == "available", true
+	}
+	return v, true
 }
 
 func extractSchemaArrayFieldFmtGo(propName, cleanMD, rawHTML string) []string {
@@ -1131,6 +1253,20 @@ func extractSchemaScalarHeuristicFmtGo(propName, lowerProp, propType, mdScanSlic
 				}
 				if v != "" {
 					return strings.TrimSpace(v), true
+				}
+			}
+		}
+		if strings.Contains(mdScanSlice, `"`+trimmedKey) || strings.Contains(strings.ToLower(mdScanSlice), `"`+strings.ToLower(trimmedKey)) {
+			jsonPat := `(?i)"` + escaped + `"[ \t]*:[ \t]*(?:"([^"\\\r\n]{1,300})"|(-?\d+(?:\.\d+)?|true|false))\b`
+			if jsonKvRe, err := regexp.Compile(jsonPat); err == nil {
+				if jm := jsonKvRe.FindStringSubmatch(mdScanSlice); len(jm) >= 3 {
+					cand := strings.TrimSpace(jm[1])
+					if cand == "" {
+						cand = strings.TrimSpace(jm[2])
+					}
+					if cand != "" {
+						return cand, true
+					}
 				}
 			}
 		}

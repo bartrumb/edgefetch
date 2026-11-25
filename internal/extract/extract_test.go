@@ -378,3 +378,64 @@ func TestRerankPassagesAndRedactPIIBranches(t *testing.T) {
 		t.Fatal("isLuhnCard length bounds failed")
 	}
 }
+
+func TestJsrTrailingEmptyCodeAndProductHeuristicSchema(t *testing.T) {
+	// 1. JSR `<pre class="highlight"><code>...</code><button class="copyButton" data-copy="...">...</button><code></code></pre>`
+	jsrHTML := `<!doctype html><html><head><title>@std/path - JSR</title></head><body><main>
+<h1>@std/path</h1>
+<h2>Path Properties</h2>
+<pre class="highlight"><code><span class="pl-k">import</span> * <span class="pl-k">as</span> path <span class="pl-k">from</span> <span class="pl-s">"@std/path"</span>;
+path.isAbsolute("/home/user");
+</code><button class="copyButton" data-copy="import * as path from &quot;@std/path&quot;;"><svg><path d="M0 0"></path></svg></button><code></code></pre>
+</main></body></html>`
+	jsrDoc := ExtractHTMLDocumentFull(jsrHTML, FullExtractOptions{
+		BaseURL:         "https://jsr.io/@std/path",
+		OnlyMainContent: true,
+	})
+	if !strings.Contains(jsrDoc.Markdown, `import * as path from "@std/path";`) || strings.Contains(jsrDoc.Markdown, "```\n\n```") {
+		t.Fatalf("expected JSR code block preserved without empty fence, got:\n%s", jsrDoc.Markdown)
+	}
+
+	// 2. Schema.org `Product` `offers` + nested `brand` object + fenced JSON scalar extraction in `ExtractStructuredJSONFromPageWithDiagnostics`
+	shopHTML := `<!doctype html><html><head><title>Wool Runner NZ</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Wool Runner NZ","brand":{"@type":"Brand","name":"Allbirds"},"sku":"WR-NZ-10","offers":[{"@type":"Offer","price":"112.00","priceCurrency":"USD","availability":"https://schema.org/InStock"}]}</script>
+</head><body><main><h1>Wool Runner NZ</h1><p>Waterproof merino sneaker.</p></main></body></html>`
+	shopDoc := ExtractHTMLDocumentFull(shopHTML, FullExtractOptions{
+		BaseURL:         "https://www.allbirds.com/products/wool-runner-nz",
+		OnlyMainContent: true,
+	})
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"title":    map[string]any{"type": "string"},
+			"brand":    map[string]any{"type": "string"},
+			"price":    map[string]any{"type": "number"},
+			"currency": map[string]any{"type": "string"},
+			"inStock":  map[string]any{"type": "boolean"},
+		},
+	}
+	res, _, unfilled := ExtractStructuredJSONFromPageWithDiagnostics(shopHTML, shopDoc, schema, "")
+	if len(unfilled) != 0 {
+		t.Fatalf("expected 0 unfilled product schema fields, got %v (res=%+v)", unfilled, res)
+	}
+	if res["price"] != float64(112) || res["currency"] != "USD" || res["brand"] != "Allbirds" || res["inStock"] != true {
+		t.Fatalf("unexpected extracted product schema JSON: %+v", res)
+	}
+
+	// 3. Fenced JSON scalar fallback (e.g. `agent` heuristic extraction over npm JSON markdown)
+	npmDoc := ExtractedDocumentFull{
+		Title:    "zod@4.6.7",
+		Markdown: "# zod@4.6.7\n\n```json\n{\n  \"name\": \"zod\",\n  \"version\": \"4.6.7\",\n  \"license\": \"MIT\"\n}\n```",
+	}
+	npmSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"version": map[string]any{"type": "string"},
+			"license": map[string]any{"type": "string"},
+		},
+	}
+	npmRes, _, npmUnfilled := ExtractStructuredJSONFromPageWithDiagnostics("", npmDoc, npmSchema, "")
+	if len(npmUnfilled) != 0 || npmRes["version"] != "4.6.7" || npmRes["license"] != "MIT" {
+		t.Fatalf("expected fenced JSON scalar extraction for version & license, got res=%+v unfilled=%v", npmRes, npmUnfilled)
+	}
+}

@@ -3856,6 +3856,7 @@ export async function executeScrapeCall(params: {
                 title: formatted.title,
                 description: formatted.description,
                 canonicalUrl: normalizedUrl,
+                ...(Array.isArray(formatted.records) ? { records: formatted.records } : {}),
                 links: formatted.links ?? [],
                 images: [],
                 branding: { title: formatted.title, description: formatted.description, canonicalUrl: normalizedUrl },
@@ -5921,6 +5922,7 @@ export async function executeScrapeCall(params: {
         language: extracted?.language,
         canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
         favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
+        ...(Array.isArray(nonEmptyUniversalRecords) ? { records: nonEmptyUniversalRecords } : {}),
         links: resolvedLinks as string[],
         images: resolvedImages as ScrapedImage[],
         branding: extracted?.branding ?? {

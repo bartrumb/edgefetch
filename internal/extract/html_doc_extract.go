@@ -4462,15 +4462,22 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		// `<pre>` blocks (optionally wrapping `<code ...>...</code>`)
 		if strings.Contains(asciiLowerExtractString(md), "<pre") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"pre"}, func(_, _, preAttrs, preInner string) string {
+				if strings.Contains(asciiLowerExtractString(preInner), "<button") {
+					preInner = stripHTMLTagsLinearFullDocGo(preInner, []string{"button"}, "", maxHTMLScanCharsFullDocGo)
+				}
 				codeAttrs := ""
 				rawCodeHTML := preInner
 				trimmedPre := strings.TrimSpace(preInner)
 				lowTrimmed := asciiLowerExtractString(trimmedPre)
 				if strings.HasPrefix(lowTrimmed, "<code") && strings.HasSuffix(lowTrimmed, "</code>") {
-					replacePairedHTMLElementsLinearFullDocGo(trimmedPre, []string{"code"}, func(_, _, cAttrs, cInner string) string {
-						if codeAttrs == "" {
+					matchedFirstCode := false
+					replacePairedHTMLElementsLinearFullDocGo(trimmedPre, []string{"code"}, func(cFull, _, cAttrs, cInner string) string {
+						if !matchedFirstCode {
+							matchedFirstCode = true
 							codeAttrs = cAttrs
-							rawCodeHTML = cInner
+							if len(cFull) == len(trimmedPre) {
+								rawCodeHTML = cInner
+							}
 						}
 						return ""
 					}, len(trimmedPre), len(trimmedPre))

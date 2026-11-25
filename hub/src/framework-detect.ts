@@ -81,9 +81,12 @@ export function filterSafeResponseHeaders(
 }
 
 export function scanGeneratorMetaTagsLinear(html: string, maxChars = FRAMEWORK_DETECT_WINDOW_CHARS): string[] {
+  const s = String(html ?? '');
+  if (!s) return [];
+  const cap = Math.max(0, maxChars);
   return (
     callCoreWasm<{ generators: string[] | null }>('scan_generator_metas', {
-      html: String(html ?? ''),
+      html: s.length > cap ? s.slice(0, cap) : s,
       maxChars,
     }).generators ?? []
   );
@@ -112,8 +115,11 @@ export function detectSiteFrameworkLinear(params: {
 }
 
 export function extractInertiaPagePropsLinear(rawHtml: string, maxScanChars = 524_288): Record<string, unknown> | null {
+  const s = String(rawHtml ?? '');
+  if (!s || !/data-page/i.test(s)) return null;
+  const cap = Math.max(0, maxScanChars);
   return callCoreWasm<{ props: Record<string, unknown> | null }>('extract_inertia_props', {
-    rawHtml: String(rawHtml ?? ''),
+    rawHtml: s.length > cap ? s.slice(0, cap) : s,
     maxScanChars,
   }).props;
 }

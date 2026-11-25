@@ -1325,13 +1325,26 @@ export default {
             };
           }
           let wantsIncludeBody = false;
+          let maxInlineBodyBytesOpt: number | undefined;
           let bodyRetentionOpt: ArtifactRetention | 'off' | undefined;
           let bodyCollectionId: string | undefined;
           try {
             const parsedCall = JSON.parse(body) as {
-              options?: { includeBody?: boolean; artifactRetention?: string; collectionId?: string };
+              options?: {
+                includeBody?: boolean;
+                maxInlineBodyBytes?: number;
+                artifactRetention?: string;
+                collectionId?: string;
+              };
             };
             wantsIncludeBody = Boolean(parsedCall.options?.includeBody);
+            if (
+              typeof parsedCall.options?.maxInlineBodyBytes === 'number' &&
+              Number.isFinite(parsedCall.options.maxInlineBodyBytes) &&
+              parsedCall.options.maxInlineBodyBytes > 0
+            ) {
+              maxInlineBodyBytesOpt = Math.floor(parsedCall.options.maxInlineBodyBytes);
+            }
             const rawOptRet = parsedCall.options?.artifactRetention;
             if (rawOptRet === 'stored' || rawOptRet === 'transient' || rawOptRet === 'off') {
               bodyRetentionOpt = rawOptRet;
@@ -1482,7 +1495,12 @@ export default {
                   }
                 } else if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
                   const hydStart = Date.now();
-                  bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
+                  bodyText = await hydrateReplyBodiesFromR2(
+                    rawCompletedBody,
+                    env.ARTIFACTS,
+                    undefined,
+                    maxInlineBodyBytesOpt,
+                  );
                   hydrateR2Ms = Date.now() - hydStart;
                 }
 

@@ -1866,7 +1866,7 @@ func FormatFeedXMLToMarkdown(raw, baseURL string) (doc *FormattedPayloadDoc, lin
 	if raw == "" {
 		return nil, nil
 	}
-	boundedXML := truncateUTF8SafeFullDocGo(raw, maxHTMLScanCharsFullDocGo)
+	boundedXML := truncateUTF8SafeFullDocGo(raw, 4*1024*1024)
 	headLower := asciiLowerExtractString(boundedXML[:minInt(len(boundedXML), 1200)])
 	hasRssRoot := strings.Contains(headLower, "<rss") || strings.Contains(headLower, "<rdf:rdf")
 	hasAtomRoot := strings.Contains(headLower, "<feed")

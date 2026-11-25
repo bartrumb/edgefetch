@@ -13,7 +13,13 @@ import { getActiveCallerAuthContext } from './oauth';
 import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
 import { ensureD1ColumnIfMissing } from './search-index';
 import { sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
-import { callCoreWasm, callCoreWasmRaw } from './wasm-bridge';
+import {
+  acquireIsolateByteBudget,
+  callCoreWasm,
+  callCoreWasmRaw,
+  isWasmInputBudgetExceededError,
+  MAX_WASM_INPUT_BYTES,
+} from './wasm-bridge';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
 
@@ -195,6 +201,27 @@ const D1_INIT_CACHE = new WeakSet<object>();
 
 export function projectLeanCatalogRecord(rec: CatalogRecord): Record<string, unknown> {
   return callCoreWasm<{ lean: Record<string, unknown> }>('catalog_project_lean', { record: rec }).lean;
+}
+
+const MAX_CATALOG_WASM_BATCH_JSON_BYTES = 1_572_864;
+
+function splitCatalogRecordsForWasm(records: CatalogRecord[]): CatalogRecord[][] {
+  if (records.length <= 1) return [records];
+  const batches: CatalogRecord[][] = [];
+  let current: CatalogRecord[] = [];
+  let currentBytes = 64;
+  for (const rec of records) {
+    const approx = JSON.stringify(rec).length * 2 + 64;
+    if (current.length > 0 && currentBytes + approx > MAX_CATALOG_WASM_BATCH_JSON_BYTES) {
+      batches.push(current);
+      current = [];
+      currentBytes = 64;
+    }
+    current.push(rec);
+    currentBytes += approx;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
 export function approxHashBundleBytes(hashes: SnapshotHashBundle | null): number {
@@ -771,9 +798,28 @@ async function reloadCatalogRecordsFromR2(r2: R2BucketLike, artifactId: string):
       const obj = await r2.get(artifactId);
       if (obj) {
         const ndjson = await readR2ObjectTextBounded(obj, artifactId);
-        const parsed = callCoreWasmRaw<{ records: CatalogRecord[]; bytes: number }>('catalog_parse_ndjson', null, ndjson);
-        loaded = parsed.records ?? [];
-        approxBytes = parsed.bytes ?? 64;
+        if (ndjson.length <= 2 * 1024 * 1024) {
+          const parsed = callCoreWasmRaw<{ records: CatalogRecord[]; bytes: number }>('catalog_parse_ndjson', null, ndjson);
+          loaded = parsed.records ?? [];
+          approxBytes = parsed.bytes ?? 64;
+        } else {
+          let cursor = 0;
+          let totalParsedBytes = 0;
+          while (cursor < ndjson.length) {
+            let end = Math.min(ndjson.length, cursor + 2 * 1024 * 1024);
+            if (end < ndjson.length) {
+              const nl = ndjson.lastIndexOf('\n', end - 1);
+              if (nl >= cursor) end = nl + 1;
+            }
+            const chunk = ndjson.slice(cursor, end);
+            cursor = end;
+            if (!chunk.trim()) continue;
+            const parsedChunk = callCoreWasmRaw<{ records: CatalogRecord[]; bytes: number }>('catalog_parse_ndjson', null, chunk);
+            if (parsedChunk.records?.length) loaded.push(...parsedChunk.records);
+            totalParsedBytes += Math.max(0, (parsedChunk.bytes ?? 64) - 64);
+          }
+          approxBytes = 64 + totalParsedBytes;
+        }
       }
     } catch {
       // ignore R2 read/decompression errors -> return partial/empty cleanly
@@ -1072,11 +1118,68 @@ export async function getCatalogRecords(params: {
     fullRecords?: CatalogRecord[];
     leanRecords?: Array<Record<string, unknown>>;
   };
-  let filteredOut = callCoreWasm<FilterOut>('catalog_filter_records', { records, filter: baseFilter });
+
+  const runCatalogFilterBounded = (flt: typeof baseFilter & { fallbackCurrency?: string }): FilterOut => {
+    const batches = splitCatalogRecordsForWasm(records);
+    if (batches.length <= 1) {
+      return callCoreWasm<FilterOut>('catalog_filter_records', { records, filter: flt });
+    }
+    let resolvedOff = flt.offset;
+    if (resolvedOff <= 0 && flt.cursor) {
+      const parsedOff = Number.parseInt(flt.cursor, 10);
+      if (Number.isFinite(parsedOff) && parsedOff > 0) resolvedOff = parsedOff;
+    }
+    resolvedOff = Math.max(0, resolvedOff);
+    const resolvedLim = Math.min(250, Math.max(1, flt.limit || 50));
+
+    let matchedTotal = 0;
+    let anyNeedsCurrency = false;
+    const windowFull: CatalogRecord[] = [];
+    const windowLean: Array<Record<string, unknown>> = [];
+
+    for (const batch of batches) {
+      let batchCursor = 0;
+      while (batchCursor < batch.length) {
+        const subOut = callCoreWasm<FilterOut>('catalog_filter_records', {
+          records: batch,
+          filter: { ...flt, offset: batchCursor, cursor: '', limit: 250 },
+        });
+        if (subOut.needsShopifyCurrency) anyNeedsCurrency = true;
+        if (batchCursor === 0) {
+          matchedTotal += subOut.matchedProducts;
+        }
+        const subItems = flt.fields === 'lean' ? (subOut.leanRecords ?? []) : (subOut.fullRecords ?? []);
+        if (subItems.length === 0) break;
+        const globalStart = matchedTotal - subOut.matchedProducts + batchCursor;
+        for (let idx = 0; idx < subItems.length; idx++) {
+          const gPos = globalStart + idx;
+          if (gPos >= resolvedOff && gPos < resolvedOff + resolvedLim) {
+            if (flt.fields === 'lean') windowLean.push(subItems[idx] as Record<string, unknown>);
+            else windowFull.push(subItems[idx] as CatalogRecord);
+          }
+        }
+        if (!subOut.hasMore) break;
+        batchCursor += subItems.length;
+      }
+    }
+    const returnedCount = flt.fields === 'lean' ? windowLean.length : windowFull.length;
+    return {
+      totalProducts: records.length,
+      matchedProducts: matchedTotal,
+      offset: resolvedOff,
+      limit: resolvedLim,
+      returned: returnedCount,
+      hasMore: resolvedOff + returnedCount < matchedTotal,
+      ...(anyNeedsCurrency ? { needsShopifyCurrency: true } : {}),
+      ...(flt.fields === 'lean' ? { leanRecords: windowLean } : { fullRecords: windowFull }),
+    };
+  };
+
+  let filteredOut = runCatalogFilterBounded(baseFilter);
   if (filteredOut.needsShopifyCurrency && summary.origin && params.executeHubFetch) {
     const fallbackCurrency = await resolveShopifyOriginCurrency(summary.origin, params.executeHubFetch);
     if (fallbackCurrency) {
-      filteredOut = callCoreWasm<FilterOut>('catalog_filter_records', { records, filter: { ...baseFilter, fallbackCurrency } });
+      filteredOut = runCatalogFilterBounded({ ...baseFilter, fallbackCurrency });
     } else if (effectiveFields === 'lean' && filteredOut.fullRecords) {
       filteredOut.leanRecords = filteredOut.fullRecords.map(projectLeanCatalogRecord);
     }
@@ -1349,7 +1452,7 @@ export async function executeCatalogCall(params: {
               url: currentUrl!,
               kind: 'json',
               accept: 'application/json',
-              maxBytes: 16_777_216,
+              maxBytes: MAX_WASM_INPUT_BYTES,
               timeoutMs: Math.min(30_000, remBeforeFetchMs),
               ...(payload.target !== undefined ? { target: payload.target } : {}),
               ...(payload.site !== undefined ? { site: payload.site } : {}),
@@ -1378,31 +1481,53 @@ export async function executeCatalogCall(params: {
             break;
           }
 
-          evalOut = callCoreWasmRaw<CatalogPageEvalResult>(
-            'catalog_evaluate_page',
-            {
-              currentUrl,
-              originWithCollection: plan.originWithCollection,
-              collection,
-              selfHost: params.selfHost ?? '',
-              platform: activeSpec.platform,
-              fields: plan.fields,
-              pagesRead,
-              triedAutoFallbackToWc,
-              autoFallbackFromShopify,
-              ...(reqPause !== undefined ? { reqPauseMs: reqPause } : {}),
-              catalogCfg: { platform: activeSpec.platform, pauseMs: activeSpec.pauseMs, pageCap: activeSpec.pageCap },
-              wooCatalogCfg: { platform: 'woocommerce', pauseMs: wcAdapter?.catalog?.pauseMs ?? 1000, pageCap: wcAdapter?.catalog?.pageCap ?? 200 },
-              status: pageResp.status,
-              outcome: pageResp.outcome ?? '',
-              problem: pageResp.problem ?? '',
-              headers: pageResp.headers,
-              finalUrl: pageResp.finalUrl ?? '',
-              ...(pageResp.retryAfterMs !== undefined ? { retryAfterMs: pageResp.retryAfterMs } : {}),
-              nowMs: Date.now(),
-            },
-            pageResp.body,
+          const pageBudgetLease = await acquireIsolateByteBudget(
+            Math.min(MAX_WASM_INPUT_BYTES, Math.max(262_144, pageResp.body.length)),
+            200,
           );
+          if (!pageBudgetLease) {
+            stopReason = 'isolate_memory_busy';
+            truncatedByBudget = true;
+            evalOut = null;
+            break;
+          }
+          try {
+            evalOut = callCoreWasmRaw<CatalogPageEvalResult>(
+              'catalog_evaluate_page',
+              {
+                currentUrl,
+                originWithCollection: plan.originWithCollection,
+                collection,
+                selfHost: params.selfHost ?? '',
+                platform: activeSpec.platform,
+                fields: plan.fields,
+                pagesRead,
+                triedAutoFallbackToWc,
+                autoFallbackFromShopify,
+                ...(reqPause !== undefined ? { reqPauseMs: reqPause } : {}),
+                catalogCfg: { platform: activeSpec.platform, pauseMs: activeSpec.pauseMs, pageCap: activeSpec.pageCap },
+                wooCatalogCfg: { platform: 'woocommerce', pauseMs: wcAdapter?.catalog?.pauseMs ?? 1000, pageCap: wcAdapter?.catalog?.pageCap ?? 200 },
+                status: pageResp.status,
+                outcome: pageResp.outcome ?? '',
+                problem: pageResp.problem ?? '',
+                headers: pageResp.headers,
+                finalUrl: pageResp.finalUrl ?? '',
+                ...(pageResp.retryAfterMs !== undefined ? { retryAfterMs: pageResp.retryAfterMs } : {}),
+                nowMs: Date.now(),
+              },
+              pageResp.body,
+            );
+          } catch (catWasmErr) {
+            if (isWasmInputBudgetExceededError(catWasmErr)) {
+              stopReason = 'page_too_large_for_edge';
+              truncatedByBudget = true;
+              evalOut = null;
+              break;
+            }
+            throw catWasmErr;
+          } finally {
+            pageBudgetLease.release();
+          }
 
           if (evalOut.action === 'cooldown') {
             if (++strikes > 3) {
@@ -1570,7 +1695,8 @@ export async function executeCatalogCall(params: {
 
       const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, plan.origin, collection, catalogId);
       const r2 = getArtifactsR2(env);
-      const finalized = callCoreWasm<{
+      const wantNdjson = Boolean(r2 && rawFinalRecords.length > 0);
+      type FinalizeOut = {
         records: CatalogRecord[];
         totalVariants: number;
         hashes: SnapshotHashBundle;
@@ -1579,13 +1705,49 @@ export async function executeCatalogCall(params: {
         ndjson: string;
         warning?: 'shrink';
         previousProducts?: number;
-      }>('catalog_finalize_pull', {
-        records: rawFinalRecords,
-        detectedCurrency,
-        ...(prevRun ? { prevProducts: prevRun.productsCount, prevHashes: prevRun.hashes } : {}),
-        isComplete: finalStatus === 'complete',
-        buildNdjson: Boolean(r2 && rawFinalRecords.length > 0),
-      });
+      };
+      const recordBatches = splitCatalogRecordsForWasm(rawFinalRecords);
+      let finalized: FinalizeOut;
+      if (recordBatches.length <= 1) {
+        finalized = callCoreWasm<FinalizeOut>('catalog_finalize_pull', {
+          records: rawFinalRecords,
+          detectedCurrency,
+          ...(prevRun ? { prevProducts: prevRun.productsCount, prevHashes: prevRun.hashes } : {}),
+          isComplete: finalStatus === 'complete',
+          buildNdjson: wantNdjson,
+        });
+      } else {
+        const mergedRecords: CatalogRecord[] = [];
+        let mergedTotalVariants = 0;
+        const mergedHashes: SnapshotHashBundle = { products: {}, variants: {} };
+        const ndjsonParts: string[] = [];
+        for (const batch of recordBatches) {
+          const part = callCoreWasm<FinalizeOut>('catalog_finalize_pull', {
+            records: batch,
+            detectedCurrency,
+            isComplete: false,
+            buildNdjson: wantNdjson,
+          });
+          mergedRecords.push(...part.records);
+          mergedTotalVariants += part.totalVariants;
+          Object.assign(mergedHashes.products, part.hashes.products);
+          Object.assign(mergedHashes.variants, part.hashes.variants);
+          if (part.ndjson) ndjsonParts.push(part.ndjson);
+        }
+        const mergedHashesBytes = approxHashBundleBytes(mergedHashes);
+        const mergedDiff =
+          prevRun?.hashes && finalStatus === 'complete' ? computeCatalogSnapshotDiff(prevRun.hashes, mergedHashes) : null;
+        const shrunk = prevRun && prevRun.productsCount > 0 && mergedRecords.length * 2 < prevRun.productsCount;
+        finalized = {
+          records: mergedRecords,
+          totalVariants: mergedTotalVariants,
+          hashes: mergedHashes,
+          hashesBytes: mergedHashesBytes,
+          diff: mergedDiff,
+          ndjson: ndjsonParts.join(''),
+          ...(shrunk ? { warning: 'shrink', previousProducts: prevRun!.productsCount } : {}),
+        };
+      }
 
       let artifactId: string | undefined;
       let hashesArtifactId: string | undefined;

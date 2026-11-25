@@ -107,6 +107,7 @@ export interface SiteExtractorTwin {
   fetchUrl: string;
   kind: 'json' | 'text';
   accept: string;
+  maxBytes?: number;
   formatTwin: (rawBody: string, originalUrl: string, htmlToMd: HtmlFragmentConverter) => TwinFormattedDoc | null;
 }
 

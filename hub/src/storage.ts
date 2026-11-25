@@ -900,16 +900,19 @@ export async function hydrateReplyBodiesFromR2(
   replyText: string,
   bucket: R2Bucket,
   budgetBytes = INLINE_HYDRATION_BUDGET_BYTES,
+  maxPerItemBytes?: number,
 ): Promise<string> {
   let parsed: {
     results?: Array<{
       body?: string;
       bodyEncoding?: 'utf-8' | 'base64';
       bodyOmitted?: boolean;
+      extractedOnNode?: boolean;
       artifactError?: string;
       artifact?: {
         blobSha256?: string;
         contentSha256?: string;
+        contentBytes?: number;
         retention?: string;
       };
       [k: string]: unknown;
@@ -936,6 +939,16 @@ export async function hydrateReplyBodiesFromR2(
   for (const r of parsed.results) {
     const art = r?.artifact;
     if (!art?.blobSha256 || typeof r.body === 'string') continue;
+    if (
+      r.extractedOnNode === true ||
+      (maxPerItemBytes !== undefined &&
+        maxPerItemBytes > 0 &&
+        typeof art.contentBytes === 'number' &&
+        art.contentBytes > maxPerItemBytes)
+    ) {
+      r.bodyOmitted = true;
+      continue;
+    }
     const prefRet: ArtifactRetention = art.retention === 'stored' ? 'stored' : 'transient';
     const fastBytes = isValidSha256Hex(art.blobSha256)
       ? lookupDecodedArtifactForHydration(bucket, prefRet, art.blobSha256, art.contentSha256, hydNow)

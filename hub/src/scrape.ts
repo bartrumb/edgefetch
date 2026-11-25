@@ -135,14 +135,17 @@ import {
 } from './llm';
 import {
   cleanFenceInfoStringLinear,
+  cutMarkdownToSanitizerBudget,
   detectPromptInjection,
   encodeBodyToRawBase64,
   escapeAllResidualLtInProseLinear,
   escapeGfmTaskListCheckboxesLinear,
+  escapeMarkdownFallbackLinear,
   extractHtmlAttributesBySelectors,
   extractStructuredProduct,
   isAsciiSpaceOrTabOnly,
   isDisallowedMarkdownLinkDestination,
+  MAX_SANITIZER_WASM_UTF8_BYTES,
   neutralizeAllUnsafeMarkdownLinksLinear,
   normalizeInlineBrowserActions,
   parsePdfParserOptions,
@@ -154,7 +157,21 @@ import {
   trimAsciiWhitespaceLinear,
   trimTrailingAsciiWhitespaceLinear,
 } from './scrape-advanced';
-import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawString } from './wasm-bridge';
+import {
+  acquireIsolateByteBudget,
+  callCoreWasm,
+  callCoreWasmRaw,
+  callCoreWasmRawString,
+  isWasmInputBudgetExceededError,
+  MAX_WASM_INPUT_BYTES,
+} from './wasm-bridge';
+
+const SCRAPE_UTF8_ENCODER = new TextEncoder();
+function exactUtf8ByteLen(s: string): number {
+  if (s.length * 3 <= MAX_WASM_INPUT_BYTES) return s.length;
+  if (s.length > MAX_WASM_INPUT_BYTES) return s.length;
+  return SCRAPE_UTF8_ENCODER.encode(s).byteLength;
+}
 
 export { recognizeAndHardenMarkdownFences, sanitizeMarkdownPageSlice, stripInvisibleSmugglingChars } from './scrape-advanced';
 export { SCRAPE_PIPELINE_VERSION } from './storage';
@@ -227,7 +244,8 @@ function unescapeUrlAttrAmpOnly(raw: string): string {
 
 export function decodeHtmlEntities(input: string): string {
   if (!input || !input.includes('&')) return input;
-  return callCoreWasm<{ out: string }>('decode_html_entities', { input }).out;
+  const { text: bounded } = cutMarkdownToSanitizerBudget(input);
+  return callCoreWasmRawString('decode_html_entities', null, bounded);
 }
 
 function parseTagAttrs(tag: string): Record<string, string> {
@@ -276,7 +294,8 @@ export function makeSafeCodeFence(code: string, lang = '', preferTilde = false):
 
 export function decodeMarkdownEntities(md: string): string {
   if (!md || !md.includes('&')) return md;
-  return callCoreWasm<{ out: string }>('decode_markdown_entities', { md }).out;
+  const { text: bounded } = cutMarkdownToSanitizerBudget(md);
+  return callCoreWasmRawString('decode_markdown_entities', null, bounded);
 }
 
 function safeDecodeURIComponent(raw: string): string {
@@ -289,7 +308,8 @@ function safeDecodeURIComponent(raw: string): string {
 
 export function cleanPdfMarkdown(md: string): string {
   if (!md) return md;
-  return callCoreWasm<{ out: string }>('clean_pdf_markdown', { md }).out;
+  const { text: bounded } = cutMarkdownToSanitizerBudget(md);
+  return callCoreWasmRawString('clean_pdf_markdown', null, bounded);
 }
 
 export function sanitizeScrapedMetadataField(raw: string | undefined, maxLen = 2_000): string | undefined {
@@ -306,7 +326,8 @@ export function sanitizeScrapedTimestampField(raw: string | undefined, maxLen = 
 
 export function redactPiiText(text: string): string {
   if (!text) return text;
-  return callCoreWasm<{ out: string }>('redact_pii', { text }).out;
+  const { text: bounded } = cutMarkdownToSanitizerBudget(text);
+  return callCoreWasmRawString('redact_pii', null, bounded);
 }
 
 export function extractLargestUrlFromSrcset(srcset: string | undefined): string | undefined {
@@ -1369,18 +1390,39 @@ function isTinyOrAvatarImageUrl(urlStr: string, alt = ''): boolean {
 
 export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
   if (!md) return '';
-  return callCoreWasmRawString(
-    'sanitize_markdown',
-    {
-      baseUrl: baseUrl ?? '',
-      allowPdfPageMarkers: Boolean(allowPdfPageMarkers),
-    },
-    md,
-  );
+  const meta = {
+    baseUrl: baseUrl ?? '',
+    allowPdfPageMarkers: Boolean(allowPdfPageMarkers),
+  };
+  if (md.length <= MAX_SANITIZER_WASM_UTF8_BYTES) {
+    try {
+      return callCoreWasmRawString('sanitize_markdown', meta, md);
+    } catch (err) {
+      if (!isWasmInputBudgetExceededError(err)) {
+        return escapeMarkdownFallbackLinear(md);
+      }
+    }
+  }
+  const { text: boundedMd } = cutMarkdownToSanitizerBudget(md);
+  try {
+    return callCoreWasmRawString('sanitize_markdown', meta, boundedMd);
+  } catch {
+    return escapeMarkdownFallbackLinear(boundedMd);
+  }
 }
 
 export function parseMarkdownFrontmatter(md: string): { title?: string; description?: string; body: string } {
   if (!md || !md.startsWith('---')) return { body: md };
+  if (md.length > 65_536) {
+    const head = md.slice(0, 65_536);
+    const parsedHead = callCoreWasm<{ title?: string; description?: string; body: string }>('parse_frontmatter', { md: head });
+    const consumedPrefix = head.length - (parsedHead.body ?? head).length;
+    return {
+      ...(parsedHead.title ? { title: parsedHead.title } : {}),
+      ...(parsedHead.description ? { description: parsedHead.description } : {}),
+      body: consumedPrefix > 0 ? md.slice(consumedPrefix) : md,
+    };
+  }
   const res = callCoreWasm<{ title?: string; description?: string; body: string }>('parse_frontmatter', { md });
   return {
     ...(res.title ? { title: res.title } : {}),
@@ -1394,16 +1436,20 @@ export function extractMarkdownLinksAndImages(
   baseUrl: string,
   includeImages: boolean,
 ): { links: string[]; images: ScrapedImage[]; title?: string; description?: string } {
-  const res = callCoreWasm<{
+  const { text: bounded } = cutMarkdownToSanitizerBudget(String(md ?? ''));
+  const res = callCoreWasmRaw<{
     links?: string[];
     images?: ScrapedImage[];
     title?: string;
     description?: string;
-  }>('extract_md_links_images', {
-    md: String(md ?? ''),
-    baseUrl: String(baseUrl ?? ''),
-    includeImages: Boolean(includeImages),
-  });
+  }>(
+    'extract_md_links_images',
+    {
+      baseUrl: String(baseUrl ?? ''),
+      includeImages: Boolean(includeImages),
+    },
+    bounded,
+  );
   return {
     links: res.links ?? [],
     images: res.images ?? [],
@@ -1601,26 +1647,40 @@ export function finalizeScrapedMarkdown(
   frontmatterTitle?: string;
   frontmatterDescription?: string;
 } {
-  const boundedInput = rawMd.length > MAX_MARKDOWN_SANITIZE_CHARS ? rawMd.slice(0, MAX_MARKDOWN_SANITIZE_CHARS) : rawMd;
+  const { text: boundedInput, cut: cutBySanitizerBudget } = cutMarkdownToSanitizerBudget(rawMd);
   const fm = opts.isPdf ? { body: boundedInput } : parseMarkdownFrontmatter(boundedInput);
-  const res = callCoreWasm<{ markdown: string }>('finalize_markdown', {
-    md: fm.body,
-    baseUrl: opts.baseUrl ?? '',
-    options: {
-      baseUrl: opts.baseUrl ?? '',
-      includeImages: Boolean(opts.includeImages),
-      isPdf: Boolean(opts.isPdf),
-      preserveOriginMarkdown: Boolean(opts.preserveOriginMarkdown),
-      allowPdfPageMarkers: Boolean(opts.allowPdfPageMarkers),
-    },
-  });
-  const md = res.markdown ?? '';
   const fmMeta = {
     ...(fm.title ? { frontmatterTitle: fm.title } : {}),
     ...(fm.description ? { frontmatterDescription: fm.description } : {}),
   };
+  let md = '';
+  try {
+    const res = callCoreWasmRaw<{ markdown: string }>(
+      'finalize_markdown',
+      {
+        baseUrl: opts.baseUrl ?? '',
+        options: {
+          baseUrl: opts.baseUrl ?? '',
+          includeImages: Boolean(opts.includeImages),
+          isPdf: Boolean(opts.isPdf),
+          preserveOriginMarkdown: Boolean(opts.preserveOriginMarkdown),
+          allowPdfPageMarkers: Boolean(opts.allowPdfPageMarkers),
+        },
+      },
+      fm.body,
+    );
+    md = res.markdown ?? '';
+  } catch {
+    const escapedFallback = escapeMarkdownFallbackLinear(fm.body);
+    return {
+      markdown: opts.maxChars && escapedFallback.length > opts.maxChars ? escapedFallback.slice(0, opts.maxChars) : escapedFallback,
+      truncated: cutBySanitizerBudget || Boolean(opts.maxChars && escapedFallback.length > opts.maxChars),
+      totalChars: rawMd.length,
+      ...fmMeta,
+    };
+  }
   if (opts.maxChars && md.length > opts.maxChars) {
-    const totalChars = md.length;
+    const totalChars = cutBySanitizerBudget ? Math.max(rawMd.length, md.length) : md.length;
     let cut = opts.maxChars;
     const minCut = Math.floor(opts.maxChars * 0.6);
     const paraBreak = md.lastIndexOf('\n\n', cut);
@@ -1634,6 +1694,16 @@ export function finalizeScrapedMarkdown(
     const remainingChars = Math.max(0, totalChars - nextOffset);
     const sliced = sanitizeMarkdownPageSlice(md, 0, rawSliced, Boolean(opts.allowPdfPageMarkers));
     return { markdown: sliced, truncated: true, totalChars, nextOffset, remainingChars, ...fmMeta };
+  }
+  if (cutBySanitizerBudget) {
+    return {
+      markdown: md,
+      truncated: true,
+      totalChars: rawMd.length,
+      nextOffset: md.length,
+      remainingChars: Math.max(0, rawMd.length - md.length),
+      ...fmMeta,
+    };
   }
   return { markdown: md, ...fmMeta };
 }
@@ -3230,6 +3300,7 @@ export async function executeScrapeCall(params: {
       includeBody: true,
       respectRobots: true,
       maxBytes: 16 * 1024 * 1024,
+      maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
       timeoutMs: timeoutMsOpt,
       discoverLlms: goDiscoverLlms,
     },
@@ -3303,7 +3374,12 @@ export async function executeScrapeCall(params: {
         target,
         JSON.stringify({
           maxSeconds: 45,
-          options: { includeBody: true, respectRobots: true, maxBytes: 16_777_216 },
+          options: {
+            includeBody: true,
+            respectRobots: true,
+            maxBytes: MAX_WASM_INPUT_BYTES,
+            maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+          },
           requests: [
             {
               id: `ats-${atsSpec.id}`,
@@ -3560,7 +3636,12 @@ export async function executeScrapeCall(params: {
         target,
         JSON.stringify({
           maxSeconds: 30,
-          options: { includeBody: true, respectRobots: true },
+          options: {
+            includeBody: true,
+            respectRobots: true,
+            maxBytes: MAX_WASM_INPUT_BYTES,
+            maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+          },
           requests: [{ id: 'gh-raw-1', url: directGhBlob.rawUrl, kind: 'text', accept: 'text/plain' }],
         }),
         site,
@@ -3675,7 +3756,12 @@ export async function executeScrapeCall(params: {
         target,
         JSON.stringify({
           maxSeconds: 30,
-          options: { includeBody: true, respectRobots: true },
+          options: {
+            includeBody: true,
+            respectRobots: true,
+            maxBytes: MAX_WASM_INPUT_BYTES,
+            maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+          },
           requests: [{ id: 'gh-patch-1', url: directGhCommit.patchUrl, kind: 'text', accept: 'text/plain' }],
         }),
         site,
@@ -3773,7 +3859,12 @@ export async function executeScrapeCall(params: {
         target,
         JSON.stringify({
           maxSeconds: 30,
-          options: { includeBody: true, respectRobots: true },
+          options: {
+            includeBody: true,
+            respectRobots: true,
+            maxBytes: registryTwin.maxBytes ?? MAX_WASM_INPUT_BYTES,
+            maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+          },
           requests: [{ id: `twin-${registryTwin.id}`, url: registryTwin.fetchUrl, kind: registryTwin.kind, accept: registryTwin.accept }],
         }),
         site,
@@ -3938,7 +4029,9 @@ export async function executeScrapeCall(params: {
             const twinSafeSummary =
               twinSummaryOut !== undefined ? (redactPii ? redactPiiText(twinSummaryOut) : twinSummaryOut) : undefined;
             const twinSafeProduct = twinProductOut ? (redactPii ? redactPiiDeep(twinProductOut) : twinProductOut) : null;
-            const twinSafeJson = twinJsonOut ? (redactPii ? redactPiiDeep(twinJsonOut) : twinJsonOut) : undefined;
+            const twinSafeJson = twinJsonOut
+              ? sanitizeRecordUrlsDeep(redactPii ? redactPiiDeep(twinJsonOut) : twinJsonOut)
+              : undefined;
             const twinTitleOut = sanitizeScrapedMetadataField(
               formatted.title ? (redactPii ? redactPiiText(formatted.title) : formatted.title) : undefined,
               512,
@@ -4653,6 +4746,322 @@ export async function executeScrapeCall(params: {
 
   let rawBodyStr = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   let finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+
+  const buildOverBudgetEdgeResponse = async (
+    rawForArtifact: string,
+    curItem: Record<string, unknown>,
+    viaUsed: string,
+  ): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
+    let overArt = !isPrivateScrape
+      ? (curItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined)
+      : undefined;
+    if (!overArt?.blobSha256 && env.ARTIFACTS && payload.ephemeral !== true && rawForArtifact.length > 0) {
+      try {
+        const rawBytes = SCRAPE_UTF8_ENCODER.encode(rawForArtifact);
+        if (rawBytes.byteLength <= MAX_ARTIFACT_CONTENT_BYTES) {
+          const effRet: ArtifactRetention = retentionMode === 'stored' ? 'stored' : 'transient';
+          const stored = isPrivateScrape
+            ? await writePrivateArtifactToR2({
+                bucket: env.ARTIFACTS,
+                userId,
+                rawBytes,
+                retention: effRet,
+              })
+            : await writeArtifactToR2({
+                bucket: env.ARTIFACTS,
+                rawBytes,
+                retention: effRet,
+              });
+          overArt = {
+            blobSha256: stored.blobSha256,
+            contentSha256: stored.contentSha256,
+          };
+        }
+      } catch {
+        // Non-fatal if R2 artifact storage fails.
+      }
+    }
+    const overFinalUrl = typeof curItem.finalUrl === 'string' && curItem.finalUrl ? curItem.finalUrl : normalizedUrl;
+    const overTitle =
+      typeof curItem.title === 'string' && curItem.title.trim()
+        ? sanitizeScrapedMetadataField(redactPii ? redactPiiText(curItem.title) : curItem.title, 512)
+        : undefined;
+    const overCt = typeof curItem.contentType === 'string' ? curItem.contentType : undefined;
+    const isOverOriginMarkdown = Boolean(
+      curItem.contentSource === 'origin-markdown' ||
+        (rawForArtifact &&
+          !/^(?:<!doctype\b|<html\b)/i.test(rawForArtifact.trimStart().slice(0, 64)) &&
+          typeof overCt === 'string' &&
+          /^text\/(?:x-)?markdown\s*(?:;|$)/i.test(overCt.trim())),
+    );
+    if (isOverOriginMarkdown && rawForArtifact.length > 0) {
+      const cleanOverRaw = redactPii ? redactPiiText(rawForArtifact) : rawForArtifact;
+      const cutSanitized = finalizeScrapedMarkdown(cleanOverRaw, {
+        isPdf: false,
+        includeImages,
+        maxChars,
+        baseUrl: overFinalUrl,
+        preserveOriginMarkdown: true,
+      });
+      return {
+        status: 200,
+        via: viaUsed,
+        body: {
+          ok: true,
+          cached: false,
+          ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          url: normalizedUrl,
+          finalUrl: overFinalUrl,
+          status: typeof curItem.status === 'number' ? curItem.status : 200,
+          via: viaUsed,
+          contentSource: 'origin-markdown' as const,
+          contentState: 'active' as const,
+          rendered: false,
+          truncated: true,
+          totalChars: rawForArtifact.length,
+          nextOffset: cutSanitized.nextOffset ?? cutSanitized.markdown.length,
+          remainingChars: Math.max(0, rawForArtifact.length - (cutSanitized.nextOffset ?? cutSanitized.markdown.length)),
+          ...(overArt?.contentSha256 ? { contentSha256: overArt.contentSha256 } : {}),
+          ...(overArt?.blobSha256 ? { artifactId: overArt.blobSha256 } : {}),
+          ...(stringFormats.has('markdown') ? { markdown: cutSanitized.markdown } : {}),
+          ...(stringFormats.has('text') ? { text: cutSanitized.markdown } : {}),
+          metadata: {
+            ...(overTitle ? { title: overTitle } : {}),
+            ...(overCt ? { contentType: overCt } : {}),
+          },
+        },
+      };
+    }
+    return {
+      status: 200,
+      via: viaUsed,
+      body: {
+        ok: true,
+        cached: false,
+        ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        url: normalizedUrl,
+        finalUrl: overFinalUrl,
+        status: typeof curItem.status === 'number' ? curItem.status : 200,
+        via: viaUsed,
+        edgeBudgetExceeded: true,
+        contentState: 'active' as const,
+        rendered: false,
+        ...(overArt?.contentSha256 ? { contentSha256: overArt.contentSha256 } : {}),
+        ...(overArt?.blobSha256 ? { artifactId: overArt.blobSha256 } : {}),
+        ...(stringFormats.has('markdown') ? { markdown: '' } : {}),
+        ...(stringFormats.has('text') ? { text: '' } : {}),
+        warnings: [
+          'Document too large for edge processing (> 4 MiB WASM input budget); raw artifact stored without truncated sanitization.',
+        ],
+        metadata: {
+          ...(overTitle ? { title: overTitle } : {}),
+          ...(overCt ? { contentType: overCt } : {}),
+        },
+      },
+    };
+  };
+
+  // Step 1 + Step 2: Over-budget (> 4 MiB) raw bodies NEVER enter Worker WASM or get truncated before sanitization.
+  // Offload to a connected Go node (`target: 'agent'`) when available, or store the raw artifact and return a clear warning.
+  const rawBodyOverBudget =
+    !isPdfResponse &&
+    !(stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing) &&
+    rawBodyStr.length > 0 &&
+    exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES;
+  if (rawBodyOverBudget && item.extractedOnNode !== true && !fetchResUsed.via.startsWith('agent') && target !== 'container') {
+    try {
+      const offloadCall = {
+        ...fetchCall,
+        options: {
+          ...fetchCall.options,
+          maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+        },
+      };
+      const nodeRes = await executeHubFetch(
+        'agent',
+        JSON.stringify(offloadCall),
+        site,
+        `${source}:offload-node`,
+        retentionMode,
+        false,
+        collectionId,
+      );
+      if (nodeRes.status === 200) {
+        const nodeParsed = JSON.parse(nodeRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        const nodeItem = nodeParsed.results?.[0];
+        if (nodeItem?.outcome === 'ok' && (nodeItem.extractedOnNode === true || typeof nodeItem.markdown === 'string')) {
+          rawBodyStr = '';
+          fetchResUsed = nodeRes;
+          item = nodeItem;
+          finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+        }
+      }
+    } catch {
+      // Fall through to clean over-budget warning + stored R2 artifact below when no Go node is reachable.
+    }
+  }
+
+  const nodeMdStr = typeof item.markdown === 'string' ? item.markdown : '';
+  if (
+    item.markdownOverBudget === true ||
+    (!isPdfResponse &&
+      !(stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing) &&
+      ((rawBodyStr.length > 0 && exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES) ||
+        (nodeMdStr.length > 0 && exactUtf8ByteLen(nodeMdStr) > MAX_WASM_INPUT_BYTES)))
+  ) {
+    const rawToStore = rawBodyStr;
+    rawBodyStr = '';
+    return buildOverBudgetEdgeResponse(rawToStore, item, fetchResUsed.via);
+  }
+
+  // Step 3: Per-isolate in-flight byte semaphore (`MAX_ISOLATE_IN_FLIGHT_BYTES` = 12 MiB) prevents concurrent
+  // multi-MiB requests in the same 128 MiB Worker isolate from stacking in V8 + WASM linear memory.
+  const estWorkBytes = Math.min(
+    MAX_WASM_INPUT_BYTES,
+    Math.max(65_536, rawBodyStr.length > 0 ? rawBodyStr.length : nodeMdStr.length),
+  );
+  const isolateLease = await acquireIsolateByteBudget(estWorkBytes, 200);
+  if (!isolateLease) {
+    if (item.extractedOnNode !== true && !fetchResUsed.via.startsWith('agent') && target !== 'container' && rawBodyStr.length >= 1_048_576) {
+      try {
+        const busyOffloadRes = await executeHubFetch(
+          'agent',
+          JSON.stringify({
+            ...fetchCall,
+            options: { ...fetchCall.options, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
+          }),
+          site,
+          `${source}:busy-offload`,
+          retentionMode,
+          false,
+          collectionId,
+        );
+        if (busyOffloadRes.status === 200) {
+          const busyParsed = JSON.parse(busyOffloadRes.bodyText) as { results?: Array<Record<string, unknown>> };
+          const busyItem = busyParsed.results?.[0];
+          if (busyItem?.outcome === 'ok' && typeof busyItem.markdown === 'string' && busyItem.markdown.length < 524_288) {
+            const smallLease = await acquireIsolateByteBudget(Math.max(65_536, busyItem.markdown.length), 100);
+            if (smallLease) {
+              rawBodyStr = '';
+              fetchResUsed = busyOffloadRes;
+              item = busyItem;
+              finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+              try {
+                // The busy shortcut must apply the same guards as the main pipeline before returning node
+                // content: WAF/challenge interstitials, the prompt-injection gate, and content-state classification.
+                const busyStatus = typeof busyItem.status === 'number' ? busyItem.status : 200;
+                const busyRawTitle = typeof busyItem.title === 'string' ? busyItem.title : '';
+                const busyWaf =
+                  (busyItem.waf && typeof busyItem.waf === 'object' ? (busyItem.waf as WafClassification) : null) ??
+                  classifyWafAndChallenge({ status: busyStatus, rawBody: busyItem.markdown });
+                if (busyWaf) {
+                  return {
+                    status: 403,
+                    via: busyOffloadRes.via,
+                    body: {
+                      ok: false,
+                      url: normalizedUrl,
+                      finalUrl,
+                      outcome: 'challenge',
+                      status: busyStatus,
+                      problem: busyWaf.summary,
+                      waf: busyWaf,
+                    },
+                  };
+                }
+                if (checkPromptInjection) {
+                  const piBusy = detectPromptInjection({ markdown: `${busyRawTitle}\n${busyItem.markdown}` });
+                  if (piBusy.detected) {
+                    return {
+                      status: 403,
+                      via: busyOffloadRes.via,
+                      body: {
+                        ok: false,
+                        url: normalizedUrl,
+                        finalUrl,
+                        error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                        message: `Prompt injection guard blocked page content (${piBusy.triggers.join(', ')})`,
+                        triggers: piBusy.triggers,
+                      },
+                    };
+                  }
+                }
+                const busyContentState = classifyContentState({
+                  status: busyStatus,
+                  url: normalizedUrl,
+                  finalUrl,
+                  title: busyRawTitle,
+                  markdown: busyItem.markdown,
+                  rendered: false,
+                  nowMs: Date.now(),
+                });
+                const safeNodeMd = finalizeScrapedMarkdown(
+                  redactPii ? redactPiiText(busyItem.markdown) : busyItem.markdown,
+                  { isPdf: false, includeImages, maxChars, baseUrl: finalUrl },
+                );
+                const nodeTitle = sanitizeScrapedMetadataField(
+                  typeof busyItem.title === 'string' ? (redactPii ? redactPiiText(busyItem.title) : busyItem.title) : undefined,
+                  512,
+                );
+                const nodeArt = !isPrivateScrape
+                  ? (busyItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined)
+                  : undefined;
+                return {
+                  status: 200,
+                  via: busyOffloadRes.via,
+                  body: {
+                    ok: true,
+                    cached: false,
+                    pipelineVersion: SCRAPE_PIPELINE_VERSION,
+                    url: normalizedUrl,
+                    finalUrl,
+                    ...(nodeTitle ? { title: nodeTitle } : {}),
+                    status: busyItem.status ?? 200,
+                    via: busyOffloadRes.via,
+                    extractedOnNode: true,
+                    contentState: busyContentState.state,
+                    ...(busyContentState.reason ? { contentStateReason: busyContentState.reason } : {}),
+                    rendered: false,
+                    ...(nodeArt?.contentSha256 ? { contentSha256: nodeArt.contentSha256 } : {}),
+                    ...(nodeArt?.blobSha256 ? { artifactId: nodeArt.blobSha256 } : {}),
+                    ...(stringFormats.has('markdown') ? { markdown: safeNodeMd.markdown } : {}),
+                    ...(stringFormats.has('text') ? { text: safeNodeMd.markdown } : {}),
+                    metadata: {
+                      ...(nodeTitle ? { title: nodeTitle } : {}),
+                      ...(typeof busyItem.contentType === 'string' ? { contentType: busyItem.contentType } : {}),
+                    },
+                  },
+                };
+              } finally {
+                smallLease.release();
+              }
+            }
+          }
+        }
+      } catch {
+        // Fall through to HTTP 429 rejection below.
+      }
+    }
+    rawBodyStr = '';
+    return {
+      status: 429,
+      via: 'hub',
+      retryAfter: '1',
+      body: {
+        ok: false,
+        url: normalizedUrl,
+        outcome: 'rate_limited',
+        error: 'isolate_memory_busy',
+        retryable: true,
+        status: 429,
+        message: 'Worker isolate memory budget busy with concurrent multi-MiB documents; retry shortly.',
+      },
+    };
+  }
+
+  try {
   let renderedViaOut: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
     renderMode === 'always'
       ? 'browser'
@@ -4663,19 +5072,18 @@ export async function executeScrapeCall(params: {
   const rawTrimmedHead = rawBodyStr ? rawBodyStr.trimStart().slice(0, 64) : '';
   const looksLikeHtmlDocument = /^(?:<!doctype\b|<html\b)/i.test(rawTrimmedHead);
   const isOriginMarkdown = Boolean(
-    rawBodyStr &&
-      !isPdfResponse &&
-      !looksLikeHtmlDocument &&
-      typeof item.contentType === 'string' &&
-      /^text\/(?:x-)?markdown\s*(?:;|$)/i.test(item.contentType.trim()),
+    item.contentSource === 'origin-markdown' ||
+      (rawBodyStr &&
+        !isPdfResponse &&
+        !looksLikeHtmlDocument &&
+        typeof item.contentType === 'string' &&
+        /^text\/(?:x-)?markdown\s*(?:;|$)/i.test(item.contentType.trim())),
   );
-  let originMdCapTruncated = false;
-  let originMdOriginalChars = 0;
-  if (isOriginMarkdown && rawBodyStr.length > MAX_HTML_SCAN_CHARS) {
-    originMdCapTruncated = true;
-    originMdOriginalChars = rawBodyStr.length;
-    rawBodyStr = rawBodyStr.slice(0, MAX_HTML_SCAN_CHARS);
-  }
+  // Step 1: NEVER slice `rawBodyStr` prior to sanitization! If an origin-markdown document is between
+  // `MAX_HTML_SCAN_CHARS` (2 MiB) and `MAX_WASM_INPUT_BYTES` (4 MiB), sanitize the ENTIRE document first
+  // and apply `MAX_HTML_SCAN_CHARS` afterwards via fence-safe `finalizeScrapedMarkdown` slicing.
+  const originMdCapTruncated = isOriginMarkdown && rawBodyStr.length > MAX_HTML_SCAN_CHARS;
+  const originMdOriginalChars = originMdCapTruncated ? rawBodyStr.length : 0;
 
   // R2 & R3 (`R3-M3`): Guard against HTTP 200 WAF/CAPTCHA interstitials on BOTH HTML AND `origin-markdown` responses!
   const wafSourceStr = rawBodyStr || (typeof item.markdown === 'string' ? item.markdown : '');
@@ -4913,7 +5321,7 @@ export async function executeScrapeCall(params: {
       ((typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('html')) ||
         /^\s*<!doctype\s+html|^\s*<html|<(head|body|main|article)\b/i.test(rawBodyStr)),
   );
-  let extracted = isHtmlBody
+  let extracted: ExtractedDocument | undefined = isHtmlBody
     ? extractHtmlDocument(rawBodyStr, {
         baseUrl: finalUrl,
         onlyMainContent,
@@ -4922,7 +5330,23 @@ export async function executeScrapeCall(params: {
         ...(includeTags.length > 0 ? { includeTags } : {}),
         ...(excludeTags.length > 0 ? { excludeTags } : {}),
       })
-    : undefined;
+    : item.extractedOnNode === true
+      ? {
+          markdown: typeof item.markdown === 'string' ? item.markdown : '',
+          text: typeof item.text === 'string' ? item.text : typeof item.markdown === 'string' ? item.markdown : '',
+          ...(typeof item.title === 'string' && item.title ? { title: item.title } : {}),
+          ...(typeof item.description === 'string' && item.description ? { description: item.description } : {}),
+          ...(typeof item.favicon === 'string' && item.favicon ? { favicon: item.favicon } : {}),
+          ...(typeof item.extractorId === 'string' && item.extractorId ? { extractorId: item.extractorId } : {}),
+          ...(Array.isArray(item.records) ? { records: item.records as Array<Record<string, unknown>> } : {}),
+          links: Array.isArray(item.links) ? (item.links as string[]) : [],
+          images: Array.isArray(item.images) ? (item.images as ScrapedImage[]) : [],
+          branding:
+            item.branding && typeof item.branding === 'object'
+              ? (item.branding as ExtractedDocument['branding'])
+              : { canonicalUrl: finalUrl },
+        }
+      : undefined;
 
   const readItemHeaders = (): Record<string, string | undefined> | undefined =>
     item.headers && typeof item.headers === 'object' && !Array.isArray(item.headers)
@@ -5371,7 +5795,12 @@ export async function executeScrapeCall(params: {
         target,
         JSON.stringify({
           maxSeconds: 30,
-          options: { includeBody: true, respectRobots: true },
+          options: {
+            includeBody: true,
+            respectRobots: true,
+            maxBytes: MAX_WASM_INPUT_BYTES,
+            maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+          },
           requests: [{ id: 'gh-raw-1', url: ghBlobTarget.rawUrl, kind: 'text', accept: 'text/plain' }],
         }),
         site,
@@ -5741,19 +6170,21 @@ export async function executeScrapeCall(params: {
           };
         })()
       : applyQueryFocus(rawCleanMarkdown);
+  const effectiveOutMaxChars =
+    maxChars ?? (originMdCapTruncated && rawCleanMarkdown.length > MAX_HTML_SCAN_CHARS ? MAX_HTML_SCAN_CHARS : undefined);
   const shaped =
-    focused.queryFiltered || maxChars !== undefined
+    focused.queryFiltered || effectiveOutMaxChars !== undefined
       ? finalizeScrapedMarkdown(focused.markdown, {
           isPdf: false,
           includeImages,
-          maxChars,
+          maxChars: effectiveOutMaxChars,
           baseUrl: finalUrl,
           preserveOriginMarkdown: isOriginMarkdown,
         })
       : fullShaped;
   markdown = shaped.markdown;
   textOut =
-    isOriginMarkdown || hydratedFromJobPostingJsonLd
+    !stringFormats.has('text') || isOriginMarkdown || hydratedFromJobPostingJsonLd
       ? markdown
       : neutralizeAllUnsafeMarkdownLinksLinear(stripInvisibleSmugglingChars(decodeHtmlEntities(textOut))).replace(
           /<(?=[ \t]*(?:javascript|vbscript|data|file|blob):)/gi,
@@ -6397,6 +6828,7 @@ export async function executeScrapeCall(params: {
     ...(redirectAnalysis.redirected ? redirectAnalysis : {}),
     status: item.status ?? 200,
     via: viaOut,
+    ...(item.extractedOnNode === true ? { extractedOnNode: true } : {}),
     ...(extractorIdOut ? { extractorId: extractorIdOut } : {}),
     ...(hasDetectedOut && detectedWithAdapter ? { detected: detectedWithAdapter } : {}),
     contentState: contentStateCheck.state,
@@ -6537,6 +6969,16 @@ export async function executeScrapeCall(params: {
   }
 
   return { status: 200, via: viaOut, body: out };
+  } catch (wasmErr) {
+    if (isWasmInputBudgetExceededError(wasmErr)) {
+      const fallbackRaw = rawBodyStr;
+      rawBodyStr = '';
+      return buildOverBudgetEdgeResponse(fallbackRaw, item, fetchResUsed.via);
+    }
+    throw wasmErr;
+  } finally {
+    isolateLease.release();
+  }
   };
   return activeTracer ? activeTracer.run(runScrape) : runScrape();
 }

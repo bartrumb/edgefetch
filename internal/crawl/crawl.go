@@ -73,6 +73,7 @@ type Request struct {
 	WaitForMs          int               `json:"waitForMs,omitempty"`
 	WaitSelector       string            `json:"waitSelector,omitempty"`
 	MaxPages           int               `json:"maxPages,omitempty"`
+	MaxBytes           int               `json:"maxBytes,omitempty"`
 	BlockTrackers      *bool             `json:"blockTrackers,omitempty"`
 	Interact           *InteractSpec     `json:"interact,omitempty"`
 }
@@ -104,56 +105,60 @@ type ArtifactRef struct {
 
 // Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID                string                         `json:"id"`
-	URL               string                         `json:"url"`
-	Kind              classify.Kind                  `json:"kind"`
-	Outcome           classify.Outcome               `json:"outcome"`
-	BlockedReason     string                         `json:"blockedReason,omitempty"`
-	Problem           string                         `json:"problem,omitempty"`
-	Status            int                            `json:"status"`
-	ContentType       string                         `json:"contentType,omitempty"`
-	ContentSource     string                         `json:"contentSource,omitempty"`
-	ResponseHeaders   map[string]string              `json:"headers,omitempty"`
-	PaymentHeaders    map[string]string              `json:"paymentHeaders,omitempty"`
-	CfMitigated       string                         `json:"cfMitigated,omitempty"`
-	WAF               *classify.WAFMatch             `json:"waf,omitempty"`
-	ETag              string                         `json:"etag,omitempty"`
-	LastModified      string                         `json:"lastModified,omitempty"`
-	RetryAfter        string                         `json:"retryAfter,omitempty"`
-	RetryAfterMs      int64                          `json:"retryAfterMs,omitempty"`
-	Bytes             int                            `json:"bytes"`
-	Truncated         bool                           `json:"truncated,omitempty"`
-	BodyOmitted       bool                           `json:"bodyOmitted,omitempty"`
-	Attempts          int                            `json:"attempts"`
-	DurationMs        int64                          `json:"durationMs"`
-	Timing            Timing                         `json:"timing"`
-	Body              string                         `json:"body,omitempty"`
-	BodyEncoding      string                         `json:"bodyEncoding,omitempty"`
-	Artifact          *ArtifactRef                   `json:"artifact,omitempty"`
-	ArtifactError     string                         `json:"artifactError,omitempty"`
-	FinalURL          string                         `json:"finalUrl,omitempty"`
-	Title             string                         `json:"title,omitempty"`
-	Description       string                         `json:"description,omitempty"`
-	Favicon           string                         `json:"favicon,omitempty"`
-	Markdown          string                         `json:"markdown,omitempty"`
-	Text              string                         `json:"text,omitempty"`
-	Links             []string                       `json:"links,omitempty"`
-	Images            []extract.ImageInfo            `json:"images,omitempty"`
-	Branding          *extract.BrandingProfile       `json:"branding,omitempty"`
-	Llms              *extract.LlmsDiscovery         `json:"llms,omitempty"`
-	Rendered          bool                           `json:"rendered,omitempty"`
-	BlockedTrackers   *int                           `json:"blockedTrackers,omitempty"`
-	SessionID         string                         `json:"sessionId,omitempty"`
-	ScreenshotBase64  string                         `json:"screenshotBase64,omitempty"`
-	ActionScreenshots []string                       `json:"actionScreenshots,omitempty"`
-	ActionScrapes     []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
-	JavascriptReturns []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
-	ActionResults     []browser.ActionResult         `json:"actionResults,omitempty"`
-	CapturedJSON      []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
-	PDFBase64         string                         `json:"pdfBase64,omitempty"`
-	PDFEngine         string                         `json:"pdfEngine,omitempty"`
-	SHA256            string                         `json:"sha256,omitempty"`
-	BodyBase64        string                         `json:"bodyBase64,omitempty"`
+	ID                 string                         `json:"id"`
+	URL                string                         `json:"url"`
+	Kind               classify.Kind                  `json:"kind"`
+	Outcome            classify.Outcome               `json:"outcome"`
+	BlockedReason      string                         `json:"blockedReason,omitempty"`
+	Problem            string                         `json:"problem,omitempty"`
+	Status             int                            `json:"status"`
+	ContentType        string                         `json:"contentType,omitempty"`
+	ContentSource      string                         `json:"contentSource,omitempty"`
+	ResponseHeaders    map[string]string              `json:"headers,omitempty"`
+	PaymentHeaders     map[string]string              `json:"paymentHeaders,omitempty"`
+	CfMitigated        string                         `json:"cfMitigated,omitempty"`
+	WAF                *classify.WAFMatch             `json:"waf,omitempty"`
+	ETag               string                         `json:"etag,omitempty"`
+	LastModified       string                         `json:"lastModified,omitempty"`
+	RetryAfter         string                         `json:"retryAfter,omitempty"`
+	RetryAfterMs       int64                          `json:"retryAfterMs,omitempty"`
+	Bytes              int                            `json:"bytes"`
+	Truncated          bool                           `json:"truncated,omitempty"`
+	BodyOmitted        bool                           `json:"bodyOmitted,omitempty"`
+	ExtractedOnNode    bool                           `json:"extractedOnNode,omitempty"`
+	MarkdownOverBudget bool                           `json:"markdownOverBudget,omitempty"`
+	ExtractorID        string                         `json:"extractorId,omitempty"`
+	Records            []map[string]any               `json:"records,omitempty"`
+	Attempts           int                            `json:"attempts"`
+	DurationMs         int64                          `json:"durationMs"`
+	Timing             Timing                         `json:"timing"`
+	Body               string                         `json:"body,omitempty"`
+	BodyEncoding       string                         `json:"bodyEncoding,omitempty"`
+	Artifact           *ArtifactRef                   `json:"artifact,omitempty"`
+	ArtifactError      string                         `json:"artifactError,omitempty"`
+	FinalURL           string                         `json:"finalUrl,omitempty"`
+	Title              string                         `json:"title,omitempty"`
+	Description        string                         `json:"description,omitempty"`
+	Favicon            string                         `json:"favicon,omitempty"`
+	Markdown           string                         `json:"markdown,omitempty"`
+	Text               string                         `json:"text,omitempty"`
+	Links              []string                       `json:"links,omitempty"`
+	Images             []extract.ImageInfo            `json:"images,omitempty"`
+	Branding           *extract.BrandingProfile       `json:"branding,omitempty"`
+	Llms               *extract.LlmsDiscovery         `json:"llms,omitempty"`
+	Rendered           bool                           `json:"rendered,omitempty"`
+	BlockedTrackers    *int                           `json:"blockedTrackers,omitempty"`
+	SessionID          string                         `json:"sessionId,omitempty"`
+	ScreenshotBase64   string                         `json:"screenshotBase64,omitempty"`
+	ActionScreenshots  []string                       `json:"actionScreenshots,omitempty"`
+	ActionScrapes      []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
+	JavascriptReturns  []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
+	ActionResults      []browser.ActionResult         `json:"actionResults,omitempty"`
+	CapturedJSON       []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
+	PDFBase64          string                         `json:"pdfBase64,omitempty"`
+	PDFEngine          string                         `json:"pdfEngine,omitempty"`
+	SHA256             string                         `json:"sha256,omitempty"`
+	BodyBase64         string                         `json:"bodyBase64,omitempty"`
 
 	traceSpanID   string
 	traceStart    time.Time
@@ -178,17 +183,18 @@ func Bool(v bool) *bool { return &v }
 
 // Options bounds a crawl batch. Zero values take safe defaults in Normalize() (including RespectRobots = true).
 type Options struct {
-	PauseMs       int   `json:"pauseMs"`
-	PauseJitterMs int   `json:"pauseJitterMs,omitempty"`
-	GapMs         int   `json:"gapMs"`
-	Concurrency   int   `json:"concurrency"`
-	TimeoutMs     int   `json:"timeoutMs"`
-	MaxBytes      int   `json:"maxBytes"`
-	MaxTotalBytes int   `json:"maxTotalBytes,omitempty"`
-	Retries       int   `json:"retries"`
-	IncludeBody   bool  `json:"includeBody"`
-	DiscoverLlms  *bool `json:"discoverLlms,omitempty"`
-	RespectRobots *bool `json:"respectRobots,omitempty"`
+	PauseMs            int   `json:"pauseMs"`
+	PauseJitterMs      int   `json:"pauseJitterMs,omitempty"`
+	GapMs              int   `json:"gapMs"`
+	Concurrency        int   `json:"concurrency"`
+	TimeoutMs          int   `json:"timeoutMs"`
+	MaxBytes           int   `json:"maxBytes"`
+	MaxTotalBytes      int   `json:"maxTotalBytes,omitempty"`
+	MaxInlineBodyBytes int   `json:"maxInlineBodyBytes,omitempty"`
+	Retries            int   `json:"retries"`
+	IncludeBody        bool  `json:"includeBody"`
+	DiscoverLlms       *bool `json:"discoverLlms,omitempty"`
+	RespectRobots      *bool `json:"respectRobots,omitempty"`
 	// Robots is accepted as a wire alias for RespectRobots. When both are omitted, Normalize() defaults to true.
 	Robots *bool `json:"robots,omitempty"`
 }
@@ -259,6 +265,12 @@ func (o Options) Normalize() Options {
 	}
 	if o.MaxTotalBytes > MaxMaxTotalBytes {
 		o.MaxTotalBytes = MaxMaxTotalBytes
+	}
+	if o.MaxInlineBodyBytes < 0 {
+		o.MaxInlineBodyBytes = 0
+	}
+	if o.MaxInlineBodyBytes > MaxMaxBytes {
+		o.MaxInlineBodyBytes = MaxMaxBytes
 	}
 	if o.Retries < 0 {
 		o.Retries = 0
@@ -655,6 +667,11 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 				res.traceEnd = reqEnd
 				if sink != nil {
 					res = sink(i, res)
+				}
+				if opts.MaxInlineBodyBytes > 0 && len(res.Body) > opts.MaxInlineBodyBytes {
+					res.Body = ""
+					res.BodyEncoding = ""
+					res.BodyOmitted = true
 				}
 				if opts.IncludeBody && len(res.Body) > 0 {
 					encodedLen := int64(len(res.Body))
@@ -1658,16 +1675,21 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 		}
 	}
 
-	// Read `MaxBytes + 1` bytes so normal responses hit `EOF` cleanly (returning the HTTP/2 or keep-alive socket to the
+	effMaxBytes := opts.MaxBytes
+	if r.MaxBytes >= 1024 && r.MaxBytes < effMaxBytes {
+		effMaxBytes = r.MaxBytes
+	}
+
+	// Read `effMaxBytes + 1` bytes so normal responses hit `EOF` cleanly (returning the HTTP/2 or keep-alive socket to the
 	// pool for reuse) while oversized streams are detected and cut off without unbounded memory allocation.
-	remBytes := int64(opts.MaxBytes) - int64(len(prefix)) + 1
+	remBytes := int64(effMaxBytes) - int64(len(prefix)) + 1
 	if remBytes < 1 {
 		remBytes = 1
 	}
 	tail, err := io.ReadAll(io.LimitReader(resp.Body, remBytes))
 	phases()
 	if err != nil {
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, err
+		return 0, nil, nil, false, effMaxBytes, nil, tm, botSigned, err
 	}
 	limited := tail
 	if len(prefix) > 0 {
@@ -1675,11 +1697,11 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 		limited = append(limited, prefix...)
 		limited = append(limited, tail...)
 	}
-	truncated := len(limited) > opts.MaxBytes
+	truncated := len(limited) > effMaxBytes
 	if truncated {
-		limited = limited[:opts.MaxBytes]
+		limited = limited[:effMaxBytes]
 	}
-	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, botSigned, nil
+	return resp.StatusCode, resp.Header, limited, truncated, effMaxBytes, nil, tm, botSigned, nil
 }
 
 func parseRobotsCacheTTL(header http.Header) time.Duration {

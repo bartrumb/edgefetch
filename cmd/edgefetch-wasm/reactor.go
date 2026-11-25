@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -19,19 +20,45 @@ import (
 )
 
 const (
-	maxWasmInputBytes   = 48 << 20 // 48 MiB ceiling per call (supports large ATS/HTML payloads)
-	shrinkBufCapBytes   = 8 << 20  // Release >8 MiB transient I/O buffers immediately after multi-MiB board/page calls
-	baseBufCapBytes     = 256 << 10
+	maxWasmInputBytes   = (4 << 20) + (64 << 10) // 4 MiB raw payload ceiling + 64 KiB RPC metadata allowance
+	shrinkBufCapBytes   = 8 << 20                // Release >8 MiB transient output buffers (matches WASM_EVICT_IO_BYTES)
+	baseBufCapBytes     = 64 << 10
 	re2RingCapacity     = 1024
 	domRingCapacity     = 32
 	wasmRawStrUnchanged = ^uint32(0)
 )
+
+var initMemStats runtime.MemStats
 
 func init() {
 	// Cloudflare Workers shares a hard 128 MiB ceiling across V8 heap + WebAssembly.Memory.
 	// Go's runtime memory limit tracks Go heap + runtime metadata (excluding static WASI data segments),
 	// so keeping it at 48 MiB bounds intra-call peak allocations while wasm-bridge.ts evicts after oversized calls.
 	debug.SetMemoryLimit(48 << 20)
+	runtime.ReadMemStats(&initMemStats)
+}
+
+func memStatsSnapshot(ms *runtime.MemStats) map[string]uint64 {
+	return map[string]uint64{
+		"alloc":        ms.Alloc,
+		"totalAlloc":   ms.TotalAlloc,
+		"sys":          ms.Sys,
+		"heapAlloc":    ms.HeapAlloc,
+		"heapSys":      ms.HeapSys,
+		"heapIdle":     ms.HeapIdle,
+		"heapInuse":    ms.HeapInuse,
+		"heapReleased": ms.HeapReleased,
+		"heapObjects":  ms.HeapObjects,
+		"stackInuse":   ms.StackInuse,
+		"stackSys":     ms.StackSys,
+		"mSpanSys":     ms.MSpanSys,
+		"mCacheSys":    ms.MCacheSys,
+		"buckHashSys":  ms.BuckHashSys,
+		"gcSys":        ms.GCSys,
+		"otherSys":     ms.OtherSys,
+		"nextGC":       ms.NextGC,
+		"numGC":        uint64(ms.NumGC),
+	}
 }
 
 type re2Slot struct {
@@ -46,8 +73,8 @@ type domDocSlot struct {
 }
 
 var (
-	wasmInBuf  = make([]byte, baseBufCapBytes)
-	wasmOutBuf = make([]byte, 0, baseBufCapBytes)
+	wasmInBuf  []byte
+	wasmOutBuf []byte
 
 	re2Table  [re2RingCapacity]re2Slot
 	re2NextID int32 = 1
@@ -89,7 +116,8 @@ func efInPtr(size uint32) uint32 {
 		wasmOutBuf = make([]byte, 0, baseBufCapBytes)
 	}
 	if cap(wasmInBuf) < need {
-		wasmInBuf = make([]byte, need)
+		allocCap := max(need, baseBufCapBytes)
+		wasmInBuf = make([]byte, need, allocCap)
 	} else if cap(wasmInBuf) > shrinkBufCapBytes && need <= shrinkBufCapBytes {
 		allocCap := max(need, baseBufCapBytes)
 		wasmInBuf = make([]byte, need, allocCap)
@@ -355,6 +383,14 @@ func dispatchWasmRawStrRPC(metaBytes []byte, rawStr string) (string, bool, error
 		return extract.SanitizeFullMarkdownDocumentForArtifact(rawStr), true, nil
 	case "neutralize_unsafe_links":
 		return extract.NeutralizeAllUnsafeMarkdownLinks(rawStr), true, nil
+	case "decode_html_entities":
+		return extract.DecodeHTMLEntities(rawStr), true, nil
+	case "decode_markdown_entities":
+		return extract.DecodeMarkdownEntities(rawStr), true, nil
+	case "clean_pdf_markdown":
+		return extract.CleanPDFMarkdown(rawStr), true, nil
+	case "redact_pii":
+		return extract.RedactPIIMarkdownSafe(rawStr), true, nil
 	case "format_yaml_card":
 		var m struct {
 			FallbackTitle string `json:"fallbackTitle"`
@@ -547,6 +583,89 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 		}
 		return map[string]any{"result": extract.ExtractNextRSCFlight(rawStr, m.BaseURL, defaultHTMLToMD)}, nil
 
+	case "extract_schema_org":
+		var m struct {
+			BaseURL string `json:"baseUrl"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"result": extract.ExtractUniversalSchemaOrg(rawStr, m.BaseURL, defaultHTMLToMD)}, nil
+
+	case "inspect_raw_schema_org":
+		return map[string]any{"out": extract.InspectRawSchemaOrgJSONLD(rawStr)}, nil
+
+	case "extract_jsonld_objects":
+		var m struct {
+			MaxEntities int `json:"maxEntities"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"objects": extract.ExtractJSONLDObjects(rawStr, m.MaxEntities)}, nil
+
+	case "cms_discover_wp":
+		var m struct {
+			PageFinalURL string `json:"pageFinalUrl"`
+			SelfHost     string `json:"selfHost"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"url": extract.DiscoverWordPressRestTwinURL(rawStr, m.PageFinalURL, m.SelfHost)}, nil
+
+	case "cms_resolve_gatsby":
+		var m struct {
+			PageFinalURL string `json:"pageFinalUrl"`
+			SelfHost     string `json:"selfHost"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"url": extract.ResolveGatsbyPageDataTwinURL(rawStr, m.PageFinalURL, m.SelfHost)}, nil
+
+	case "cms_format_wp":
+		var m struct {
+			BaseURL string `json:"baseUrl"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"result": extract.FormatWordPressRestPostJSON(rawStr, m.BaseURL, defaultHTMLToMD)}, nil
+
+	case "cms_format_gatsby":
+		var m struct {
+			BaseURL string `json:"baseUrl"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"result": extract.FormatGatsbyPageDataJSON(rawStr, m.BaseURL, defaultHTMLToMD)}, nil
+
+	case "scan_iframes":
+		var m struct {
+			PageURL string `json:"pageUrl"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		return map[string]any{"result": classify.HasExternalOrWidgetIframe(rawStr, m.PageURL)}, nil
+
+	case "extract_md_links_images":
+		var m struct {
+			BaseURL       string `json:"baseUrl"`
+			IncludeImages *bool  `json:"includeImages"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &m)
+		}
+		incImg := true
+		if m.IncludeImages != nil {
+			incImg = *m.IncludeImages
+		}
+		links, images, title, desc := extract.ExtractMarkdownLinksImagesAndMeta(rawStr, m.BaseURL, incImg)
+		return map[string]any{"links": links, "images": images, "title": title, "description": desc}, nil
+
 	case "manifest_format_twin":
 		var p struct {
 			AdapterID string                              `json:"adapterId"`
@@ -671,6 +790,25 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 
 	case "has_unicode_tag":
 		return map[string]any{"hit": extract.HasRawOrEncodedUnicodeTag(rawStr)}, nil
+
+	case "finalize_markdown":
+		var p struct {
+			BaseURL string                     `json:"baseUrl"`
+			Options extract.FullExtractOptions `json:"options"`
+		}
+		if len(env.Meta) > 0 {
+			if err := json.Unmarshal(env.Meta, &p); err != nil {
+				return nil, err
+			}
+		}
+		finalMD, totalChars, returnedChars, truncated, nextOffset := extract.FinalizeScrapedMarkdown(rawStr, p.BaseURL, p.Options)
+		return map[string]any{
+			"markdown":      finalMD,
+			"totalChars":    totalChars,
+			"returnedChars": returnedChars,
+			"truncated":     truncated,
+			"nextOffset":    nextOffset,
+		}, nil
 
 	default:
 		for _, fn := range []func(string, json.RawMessage, string) (any, bool, error){
@@ -963,6 +1101,7 @@ func dispatchWasmRPC(rawReq []byte) (any, error) {
 			"kind":         string(m.Kind),
 			"accept":       m.Accept,
 			"rawAccept":    m.RawAccept(),
+			"maxBytes":     m.EffectiveMaxBytes(),
 			"commerceMode": m.CommerceMode(),
 		}, nil
 
@@ -1095,6 +1234,7 @@ func dispatchWasmRPC(rawReq []byte) (any, error) {
 			"kind":         string(m.Kind),
 			"accept":       m.Accept,
 			"rawAccept":    m.RawAccept(),
+			"maxBytes":     m.EffectiveMaxBytes(),
 			"commerceMode": m.CommerceMode(),
 		}, nil
 
@@ -1180,6 +1320,14 @@ func dispatchWasmRPC(rawReq []byte) (any, error) {
 		}
 		doc, ok := extract.FormatJSONWithExtractSpec(p.RawBody, p.Extract, p.Params, p.OrigURL)
 		return map[string]any{"ok": ok, "doc": doc}, nil
+
+	case "wasm_mem_stats":
+		var cur runtime.MemStats
+		runtime.ReadMemStats(&cur)
+		return map[string]any{
+			"init":    memStatsSnapshot(&initMemStats),
+			"current": memStatsSnapshot(&cur),
+		}, nil
 
 	case "dom_parse":
 		var p struct {

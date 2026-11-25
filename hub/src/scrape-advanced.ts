@@ -7,7 +7,240 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
-import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawPair, callCoreWasmRawString } from './wasm-bridge';
+import {
+  callCoreWasm,
+  callCoreWasmRaw,
+  callCoreWasmRawPair,
+  callCoreWasmRawString,
+  MAX_WASM_INPUT_BYTES,
+} from './wasm-bridge';
+
+export const MAX_SANITIZER_WASM_UTF8_BYTES = MAX_WASM_INPUT_BYTES - 16_384;
+const SANITIZER_CUT_ENCODER = new TextEncoder();
+let sanitizerScratchBuf: Uint8Array | null = null;
+
+/**
+ * Cuts an oversized Markdown input to `maxUtf8Bytes` (default ~3.98 MiB < `MAX_WASM_INPUT_BYTES`)
+ * at a line break (`\n`) when available (or at a surrogate-safe UTF-16 code-point boundary on single-line inputs)
+ * so Go's WASM sanitizer sees the entire remaining prefix as one coherent document (never chunked across fences).
+ */
+export function cutMarkdownToSanitizerBudget(
+  raw: string,
+  maxUtf8Bytes = MAX_SANITIZER_WASM_UTF8_BYTES,
+): { text: string; cut: boolean } {
+  if (!raw) return { text: '', cut: false };
+  if (raw.length * 3 <= maxUtf8Bytes) {
+    return { text: raw, cut: false };
+  }
+  let candidateChars = Math.min(raw.length, maxUtf8Bytes);
+  if (candidateChars < raw.length && candidateChars > 0) {
+    const tailUnit = raw.charCodeAt(candidateChars - 1);
+    if (tailUnit >= 0xd800 && tailUnit <= 0xdbff) {
+      candidateChars--;
+    }
+  }
+  // Fast ASCII check: if `raw.length <= maxUtf8Bytes` and all code units < 0x80, 1 char === 1 UTF-8 byte (`0` copy!).
+  if (raw.length <= maxUtf8Bytes) {
+    let allAscii = true;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw.charCodeAt(i) >= 0x80) {
+        allAscii = false;
+        break;
+      }
+    }
+    if (allAscii) return { text: raw, cut: false };
+  } else {
+    // Check if prefix `0..candidateChars` is pure ASCII so e.g. `'['.repeat(7_000_000)` cuts in < 2ms without allocating 4 MiB!
+    let prefixAscii = true;
+    for (let i = 0; i < candidateChars; i++) {
+      if (raw.charCodeAt(i) >= 0x80) {
+        prefixAscii = false;
+        break;
+      }
+    }
+    if (prefixAscii) {
+      let cutPos = candidateChars;
+      const nl = raw.lastIndexOf('\n', cutPos - 1);
+      if (nl > 0) {
+        cutPos = nl;
+      }
+      return { text: raw.slice(0, cutPos), cut: true };
+    }
+  }
+
+  if (!sanitizerScratchBuf || sanitizerScratchBuf.byteLength < maxUtf8Bytes) {
+    sanitizerScratchBuf = new Uint8Array(maxUtf8Bytes);
+  }
+  const prefixSlice = candidateChars === raw.length ? raw : raw.slice(0, candidateChars);
+  const encRes = SANITIZER_CUT_ENCODER.encodeInto(prefixSlice, sanitizerScratchBuf.subarray(0, maxUtf8Bytes));
+  if (candidateChars === raw.length && encRes.read === raw.length) {
+    return { text: raw, cut: false };
+  }
+  let cutPos = encRes.read;
+  const nl = raw.lastIndexOf('\n', cutPos - 1);
+  if (nl > 0) {
+    cutPos = nl;
+  } else if (cutPos > 0) {
+    const prev = raw.charCodeAt(cutPos - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) cutPos--;
+  }
+  return { text: raw.slice(0, cutPos), cut: true };
+}
+
+/** Invisible / format characters (below U+200B) that the fallback strips: soft hyphen, CGJ, ALM, Mongolian VS. */
+function isFallbackStrippedLowInvisible(c: number): boolean {
+  return c === 0x00ad || c === 0x034f || c === 0x061c || (c >= 0x180b && c <= 0x180f);
+}
+
+/**
+ * Pure-TS linear O(N) emergency fallback when WASM sanitization fails for any reason.
+ * Escapes every `&`, `<` and `>` as HTML entities (so a later entity decode cannot revive a tag),
+ * strips control/invisible smuggling characters, unwraps simple
+ * `[label](dest)` / `![alt](dest)` link/image syntax to plain visible text, and escapes any remaining
+ * `[` / `]` so zero HTML tags, autolinks, links, or images can ever reach a caller unsanitized.
+ */
+export function escapeMarkdownFallbackLinear(
+  raw: string,
+  maxChars = MAX_SANITIZER_WASM_UTF8_BYTES,
+): string {
+  if (!raw) return '';
+  let limit = Math.min(raw.length, maxChars);
+  if (limit < raw.length) {
+    const nl = raw.lastIndexOf('\n', limit - 1);
+    if (nl > 0 && (limit - nl <= 262_144 || nl >= (limit >>> 1))) {
+      limit = nl;
+    } else if (limit > 0) {
+      const prev = raw.charCodeAt(limit - 1);
+      if (prev >= 0xd800 && prev <= 0xdbff) limit--;
+    }
+  }
+
+  const chunks: string[] = [];
+  // End of the furthest failed `](...)` paren scan. A later `[` whose paren region starts before this point is
+  // escaped instead of rescanned, which keeps the whole pass linear (e.g. `'[](('.repeat(1e6)`). Escaping is
+  // always the safe outcome; it only forgoes link unwrapping in that rare overlap.
+  let parenScanFailedUntil = -1;
+  let i = 0;
+  while (i < limit) {
+    const c = raw.charCodeAt(i);
+    // Strip ASCII control chars except TAB (9), LF (10), CR (13)
+    if ((c < 0x20 && c !== 9 && c !== 10 && c !== 13) || c === 0x7f) {
+      i++;
+      continue;
+    }
+    // Strip zero-width, Bidi override, variation-selector & other invisible smuggling characters
+    if (
+      isFallbackStrippedLowInvisible(c) ||
+      (c >= 0x200b && c <= 0x200f) ||
+      (c >= 0x202a && c <= 0x202e) ||
+      (c >= 0x2060 && c <= 0x2069) ||
+      (c >= 0xfe00 && c <= 0xfe0f) ||
+      c === 0xfeff
+    ) {
+      i++;
+      continue;
+    }
+    // Strip Astral Plane 14 Unicode Tag characters (U+E0000..U+E007F, high surrogate 0xDB40)
+    if (c === 0xdb40 && i + 1 < limit) {
+      const lo = raw.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdc7f) {
+        i += 2;
+        continue;
+      }
+    }
+    if (c === 0x3c /* < */) {
+      chunks.push('&lt;');
+      i++;
+      continue;
+    }
+    if (c === 0x3e /* > */) {
+      chunks.push('&gt;');
+      i++;
+      continue;
+    }
+    if (c === 0x26 /* & */) {
+      chunks.push('&amp;');
+      i++;
+      continue;
+    }
+    // Unwrap `![alt](dest)` or `[label](dest)` within a bounded 512-char window; otherwise escape `[` / `]`.
+    if ((c === 0x21 /* ! */ && i + 1 < limit && raw.charCodeAt(i + 1) === 0x5b) || c === 0x5b /* [ */) {
+      const bracketOpen = c === 0x21 ? i + 1 : i;
+      const scanCap = Math.min(limit, bracketOpen + 512);
+      let closeBracket = -1;
+      for (let k = bracketOpen + 1; k < scanCap; k++) {
+        const kc = raw.charCodeAt(k);
+        if (kc === 0x5b || kc === 0x0a || kc === 0x0d) break;
+        if (kc === 0x5d /* ] */) {
+          closeBracket = k;
+          break;
+        }
+      }
+      if (
+        closeBracket > bracketOpen &&
+        closeBracket + 1 < limit &&
+        raw.charCodeAt(closeBracket + 1) === 0x28 /* ( */ &&
+        closeBracket + 2 >= parenScanFailedUntil
+      ) {
+        const parenCap = Math.min(limit, closeBracket + 2 + 2_048);
+        let depth = 1;
+        let p = closeBracket + 2;
+        while (p < parenCap && depth > 0) {
+          const pc = raw.charCodeAt(p);
+          if (pc === 0x0a || pc === 0x0d) break;
+          if (pc === 0x28) depth++;
+          else if (pc === 0x29) depth--;
+          p++;
+        }
+        if (depth === 0) {
+          const rawLabel = raw.slice(bracketOpen + 1, closeBracket);
+          if (rawLabel) {
+            chunks.push(escapeMarkdownFallbackLinear(rawLabel, rawLabel.length));
+          }
+          i = p;
+          continue;
+        }
+        parenScanFailedUntil = p;
+      }
+      if (c === 0x21) {
+        chunks.push('!&#91;');
+        i += 2;
+      } else {
+        chunks.push('&#91;');
+        i++;
+      }
+      continue;
+    }
+    if (c === 0x5d /* ] */) {
+      chunks.push('&#93;');
+      i++;
+      continue;
+    }
+    // Fast span copy for safe plain characters
+    const runStart = i;
+    i++;
+    while (i < limit) {
+      const nc = raw.charCodeAt(i);
+      if (
+        nc < 0x20 ||
+        nc === 0x7f ||
+        nc === 0x3c ||
+        nc === 0x3e ||
+        nc === 0x26 ||
+        nc === 0x21 ||
+        isFallbackStrippedLowInvisible(nc) ||
+        nc === 0x5b ||
+        nc === 0x5d ||
+        nc >= 0x200b
+      ) {
+        break;
+      }
+      i++;
+    }
+    chunks.push(raw.slice(runStart, i));
+  }
+  return chunks.join('');
+}
 
 export function isAsciiWhitespaceCode(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 13;
@@ -43,22 +276,26 @@ export function isDisallowedMarkdownLinkDestination(rawHref: string): boolean {
 
 export function neutralizeAllUnsafeMarkdownLinksLinear(prose: string): string {
   if (!prose) return '';
-  return callCoreWasmRawString('neutralize_unsafe_links', null, String(prose));
+  const { text: bounded } = cutMarkdownToSanitizerBudget(String(prose));
+  return callCoreWasmRawString('neutralize_unsafe_links', null, bounded);
 }
 
 export function escapeGfmTaskListCheckboxesLinear(prose: string): string {
   if (!prose || !prose.includes('[')) return prose;
-  return callCoreWasmRawString('escape_task_checkboxes', null, prose);
+  const { text: bounded } = cutMarkdownToSanitizerBudget(prose);
+  return callCoreWasmRawString('escape_task_checkboxes', null, bounded);
 }
 
 export function escapeAllResidualLtInProseLinear(prose: string, allowPdfPageMarkers = false): string {
   if (!prose || !prose.includes('<')) return prose;
-  return callCoreWasmRawString('escape_residual_lt', { allowPdfPageMarkers }, prose);
+  const { text: bounded } = cutMarkdownToSanitizerBudget(prose);
+  return callCoreWasmRawString('escape_residual_lt', { allowPdfPageMarkers }, bounded);
 }
 
 export function stripInvisibleSmugglingChars(s: string): string {
   if (!s) return '';
-  return callCoreWasmRawString('strip_invisible', null, s);
+  const { text: bounded } = cutMarkdownToSanitizerBudget(s);
+  return callCoreWasmRawString('strip_invisible', null, bounded);
 }
 
 export function cleanFenceInfoStringLinear(rawInfo: string): string {
@@ -251,12 +488,39 @@ export function sanitizeMarkdownPageSlice(
 
 export function sanitizeFullMarkdownDocumentForArtifact(fullMd: string): string {
   if (!fullMd) return '';
-  return callCoreWasmRawString('full_artifact_markdown', null, fullMd);
+  const { text: boundedMd } = cutMarkdownToSanitizerBudget(fullMd);
+  try {
+    return callCoreWasmRawString('full_artifact_markdown', null, boundedMd);
+  } catch {
+    return escapeMarkdownFallbackLinear(boundedMd);
+  }
 }
 
 export function stripMarkdownTableDividerLinesLinear(s: string): string {
   if (!s || !s.includes('-')) return s;
   return callCoreWasmRawString('strip_table_dividers', null, s);
+}
+
+/** UTF-8 byte length of `s`, counting stops early once it exceeds `cap` (returns a value > cap). */
+const ALL_ASCII_RE = /^[\x00-\x7f]*$/;
+function utf8ByteLenUpTo(s: string, cap: number): number {
+  if (s.length > cap) return s.length; // every UTF-16 code unit is >= 1 UTF-8 byte
+  if (ALL_ASCII_RE.test(s)) return s.length; // native scan; avoids a JS loop on the common ASCII case
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else bytes += 3;
+    } else bytes += 3;
+    if (bytes > cap) return bytes;
+  }
+  return bytes;
 }
 
 export function detectPromptInjection(params: {
@@ -268,13 +532,54 @@ export function detectPromptInjection(params: {
 } {
   const md = String(params.markdown ?? '');
   const html = String(params.rawHtml ?? '');
-  const res =
-    html.length === 0
-      ? callCoreWasmRaw<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', null, md)
-      : callCoreWasmRawPair<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', md, html);
+  const PI_MAX_SCAN_CHARS = 8 * 1024 * 1024;
+  // The WASM budget is in UTF-8 bytes. One UTF-16 code unit is at most 3 UTF-8 bytes, so a window of
+  // `PI_WASM_BYTES / 3` chars always fits, even for all-CJK pages (a 2M-char CJK window would be ~6 MB).
+  const PI_WASM_BYTES = MAX_WASM_INPUT_BYTES - 65_536;
+  const PI_WINDOW_CHARS = Math.floor(PI_WASM_BYTES / 3);
+  const PI_OVERLAP_CHARS = 16_384;
+  const boundedMd = md.length > PI_MAX_SCAN_CHARS ? md.slice(0, PI_MAX_SCAN_CHARS) : md;
+  const boundedHtml = html.length > PI_MAX_SCAN_CHARS ? html.slice(0, PI_MAX_SCAN_CHARS) : html;
+
+  if (
+    boundedMd.length <= 2 * 1024 * 1024 &&
+    boundedHtml.length <= 1024 * 1024 &&
+    utf8ByteLenUpTo(boundedMd, PI_WASM_BYTES) + utf8ByteLenUpTo(boundedHtml, PI_WASM_BYTES) <= PI_WASM_BYTES
+  ) {
+    const res =
+      boundedHtml.length === 0
+        ? callCoreWasmRaw<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', null, boundedMd)
+        : callCoreWasmRawPair<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', boundedMd, boundedHtml);
+    return {
+      detected: Boolean(res.detected),
+      triggers: res.triggers ?? [],
+    };
+  }
+
+  const triggerSet = new Set<string>();
+  const scanWindowed = (src: string, isHtml: boolean) => {
+    for (let pos = 0; pos < src.length; pos += PI_WINDOW_CHARS - PI_OVERLAP_CHARS) {
+      let end = Math.min(src.length, pos + PI_WINDOW_CHARS);
+      if (end < src.length) {
+        const code = src.charCodeAt(end - 1);
+        if (code >= 0xd800 && code <= 0xdbff) end++;
+      }
+      const chunk = src.slice(pos, end);
+      const r = isHtml
+        ? callCoreWasmRawPair<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', '', chunk)
+        : callCoreWasmRaw<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', null, chunk);
+      if (r.triggers) {
+        for (const t of r.triggers) triggerSet.add(t);
+      }
+      if (end >= src.length) break;
+    }
+  };
+  if (boundedMd.length > 0) scanWindowed(boundedMd, false);
+  if (boundedHtml.length > 0) scanWindowed(boundedHtml, true);
+  const triggers = [...triggerSet];
   return {
-    detected: Boolean(res.detected),
-    triggers: res.triggers ?? [],
+    detected: triggers.length > 0,
+    triggers,
   };
 }
 

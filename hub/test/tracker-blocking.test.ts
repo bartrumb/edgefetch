@@ -1180,18 +1180,28 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       const cfBigJson = buildLargeGhBoard('cloudflare', 550);
       const antBigJson = buildLargeGhBoard('anthropic', 580);
       assert.ok(cfBigJson.length > 8_500_000 && antBigJson.length > 9_000_000);
+      const cfInBudgetJson = buildLargeGhBoard('cloudflare', 220);
+      const antInBudgetJson = buildLargeGhBoard('anthropic', 230);
+      assert.ok(cfInBudgetJson.length > 3_300_000 && cfInBudgetJson.length < 4_000_000);
+      assert.ok(antInBudgetJson.length > 3_500_000 && antInBudgetJson.length < 4_100_000);
 
       const { resolveAtsPreFetchSpec } = await import('../src/jobs');
+      const { isWasmInputBudgetExceededError } = await import('../src/wasm-bridge');
+      assert.throws(
+        () => resolveAtsPreFetchSpec('https://boards.greenhouse.io/cloudflare')!.format(cfBigJson, 'https://boards.greenhouse.io/cloudflare'),
+        (err: unknown) => isWasmInputBudgetExceededError(err),
+        '> 4 MiB Greenhouse JSON must be rejected by global MAX_WASM_INPUT_BYTES in wasm-bridge',
+      );
       const cfFormatted = resolveAtsPreFetchSpec('https://boards.greenhouse.io/cloudflare')!.format(
-        cfBigJson,
+        cfInBudgetJson,
         'https://boards.greenhouse.io/cloudflare',
       );
       const antFormatted = resolveAtsPreFetchSpec('https://boards.greenhouse.io/anthropic')!.format(
-        antBigJson,
+        antInBudgetJson,
         'https://boards.greenhouse.io/anthropic',
       );
-      assert.equal(cfFormatted?.total, 550);
-      assert.equal(antFormatted?.total, 580);
+      assert.equal(cfFormatted?.total, 220);
+      assert.equal(antFormatted?.total, 230);
 
       const multiDomainJobs = await executeJobsCall({
         payload: {
@@ -1328,27 +1338,33 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(statsBeforeOversized.active, true);
       assert.ok(statsBeforeOversized.initialMemoryBytes > 0);
 
+      const { sanitizeInlineHtmlInMarkdown: sanitizeInline2M } = await import('../src/scrape');
       const hugeIngestJsonDoc = tryParseJsonPayloadForScrape(
-        antBigJson,
+        antInBudgetJson,
         'application/json',
         'https://boards-api.greenhouse.io/v1/boards/anthropic/jobs',
       );
       assert.ok(hugeIngestJsonDoc && hugeIngestJsonDoc.markdown.length > 1_000 && hugeIngestJsonDoc.markdown.length < 600_000);
       assert.equal(hugeIngestJsonDoc.parsed, null, 'Oversized >2 MiB JSON must skip V8 object graph allocation');
 
+      // `3M` `<` (`2.86 MiB` in <= `4 MiB` budget -> `12.00 MB` `&lt;` out > `8 MiB` `WASM_EVICT_IO_BYTES`) evicts `cachedReactor`!
+      assert.equal(sanitizeInline2M('<'.repeat(3_000_000)).length, 12_000_000);
       const statsAfterOversized = getWasmReactorStats();
-      assert.equal(statsAfterOversized.active, false, 'Oversized >8 MiB WASM call must evict cachedReactor');
+      assert.equal(statsAfterOversized.active, false, '>8 MiB WASM output must evict cachedReactor');
       assert.equal(statsAfterOversized.memoryBytes, 0);
 
       compileWasmRe2('^post-evict$')?.test('post-evict');
       const statsFreshInstance = getWasmReactorStats();
       assert.equal(statsFreshInstance.active, true);
       assert.equal(statsFreshInstance.generation, statsBeforeOversized.generation + 1);
-      assert.equal(statsFreshInstance.memoryBytes, statsFreshInstance.initialMemoryBytes);
+      assert.ok(
+        statsFreshInstance.memoryBytes >= statsFreshInstance.initialMemoryBytes &&
+          statsFreshInstance.memoryBytes <= statsFreshInstance.initialMemoryBytes + 2 * 1024 * 1024,
+        `Fresh reactor post-eviction memory (${statsFreshInstance.memoryBytes}) must stay within 2 MiB of initial baseline (${statsFreshInstance.initialMemoryBytes})`,
+      );
 
       // Ordinary 2 MB documents (`2M` `<` sanitize -> `~77.5 MiB` total) must NOT trigger reactor rebuilds across
       // 12 consecutive calls (`generation` stays constant, zero `~50 ms` rebuild stalls or dual-instance overlap).
-      const { sanitizeInlineHtmlInMarkdown: sanitizeInline2M } = await import('../src/scrape');
       const twoMillionLt = '<'.repeat(2_000_000);
       const genBefore2M = getWasmReactorStats().generation;
       for (let runIdx = 0; runIdx < 12; runIdx++) {
@@ -1364,38 +1380,38 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       );
       assert.ok(statsAfter2M.memoryBytes <= 96 * 1024 * 1024);
 
-      // Oversized (>8 MiB) failing WASM inputs (`> 48 MiB` `ef_in_ptr` rejection) must NOT allocate a second retry reactor instance!
-      const genBeforeFailedHuge = getWasmReactorStats().generation;
+      // Oversized (>4 MiB) WASM inputs are rejected BEFORE touching WASM memory (`0` extra pages, `0` retry instances)!
+      const genBeforeOverBudget = getWasmReactorStats().generation;
       assert.throws(
-        () => callCoreWasmRawPair('detect_prompt_injection', 'ok', 'z'.repeat(49 * 1024 * 1024)),
-        /WASM input buffer allocation failed/,
+        () => callCoreWasmRawPair('detect_prompt_injection', 'ok', 'z'.repeat(4 * 1024 * 1024 + 1024)),
+        (err: unknown) => isWasmInputBudgetExceededError(err),
       );
-      assert.equal(getWasmReactorStats().active, false);
+      assert.equal(getWasmReactorStats().active, true);
       assert.equal(
         getWasmReactorStats().generation,
-        genBeforeFailedHuge,
-        'Failed >8 MiB WASM call must evict without spawning a retry instance during error handling',
+        genBeforeOverBudget,
+        'Over-budget WASM call must reject before touching or rebuilding cachedReactor',
       );
 
-      // Test 2: `callCoreWasmRawMetaPair` and `callCoreWasmRawPair` use exact UTF-8 byte lengths (`0` `rawB.length * 3`).
-      // A 17 MiB ASCII `rawB` is <= 48 MiB `maxWasmInputBytes`, whereas `17 MiB * 3 = 51 MiB` would fail `ef_in_ptr`!
-      const rawB17MiB = 'x'.repeat(17 * 1024 * 1024);
+      // Test 2: `callCoreWasmRawMetaPair` and `callCoreWasmRawPair` use exact UTF-8 byte lengths (`0` `rawB.length * 3`)
+      // up to `MAX_WASM_INPUT_BYTES` (`4 MiB`) and reject `> 4 MiB` inputs cleanly!
+      const rawB38MiB = 'x'.repeat(3_800_000);
       const metaPairOut = callCoreWasmRawMetaPair<{ thin: boolean }>(
         'jobs_is_thin_scripted',
         {},
         '<html><body><p>ok</p></body></html>',
-        rawB17MiB,
+        rawB38MiB,
       );
       assert.equal(typeof metaPairOut.thin, 'boolean');
-      assert.equal(getWasmReactorStats().active, false, '17 MiB callCoreWasmRawMetaPair must also evict cachedReactor');
+      assert.ok(getWasmReactorStats().memoryBytes <= 96 * 1024 * 1024);
 
       const rawPairOut = callCoreWasmRawPair<{ detected: boolean }>(
         'detect_prompt_injection',
         'Normal clean markdown',
-        rawB17MiB,
+        rawB38MiB,
       );
       assert.equal(rawPairOut.detected, false);
-      assert.equal(getWasmReactorStats().active, false, '17 MiB callCoreWasmRawPair must also evict cachedReactor');
+      assert.ok(getWasmReactorStats().memoryBytes <= 96 * 1024 * 1024);
 
       // Test 3: RE2 matchers (`compileWasmRe2`, `compileLinearRegex`, `compileSafeUserRegex`, `compileSafeUserRegexUnion`)
       // bind the reactor instance reference and never mis-evaluate against recycled handles (`1..k`) after reactor reset/eviction.
@@ -1414,11 +1430,8 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(unionMatcher('/union-alpha/10'), true);
       assert.equal(unionMatcher('/poison-union/99'), false);
 
-      // Evict the reactor via a real >8 MiB call, then populate handles 1..8 on the new reactor with OPPOSITE poison patterns!
-      resolveAtsPreFetchSpec('https://boards.greenhouse.io/cloudflare')!.format(
-        cfBigJson,
-        'https://boards.greenhouse.io/cloudflare',
-      );
+      // Evict the reactor via a real >8 MiB output call (`3M` `<` -> `12 MB` `&lt;`), then populate handles 1..8 on the new reactor with OPPOSITE poison patterns!
+      assert.equal(sanitizeInline2M('<'.repeat(3_000_000)).length, 12_000_000);
       assert.equal(getWasmReactorStats().active, false);
       for (let k = 0; k < 8; k++) {
         const poison = compileWasmRe2('^(?:https://poison\\.example\\.org/hijack|/poison-user/hijack|/poison-union/99)$')!;

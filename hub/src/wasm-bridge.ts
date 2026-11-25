@@ -27,17 +27,123 @@ const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
 const EMPTY_BYTES = new Uint8Array(0);
 
-// WebAssembly linear memory pages (`64 KiB` each) can never shrink once grown.
-// Measured under `debug.SetMemoryLimit(48 << 20)` (`initialMemoryBytes ≈ 50.5–51.0 MiB`):
-//   - Ordinary 2 MB documents (`2M` `<` sanitize -> `77.5 MiB` total, `+26.5 MiB`) stabilize below `80 MiB` across
-//     repeated calls; an aggressive `+28 MiB` growth cap would rebuild the instance every ~3rd call (`~50 ms` stall +
-//     brief `78 + 51 ≈ 129 MiB` old/new instance overlap before V8 GC).
-//   - Evict ONLY after multi-MiB calls (`> 8 MiB` in or out) OR when total linear memory exceeds `96 MiB` (`WASM_MAX_TOTAL_MEMORY_BYTES`),
-//     and never allocate a second retry instance when the failing input itself exceeded `8 MiB` (`WASM_MAX_RETRY_INPUT_BYTES`).
-const WASM_EVICT_IO_BYTES = 8 * 1024 * 1024;
-const WASM_MAX_TOTAL_MEMORY_BYTES = 96 * 1024 * 1024;
-const WASM_MAX_RETRY_INPUT_BYTES = 8 * 1024 * 1024;
+// Shared edge WASM input & isolate concurrency budgets (`PR #73`):
+//   - `MAX_WASM_INPUT_BYTES = 4 MiB` enforced in every shared writer below so all ~30 raw/JSON/RE2 ops are bounded in one place.
+//   - `MAX_ISOLATE_IN_FLIGHT_BYTES = 12 MiB` semaphore caps concurrent multi-MiB requests sharing one 128 MiB Worker isolate.
+//   - Evict `cachedReactor` only when I/O exceeds `8 MiB` (`WASM_EVICT_IO_BYTES`) or total linear memory exceeds `96 MiB`
+//     (`WASM_MAX_TOTAL_MEMORY_BYTES`), keeping `<= 4 MiB` inputs and `2M` `<` (`8.00 MB` out) steady with 0 rebuild stalls.
+export const MAX_WASM_INPUT_BYTES = 4 * 1024 * 1024;
+export const MAX_ISOLATE_IN_FLIGHT_BYTES = 12 * 1024 * 1024;
+export const WASM_EVICT_IN_BYTES = 8 * 1024 * 1024;
+export const WASM_EVICT_IO_BYTES = WASM_EVICT_IN_BYTES;
+export const WASM_EVICT_OUT_BYTES = 8 * 1024 * 1024;
+export const WASM_MAX_TOTAL_MEMORY_BYTES = 96 * 1024 * 1024;
 const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 524_288;
+
+export class WasmInputBudgetExceededError extends Error {
+  readonly code = 'wasm_input_budget_exceeded' as const;
+  readonly inputBytes: number;
+  readonly budgetBytes: number;
+
+  constructor(inputBytes: number, budgetBytes = MAX_WASM_INPUT_BYTES) {
+    super(`Document exceeds ${Math.round(budgetBytes / (1024 * 1024))} MiB edge WASM input budget (${inputBytes} bytes)`);
+    this.name = 'WasmInputBudgetExceededError';
+    this.inputBytes = inputBytes;
+    this.budgetBytes = budgetBytes;
+  }
+}
+
+export function isWasmInputBudgetExceededError(err: unknown): err is WasmInputBudgetExceededError {
+  return (
+    err instanceof WasmInputBudgetExceededError ||
+    (Boolean(err) && typeof err === 'object' && (err as { code?: unknown }).code === 'wasm_input_budget_exceeded')
+  );
+}
+
+export interface IsolateBudgetLease {
+  readonly bytes: number;
+  release(): void;
+}
+
+interface IsolateBudgetWaiter {
+  bytes: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolve: (lease: IsolateBudgetLease | null) => void;
+}
+
+let isolateBytesInFlight = 0;
+const isolateWaitQueue: IsolateBudgetWaiter[] = [];
+
+function createLease(cost: number): IsolateBudgetLease {
+  let released = false;
+  return {
+    bytes: cost,
+    release(): void {
+      if (released) return;
+      released = true;
+      isolateBytesInFlight = Math.max(0, isolateBytesInFlight - cost);
+      drainIsolateWaitQueue();
+    },
+  };
+}
+
+function drainIsolateWaitQueue(): void {
+  while (isolateWaitQueue.length > 0) {
+    const head = isolateWaitQueue[0]!;
+    if (isolateBytesInFlight + head.bytes > MAX_ISOLATE_IN_FLIGHT_BYTES) {
+      break;
+    }
+    isolateWaitQueue.shift();
+    clearTimeout(head.timer);
+    isolateBytesInFlight += head.bytes;
+    head.resolve(createLease(head.bytes));
+  }
+}
+
+export function acquireIsolateByteBudget(
+  requestedBytes: number,
+  waitTimeoutMs = 200,
+): Promise<IsolateBudgetLease | null> {
+  const cost = Math.max(1, Math.min(MAX_ISOLATE_IN_FLIGHT_BYTES, Math.ceil(Number.isFinite(requestedBytes) ? requestedBytes : 1)));
+  if (isolateWaitQueue.length === 0 && isolateBytesInFlight + cost <= MAX_ISOLATE_IN_FLIGHT_BYTES) {
+    isolateBytesInFlight += cost;
+    return Promise.resolve(createLease(cost));
+  }
+  if (waitTimeoutMs <= 0) {
+    return Promise.resolve(null);
+  }
+  return new Promise<IsolateBudgetLease | null>((resolve) => {
+    const waiter: IsolateBudgetWaiter = {
+      bytes: cost,
+      timer: setTimeout(() => {
+        const idx = isolateWaitQueue.indexOf(waiter);
+        if (idx >= 0) isolateWaitQueue.splice(idx, 1);
+        resolve(null);
+        // A timed-out head waiter may have been the only thing blocking smaller waiters that already fit.
+        if (idx === 0) drainIsolateWaitQueue();
+      }, waitTimeoutMs),
+      resolve,
+    };
+    isolateWaitQueue.push(waiter);
+  });
+}
+
+export function getIsolateBudgetStats(): { inFlightBytes: number; maxBytes: number; queuedWaiters: number } {
+  return {
+    inFlightBytes: isolateBytesInFlight,
+    maxBytes: MAX_ISOLATE_IN_FLIGHT_BYTES,
+    queuedWaiters: isolateWaitQueue.length,
+  };
+}
+
+export function resetIsolateBudgetForTests(): void {
+  while (isolateWaitQueue.length > 0) {
+    const w = isolateWaitQueue.shift()!;
+    clearTimeout(w.timer);
+    w.resolve(null);
+  }
+  isolateBytesInFlight = 0;
+}
 
 let cachedReactor: CoreReactorExports | null = null;
 let cachedReactorInitMemBytes = 0;
@@ -77,8 +183,8 @@ function maybeEvictOversizedReactor(
   if (cachedReactor !== reactor) return;
   const memBytes = reactor.memory.buffer.byteLength;
   if (
-    inBytes > WASM_EVICT_IO_BYTES ||
-    outBytes > WASM_EVICT_IO_BYTES ||
+    inBytes > WASM_EVICT_IN_BYTES ||
+    outBytes > WASM_EVICT_OUT_BYTES ||
     (!skipTotalCeiling && memBytes > WASM_MAX_TOTAL_MEMORY_BYTES)
   ) {
     cachedReactor = null;
@@ -218,6 +324,9 @@ if (
 }
 
 function writeInputBytes(reactor: CoreReactorExports, bytes: Uint8Array): number {
+  if (bytes.byteLength > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(bytes.byteLength);
+  }
   const ptr = reactor.ef_in_ptr(bytes.byteLength) >>> 0;
   if (ptr === 0 && bytes.byteLength > 0) {
     throw new Error(`WASM input buffer allocation failed (${bytes.byteLength} bytes)`);
@@ -228,9 +337,37 @@ function writeInputBytes(reactor: CoreReactorExports, bytes: Uint8Array): number
   return bytes.byteLength;
 }
 
+export interface WasmGoMemStatsSnapshot {
+  alloc: number;
+  totalAlloc: number;
+  sys: number;
+  heapAlloc: number;
+  heapSys: number;
+  heapIdle: number;
+  heapInuse: number;
+  heapReleased: number;
+  heapObjects: number;
+  stackInuse: number;
+  stackSys: number;
+  mSpanSys: number;
+  mCacheSys: number;
+  buckHashSys: number;
+  gcSys: number;
+  otherSys: number;
+  nextGC: number;
+  numGC: number;
+}
+
+export function getWasmRuntimeMemStats(): { init: WasmGoMemStatsSnapshot; current: WasmGoMemStatsSnapshot } {
+  return callCoreWasm<{ init: WasmGoMemStatsSnapshot; current: WasmGoMemStatsSnapshot }>('wasm_mem_stats', {});
+}
+
 export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: unknown): T {
   let reactor = getReactor();
   const reqBytes = utf8Encoder.encode(JSON.stringify({ op, payload }));
+  if (reqBytes.byteLength > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(reqBytes.byteLength);
+  }
   let inLen = 0;
   let outLen = 0;
   let jsonText = '{}';
@@ -239,9 +376,9 @@ export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: u
       inLen = writeInputBytes(reactor, reqBytes);
       outLen = reactor.ef_call(inLen) >>> 0;
     } catch (err) {
-      // Fault-isolated auto-recovery if the WASI reactor ever traps (skip retry on >8 MiB inputs to avoid dual-instance OOM)
+      if (isWasmInputBudgetExceededError(err)) throw err;
+      // Fault-isolated auto-recovery if the WASI reactor ever traps
       resetWasmReactor();
-      if (reqBytes.byteLength > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       inLen = writeInputBytes(reactor, reqBytes);
       outLen = reactor.ef_call(inLen) >>> 0;
@@ -267,14 +404,16 @@ function writeMetaAndRawStrings(
   rawA: string,
   rawB = '',
 ): { metaLen: number; firstRawBytes: number; totalLen: number } {
-  // For multi-MiB strings (e.g. 10 MiB Greenhouse/Ashby JSON or HTML), pre-encoding with `utf8Encoder.encode`
-  // allocates the exact UTF-8 byte length (~1x) in WASM linear memory instead of `length * 3` (~30 MiB),
-  // avoiding permanent `WebAssembly.Memory` page growth inside Cloudflare Workers' 128 MiB isolate ceiling.
+  // Global WASM input byte budget (`MAX_WASM_INPUT_BYTES` = 4 MiB) enforced in the shared writer
+  // so every raw/HTML/JSON/XML/CSV/Markdown op is bounded automatically without per-op drift.
   const totalChars = rawA.length + rawB.length;
+  if (totalChars > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(totalChars);
+  }
   if (totalChars > EXACT_UTF8_ENCODE_THRESHOLD_CHARS) {
     const slack = Math.min(262_144, (totalChars >>> 4) + 4_096);
     const optimisticSize = metaBytes.byteLength + totalChars + slack;
-    if (optimisticSize <= 48 * 1024 * 1024) {
+    if (optimisticSize <= metaBytes.byteLength + MAX_WASM_INPUT_BYTES + 262_144) {
       const optPtr = reactor.ef_in_ptr(optimisticSize) >>> 0;
       if (optPtr !== 0) {
         const mem = new Uint8Array(reactor.memory.buffer);
@@ -301,6 +440,10 @@ function writeMetaAndRawStrings(
           }
         }
         if (fits) {
+          const rawBytesWritten = offset - (optPtr + metaBytes.byteLength);
+          if (rawBytesWritten > MAX_WASM_INPUT_BYTES) {
+            throw new WasmInputBudgetExceededError(rawBytesWritten);
+          }
           return { metaLen: metaBytes.byteLength, firstRawBytes, totalLen: offset - optPtr };
         }
       }
@@ -310,6 +453,9 @@ function writeMetaAndRawStrings(
     const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : null;
     const lenA = encA ? encA.byteLength : 0;
     const lenB = encB ? encB.byteLength : 0;
+    if (lenA + lenB > MAX_WASM_INPUT_BYTES) {
+      throw new WasmInputBudgetExceededError(lenA + lenB);
+    }
     const allocSize = metaBytes.byteLength + lenA + lenB;
     const ptr = reactor.ef_in_ptr(allocSize) >>> 0;
     if (ptr === 0 && allocSize > 0) {
@@ -329,7 +475,7 @@ function writeMetaAndRawStrings(
     return { metaLen: metaBytes.byteLength, firstRawBytes: lenA, totalLen: offset - ptr };
   }
 
-  const maxRawBytes = (rawA.length + rawB.length) * 3;
+  const maxRawBytes = totalChars * 3;
   const allocSize = metaBytes.byteLength + maxRawBytes;
   const ptr = reactor.ef_in_ptr(allocSize) >>> 0;
   if (ptr === 0 && allocSize > 0) {
@@ -347,6 +493,10 @@ function writeMetaAndRawStrings(
   if (rawB.length > 0) {
     const encB = utf8Encoder.encodeInto(rawB, mem.subarray(offset, offset + rawB.length * 3));
     offset += encB.written;
+  }
+  const rawBytesWritten = offset - (ptr + metaBytes.byteLength);
+  if (rawBytesWritten > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(rawBytesWritten);
   }
   return { metaLen: metaBytes.byteLength, firstRawBytes, totalLen: offset - ptr };
 }
@@ -367,8 +517,8 @@ export function callCoreWasmRaw<T = Record<string, unknown>>(op: string, meta: u
       usedTotalLen = totalLen;
       outLen = reactor.ef_call_raw(metaLen, totalLen) >>> 0;
     } catch (err) {
+      if (isWasmInputBudgetExceededError(err)) throw err;
       resetWasmReactor();
-      if (rawStr.length > WASM_MAX_RETRY_INPUT_BYTES || usedTotalLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
       usedTotalLen = totalLen;
@@ -395,9 +545,15 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
   rawA: string,
   rawB: string,
 ): T {
+  if (rawA.length + rawB.length > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(rawA.length + rawB.length);
+  }
   let reactor = getReactor();
   const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : EMPTY_BYTES;
   const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : EMPTY_BYTES;
+  if (encA.byteLength + encB.byteLength > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(encA.byteLength + encB.byteLength);
+  }
   const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { ...metaObj, htmlByteLen: encA.byteLength } }));
   const allocLen = metaBytes.byteLength + encA.byteLength + encB.byteLength;
   const run = (r: CoreReactorExports): number => {
@@ -424,8 +580,8 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
     try {
       outLen = run(reactor);
     } catch (err) {
+      if (isWasmInputBudgetExceededError(err)) throw err;
       resetWasmReactor();
-      if (allocLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       outLen = run(reactor);
       void err;
@@ -441,9 +597,15 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
 }
 
 export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, rawA: string, rawB: string): T {
+  if (rawA.length + rawB.length > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(rawA.length + rawB.length);
+  }
   let reactor = getReactor();
   const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : EMPTY_BYTES;
   const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : EMPTY_BYTES;
+  if (encA.byteLength + encB.byteLength > MAX_WASM_INPUT_BYTES) {
+    throw new WasmInputBudgetExceededError(encA.byteLength + encB.byteLength);
+  }
   const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { mdByteLen: encA.byteLength } }));
   const allocLen = metaBytes.byteLength + encA.byteLength + encB.byteLength;
   const run = (r: CoreReactorExports): number => {
@@ -470,8 +632,8 @@ export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, raw
     try {
       outLen = run(reactor);
     } catch (err) {
+      if (isWasmInputBudgetExceededError(err)) throw err;
       resetWasmReactor();
-      if (allocLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       outLen = run(reactor);
       void err;
@@ -501,8 +663,8 @@ export function callCoreWasmRawString(op: string, meta: unknown, rawStr: string)
       usedTotalLen = totalLen;
       outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
     } catch (err) {
+      if (isWasmInputBudgetExceededError(err)) throw err;
       resetWasmReactor();
-      if (rawStr.length > WASM_MAX_RETRY_INPUT_BYTES || usedTotalLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
       usedTotalLen = totalLen;
@@ -534,6 +696,7 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
     const patLen = writeInputBytes(initReactor, patBytes);
     handle = initReactor.ef_re2_compile(patLen);
   } catch (err) {
+    if (isWasmInputBudgetExceededError(err)) throw err;
     resetWasmReactor();
     initReactor = getReactor();
     const patLen = writeInputBytes(initReactor, patBytes);
@@ -553,6 +716,9 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
 
   return {
     test(subject: string): boolean {
+      if (subject.length > MAX_WASM_INPUT_BYTES) {
+        throw new WasmInputBudgetExceededError(subject.length);
+      }
       let r = getReactor();
       const subjBytes = utf8Encoder.encode(subject);
       let res: number;
@@ -566,9 +732,9 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
           res = r.ef_re2_test(handle, retryLen);
         }
       } catch (err) {
+        if (isWasmInputBudgetExceededError(err)) throw err;
         resetWasmReactor();
         boundReactor = null;
-        if (subjBytes.byteLength > WASM_MAX_RETRY_INPUT_BYTES) throw err;
         r = getReactor();
         if (ensureHandle(r) <= 0) return false;
         const retryLen = writeInputBytes(r, subjBytes);
@@ -580,6 +746,9 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
       return res === 1;
     },
     exec(subject: string): RegExpExecArray | null {
+      if (subject.length > MAX_WASM_INPUT_BYTES) {
+        throw new WasmInputBudgetExceededError(subject.length);
+      }
       let r = getReactor();
       const subjBytes = utf8Encoder.encode(subject);
       let outLen = 0;
@@ -595,9 +764,9 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
             outLen = r.ef_re2_exec(handle, retryLen) >>> 0;
           }
         } catch (err) {
+          if (isWasmInputBudgetExceededError(err)) throw err;
           resetWasmReactor();
           boundReactor = null;
-          if (subjBytes.byteLength > WASM_MAX_RETRY_INPUT_BYTES) throw err;
           r = getReactor();
           if (ensureHandle(r) <= 0) return null;
           const retryLen = writeInputBytes(r, subjBytes);

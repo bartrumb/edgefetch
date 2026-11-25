@@ -2,7 +2,7 @@
  * CMS Auto-Twins Bridge (`hub/src/extractors/cms-twins.ts`) — delegates URL discovery & JSON formatting to Go `internal/extract/cms_twins.go` via `edgefetch-core.wasm`.
  */
 
-import { callCoreWasm } from '../wasm-bridge';
+import { callCoreWasmRaw } from '../wasm-bridge';
 import type { HtmlFragmentConverter } from './types';
 
 export interface CmsAutoTwinResult {
@@ -27,11 +27,16 @@ export function discoverWordPressRestTwinUrlLinear(
   pageFinalUrl: string,
   selfHost?: string,
 ): string | null {
-  const url = callCoreWasm<{ url: string }>('cms_discover_wp', {
-    rawHtml: String(rawHtml ?? ''),
-    pageFinalUrl: String(pageFinalUrl ?? ''),
-    selfHost: selfHost ?? '',
-  }).url;
+  const s = String(rawHtml ?? '');
+  if (!s) return null;
+  const url = callCoreWasmRaw<{ url: string }>(
+    'cms_discover_wp',
+    {
+      pageFinalUrl: String(pageFinalUrl ?? ''),
+      selfHost: selfHost ?? '',
+    },
+    s,
+  ).url;
   return url || null;
 }
 
@@ -40,11 +45,16 @@ export function resolveGatsbyPageDataTwinUrl(
   pageFinalUrl: string,
   selfHost?: string,
 ): string | null {
-  const url = callCoreWasm<{ url: string }>('cms_resolve_gatsby', {
-    rawHtml: String(rawHtml ?? ''),
-    pageFinalUrl: String(pageFinalUrl ?? ''),
-    selfHost: selfHost ?? '',
-  }).url;
+  const s = String(rawHtml ?? '');
+  if (!s) return null;
+  const url = callCoreWasmRaw<{ url: string }>(
+    'cms_resolve_gatsby',
+    {
+      pageFinalUrl: String(pageFinalUrl ?? ''),
+      selfHost: selfHost ?? '',
+    },
+    s,
+  ).url;
   return url || null;
 }
 
@@ -53,10 +63,13 @@ export function formatWordPressRestPostJson(
   baseUrl: string,
   _htmlToMd?: HtmlFragmentConverter,
 ): Omit<CmsAutoTwinResult, 'extractorId' | 'twinUrl'> | null {
-  return callCoreWasm<{ result: Omit<CmsAutoTwinResult, 'extractorId' | 'twinUrl'> | null }>('cms_format_wp', {
-    rawJson: String(rawJson ?? ''),
-    baseUrl: String(baseUrl ?? ''),
-  }).result;
+  const s = String(rawJson ?? '');
+  if (!s) return null;
+  return callCoreWasmRaw<{ result: Omit<CmsAutoTwinResult, 'extractorId' | 'twinUrl'> | null }>(
+    'cms_format_wp',
+    { baseUrl: String(baseUrl ?? '') },
+    s,
+  ).result;
 }
 
 export async function tryFetchCmsAutoTwin(params: {
@@ -95,9 +108,10 @@ export async function tryFetchCmsAutoTwin(params: {
       try {
         const rawJson = await fetchSameOriginJson(gatsbyUrl, 'gatsby-page-data');
         if (rawJson.trim() && rawJson.length <= 2 * 1024 * 1024) {
-          const hydrated = callCoreWasm<{ result: Omit<CmsAutoTwinResult, 'extractorId' | 'twinUrl'> | null }>(
+          const hydrated = callCoreWasmRaw<{ result: Omit<CmsAutoTwinResult, 'extractorId' | 'twinUrl'> | null }>(
             'cms_format_gatsby',
-            { rawJson, baseUrl: finalUrl },
+            { baseUrl: finalUrl },
+            rawJson,
           ).result;
           if (hydrated) {
             const newWords = (hydrated.markdown.match(/[\p{L}\p{N}_'-]+/gu) ?? []).length;

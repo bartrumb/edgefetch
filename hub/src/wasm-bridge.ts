@@ -192,12 +192,41 @@ export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: u
   return parsed;
 }
 
+const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 3_145_728;
+
 function writeMetaAndRawStrings(
   reactor: CoreReactorExports,
   metaBytes: Uint8Array,
   rawA: string,
   rawB = '',
 ): { metaLen: number; firstRawBytes: number; totalLen: number } {
+  // For multi-MiB strings (e.g. 10 MiB Greenhouse/Ashby JSON or HTML), pre-encoding with `utf8Encoder.encode`
+  // allocates the exact UTF-8 byte length (~1x) in WASM linear memory instead of `length * 3` (~30 MiB),
+  // avoiding permanent `WebAssembly.Memory` page growth inside Cloudflare Workers' 128 MiB isolate ceiling.
+  if (rawA.length + rawB.length > EXACT_UTF8_ENCODE_THRESHOLD_CHARS) {
+    const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : null;
+    const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : null;
+    const lenA = encA ? encA.byteLength : 0;
+    const lenB = encB ? encB.byteLength : 0;
+    const allocSize = metaBytes.byteLength + lenA + lenB;
+    const ptr = reactor.ef_in_ptr(allocSize) >>> 0;
+    if (ptr === 0 && allocSize > 0) {
+      throw new Error(`WASM input buffer allocation failed (${allocSize} bytes)`);
+    }
+    const mem = new Uint8Array(reactor.memory.buffer);
+    mem.set(metaBytes, ptr);
+    let offset = ptr + metaBytes.byteLength;
+    if (encA && lenA > 0) {
+      mem.set(encA, offset);
+      offset += lenA;
+    }
+    if (encB && lenB > 0) {
+      mem.set(encB, offset);
+      offset += lenB;
+    }
+    return { metaLen: metaBytes.byteLength, firstRawBytes: lenA, totalLen: offset - ptr };
+  }
+
   const maxRawBytes = (rawA.length + rawB.length) * 3;
   const allocSize = metaBytes.byteLength + maxRawBytes;
   const ptr = reactor.ef_in_ptr(allocSize) >>> 0;

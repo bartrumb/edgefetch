@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"encoding/json"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -173,5 +175,58 @@ func TestBoardDiscoveryStatusAndIdentity(t *testing.T) {
 	}, []string{"systems", "engineer"})
 	if len(sim) != 1 || sim[0].URL != "https://simco.recruitee.com/o/1" {
 		t.Fatalf("unexpected similar roles: %+v", sim)
+	}
+}
+
+func TestLargeGreenhouseAndAshbyStreamingBoundedHeap(t *testing.T) {
+	refNow := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	// Build a realistic ~9.5 MiB 600-posting Greenhouse `?content=true` payload (matching Cloudflare/Anthropic scale),
+	// placing `"meta"` AFTER `"jobs"` to verify key-order-independent streaming.
+	htmlChunk := strings.Repeat("&lt;p&gt;Build distributed systems in Go and Rust across global edge PoPs. Base salary $185,000 - $240,000 USD.&lt;/p&gt;", 120)
+	var sb strings.Builder
+	sb.Grow(10 << 20)
+	sb.WriteString(`{"jobs":[`)
+	for i := 0; i < 600; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `{"id":%d,"title":"Systems Engineer %d","absolute_url":"https://boards.greenhouse.io/bigco/jobs/%d","location":{"name":"Distributed, United States"},"updated_at":"2026-11-24T10:00:00Z","content":"%s"}`, 10000+i, i, 10000+i, htmlChunk)
+	}
+	sb.WriteString(`],"meta":{"total":625}}`)
+	bigGH := sb.String()
+	if len(bigGH) < 8<<20 {
+		t.Fatalf("expected >=8 MiB Greenhouse payload, got %d bytes", len(bigGH))
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	res := FormatATSResponse("https://boards.greenhouse.io/bigco", bigGH, "https://boards.greenhouse.io/bigco", nil, refNow)
+	if res == nil || res.Total == nil || *res.Total != 625 || res.Returned == nil || *res.Returned != 600 || res.Truncated == nil || !*res.Truncated {
+		t.Fatalf("unexpected streaming Greenhouse result: total=%v returned=%v truncated=%v", res.Total, res.Returned, res.Truncated)
+	}
+	if len(res.Jobs) != 600 || len(res.Links) != 600 || res.Jobs[0].WorkplaceType != WorkplaceRemote || res.Jobs[0].Pay == nil {
+		t.Fatalf("unexpected first Greenhouse job: %+v", res.Jobs[0])
+	}
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	var liveDelta int64
+	if after.HeapAlloc > before.HeapAlloc {
+		liveDelta = int64(after.HeapAlloc - before.HeapAlloc)
+	}
+	// Retained result for 600 compact StructuredJobRecord structs + links + 120-bullet markdown must stay well under 4 MiB.
+	if liveDelta > 4<<20 {
+		t.Fatalf("retained heap delta too high after streaming 600-job Greenhouse board: %d bytes", liveDelta)
+	}
+
+	// Verify Ashby streaming when `"jobs"` precedes `"organizationName"` so `records[i].Company` still resolves to `organizationName`.
+	ashbyTrailingOrg := `{"jobs":[{"id":"lin-1","title":"Product Engineer","location":"Remote","isRemote":true,"descriptionPlain":"$190k - $230k base"}],"organizationName":"Linear"}`
+	ashbyRes := FormatATSResponse("https://jobs.ashbyhq.com/linear", ashbyTrailingOrg, "https://jobs.ashbyhq.com/linear", nil, refNow)
+	if ashbyRes == nil || len(ashbyRes.Jobs) != 1 || ashbyRes.Jobs[0].Company != "Linear" {
+		t.Fatalf("expected Ashby streaming to backfill trailing organizationName='Linear', got %+v", ashbyRes)
 	}
 }

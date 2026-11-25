@@ -821,16 +821,32 @@ function readJobsScrapeCache(partition: JobsCachePartition, key: string, now = D
   return cloneJobsScrapeResponse(hit.value);
 }
 
+const MAX_JOBS_CACHE_TOTAL_RECORDS = 8_000;
+
+function approxCachedJobsCount(res: JobsScrapeResponse): number {
+  const jobs = res.body?.jobs;
+  return Array.isArray(jobs) ? jobs.length : 1;
+}
+
 function writeJobsScrapeCache(partition: JobsCachePartition, key: string, value: JobsScrapeResponse, now = Date.now()): void {
   if (value.status !== 200 || value.body?.ok !== true) return;
+  let totalRecords = 0;
   for (const [k, v] of partition.lru.entries()) {
-    if (v.expiresAt <= now) partition.lru.delete(k);
+    if (v.expiresAt <= now) {
+      partition.lru.delete(k);
+    } else if (k !== key) {
+      totalRecords += approxCachedJobsCount(v.value);
+    }
   }
   partition.lru.delete(key);
-  partition.lru.set(key, { expiresAt: now + JOBS_CACHE_TTL_MS, value: cloneJobsScrapeResponse(value) });
-  while (partition.lru.size > MAX_JOBS_CACHE_ENTRIES) {
+  const cloned = cloneJobsScrapeResponse(value);
+  totalRecords += approxCachedJobsCount(cloned);
+  partition.lru.set(key, { expiresAt: now + JOBS_CACHE_TTL_MS, value: cloned });
+  while (partition.lru.size > MAX_JOBS_CACHE_ENTRIES || (partition.lru.size > 1 && totalRecords > MAX_JOBS_CACHE_TOTAL_RECORDS)) {
     const oldest = partition.lru.keys().next().value;
     if (oldest === undefined) break;
+    const evicted = partition.lru.get(oldest);
+    if (evicted) totalRecords -= approxCachedJobsCount(evicted.value);
     partition.lru.delete(oldest);
   }
 }

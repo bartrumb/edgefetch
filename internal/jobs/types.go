@@ -214,6 +214,7 @@ func DefaultHTMLToMD(frag, base string) (string, []string) {
 		BaseURL:         base,
 		OnlyMainContent: false,
 		IncludeImages:   true,
+		IsFragment:      true,
 	})
 	return doc.Markdown, doc.Links
 }

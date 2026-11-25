@@ -19,6 +19,8 @@ import {
 import { AgentHubEngine } from '../src/agent-hub';
 import { buildCrawlChildSpans } from '../src/otel';
 import { buildCrawlActivityEvents } from '../src/activity-log';
+import { executeJobsCall, resetJobsCacheForTests } from '../src/jobs';
+import { executeCatalogCall, getCatalogRecords, resetCatalogStateForTests } from '../src/catalog';
 
 const OWNER_TOKEN = 'ef_owner_tracker_test_secret_token_0123456789';
 const AGENT_TOKEN = 'ef_agent_tracker_test_secret_token_0123456789';
@@ -1158,6 +1160,150 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(fullScaleOut.updated, true);
       assert.equal(fullScaleOut.current?.meta.hostCount, 45_001);
       assert.ok(elapsed45k < 1_000, `Expected 45k EasyPrivacy list refresh in < 1000ms, took ${elapsed45k.toFixed(1)}ms`);
+
+      // Multi-domain 10 MiB Greenhouse + Ashby `jobs` (`cloudflare.com`, `linear.app`, `anthropic.com` scale)
+      // streams through `edgefetch-core.wasm` without exceeding Cloudflare's 128 MiB Worker + WASM ceiling
+      resetJobsCacheForTests();
+      const bigHtmlDesc =
+        '&lt;p&gt;Build distributed systems in Go/Rust across global edge nodes. US Base Salary Range: $185,000 - $240,000 USD.&lt;/p&gt;'.repeat(
+          135,
+        );
+      const buildLargeGhBoard = (slug: string, count: number): string => {
+        const parts: string[] = [];
+        for (let i = 0; i < count; i++) {
+          parts.push(
+            `{"id":${20000 + i},"title":"${i % 25 === 0 ? 'Distributed Systems Engineer' : 'Account Executive'} ${i}","absolute_url":"https://boards.greenhouse.io/${slug}/jobs/${20000 + i}","location":{"name":"Distributed, United States"},"updated_at":"2026-11-24T12:00:00Z","content":"${bigHtmlDesc}"}`,
+          );
+        }
+        return `{"jobs":[${parts.join(',')}],"meta":{"total":${count}}}`;
+      };
+      const cfBigJson = buildLargeGhBoard('cloudflare', 550);
+      const antBigJson = buildLargeGhBoard('anthropic', 580);
+      assert.ok(cfBigJson.length > 8_500_000 && antBigJson.length > 9_000_000);
+
+      const { resolveAtsPreFetchSpec } = await import('../src/jobs');
+      const cfFormatted = resolveAtsPreFetchSpec('https://boards.greenhouse.io/cloudflare')!.format(
+        cfBigJson,
+        'https://boards.greenhouse.io/cloudflare',
+      );
+      const antFormatted = resolveAtsPreFetchSpec('https://boards.greenhouse.io/anthropic')!.format(
+        antBigJson,
+        'https://boards.greenhouse.io/anthropic',
+      );
+      assert.equal(cfFormatted?.total, 550);
+      assert.equal(antFormatted?.total, 580);
+
+      const multiDomainJobs = await executeJobsCall({
+        payload: {
+          domains: ['cloudflare.com', 'linear.app', 'anthropic.com'],
+          query: 'Distributed Systems Engineer',
+          remote: true,
+          minBase: 150_000,
+          limit: 10,
+        },
+        env: {},
+        executeSearch: async () => ({ status: 200, body: { results: [] } }),
+        executeScrape: async (args) => {
+          const u = String(args.url ?? '');
+          if (u === 'https://cloudflare.com/careers') {
+            return { status: 200, body: { ok: true, finalUrl: u, rawHtml: '<a href="https://boards.greenhouse.io/cloudflare">Jobs</a>', links: ['https://boards.greenhouse.io/cloudflare'] } };
+          }
+          if (u === 'https://anthropic.com/careers') {
+            return { status: 200, body: { ok: true, finalUrl: u, rawHtml: '<a href="https://boards.greenhouse.io/anthropic">Jobs</a>', links: ['https://boards.greenhouse.io/anthropic'] } };
+          }
+          if (u === 'https://linear.app/careers') {
+            return { status: 200, body: { ok: true, finalUrl: u, rawHtml: '<a href="https://jobs.ashbyhq.com/linear">Jobs</a>', links: ['https://jobs.ashbyhq.com/linear'] } };
+          }
+          if (u.includes('greenhouse.io/cloudflare')) {
+            return { status: 200, body: { ok: true, extractorId: 'greenhouse-board', ...cfFormatted } };
+          }
+          if (u.includes('greenhouse.io/anthropic')) {
+            return { status: 200, body: { ok: true, extractorId: 'greenhouse-board', ...antFormatted } };
+          }
+          if (u.includes('ashbyhq.com/linear')) {
+            const linFmt = resolveAtsPreFetchSpec('https://jobs.ashbyhq.com/linear')!.format(
+              JSON.stringify({
+                organizationName: 'Linear',
+                jobs: [
+                  {
+                    id: 'lin-1',
+                    title: 'Distributed Systems Engineer',
+                    location: 'Remote',
+                    isRemote: true,
+                    publishedAt: '2026-11-24T00:00:00Z',
+                    descriptionPlain: 'Base salary $190,000 - $230,000',
+                  },
+                ],
+              }),
+              'https://jobs.ashbyhq.com/linear',
+            );
+            return { status: 200, body: { ok: true, extractorId: 'ashby-board', ...linFmt } };
+          }
+          return { status: 404, body: { ok: false } };
+        },
+      });
+      assert.equal(multiDomainJobs.status, 200);
+      assert.equal(multiDomainJobs.body.ok, true);
+      assert.equal((multiDomainJobs.body.jobs as unknown[]).length, 10);
+
+      // Catalog parallel currency + UCP probes warm caches so repeat runs & `getCatalogRecords` avoid redundant `/meta.json` & `/robots.txt` fetches
+      resetCatalogStateForTests();
+      let metaCalls = 0;
+      let robotsCalls = 0;
+      const mockCatalogFetch = async ({ url: u, timeoutMs }: { url: string; timeoutMs?: number }) => {
+        if (u.includes('/products.json')) {
+          return {
+            status: 200,
+            body: JSON.stringify({
+              products: [
+                {
+                  id: 777,
+                  title: 'Wool Runner NZ',
+                  handle: 'wool-runner-nz',
+                  vendor: 'Allbirds',
+                  product_type: 'Shoes',
+                  variants: [{ id: 888, title: '10', price: '112.00', available: true }],
+                },
+              ],
+            }),
+          };
+        }
+        if (u.endsWith('/meta.json')) {
+          assert.ok(typeof timeoutMs === 'number' && timeoutMs <= 4_000, `Expected bounded timeoutMs on /meta.json, got ${timeoutMs}`);
+          metaCalls++;
+          return { status: 200, body: JSON.stringify({ currency: 'USD' }) };
+        }
+        if (u.endsWith('/robots.txt')) {
+          assert.ok(typeof timeoutMs === 'number' && timeoutMs <= 4_500, `Expected bounded timeoutMs on /robots.txt, got ${timeoutMs}`);
+          robotsCalls++;
+          return { status: 200, body: 'User-agent: *\nDisallow: /cart.js\n# /.well-known/ucp\n' };
+        }
+        return { status: 404, body: '' };
+      };
+      const catFirst = await executeCatalogCall({
+        payload: { url: 'https://www.allbirds-cache-test.example.com', maxPages: 1, fields: 'lean' },
+        executeHubFetch: mockCatalogFetch,
+      });
+      assert.equal(catFirst.status, 200);
+      assert.equal(metaCalls, 1);
+      assert.equal(robotsCalls, 1);
+      assert.equal((catFirst.body.ucp as { advertised?: boolean })?.advertised, true);
+
+      const catFirstRecs = await getCatalogRecords({
+        catalogId: String(catFirst.body.catalogId),
+        fields: 'lean',
+        executeHubFetch: mockCatalogFetch,
+      });
+      assert.equal((catFirstRecs.body.records as Array<{ currency: string }>)[0]?.currency, 'USD');
+      assert.equal(metaCalls, 1, 'getCatalogRecords must reuse backfilled/cached currency with zero extra /meta.json calls');
+
+      const catSecond = await executeCatalogCall({
+        payload: { url: 'https://www.allbirds-cache-test.example.com', maxPages: 1, fields: 'lean' },
+        executeHubFetch: mockCatalogFetch,
+      });
+      assert.equal(catSecond.status, 200);
+      assert.equal(metaCalls, 1, 'Repeat catalog pull on warm origin must hit SHOPIFY_ORIGIN_CURRENCY_CACHE');
+      assert.equal(robotsCalls, 1, 'Repeat catalog pull on warm origin must hit ORIGIN_UCP_CACHE');
 
       wsAgent.close();
     } finally {

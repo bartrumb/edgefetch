@@ -4,7 +4,6 @@ import (
 	"html"
 	"math"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -56,63 +55,63 @@ type ExtractOptions struct {
 }
 
 var (
-	reHTMLComment = regexp.MustCompile(`(?is)<!--.*?-->`)
-	reDropBlocks  = []*regexp.Regexp{
-		regexp.MustCompile(`(?is)<head\b[^>]*>.*?</head>`),
-		regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`),
-		regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`),
-		regexp.MustCompile(`(?is)<noscript\b[^>]*>.*?</noscript>`),
-		regexp.MustCompile(`(?is)<template\b[^>]*>.*?</template>`),
-		regexp.MustCompile(`(?is)<svg\b[^>]*>.*?</svg>`),
-		regexp.MustCompile(`(?is)<canvas\b[^>]*>.*?</canvas>`),
-		regexp.MustCompile(`(?is)<iframe\b[^>]*>.*?</iframe>`),
+	reHTMLComment = newLazyRegexp(`(?is)<!--.*?-->`)
+	reDropBlocks  = []*lazyRegexp{
+		newLazyRegexp(`(?is)<head\b[^>]*>.*?</head>`),
+		newLazyRegexp(`(?is)<script\b[^>]*>.*?</script>`),
+		newLazyRegexp(`(?is)<style\b[^>]*>.*?</style>`),
+		newLazyRegexp(`(?is)<noscript\b[^>]*>.*?</noscript>`),
+		newLazyRegexp(`(?is)<template\b[^>]*>.*?</template>`),
+		newLazyRegexp(`(?is)<svg\b[^>]*>.*?</svg>`),
+		newLazyRegexp(`(?is)<canvas\b[^>]*>.*?</canvas>`),
+		newLazyRegexp(`(?is)<iframe\b[^>]*>.*?</iframe>`),
 	}
-	reChromeBlocks = []*regexp.Regexp{
-		regexp.MustCompile(`(?is)<nav\b[^>]*>.*?</nav>`),
-		regexp.MustCompile(`(?is)<footer\b[^>]*>.*?</footer>`),
-		regexp.MustCompile(`(?is)<aside\b[^>]*>.*?</aside>`),
+	reChromeBlocks = []*lazyRegexp{
+		newLazyRegexp(`(?is)<nav\b[^>]*>.*?</nav>`),
+		newLazyRegexp(`(?is)<footer\b[^>]*>.*?</footer>`),
+		newLazyRegexp(`(?is)<aside\b[^>]*>.*?</aside>`),
 	}
-	reHeaderBlock  = regexp.MustCompile(`(?is)<header\b[^>]*>.*?</header>`)
-	reMainBlock    = regexp.MustCompile(`(?is)<main\b[^>]*>(.*?)</main>`)
-	reArticleBlock = regexp.MustCompile(`(?is)<article\b[^>]*>(.*?)</article>`)
-	reTitleTag     = regexp.MustCompile(`(?is)<title\b[^>]*>(.*?)</title>`)
-	reMetaTag      = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
-	reLinkTag      = regexp.MustCompile(`(?is)<link\b[^>]*>`)
-	reStyleContent = regexp.MustCompile(`(?is)<style\b[^>]*>(.*?)</style>`)
-	reAttrPair     = regexp.MustCompile(`(?is)([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+))`)
+	reHeaderBlock  = newLazyRegexp(`(?is)<header\b[^>]*>.*?</header>`)
+	reMainBlock    = newLazyRegexp(`(?is)<main\b[^>]*>(.*?)</main>`)
+	reArticleBlock = newLazyRegexp(`(?is)<article\b[^>]*>(.*?)</article>`)
+	reTitleTag     = newLazyRegexp(`(?is)<title\b[^>]*>(.*?)</title>`)
+	reMetaTag      = newLazyRegexp(`(?is)<meta\b[^>]*>`)
+	reLinkTag      = newLazyRegexp(`(?is)<link\b[^>]*>`)
+	reStyleContent = newLazyRegexp(`(?is)<style\b[^>]*>(.*?)</style>`)
+	reAttrPair     = newLazyRegexp(`(?is)([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+))`)
 
-	reAnchor    = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
-	reImgTag    = regexp.MustCompile(`(?is)<img\b([^>]*)>`)
-	rePreCode   = regexp.MustCompile(`(?is)<pre\b([^>]*)>\s*(?:<code\b([^>]*)>)?(.*?)(?:</code>)?\s*</pre>`)
-	reCodeLang  = regexp.MustCompile(`(?i)(?:\b(?:language|lang)-|\bdata-(?:language|lang)=["']?)([a-z0-9_+#-]+)\b`)
-	reEcLine    = regexp.MustCompile(`(?is)<div\b[^>]*\bec-line\b[^>]*>`)
-	reInlineCd  = regexp.MustCompile(`(?is)<code\b[^>]*>(.*?)</code>`)
-	reHeading   = regexp.MustCompile(`(?is)<h([1-6])\b[^>]*>(.*?)</h[1-6]>`)
-	reStrong    = regexp.MustCompile(`(?is)<strong\b[^>]*>(.*?)</strong>|<b\b[^>]*>(.*?)</b>`)
-	reEm        = regexp.MustCompile(`(?is)<em\b[^>]*>(.*?)</em>|<i\b[^>]*>(.*?)</i>`)
-	reListItem  = regexp.MustCompile(`(?is)<li\b[^>]*>(.*?)</li>`)
-	reBlockquot = regexp.MustCompile(`(?is)<blockquote\b[^>]*>(.*?)</blockquote>`)
-	reTable     = regexp.MustCompile(`(?is)<table\b[^>]*>(.*?)</table>`)
-	reTableRow  = regexp.MustCompile(`(?is)<tr\b[^>]*>(.*?)</tr>`)
-	reTableCell = regexp.MustCompile(`(?is)<t([hd])\b[^>]*>(.*?)</t[hd]>`)
-	reBlockEnd  = regexp.MustCompile(`(?is)</(p|div|section|article|main|ul|ol|dl|dd|dt|figure|figcaption|tr|header)>`)
-	reBrHr      = regexp.MustCompile(`(?is)<(br|hr)\b[^>]*/?>`)
-	reAnyTag    = regexp.MustCompile(`(?s)<[^>]+>`)
-	reMultiLine = regexp.MustCompile(`\n{3,}`)
-	reSpaceRun  = regexp.MustCompile(`[ \t]{2,}`)
-	reDupLink   = regexp.MustCompile(`(\[[^\]]+\]\((https?://[^)\s]+)\))[ \t]*\((https?://[^)\s]+)\)`)
-	reDupInLink = regexp.MustCompile(`\[([^\[\]\n]+?)[ \t]*\((https?://[^)\s]+)\)\]\((https?://[^)\s]+)\)`)
+	reAnchor    = newLazyRegexp(`(?is)<a\b([^>]*)>(.*?)</a>`)
+	reImgTag    = newLazyRegexp(`(?is)<img\b([^>]*)>`)
+	rePreCode   = newLazyRegexp(`(?is)<pre\b([^>]*)>\s*(?:<code\b([^>]*)>)?(.*?)(?:</code>)?\s*</pre>`)
+	reCodeLang  = newLazyRegexp(`(?i)(?:\b(?:language|lang)-|\bdata-(?:language|lang)=["']?)([a-z0-9_+#-]+)\b`)
+	reEcLine    = newLazyRegexp(`(?is)<div\b[^>]*\bec-line\b[^>]*>`)
+	reInlineCd  = newLazyRegexp(`(?is)<code\b[^>]*>(.*?)</code>`)
+	reHeading   = newLazyRegexp(`(?is)<h([1-6])\b[^>]*>(.*?)</h[1-6]>`)
+	reStrong    = newLazyRegexp(`(?is)<strong\b[^>]*>(.*?)</strong>|<b\b[^>]*>(.*?)</b>`)
+	reEm        = newLazyRegexp(`(?is)<em\b[^>]*>(.*?)</em>|<i\b[^>]*>(.*?)</i>`)
+	reListItem  = newLazyRegexp(`(?is)<li\b[^>]*>(.*?)</li>`)
+	reBlockquot = newLazyRegexp(`(?is)<blockquote\b[^>]*>(.*?)</blockquote>`)
+	reTable     = newLazyRegexp(`(?is)<table\b[^>]*>(.*?)</table>`)
+	reTableRow  = newLazyRegexp(`(?is)<tr\b[^>]*>(.*?)</tr>`)
+	reTableCell = newLazyRegexp(`(?is)<t([hd])\b[^>]*>(.*?)</t[hd]>`)
+	reBlockEnd  = newLazyRegexp(`(?is)</(p|div|section|article|main|ul|ol|dl|dd|dt|figure|figcaption|tr|header)>`)
+	reBrHr      = newLazyRegexp(`(?is)<(br|hr)\b[^>]*/?>`)
+	reAnyTag    = newLazyRegexp(`(?s)<[^>]+>`)
+	reMultiLine = newLazyRegexp(`\n{3,}`)
+	reSpaceRun  = newLazyRegexp(`[ \t]{2,}`)
+	reDupLink   = newLazyRegexp(`(\[[^\]]+\]\((https?://[^)\s]+)\))[ \t]*\((https?://[^)\s]+)\)`)
+	reDupInLink = newLazyRegexp(`\[([^\[\]\n]+?)[ \t]*\((https?://[^)\s]+)\)\]\((https?://[^)\s]+)\)`)
 
-	reHexColor   = regexp.MustCompile(`#[0-9a-fA-F]{6}\b`)
-	reFontFamily = regexp.MustCompile(`(?i)font-family\s*:\s*([^;}{]+)`)
-	reGoogleFont = regexp.MustCompile(`(?i)fonts\.googleapis\.com/css2?\?family=([^&"'\s>]+)`)
+	reHexColor   = newLazyRegexp(`#[0-9a-fA-F]{6}\b`)
+	reFontFamily = newLazyRegexp(`(?i)font-family\s*:\s*([^;}{]+)`)
+	reGoogleFont = newLazyRegexp(`(?i)fonts\.googleapis\.com/css2?\?family=([^&"'\s>]+)`)
 
-	reEmail = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
-	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
-	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\b\d{3})[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
-	reCard  = regexp.MustCompile(`\b(?:\d[ -]*?){13,19}\b`)
+	reEmail = newLazyRegexp(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
+	reSSN   = newLazyRegexp(`\b\d{3}-\d{2}-\d{4}\b`)
+	rePhone = newLazyRegexp(`(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\b\d{3})[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
+	reCard  = newLazyRegexp(`\b(?:\d[ -]*?){13,19}\b`)
 
-	reSPAShell = regexp.MustCompile(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)
+	reSPAShell = newLazyRegexp(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)
 )
 
 // DetectRenderedChallenge checks whether an HTML payload (HTTP or headless browser) is gated by a bot/CAPTCHA challenge.
@@ -920,8 +919,8 @@ func firstAttr(attrs map[string]string, keys ...string) string {
 	return ""
 }
 
-var reHrefAmpEntity = regexp.MustCompile(`(?i)&(?:amp|#0*38|#x0*26);`)
-var reInvisibleSmuggling = regexp.MustCompile(`[\x{E0000}-\x{E007F}\x{202A}-\x{202E}\x{2066}-\x{2069}]`)
+var reHrefAmpEntity = newLazyRegexp(`(?i)&(?:amp|#0*38|#x0*26);`)
+var reInvisibleSmuggling = newLazyRegexp(`[\x{E0000}-\x{E007F}\x{202A}-\x{202E}\x{2066}-\x{2069}]`)
 
 // unescapeHrefAmpOnly safely replaces only `&amp;` / `&#38;` / `&#x26;` inside URLs.
 // Calling `html.UnescapeString` on raw hrefs corrupts semicolon-less query params like

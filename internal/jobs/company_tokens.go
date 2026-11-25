@@ -1,7 +1,6 @@
 package jobs
 
 import (
-	"regexp"
 	"strings"
 	"unicode"
 )
@@ -166,27 +165,27 @@ var (
 		"co": true, "app": true, "dev": true, "so": true, "sh": true, "gg": true, "tech": true, "cloud": true, "jobs": true,
 	}
 
-	reConcatNegationPrefix = regexp.MustCompile(`^(?:not|non|anti|ex|former|unlike|fake|clone|mock|spoof|phish|scam|impostor|imposter|unofficial)`)
-	reNumericOrHexTLD      = regexp.MustCompile(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
-	reDottedCorpAbbrev     = regexp.MustCompile(`(?i)\b(?:l\.l\.c|p\.b\.c|p\.l\.c|l\.l\.p|i\.n\.c|c\.o\.r\.p|l\.t\.d|u\.s\.a|u\.s|u\.k|s\.a|b\.v|n\.v|a\.g|s\.e|k\.k)\.?`)
-	reDomainLikeInput      = regexp.MustCompile(`(?i)^[a-z0-9-]+(?:\.[a-z0-9-]+)+$`)
-	reDottedAbbrevTail     = regexp.MustCompile(`(?i)\.(?:l\.l\.c|p\.b\.c|p\.l\.c|i\.n\.c|l\.t\.d|u\.k|u\.s\.a|k\.k)\.?$`)
-	reAlnumWords           = regexp.MustCompile(`[a-z0-9]+`)
-	reAshbySpaceSlug       = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_-]| [A-Za-z0-9_-])*$`)
-	reATSSlugChars         = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	reSingleLetterBrandSpf = regexp.MustCompile(`(?:^|\s)[A-Za-z](?:[.\-/][A-Za-z]){3,}\b`)
-	reAllowedCareerPath    = regexp.MustCompile(`(?i)^/(?:careers|jobs|about|company|en|intl)\b`)
-	reParenStrip           = regexp.MustCompile(`\(.*?\)`)
+	reConcatNegationPrefix = newLazyRegexp(`^(?:not|non|anti|ex|former|unlike|fake|clone|mock|spoof|phish|scam|impostor|imposter|unofficial)`)
+	reNumericOrHexTLD      = newLazyRegexp(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
+	reDottedCorpAbbrev     = newLazyRegexp(`(?i)\b(?:l\.l\.c|p\.b\.c|p\.l\.c|l\.l\.p|i\.n\.c|c\.o\.r\.p|l\.t\.d|u\.s\.a|u\.s|u\.k|s\.a|b\.v|n\.v|a\.g|s\.e|k\.k)\.?`)
+	reDomainLikeInput      = newLazyRegexp(`(?i)^[a-z0-9-]+(?:\.[a-z0-9-]+)+$`)
+	reDottedAbbrevTail     = newLazyRegexp(`(?i)\.(?:l\.l\.c|p\.b\.c|p\.l\.c|i\.n\.c|l\.t\.d|u\.k|u\.s\.a|k\.k)\.?$`)
+	reAlnumWords           = newLazyRegexp(`[a-z0-9]+`)
+	reAshbySpaceSlug       = newLazyRegexp(`^[A-Za-z0-9](?:[A-Za-z0-9_-]| [A-Za-z0-9_-])*$`)
+	reATSSlugChars         = newLazyRegexp(`^[A-Za-z0-9_-]+$`)
+	reSingleLetterBrandSpf = newLazyRegexp(`(?:^|\s)[A-Za-z](?:[.\-/][A-Za-z]){3,}\b`)
+	reAllowedCareerPath    = newLazyRegexp(`(?i)^/(?:careers|jobs|about|company|en|intl)\b`)
+	reParenStrip           = newLazyRegexp(`\(.*?\)`)
 
-	reICRoleWord   = regexp.MustCompile(`^(?:engineers?|developers?|scientists?|designers?|researchers?|architects?|analysts?)$`)
-	reMgmtRoleWord = regexp.MustCompile(`^(?:managers?|management|directors?|vp|presidents?|chief|head)$`)
-	reUSExplicit   = regexp.MustCompile(`(?i)\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?[ \t]{0,8}\(us\)|us-[a-z]{2}\b|alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|district of columbia|florida|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston|pittsburgh|philadelphia|phoenix|portland|san diego|raleigh|durham|minneapolis|detroit|salt lake city|miami|dallas|houston|charlotte|nashville|columbus|indianapolis)\b`)
-	reGeorgiaWord  = regexp.MustCompile(`(?i)\bgeorgia\b`)
-	reTbilisiWord  = regexp.MustCompile(`(?i)\btbilisi\b`)
-	reRemoteAmer   = regexp.MustCompile(`(?i)\bremote\b[^|]{0,24}\b(?:north america|americas)\b|\b(?:north america|americas)\b[^|]{0,24}\bremote\b`)
-	reCanadianLoc  = regexp.MustCompile(`(?i)\b(?:canada|toronto|vancouver|montreal|ottawa|calgary|ontario|quebec|british columbia)\b|,[ \t]{0,8}(?:on|bc|qc|ab),[ \t]{0,8}ca\b`)
-	reUSStateAbbr  = regexp.MustCompile(`(?i),[ \t]{0,8}(?:al|ak|az|ar|ca|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy)\b`)
-	reAgeLabel     = regexp.MustCompile(`(?i)^(\d+)(\+)?\s*(days?|weeks?|months?|years?)\b`)
+	reICRoleWord   = newLazyRegexp(`^(?:engineers?|developers?|scientists?|designers?|researchers?|architects?|analysts?)$`)
+	reMgmtRoleWord = newLazyRegexp(`^(?:managers?|management|directors?|vp|presidents?|chief|head)$`)
+	reUSExplicit   = newLazyRegexp(`(?i)\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?[ \t]{0,8}\(us\)|us-[a-z]{2}\b|alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|district of columbia|florida|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston|pittsburgh|philadelphia|phoenix|portland|san diego|raleigh|durham|minneapolis|detroit|salt lake city|miami|dallas|houston|charlotte|nashville|columbus|indianapolis)\b`)
+	reGeorgiaWord  = newLazyRegexp(`(?i)\bgeorgia\b`)
+	reTbilisiWord  = newLazyRegexp(`(?i)\btbilisi\b`)
+	reRemoteAmer   = newLazyRegexp(`(?i)\bremote\b[^|]{0,24}\b(?:north america|americas)\b|\b(?:north america|americas)\b[^|]{0,24}\bremote\b`)
+	reCanadianLoc  = newLazyRegexp(`(?i)\b(?:canada|toronto|vancouver|montreal|ottawa|calgary|ontario|quebec|british columbia)\b|,[ \t]{0,8}(?:on|bc|qc|ab),[ \t]{0,8}ca\b`)
+	reUSStateAbbr  = newLazyRegexp(`(?i),[ \t]{0,8}(?:al|ak|az|ar|ca|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy)\b`)
+	reAgeLabel     = newLazyRegexp(`(?i)^(\d+)(\+)?\s*(days?|weeks?|months?|years?)\b`)
 )
 
 // RegistrableBrandInfo describes the registrable brand SLD and TLD of a hostname.

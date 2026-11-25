@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -166,9 +165,9 @@ func IsPDFBytes(data []byte) bool {
 }
 
 var (
-	rePDFStream  = regexp.MustCompile(`(?s)stream\r?\n(.*?)\r?\nendstream`)
-	rePDFTextRun = regexp.MustCompile(`\((?:\\.|[^\\)])*\)\s*Tj|\[(.*?)\]\s*TJ`)
-	rePDFParen   = regexp.MustCompile(`\((?:\\.|[^\\)])*\)`)
+	rePDFStream  = newLazyRegexp(`(?s)stream\r?\n(.*?)\r?\nendstream`)
+	rePDFTextRun = newLazyRegexp(`\((?:\\.|[^\\)])*\)\s*Tj|\[(.*?)\]\s*TJ`)
+	rePDFParen   = newLazyRegexp(`\((?:\\.|[^\\)])*\)`)
 )
 
 func extractPDFTextPureGo(pdfBytes []byte, maxStreams int) string {

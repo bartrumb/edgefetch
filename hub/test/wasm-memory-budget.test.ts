@@ -203,6 +203,14 @@ test('Step 4: wasm_mem_stats captures exact Go runtime MemStats snapshot right a
   );
   assert.equal(reactorStats.active, true);
   assert.ok(reactorStats.initialMemoryBytes > 0);
+  assert.ok(
+    reactorStats.initialMemoryBytes <= 12 * 1024 * 1024,
+    `Fresh WASM baseline (${reactorStats.initialMemoryBytes} B) must stay <= 12 MiB (~7.25 MiB after crypto/ removal + lazy regexes)`,
+  );
+  assert.ok(
+    memStats.init.heapAlloc < 1024 * 1024,
+    `Fresh Go WASM init HeapAlloc (${memStats.init.heapAlloc} B) must stay < 1 MiB`,
+  );
   assert.ok(memStats.init.sys > 0 && memStats.current.sys >= memStats.init.sys);
 });
 

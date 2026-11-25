@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 )
 
@@ -58,7 +57,7 @@ var localLoopbackInferencePorts = map[string]bool{
 	"8080":  true,
 }
 
-var reValidLLMModel = regexp.MustCompile(`^[A-Za-z0-9._:@/-]{1,160}$`)
+var reValidLLMModel = newLazyRegexp(`^[A-Za-z0-9._:@/-]{1,160}$`)
 
 // LLMEnvConfig holds operator environment variables and binding flags for BYO-LLM resolution.
 type LLMEnvConfig struct {

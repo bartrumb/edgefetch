@@ -3,7 +3,6 @@ package classify
 import (
 	"html"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -64,47 +63,47 @@ type BlockedRefinement struct {
 }
 
 var (
-	reWordTokensCSGo                = regexp.MustCompile(`[\p{L}\p{N}_'-]+`)
-	reNamedEntitiesCSGo             = regexp.MustCompile(`(?i)&[a-z0-9#]+;`)
-	reRichSchemaInnerCSGo           = regexp.MustCompile(`(?is)"@type"\s*:\s*(?:\[[^\]]{0,400})?["'](?:Article|TechArticle|NewsArticle|BlogPosting|ScholarlyArticle|JobPosting|Product|SoftwareSourceCode|FAQPage|APIReference)["']`)
-	reJSONLDAttrCSGo                = regexp.MustCompile(`(?i)\btype\s*=\s*["']application/ld\+json["']`)
-	reDataScriptAttrCSGo            = regexp.MustCompile(`(?i)\b(?:type\s*=\s*["']application/(?:ld\+)?json["']|id\s*=\s*["']__(?:NEXT|NUXT)_DATA__["'])`)
-	reScriptBlocksCSGo              = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
-	reVisibleDropBlocksCSGo         = regexp.MustCompile(`(?is)<(?:pre|code|blockquote|textarea|svg|style|script)\b[^>]*>.*?</(?:pre|code|blockquote|textarea|svg|style|script)>`)
-	reScrubDomBlocksCSGo            = regexp.MustCompile(`(?is)<(?:pre|code|blockquote|textarea|svg|style)\b[^>]*>.*?</(?:pre|code|blockquote|textarea|svg|style)>`)
-	reProseLeakBlocksCSGo           = regexp.MustCompile(`(?is)<(?:script|style|noscript|template)\b[^>]*>.*?</(?:script|style|noscript|template)>`)
-	reVisibleHTMLDropCSGo           = regexp.MustCompile(`(?is)<(?:script|style|noscript|template|svg)\b[^>]*>.*?</(?:script|style|noscript|template|svg)>`)
-	reH1BlockCSGo                   = regexp.MustCompile(`(?is)<h1\b[^>]*>(.*?)</h1>`)
-	reMarkdownH1CSGo                = regexp.MustCompile(`^(?:\s*\r?\n)*[ \t]{0,3}#{1,2}[ \t]+([^\r\n]{1,200})`)
-	reCloudflareTitleFullCSGo       = regexp.MustCompile(`(?i)^(?:just a moment\.{0,3}|attention required!\s*\|\s*cloudflare|ddos-guard|checking your browser)$`)
-	reGenericChallengeTitleFullCSGo = regexp.MustCompile(`(?i)^(?:verify you are human|human verification|pardon our interruption|access to this page has been denied|bot verification|security check|vercel security checkpoint)$`)
-	reAkamaiRefFullCSGo             = regexp.MustCompile(`(?i)reference\s*#18\.[0-9a-f]{4,}\.[0-9]{6,}`)
+	reWordTokensCSGo                = newLazyRegexp(`[\p{L}\p{N}_'-]+`)
+	reNamedEntitiesCSGo             = newLazyRegexp(`(?i)&[a-z0-9#]+;`)
+	reRichSchemaInnerCSGo           = newLazyRegexp(`(?is)"@type"\s*:\s*(?:\[[^\]]{0,400})?["'](?:Article|TechArticle|NewsArticle|BlogPosting|ScholarlyArticle|JobPosting|Product|SoftwareSourceCode|FAQPage|APIReference)["']`)
+	reJSONLDAttrCSGo                = newLazyRegexp(`(?i)\btype\s*=\s*["']application/ld\+json["']`)
+	reDataScriptAttrCSGo            = newLazyRegexp(`(?i)\b(?:type\s*=\s*["']application/(?:ld\+)?json["']|id\s*=\s*["']__(?:NEXT|NUXT)_DATA__["'])`)
+	reScriptBlocksCSGo              = newLazyRegexp(`(?is)<script\b([^>]*)>(.*?)</script>`)
+	reVisibleDropBlocksCSGo         = newLazyRegexp(`(?is)<(?:pre|code|blockquote|textarea|svg|style|script)\b[^>]*>.*?</(?:pre|code|blockquote|textarea|svg|style|script)>`)
+	reScrubDomBlocksCSGo            = newLazyRegexp(`(?is)<(?:pre|code|blockquote|textarea|svg|style)\b[^>]*>.*?</(?:pre|code|blockquote|textarea|svg|style)>`)
+	reProseLeakBlocksCSGo           = newLazyRegexp(`(?is)<(?:script|style|noscript|template)\b[^>]*>.*?</(?:script|style|noscript|template)>`)
+	reVisibleHTMLDropCSGo           = newLazyRegexp(`(?is)<(?:script|style|noscript|template|svg)\b[^>]*>.*?</(?:script|style|noscript|template|svg)>`)
+	reH1BlockCSGo                   = newLazyRegexp(`(?is)<h1\b[^>]*>(.*?)</h1>`)
+	reMarkdownH1CSGo                = newLazyRegexp(`^(?:\s*\r?\n)*[ \t]{0,3}#{1,2}[ \t]+([^\r\n]{1,200})`)
+	reCloudflareTitleFullCSGo       = newLazyRegexp(`(?i)^(?:just a moment\.{0,3}|attention required!\s*\|\s*cloudflare|ddos-guard|checking your browser)$`)
+	reGenericChallengeTitleFullCSGo = newLazyRegexp(`(?i)^(?:verify you are human|human verification|pardon our interruption|access to this page has been denied|bot verification|security check|vercel security checkpoint)$`)
+	reAkamaiRefFullCSGo             = newLazyRegexp(`(?i)reference\s*#18\.[0-9a-f]{4,}\.[0-9]{6,}`)
 
-	reNonContentIframeHostCSGo = regexp.MustCompile(`(?i)(?:googletagmanager\.com|doubleclick\.net|googlesyndication\.com|google-analytics\.com|facebook\.com/tr|challenges\.cloudflare\.com|recaptcha|hcaptcha|captcha-delivery\.com|_incapsula_resource|js\.stripe\.com|newrelic\.com|demdex\.net)`)
-	reIframeSkipSchemeCSGo     = regexp.MustCompile(`(?i)^(?:about:blank|javascript:|data:)`)
-	reIframeSrcValidCSGo       = regexp.MustCompile(`(?i)^(?:https?://|//|/[A-Za-z0-9_.-])`)
-	reHiddenStyleCSGo          = regexp.MustCompile(`(?i)(?:display\s*:\s*none|visibility\s*:\s*hidden)`)
-	reHiddenBoolAttrCSGo       = regexp.MustCompile(`(?i)(?:^|\s)hidden(?:\s*=\s*(?:""|''|"true"|'true'|"hidden"|'hidden'|true|hidden))?(?:\s|$)`)
-	reSimpleTagAttrCSGo        = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_.:-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+)))?`)
-	reWidgetSameHostHintCSGo   = regexp.MustCompile(`(?i)(?:icims|in_iframe|embed|widget|greenhouse|lever|ashby|workday|smartrecruiters|bamboohr|workable|recruitee|jobvite|taleo)`)
+	reNonContentIframeHostCSGo = newLazyRegexp(`(?i)(?:googletagmanager\.com|doubleclick\.net|googlesyndication\.com|google-analytics\.com|facebook\.com/tr|challenges\.cloudflare\.com|recaptcha|hcaptcha|captcha-delivery\.com|_incapsula_resource|js\.stripe\.com|newrelic\.com|demdex\.net)`)
+	reIframeSkipSchemeCSGo     = newLazyRegexp(`(?i)^(?:about:blank|javascript:|data:)`)
+	reIframeSrcValidCSGo       = newLazyRegexp(`(?i)^(?:https?://|//|/[A-Za-z0-9_.-])`)
+	reHiddenStyleCSGo          = newLazyRegexp(`(?i)(?:display\s*:\s*none|visibility\s*:\s*hidden)`)
+	reHiddenBoolAttrCSGo       = newLazyRegexp(`(?i)(?:^|\s)hidden(?:\s*=\s*(?:""|''|"true"|'true'|"hidden"|'hidden'|true|hidden))?(?:\s|$)`)
+	reSimpleTagAttrCSGo        = newLazyRegexp(`([a-zA-Z_:][a-zA-Z0-9_.:-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+)))?`)
+	reWidgetSameHostHintCSGo   = newLazyRegexp(`(?i)(?:icims|in_iframe|embed|widget|greenhouse|lever|ashby|workday|smartrecruiters|bamboohr|workable|recruitee|jobvite|taleo)`)
 
-	reClosedPostingCSGo    = regexp.MustCompile(`(?i)\b(?:this\s+(?:job|position|role|posting)\s+(?:is\s+no\s+longer|has\s+been\s+(?:filled|closed))|no\s+longer\s+accepting\s+applications|position\s+has\s+been\s+filled|job\s+is\s+no\s+longer\s+(?:open|available|active)|sorry,\s*this\s+job\s+(?:opening\s+)?is\s+closed)\b`)
-	reSoft404H1CSGo        = regexp.MustCompile(`(?m)^#\s+([^\n]+)`)
-	reNotFoundHeadingCSGo  = regexp.MustCompile(`(?i)\b(?:404\b|page\s+not\s+found|job\s+not\s+found|post(?:ing)?\s+not\s+found|couldn['’]t\s+find\s+(?:that|this)\s+page|page\s+doesn['’]t\s+exist)\b`)
-	reNotFoundBodyCSGo     = regexp.MustCompile(`(?i)\b(?:the\s+page\s+you\s+(?:requested|are\s+looking\s+for)\s+(?:could\s+not\s+be\s+found|does\s+not\s+exist)|error\s+404|we\s+can['’]t\s+seem\s+to\s+find\s+the\s+page)\b`)
-	reLoginGateHeadingCSGo = regexp.MustCompile(`(?i)^(?:sign\s+in|log\s*in|authentication\s+required|members\s+only)(?:\s+to\s+\S+|\s*[-|–]\s*.*)?$`)
-	reLoginGateCopyCSGo    = regexp.MustCompile(`(?i)\b(?:sign\s+in\s+to\s+(?:view|read|continue|access)|log\s+in\s+to\s+(?:view|read|continue|access)|please\s+(?:sign|log)\s+in\s+to\s+continue|create\s+a\s+free\s+account\s+to\s+continue\s+reading)\b`)
+	reClosedPostingCSGo    = newLazyRegexp(`(?i)\b(?:this\s+(?:job|position|role|posting)\s+(?:is\s+no\s+longer|has\s+been\s+(?:filled|closed))|no\s+longer\s+accepting\s+applications|position\s+has\s+been\s+filled|job\s+is\s+no\s+longer\s+(?:open|available|active)|sorry,\s*this\s+job\s+(?:opening\s+)?is\s+closed)\b`)
+	reSoft404H1CSGo        = newLazyRegexp(`(?m)^#\s+([^\n]+)`)
+	reNotFoundHeadingCSGo  = newLazyRegexp(`(?i)\b(?:404\b|page\s+not\s+found|job\s+not\s+found|post(?:ing)?\s+not\s+found|couldn['’]t\s+find\s+(?:that|this)\s+page|page\s+doesn['’]t\s+exist)\b`)
+	reNotFoundBodyCSGo     = newLazyRegexp(`(?i)\b(?:the\s+page\s+you\s+(?:requested|are\s+looking\s+for)\s+(?:could\s+not\s+be\s+found|does\s+not\s+exist)|error\s+404|we\s+can['’]t\s+seem\s+to\s+find\s+the\s+page)\b`)
+	reLoginGateHeadingCSGo = newLazyRegexp(`(?i)^(?:sign\s+in|log\s*in|authentication\s+required|members\s+only)(?:\s+to\s+\S+|\s*[-|–]\s*.*)?$`)
+	reLoginGateCopyCSGo    = newLazyRegexp(`(?i)\b(?:sign\s+in\s+to\s+(?:view|read|continue|access)|log\s+in\s+to\s+(?:view|read|continue|access)|please\s+(?:sign|log)\s+in\s+to\s+continue|create\s+a\s+free\s+account\s+to\s+continue\s+reading)\b`)
 
-	reDNSNotFoundCSGo            = regexp.MustCompile(`(?i)\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist`)
-	reSchemeDowngradeCSGo        = regexp.MustCompile(`(?is)(?:scheme_downgrade|https?-to-http|scheme\s+downgrade|(?:disallowed_url|redirect).{0,140}?(?:only\s+https://|scheme\s+must\s+be\s+https|to\s+http://))`)
-	reSSRFBlockedCSGo            = regexp.MustCompile(`(?is)\b(?:blocked_ssrf|ssrf)\b|forbidden\s+redirect\s+target.{0,80}?internal|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)`)
-	reRobotsUnreachableCSGo      = regexp.MustCompile(`(?is)robots\.txt.{0,180}?(?:unreachable|timed out|returned http (?:5\d\d|429)|budget exhausted|redirect failed|unexpected http)`)
-	reContentSignalCSGo          = regexp.MustCompile(`(?i)content-signal|ai-input\s*=\s*no`)
-	reDisallowsPathInRobotsCSGo  = regexp.MustCompile(`(?i)disallows\s+this\s+path\s+in\s+robots\.txt`)
-	reAggregatorSugCSGo          = regexp.MustCompile(`(?i)aggregator|go\s+directly\s+to\s+the\s+employer|board\s+instead\s+of\s+job\s+boards`)
-	reBlockedAggregatorHostCSGo  = regexp.MustCompile(`(?i)(?:^|\.)(?:linkedin\.com|indeed\.com|dice\.com|startup\.jobs|glassdoor\.com|ziprecruiter\.com)$`)
-	reSmartRecruitersAPIHostCSGo = regexp.MustCompile(`(?i)^api\.smartrecruiters\.com$`)
-	rePyPIJSONPathCSGo           = regexp.MustCompile(`(?i)/json/?$`)
+	reDNSNotFoundCSGo            = newLazyRegexp(`(?i)\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist`)
+	reSchemeDowngradeCSGo        = newLazyRegexp(`(?is)(?:scheme_downgrade|https?-to-http|scheme\s+downgrade|(?:disallowed_url|redirect).{0,140}?(?:only\s+https://|scheme\s+must\s+be\s+https|to\s+http://))`)
+	reSSRFBlockedCSGo            = newLazyRegexp(`(?is)\b(?:blocked_ssrf|ssrf)\b|forbidden\s+redirect\s+target.{0,80}?internal|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)`)
+	reRobotsUnreachableCSGo      = newLazyRegexp(`(?is)robots\.txt.{0,180}?(?:unreachable|timed out|returned http (?:5\d\d|429)|budget exhausted|redirect failed|unexpected http)`)
+	reContentSignalCSGo          = newLazyRegexp(`(?i)content-signal|ai-input\s*=\s*no`)
+	reDisallowsPathInRobotsCSGo  = newLazyRegexp(`(?i)disallows\s+this\s+path\s+in\s+robots\.txt`)
+	reAggregatorSugCSGo          = newLazyRegexp(`(?i)aggregator|go\s+directly\s+to\s+the\s+employer|board\s+instead\s+of\s+job\s+boards`)
+	reBlockedAggregatorHostCSGo  = newLazyRegexp(`(?i)(?:^|\.)(?:linkedin\.com|indeed\.com|dice\.com|startup\.jobs|glassdoor\.com|ziprecruiter\.com)$`)
+	reSmartRecruitersAPIHostCSGo = newLazyRegexp(`(?i)^api\.smartrecruiters\.com$`)
+	rePyPIJSONPathCSGo           = newLazyRegexp(`(?i)/json/?$`)
 )
 
 func capStringBytesUTF8CSGo(s string, maxBytes int) string {
@@ -873,8 +872,8 @@ func HasExternalOrWidgetIframe(rawHTML, pageURL string) IframeScanResult {
 }
 
 var (
-	reGHJobPathCSGo    = regexp.MustCompile(`(?i)/jobs/(\d+)`)
-	reBoardJobUUIDCSGo = regexp.MustCompile(`(?i)^/[^/]+/([0-9a-f]{8}-[0-9a-f-]{27})\b`)
+	reGHJobPathCSGo    = newLazyRegexp(`(?i)/jobs/(\d+)`)
+	reBoardJobUUIDCSGo = newLazyRegexp(`(?i)^/[^/]+/([0-9a-f]{8}-[0-9a-f-]{27})\b`)
 )
 
 // ClassifyContentStateFull evaluates ContentStateInput with full ATS silent-redirect, validThrough expiry, and rendered-iframe awareness.

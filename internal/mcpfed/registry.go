@@ -2,7 +2,6 @@ package mcpfed
 
 import (
 	"encoding/json"
-	"regexp"
 	"sort"
 	"strings"
 )
@@ -15,8 +14,8 @@ const (
 )
 
 var (
-	envVarNameStrictRe      = regexp.MustCompile(`^[A-Za-z0-9_]{1,80}$`)
-	secretEnvVarHeuristicRe = regexp.MustCompile(`(?i)KEY|TOKEN|SECRET|PASSWORD|AUTH|PAT`)
+	envVarNameStrictRe      = newLazyRegexp(`^[A-Za-z0-9_]{1,80}$`)
+	secretEnvVarHeuristicRe = newLazyRegexp(`(?i)KEY|TOKEN|SECRET|PASSWORD|AUTH|PAT`)
 )
 
 var forbiddenManifestHeaderNames = map[string]bool{

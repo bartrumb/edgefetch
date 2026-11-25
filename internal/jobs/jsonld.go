@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -15,29 +14,29 @@ import (
 const maxJobPIChars = 1_572_864
 
 var (
-	reJobPostingToken    = regexp.MustCompile(`(?i)JobPosting`)
-	reTelecommuteToken   = regexp.MustCompile(`(?i)TELECOMMUTE`)
-	reSafeHTTPApplyURL   = regexp.MustCompile(`(?i)^https?://[^\s<>()"` + "`" + `]+$`)
-	reBoilerplateHeading = regexp.MustCompile(`(?i)^(?:equal\s+(?:employment\s+)?opportunity|eeo\s+statement|accommodations?|reasonable\s+accommodation|ai\s+in\s+hiring|applicant\s+privacy|privacy\s+notice|ccpa|fair\s+chance)`)
-	reBoilerplateEEO1    = regexp.MustCompile(`\bequal\s+(?:employment\s+)?opportunity\s+employer\b|\bproud\s+to\s+be\s+an?\s+equal\s+opportunity\b`)
-	reBoilerplateEEO2    = regexp.MustCompile(`\bwithout\s+regard\s+to\s+race,\s*color,\s*religion\b|\bnational\s+origin,\s*(?:sex|gender|age|disability)\b`)
-	reBoilerplateAccomm  = regexp.MustCompile(`(?s)\breasonable\s+accommodations?\b.{0,120}\b(?:disabilit(?:y|ies)|qualified\s+individuals)\b`)
-	reBoilerplateAI1     = regexp.MustCompile(`(?s)\bartificial\s+intelligence\b.{0,140}\b(?:hiring|recruitment|application\s+process|automated\s+employment\s+decision)\b`)
-	reBoilerplateAI2     = regexp.MustCompile(`\bautomated\s+employment\s+decision\s+tool\b|\bnyc\s+local\s+law\s+144\b|\bcandidate\s+privacy\s+notice\b`)
+	reJobPostingToken    = newLazyRegexp(`(?i)JobPosting`)
+	reTelecommuteToken   = newLazyRegexp(`(?i)TELECOMMUTE`)
+	reSafeHTTPApplyURL   = newLazyRegexp(`(?i)^https?://[^\s<>()"` + "`" + `]+$`)
+	reBoilerplateHeading = newLazyRegexp(`(?i)^(?:equal\s+(?:employment\s+)?opportunity|eeo\s+statement|accommodations?|reasonable\s+accommodation|ai\s+in\s+hiring|applicant\s+privacy|privacy\s+notice|ccpa|fair\s+chance)`)
+	reBoilerplateEEO1    = newLazyRegexp(`\bequal\s+(?:employment\s+)?opportunity\s+employer\b|\bproud\s+to\s+be\s+an?\s+equal\s+opportunity\b`)
+	reBoilerplateEEO2    = newLazyRegexp(`\bwithout\s+regard\s+to\s+race,\s*color,\s*religion\b|\bnational\s+origin,\s*(?:sex|gender|age|disability)\b`)
+	reBoilerplateAccomm  = newLazyRegexp(`(?s)\breasonable\s+accommodations?\b.{0,120}\b(?:disabilit(?:y|ies)|qualified\s+individuals)\b`)
+	reBoilerplateAI1     = newLazyRegexp(`(?s)\bartificial\s+intelligence\b.{0,140}\b(?:hiring|recruitment|application\s+process|automated\s+employment\s+decision)\b`)
+	reBoilerplateAI2     = newLazyRegexp(`\bautomated\s+employment\s+decision\s+tool\b|\bnyc\s+local\s+law\s+144\b|\bcandidate\s+privacy\s+notice\b`)
 
-	reScriptTagProbe   = regexp.MustCompile(`(?i)<script\b`)
-	reScriptOpenAttrs  = regexp.MustCompile(`(?i)<script\b([^>]{0,600})>`)
-	reScriptTypeAttr   = regexp.MustCompile(`(?i)\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
-	reMarkdownHeading  = regexp.MustCompile(`^#{1,6}\s`)
-	reMarkdownInlineLk = regexp.MustCompile(`\[([^\]]*)\]\([^)]+\)`)
-	reMarkdownListPfx  = regexp.MustCompile(`^[-*+]\s*`)
+	reScriptTagProbe   = newLazyRegexp(`(?i)<script\b`)
+	reScriptOpenAttrs  = newLazyRegexp(`(?i)<script\b([^>]{0,600})>`)
+	reScriptTypeAttr   = newLazyRegexp(`(?i)\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
+	reMarkdownHeading  = newLazyRegexp(`^#{1,6}\s`)
+	reMarkdownInlineLk = newLazyRegexp(`\[([^\]]*)\]\([^)]+\)`)
+	reMarkdownListPfx  = newLazyRegexp(`^[-*+]\s*`)
 
-	reJSONURLHint       = regexp.MustCompile(`(?i)\.json(?:$|[?#])|/api/|posting-api|/v\d+/`)
-	reJSONFilterSplit   = regexp.MustCompile(`\s*(?:&&|,)\s*`)
-	reJSONFilterClause  = regexp.MustCompile(`^([A-Za-z0-9_.-]+)\s*(!=|~=|~|=)\s*(.+)$`)
-	reRegexMetachar     = regexp.MustCompile(`[\\^$.*+?()[\]{}|]`)
-	reHTMLTagProbeChunk = regexp.MustCompile(`(?is)<[a-z].*>`)
-	reHTMLEntityProbe   = regexp.MustCompile(`(?i)&(?:lt|gt|amp|nbsp|#\d+);`)
+	reJSONURLHint       = newLazyRegexp(`(?i)\.json(?:$|[?#])|/api/|posting-api|/v\d+/`)
+	reJSONFilterSplit   = newLazyRegexp(`\s*(?:&&|,)\s*`)
+	reJSONFilterClause  = newLazyRegexp(`^([A-Za-z0-9_.-]+)\s*(!=|~=|~|=)\s*(.+)$`)
+	reRegexMetachar     = newLazyRegexp(`[\\^$.*+?()[\]{}|]`)
+	reHTMLTagProbeChunk = newLazyRegexp(`(?is)<[a-z].*>`)
+	reHTMLEntityProbe   = newLazyRegexp(`(?i)&(?:lt|gt|amp|nbsp|#\d+);`)
 )
 
 // scanScriptBlocksQuoteAware scans `<script ...>...</script>` blocks linearly using HTML5 quote-aware tag boundaries.

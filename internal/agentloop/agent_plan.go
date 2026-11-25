@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -14,8 +13,8 @@ var (
 		"click": true, "fill": true, "write": true, "type": true,
 		"press": true, "scroll": true, "wait": true, "select": true,
 	}
-	reCountryISO2 = regexp.MustCompile(`^[A-Za-z]{2}$`)
-	reLanguageTag = regexp.MustCompile(`^[A-Za-z]{2}(?:-[A-Za-z0-9]{2,8})?$`)
+	reCountryISO2 = newLazyRegexp(`^[A-Za-z]{2}$`)
+	reLanguageTag = newLazyRegexp(`^[A-Za-z]{2}(?:-[A-Za-z0-9]{2,8})?$`)
 )
 
 // IsURLAllowedByConstraint validates candidateURL against strictConstrainToURLs seed URL prefixes.

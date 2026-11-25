@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -13,14 +12,14 @@ import (
 )
 
 var (
-	ansiCSISequenceRe       = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
-	slugifyPrefixStripRe    = regexp.MustCompile(`(?i)^(?:io\.github\.[^/]+/|io\.modelcontextprotocol\.[^/]+/|@[a-z0-9._-]+/)`)
-	slugifyNonSlugRunRe     = regexp.MustCompile(`[^a-z0-9_-]+`)
-	slugifyMultiSepRe       = regexp.MustCompile(`[_-]{2,}`)
-	strictConnectorDomainRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
-	dottedIPv4DigitsRe      = regexp.MustCompile(`^\d+(?:\.\d+){3}$`)
-	reservedInternalTLDRe   = regexp.MustCompile(`(?i)\.(?:local|localhost|internal|intranet|corp|home|lan|arpa|onion)$`)
-	numericOrHexTLDRe       = regexp.MustCompile(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
+	ansiCSISequenceRe       = newLazyRegexp(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	slugifyPrefixStripRe    = newLazyRegexp(`(?i)^(?:io\.github\.[^/]+/|io\.modelcontextprotocol\.[^/]+/|@[a-z0-9._-]+/)`)
+	slugifyNonSlugRunRe     = newLazyRegexp(`[^a-z0-9_-]+`)
+	slugifyMultiSepRe       = newLazyRegexp(`[_-]{2,}`)
+	strictConnectorDomainRe = newLazyRegexp(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	dottedIPv4DigitsRe      = newLazyRegexp(`^\d+(?:\.\d+){3}$`)
+	reservedInternalTLDRe   = newLazyRegexp(`(?i)\.(?:local|localhost|internal|intranet|corp|home|lan|arpa|onion)$`)
+	numericOrHexTLDRe       = newLazyRegexp(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
 )
 
 var disallowedHostSuffixes = []string{

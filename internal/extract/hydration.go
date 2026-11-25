@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,15 +146,15 @@ var (
 		"type", "status", "author", "version", "downloads", "stars", "stargazers_count",
 	}
 
-	reNavContainerKeyHydrateGo = regexp.MustCompile(`(?i)^(?:nav|navigation|navbar|menu|menus|menuitems|header|footer|breadcrumbs?|social|sociallinks|locales?|languages?|tabs|routes|icons?|themes?|shortcuts)$`)
-	reRecordBonusKeyHydrateGo  = regexp.MustCompile(`(?i)^(?:items|results|records|jobs|postings|posts|articles|products|hits|nodes|edges|entries|listings|packages|models|datasets|events|questions|threads|topics|rows)$`)
-	reUUIDPrefixHydrateGo      = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-`)
-	reSlugLikeURLHydrateGo     = regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9/_-]{2,120}$`)
-	reRelPathSlugHydrateGo     = regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9/_.-]{1,120}$`)
-	reRichProseKeySubHydrateGo = regexp.MustCompile(`(?i)description|content|markdown|body|overview|article|post`)
-	reHydrateHTMLTagHydrateGo  = regexp.MustCompile(`(?i)<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|a)\b`)
-	reInertiaHTMLTagHydrateGo  = regexp.MustCompile(`(?i)<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|a|table|blockquote)\b`)
-	reAnyAlphaTagHydrateGo     = regexp.MustCompile(`(?i)<[a-z]`)
+	reNavContainerKeyHydrateGo = newLazyRegexp(`(?i)^(?:nav|navigation|navbar|menu|menus|menuitems|header|footer|breadcrumbs?|social|sociallinks|locales?|languages?|tabs|routes|icons?|themes?|shortcuts)$`)
+	reRecordBonusKeyHydrateGo  = newLazyRegexp(`(?i)^(?:items|results|records|jobs|postings|posts|articles|products|hits|nodes|edges|entries|listings|packages|models|datasets|events|questions|threads|topics|rows)$`)
+	reUUIDPrefixHydrateGo      = newLazyRegexp(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-`)
+	reSlugLikeURLHydrateGo     = newLazyRegexp(`(?i)^[a-z0-9][a-z0-9/_-]{2,120}$`)
+	reRelPathSlugHydrateGo     = newLazyRegexp(`(?i)^[a-z0-9][a-z0-9/_.-]{1,120}$`)
+	reRichProseKeySubHydrateGo = newLazyRegexp(`(?i)description|content|markdown|body|overview|article|post`)
+	reHydrateHTMLTagHydrateGo  = newLazyRegexp(`(?i)<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|a)\b`)
+	reInertiaHTMLTagHydrateGo  = newLazyRegexp(`(?i)<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|a|table|blockquote)\b`)
+	reAnyAlphaTagHydrateGo     = newLazyRegexp(`(?i)<[a-z]`)
 )
 
 // ScanJSONStringLiteralAt scans a double-quoted JSON string literal starting at `src[openQuoteIdx] == '"'`

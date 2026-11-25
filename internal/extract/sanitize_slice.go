@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -79,15 +78,15 @@ type AttrSelectorItem struct {
 }
 
 var (
-	reAttrSelectorBracketSliceGo = regexp.MustCompile(`\[([a-zA-Z0-9_:-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]*)))?\]`)
-	reAttrSelectorIDSliceGo      = regexp.MustCompile(`#([a-zA-Z0-9_-]+)`)
-	reAttrSelectorClassSliceGo   = regexp.MustCompile(`\.([a-zA-Z0-9_-]+)`)
-	reSimpleTagNameSliceGo       = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]*$`)
-	reOpenTagAttrPairSliceGo     = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_.:-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+)))?`)
-	reJsonLdScriptTypeSliceGo    = regexp.MustCompile(`(?i)\btype[ \t\r\n]*=[ \t\r\n]*(?:"application/ld\+json(?:[ \t]*;[^"]*)?[ \t]*"|'application/ld\+json(?:[ \t]*;[^']*)?[ \t]*'|application/ld\+json(?:;[^ \t\r\n"'>]*)?(?:[ \t\r\n/>]|$))`)
-	reProductTypeNameSliceGo     = regexp.MustCompile(`(?i)^(?:schema:)?(?:Product|ProductGroup|IndividualProduct|SoftwareApplication)$`)
-	reSchemaOrgPrefixSliceGo     = regexp.MustCompile(`(?i)^https?://schema\.org/`)
-	reBarcodeProductPathSliceGo  = regexp.MustCompile(`(?i)/product/(\d{8,14})(?:/|$)`)
+	reAttrSelectorBracketSliceGo = newLazyRegexp(`\[([a-zA-Z0-9_:-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]*)))?\]`)
+	reAttrSelectorIDSliceGo      = newLazyRegexp(`#([a-zA-Z0-9_-]+)`)
+	reAttrSelectorClassSliceGo   = newLazyRegexp(`\.([a-zA-Z0-9_-]+)`)
+	reSimpleTagNameSliceGo       = newLazyRegexp(`^[a-zA-Z][a-zA-Z0-9-]*$`)
+	reOpenTagAttrPairSliceGo     = newLazyRegexp(`([a-zA-Z_:][a-zA-Z0-9_.:-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+)))?`)
+	reJsonLdScriptTypeSliceGo    = newLazyRegexp(`(?i)\btype[ \t\r\n]*=[ \t\r\n]*(?:"application/ld\+json(?:[ \t]*;[^"]*)?[ \t]*"|'application/ld\+json(?:[ \t]*;[^']*)?[ \t]*'|application/ld\+json(?:;[^ \t\r\n"'>]*)?(?:[ \t\r\n/>]|$))`)
+	reProductTypeNameSliceGo     = newLazyRegexp(`(?i)^(?:schema:)?(?:Product|ProductGroup|IndividualProduct|SoftwareApplication)$`)
+	reSchemaOrgPrefixSliceGo     = newLazyRegexp(`(?i)^https?://schema\.org/`)
+	reBarcodeProductPathSliceGo  = newLazyRegexp(`(?i)/product/(\d{8,14})(?:/|$)`)
 )
 
 var disallowedHostSuffixesSliceGo = []string{

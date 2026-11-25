@@ -2,7 +2,6 @@ package classify
 
 import (
 	"html"
-	"regexp"
 	"strings"
 )
 
@@ -17,21 +16,21 @@ type WAFMatch struct {
 }
 
 var (
-	reWafScriptDataStrip = regexp.MustCompile(`(?is)<script\b[^>]*(?:type\s*=\s*["']application/(?:ld\+)?json["']|id\s*=\s*["']__(?:NEXT|NUXT)_DATA__["'])[^>]*>.*?</script>`)
-	reWafCodeQuoteStrip  = regexp.MustCompile(`(?is)<(?:pre|code|blockquote|textarea|svg|style)\b[^>]*>.*?</(?:pre|code|blockquote|textarea|svg|style)>`)
-	reWafAllScriptsStrip = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
-	reWafHTMLComments    = regexp.MustCompile(`(?is)<!--.*?-->`)
-	reWafAnyTag          = regexp.MustCompile(`(?s)<[^>]+>`)
-	reWafTitle           = regexp.MustCompile(`(?is)<title\b[^>]*>(.*?)</title>`)
-	reWafMainOrArticle   = regexp.MustCompile(`(?is)<(?:main|article)\b[^>]*>(.*?)</(?:main|article)>`)
-	reWafSubheadings     = regexp.MustCompile(`(?is)<h[23]\b[^>]*>.*?</h[23]>`)
-	reWafNavBlock        = regexp.MustCompile(`(?is)<nav\b[^>]*>(.*?)</nav>`)
-	reWafNavAnchor       = regexp.MustCompile(`(?is)<a\b[^>]*\bhref\s*=`)
-	reWafSchemaRichType  = regexp.MustCompile(`(?is)<script\b[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>[^<]*"@type"\s*:\s*(?:\[[^\]]*)?["'](?:Article|TechArticle|NewsArticle|BlogPosting|ScholarlyArticle|JobPosting|Product|SoftwareSourceCode|FAQPage|APIReference)["']`)
+	reWafScriptDataStrip = newLazyRegexp(`(?is)<script\b[^>]*(?:type\s*=\s*["']application/(?:ld\+)?json["']|id\s*=\s*["']__(?:NEXT|NUXT)_DATA__["'])[^>]*>.*?</script>`)
+	reWafCodeQuoteStrip  = newLazyRegexp(`(?is)<(?:pre|code|blockquote|textarea|svg|style)\b[^>]*>.*?</(?:pre|code|blockquote|textarea|svg|style)>`)
+	reWafAllScriptsStrip = newLazyRegexp(`(?is)<script\b[^>]*>.*?</script>`)
+	reWafHTMLComments    = newLazyRegexp(`(?is)<!--.*?-->`)
+	reWafAnyTag          = newLazyRegexp(`(?s)<[^>]+>`)
+	reWafTitle           = newLazyRegexp(`(?is)<title\b[^>]*>(.*?)</title>`)
+	reWafMainOrArticle   = newLazyRegexp(`(?is)<(?:main|article)\b[^>]*>(.*?)</(?:main|article)>`)
+	reWafSubheadings     = newLazyRegexp(`(?is)<h[23]\b[^>]*>.*?</h[23]>`)
+	reWafNavBlock        = newLazyRegexp(`(?is)<nav\b[^>]*>(.*?)</nav>`)
+	reWafNavAnchor       = newLazyRegexp(`(?is)<a\b[^>]*\bhref\s*=`)
+	reWafSchemaRichType  = newLazyRegexp(`(?is)<script\b[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>[^<]*"@type"\s*:\s*(?:\[[^\]]*)?["'](?:Article|TechArticle|NewsArticle|BlogPosting|ScholarlyArticle|JobPosting|Product|SoftwareSourceCode|FAQPage|APIReference)["']`)
 
-	reCloudflareTitle = regexp.MustCompile(`(?i)^\s*(?:just a moment\.{0,3}|attention required!\s*\|\s*cloudflare|ddos-guard|checking your browser)\s*$`)
-	reGenericTitle    = regexp.MustCompile(`(?i)^\s*(?:verify you are human|human verification|pardon our interruption|access to this page has been denied|bot verification|security check)\s*$`)
-	reAkamaiRef       = regexp.MustCompile(`(?i)reference\s*#18\.[0-9a-f]{4,}\.[0-9]{6,}`)
+	reCloudflareTitle = newLazyRegexp(`(?i)^\s*(?:just a moment\.{0,3}|attention required!\s*\|\s*cloudflare|ddos-guard|checking your browser)\s*$`)
+	reGenericTitle    = newLazyRegexp(`(?i)^\s*(?:verify you are human|human verification|pardon our interruption|access to this page has been denied|bot verification|security check)\s*$`)
+	reAkamaiRef       = newLazyRegexp(`(?i)reference\s*#18\.[0-9a-f]{4,}\.[0-9]{6,}`)
 )
 
 func countPlainWords(s string) int {

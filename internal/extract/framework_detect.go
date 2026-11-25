@@ -3,7 +3,6 @@ package extract
 import (
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -83,11 +82,11 @@ type DetectSiteFrameworkParams struct {
 }
 
 var (
-	reEntityQuotFWGo = regexp.MustCompile(`(?i)&quot;`)
-	reEntityAposFWGo = regexp.MustCompile(`(?i)&apos;`)
-	reEntityLtFWGo   = regexp.MustCompile(`(?i)&lt;`)
-	reEntityGtFWGo   = regexp.MustCompile(`(?i)&gt;`)
-	reEntityAmpFWGo  = regexp.MustCompile(`(?i)&amp;`)
+	reEntityQuotFWGo = newLazyRegexp(`(?i)&quot;`)
+	reEntityAposFWGo = newLazyRegexp(`(?i)&apos;`)
+	reEntityLtFWGo   = newLazyRegexp(`(?i)&lt;`)
+	reEntityGtFWGo   = newLazyRegexp(`(?i)&gt;`)
+	reEntityAmpFWGo  = newLazyRegexp(`(?i)&amp;`)
 )
 
 func isAsciiWsFWGo(c byte) bool {

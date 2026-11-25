@@ -3,7 +3,6 @@ package jobs
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -11,49 +10,49 @@ import (
 )
 
 var (
-	rePayBasisTotal = regexp.MustCompile(`\b(?:total\s+target\s+cash|total\s+cash|total\s+comp(?:ensation)?|total\s+rewards|annual\s+total|base\s*\+\s*(?:bonus|variable|equity)|ttc\b|target\s+cash)\b`)
-	rePayBasisOTE   = regexp.MustCompile(`\b(?:ote|on[- ]target\s+earnings|target\s+commission|base\s*\+\s*commission|variable\s+target)\b`)
+	rePayBasisTotal = newLazyRegexp(`\b(?:total\s+target\s+cash|total\s+cash|total\s+comp(?:ensation)?|total\s+rewards|annual\s+total|base\s*\+\s*(?:bonus|variable|equity)|ttc\b|target\s+cash)\b`)
+	rePayBasisOTE   = newLazyRegexp(`\b(?:ote|on[- ]target\s+earnings|target\s+commission|base\s*\+\s*commission|variable\s+target)\b`)
 
-	rePeriodHour  = regexp.MustCompile(`hour|hr|hourly`)
-	rePeriodDay   = regexp.MustCompile(`day|daily`)
-	rePeriodWeek  = regexp.MustCompile(`week|wk|weekly`)
-	rePeriodMonth = regexp.MustCompile(`month|mo|monthly`)
+	rePeriodHour  = newLazyRegexp(`hour|hr|hourly`)
+	rePeriodDay   = newLazyRegexp(`day|daily`)
+	rePeriodWeek  = newLazyRegexp(`week|wk|weekly`)
+	rePeriodMonth = newLazyRegexp(`month|mo|monthly`)
 
-	rePayRangeGo = regexp.MustCompile(`(?i)(?:(USD|CAD|EUR|GBP|AUD|CHF)[ \t]{0,4})?(?:([\$£€])[ \t]{0,4})?(\d{1,3}(?:,\d{3}){1,3}(?:\.\d{1,2})?|\d{2,7}(?:\.\d{1,2})?)(?:[ \t]{0,2}([kK]))?[ \t]{0,6}(?:[-–—]|to)[ \t]{0,6}(?:(USD|CAD|EUR|GBP|AUD|CHF)[ \t]{0,4})?(?:([\$£€])[ \t]{0,4})?(\d{1,3}(?:,\d{3}){1,3}(?:\.\d{1,2})?|\d{2,7}(?:\.\d{1,2})?)(?:[ \t]{0,2}([kK]))?(?:[ \t]{0,4}(USD|CAD|EUR|GBP|AUD|CHF)\b)?`)
+	rePayRangeGo = newLazyRegexp(`(?i)(?:(USD|CAD|EUR|GBP|AUD|CHF)[ \t]{0,4})?(?:([\$£€])[ \t]{0,4})?(\d{1,3}(?:,\d{3}){1,3}(?:\.\d{1,2})?|\d{2,7}(?:\.\d{1,2})?)(?:[ \t]{0,2}([kK]))?[ \t]{0,6}(?:[-–—]|to)[ \t]{0,6}(?:(USD|CAD|EUR|GBP|AUD|CHF)[ \t]{0,4})?(?:([\$£€])[ \t]{0,4})?(\d{1,3}(?:,\d{3}){1,3}(?:\.\d{1,2})?|\d{2,7}(?:\.\d{1,2})?)(?:[ \t]{0,2}([kK]))?(?:[ \t]{0,4}(USD|CAD|EUR|GBP|AUD|CHF)\b)?`)
 
-	reForeignBeforeNear = regexp.MustCompile(`(?i)(?:[₹¥₩₪₫₱฿₴₦₲₵₡₸₺₽]|(?:R|S|HK|NT|NZ|MX|A|C)\$|\b(?:INR|JPY|CNY|RMB|KRW|BRL|MXN|PLN|SEK|NOK|DKK|CZK|HUF|RON|TRY|ILS|ZAR|SGD|HKD|TWD|NZD|PHP|THB|IDR|MYR|VND|AED|SAR|COP|CLP|ARS|PEN|UAH|PKR|BDT|NGN|EGP|ZIP(?:\s+CODE)?))[ \t:]*$`)
-	reForeignAfterNear  = regexp.MustCompile(`(?i)^[ \t]*(?:[₹¥₩₪₫₱฿₴₦₲₵₡₸₺₽]|\b(?:INR|JPY|CNY|RMB|KRW|BRL|MXN|PLN|SEK|NOK|DKK|CZK|HUF|RON|TRY|ILS|ZAR|SGD|HKD|TWD|NZD|PHP|THB|IDR|MYR|VND|AED|SAR|COP|CLP|ARS|PEN|UAH|PKR|BDT|NGN|EGP))\b`)
-	reCompKeyword       = regexp.MustCompile(`(?i)\b(?:compensation|base\s+salary|salary|pay\s+(?:range|rate|band|scale|offered|for)|base\s+(?:pay|range)|hourly\s+(?:rate|wage)|annual\s+base|target\s+cash|remuneration)\b`)
-	reNonMonetaryAfter  = regexp.MustCompile(`(?i)^\s*(?:%|percent\b|years?\b|yrs?\b|months?\b|mos?\b|weeks?\b|days?\b|hours?\b|hrs?\b|employees?\b|people\b|users?\b|customers?\b|clients?\b|members?\b|seats?\b|locations?\b|offices?\b|stores?\b|countries\b|miles?\b|km\b|mb\b|gb\b|tb\b|points?\b|tokens?\b|requests?\b|transactions?\b|events?\b|ops\b|rps\b|qps\b|queries\b|rsus?\b|shares?\b|options?\b|stock\b|equity\b|zip\b|codes?\b)`)
-	reExplicitHourly    = regexp.MustCompile(`(?i)\b(?:per\s+hour|/\s*hr|hourly)\b`)
-	reExplicitMonthly   = regexp.MustCompile(`(?i)\b(?:per\s+month|/\s*mo|monthly)\b`)
-	reExplicitAnnual    = regexp.MustCompile(`(?i)\b(?:annually|annual|per\s+(?:year|annum|month)|/\s*(?:yr|year|mo|month)|monthly|a\s+year)\b`)
-	reCommaThousands    = regexp.MustCompile(`^\d{1,3}(?:,\d{3}){1,2}(?:\.\d{2})?$`)
-	reHourlyFormatted   = regexp.MustCompile(`^\d{2,3}(?:\.\d{2})?$`)
-	reFundingValuation  = regexp.MustCompile(`(?i)\b(?:arr|mrr|funding|raised|valuation|series\s+[a-f]|revenue)\b`)
+	reForeignBeforeNear = newLazyRegexp(`(?i)(?:[₹¥₩₪₫₱฿₴₦₲₵₡₸₺₽]|(?:R|S|HK|NT|NZ|MX|A|C)\$|\b(?:INR|JPY|CNY|RMB|KRW|BRL|MXN|PLN|SEK|NOK|DKK|CZK|HUF|RON|TRY|ILS|ZAR|SGD|HKD|TWD|NZD|PHP|THB|IDR|MYR|VND|AED|SAR|COP|CLP|ARS|PEN|UAH|PKR|BDT|NGN|EGP|ZIP(?:\s+CODE)?))[ \t:]*$`)
+	reForeignAfterNear  = newLazyRegexp(`(?i)^[ \t]*(?:[₹¥₩₪₫₱฿₴₦₲₵₡₸₺₽]|\b(?:INR|JPY|CNY|RMB|KRW|BRL|MXN|PLN|SEK|NOK|DKK|CZK|HUF|RON|TRY|ILS|ZAR|SGD|HKD|TWD|NZD|PHP|THB|IDR|MYR|VND|AED|SAR|COP|CLP|ARS|PEN|UAH|PKR|BDT|NGN|EGP))\b`)
+	reCompKeyword       = newLazyRegexp(`(?i)\b(?:compensation|base\s+salary|salary|pay\s+(?:range|rate|band|scale|offered|for)|base\s+(?:pay|range)|hourly\s+(?:rate|wage)|annual\s+base|target\s+cash|remuneration)\b`)
+	reNonMonetaryAfter  = newLazyRegexp(`(?i)^\s*(?:%|percent\b|years?\b|yrs?\b|months?\b|mos?\b|weeks?\b|days?\b|hours?\b|hrs?\b|employees?\b|people\b|users?\b|customers?\b|clients?\b|members?\b|seats?\b|locations?\b|offices?\b|stores?\b|countries\b|miles?\b|km\b|mb\b|gb\b|tb\b|points?\b|tokens?\b|requests?\b|transactions?\b|events?\b|ops\b|rps\b|qps\b|queries\b|rsus?\b|shares?\b|options?\b|stock\b|equity\b|zip\b|codes?\b)`)
+	reExplicitHourly    = newLazyRegexp(`(?i)\b(?:per\s+hour|/\s*hr|hourly)\b`)
+	reExplicitMonthly   = newLazyRegexp(`(?i)\b(?:per\s+month|/\s*mo|monthly)\b`)
+	reExplicitAnnual    = newLazyRegexp(`(?i)\b(?:annually|annual|per\s+(?:year|annum|month)|/\s*(?:yr|year|mo|month)|monthly|a\s+year)\b`)
+	reCommaThousands    = newLazyRegexp(`^\d{1,3}(?:,\d{3}){1,2}(?:\.\d{2})?$`)
+	reHourlyFormatted   = newLazyRegexp(`^\d{2,3}(?:\.\d{2})?$`)
+	reFundingValuation  = newLazyRegexp(`(?i)\b(?:arr|mrr|funding|raised|valuation|series\s+[a-f]|revenue)\b`)
 
-	reCtxGBP = regexp.MustCompile(`(?i)\b(?:gbp|pounds?\s+sterling)\b`)
-	reCtxEUR = regexp.MustCompile(`(?i)\beuros?\b`)
-	reCtxCAD = regexp.MustCompile(`(?i)\bcad\b`)
-	reCtxAUD = regexp.MustCompile(`(?i)\baud\b`)
-	reCtxCHF = regexp.MustCompile(`(?i)\bchf\b`)
+	reCtxGBP = newLazyRegexp(`(?i)\b(?:gbp|pounds?\s+sterling)\b`)
+	reCtxEUR = newLazyRegexp(`(?i)\beuros?\b`)
+	reCtxCAD = newLazyRegexp(`(?i)\bcad\b`)
+	reCtxAUD = newLazyRegexp(`(?i)\baud\b`)
+	reCtxCHF = newLazyRegexp(`(?i)\bchf\b`)
 
-	reWpHybrid = regexp.MustCompile(`\bhybrid\b`)
-	reWpRemote = regexp.MustCompile(`\b(?:remote|telecommute|work\s+from\s+anywhere|distributed)\b`)
-	reWpOnsite = regexp.MustCompile(`\b(?:on[- ]?site|in[- ]?office|in[- ]?person)\b`)
+	reWpHybrid = newLazyRegexp(`\bhybrid\b`)
+	reWpRemote = newLazyRegexp(`\b(?:remote|telecommute|work\s+from\s+anywhere|distributed)\b`)
+	reWpOnsite = newLazyRegexp(`\b(?:on[- ]?site|in[- ]?office|in[- ]?person)\b`)
 
-	reExplicitWpHybrid = regexp.MustCompile(`(?i)^hybrid$|\bhybrid\b`)
-	reExplicitWpOnsite = regexp.MustCompile(`(?i)^(?:on[-_\s]?site|in[-_\s]?office|in[-_\s]?person)$|\bon[-_\s]?site\b|\bin[-_\s]?office\b`)
-	reExplicitWpRemote = regexp.MustCompile(`(?i)^remote$|\bremote\b`)
-	reAshbyEmbeddedWp  = regexp.MustCompile(`(?i)"workplaceType"\s*:\s*"(Hybrid|OnSite|On-site|Remote)"`)
-	reProseLabelWp     = regexp.MustCompile(`(?i)(?:Location|Workplace)\s*Type\s*[:\n\r\t-]+\s*(Hybrid|On[-_\s]?site|In[-_\s]?office|Remote)\b`)
-	reVagueWorkdayLoc  = regexp.MustCompile(`(?i)^(?:locations?|multiple(?:\s+locations?)?|various|flexible|global|worldwide|anywhere|tbd|n/a|\d+\s+locations?)$`)
+	reExplicitWpHybrid = newLazyRegexp(`(?i)^hybrid$|\bhybrid\b`)
+	reExplicitWpOnsite = newLazyRegexp(`(?i)^(?:on[-_\s]?site|in[-_\s]?office|in[-_\s]?person)$|\bon[-_\s]?site\b|\bin[-_\s]?office\b`)
+	reExplicitWpRemote = newLazyRegexp(`(?i)^remote$|\bremote\b`)
+	reAshbyEmbeddedWp  = newLazyRegexp(`(?i)"workplaceType"\s*:\s*"(Hybrid|OnSite|On-site|Remote)"`)
+	reProseLabelWp     = newLazyRegexp(`(?i)(?:Location|Workplace)\s*Type\s*[:\n\r\t-]+\s*(Hybrid|On[-_\s]?site|In[-_\s]?office|Remote)\b`)
+	reVagueWorkdayLoc  = newLazyRegexp(`(?i)^(?:locations?|multiple(?:\s+locations?)?|various|flexible|global|worldwide|anywhere|tbd|n/a|\d+\s+locations?)$`)
 
-	reWorkdayISODate    = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?$)`)
-	reWorkdayPostedTdy  = regexp.MustCompile(`(?i)^posted\s+today\b`)
-	reWorkdayPostedYest = regexp.MustCompile(`(?i)^posted\s+yesterday\b`)
-	reWorkdayPostedDays = regexp.MustCompile(`(?i)^posted\s+(\d+)(\+)?\s+days?\s+ago\b`)
-	reWorkdayPostedPfx  = regexp.MustCompile(`(?i)^posted\s+`)
+	reWorkdayISODate    = newLazyRegexp(`^(\d{4}-\d{2}-\d{2})(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?$)`)
+	reWorkdayPostedTdy  = newLazyRegexp(`(?i)^posted\s+today\b`)
+	reWorkdayPostedYest = newLazyRegexp(`(?i)^posted\s+yesterday\b`)
+	reWorkdayPostedDays = newLazyRegexp(`(?i)^posted\s+(\d+)(\+)?\s+days?\s+ago\b`)
+	reWorkdayPostedPfx  = newLazyRegexp(`(?i)^posted\s+`)
 )
 
 // InferPayBasis classifies compensation basis (`base` vs `ote` vs `total`) from surrounding prose context.

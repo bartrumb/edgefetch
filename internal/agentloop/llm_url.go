@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -46,8 +45,8 @@ var disallowedExactHosts = map[string]bool{
 }
 
 var (
-	reEncodedPathBypass = regexp.MustCompile(`(?i)%2e|%2f|%5c|%3b|%3f|%23`)
-	reNumericOrHexLabel = regexp.MustCompile(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
+	reEncodedPathBypass = newLazyRegexp(`(?i)%2e|%2f|%5c|%3b|%3f|%23`)
+	reNumericOrHexLabel = newLazyRegexp(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
 )
 
 // PublicURLCheckResult reports validation of a public HTTPS target URL.

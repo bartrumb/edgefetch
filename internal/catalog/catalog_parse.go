@@ -3,7 +3,6 @@ package catalog
 import (
 	"math"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,19 +11,19 @@ import (
 )
 
 var (
-	reUCPEndpointPath      = regexp.MustCompile(`(?i)(?:/api/ucp/mcp|/\.well-known/ucp)\b`)
-	reOAuthMultiClient     = regexp.MustCompile(`(?i)^([a-z0-9_]+)-client-\d+$`)
-	reChallengeProblem     = regexp.MustCompile(`(?i)challenge|cf-mitigated|turnstile|captcha|verify you are human`)
-	reChallengeBodyMarkers = regexp.MustCompile(`(?i)cf-mitigated|_cf_chl_opt|challenge-platform|turnstile|verify you are human`)
-	reNonStorefrontWAFText = regexp.MustCompile(`(?i)blocked|access\s+denied|forbidden|captcha|turnstile|cf-mitigated|just\s+a\s+moment|attention\s+required|_incapsula_resource|incapsula|awswafintegration|aws-waf-token|px-captcha|_pxappid|perimeterx|captcha-delivery\.com|datadome|kpsdk|/ips\.js|sec-cpt|bazadebezolkohpepadr|verifying\s+your\s+browser|checking\s+your\s+browser|pardon\s+our\s+interruption|human\s+verification|bot\s+verification|security\s+check|enable\s+javascript|enable\s+js`)
-	reNonStorefrontShopify = regexp.MustCompile(`(?i)cdn\.shopify\.com|shopify\.theme|shopify-digital-wallet`)
-	reNonStorefrontWoo     = regexp.MustCompile(`(?i)woocommerce|wc-block|wp-content/plugins/woocommerce`)
-	reDoctypeHTML          = regexp.MustCompile(`(?i)^<!doctype\s+html\b`)
-	reHTMLOpenTag          = regexp.MustCompile(`(?i)^<html\b`)
-	reContentSignalProb    = regexp.MustCompile(`(?i)content-signal|ai-input\s*=\s*no`)
-	reRobotsProb           = regexp.MustCompile(`(?i)robots\.txt`)
-	reUnreachableProb      = regexp.MustCompile(`(?i)timed?\s*out|unreachable`)
-	reValidCatalogID       = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
+	reUCPEndpointPath      = newLazyRegexp(`(?i)(?:/api/ucp/mcp|/\.well-known/ucp)\b`)
+	reOAuthMultiClient     = newLazyRegexp(`(?i)^([a-z0-9_]+)-client-\d+$`)
+	reChallengeProblem     = newLazyRegexp(`(?i)challenge|cf-mitigated|turnstile|captcha|verify you are human`)
+	reChallengeBodyMarkers = newLazyRegexp(`(?i)cf-mitigated|_cf_chl_opt|challenge-platform|turnstile|verify you are human`)
+	reNonStorefrontWAFText = newLazyRegexp(`(?i)blocked|access\s+denied|forbidden|captcha|turnstile|cf-mitigated|just\s+a\s+moment|attention\s+required|_incapsula_resource|incapsula|awswafintegration|aws-waf-token|px-captcha|_pxappid|perimeterx|captcha-delivery\.com|datadome|kpsdk|/ips\.js|sec-cpt|bazadebezolkohpepadr|verifying\s+your\s+browser|checking\s+your\s+browser|pardon\s+our\s+interruption|human\s+verification|bot\s+verification|security\s+check|enable\s+javascript|enable\s+js`)
+	reNonStorefrontShopify = newLazyRegexp(`(?i)cdn\.shopify\.com|shopify\.theme|shopify-digital-wallet`)
+	reNonStorefrontWoo     = newLazyRegexp(`(?i)woocommerce|wc-block|wp-content/plugins/woocommerce`)
+	reDoctypeHTML          = newLazyRegexp(`(?i)^<!doctype\s+html\b`)
+	reHTMLOpenTag          = newLazyRegexp(`(?i)^<html\b`)
+	reContentSignalProb    = newLazyRegexp(`(?i)content-signal|ai-input\s*=\s*no`)
+	reRobotsProb           = newLazyRegexp(`(?i)robots\.txt`)
+	reUnreachableProb      = newLazyRegexp(`(?i)timed?\s*out|unreachable`)
+	reValidCatalogID       = newLazyRegexp(`^[A-Za-z0-9_-]{1,80}$`)
 )
 
 // IsValidCatalogID validates a `catalogId` parameter against path traversal and control-byte injection.

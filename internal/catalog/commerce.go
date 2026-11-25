@@ -6,7 +6,6 @@ import (
 	"math"
 	"net/netip"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -16,13 +15,13 @@ import (
 )
 
 var (
-	reDangerousInlineLinkScheme = regexp.MustCompile(`(?i)\]\(\s*(?:javascript|vbscript|data|file|blob):[^)]*\)`)
-	reCloseBracketSpaceParen    = regexp.MustCompile(`\]\s*\(`)
-	reCloseBracketSpaceOpen     = regexp.MustCompile(`\]\s*\[`)
-	reCloseBracketSpaceColon    = regexp.MustCompile(`\]\s*:`)
-	reNumericOrHexTLD           = regexp.MustCompile(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
-	reISOCurrency3              = regexp.MustCompile(`^[A-Z]{3}$`)
-	reMarkdownImgTag            = regexp.MustCompile(`!\[([^\]]*)\]\(([^)\r\n]+)\)`)
+	reDangerousInlineLinkScheme = newLazyRegexp(`(?i)\]\(\s*(?:javascript|vbscript|data|file|blob):[^)]*\)`)
+	reCloseBracketSpaceParen    = newLazyRegexp(`\]\s*\(`)
+	reCloseBracketSpaceOpen     = newLazyRegexp(`\]\s*\[`)
+	reCloseBracketSpaceColon    = newLazyRegexp(`\]\s*:`)
+	reNumericOrHexTLD           = newLazyRegexp(`(?i)^(?:\d+|0x[0-9a-f]+)$`)
+	reISOCurrency3              = newLazyRegexp(`^[A-Z]{3}$`)
+	reMarkdownImgTag            = newLazyRegexp(`!\[([^\]]*)\]\(([^)\r\n]+)\)`)
 
 	disallowedHostSuffixes = []string{
 		".localhost",

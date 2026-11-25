@@ -3,11 +3,10 @@ package mcpfed
 import (
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"strings"
 )
 
-var oauthScopeTokenRe = regexp.MustCompile(`^[\x21-\x7e]{1,80}$`)
+var oauthScopeTokenRe = newLazyRegexp(`^[\x21-\x7e]{1,80}$`)
 
 // DiscoveredRemoteOAuthMetadata describes validated RFC 9728 / RFC 8414 OAuth 2.1 endpoints.
 type DiscoveredRemoteOAuthMetadata struct {

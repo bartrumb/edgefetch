@@ -5,15 +5,14 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"regexp"
 	"strings"
 	"time"
 )
 
 var (
-	reHeadingPrefix  = regexp.MustCompile(`^#{1,3}\s+`)
-	reBulletPrefix   = regexp.MustCompile(`^[-*]\s+`)
-	reCollapseSpaces = regexp.MustCompile(`\s+`)
+	reHeadingPrefix  = newLazyRegexp(`^#{1,3}\s+`)
+	reBulletPrefix   = newLazyRegexp(`^[-*]\s+`)
+	reCollapseSpaces = newLazyRegexp(`\s+`)
 )
 
 func replaceBoundedSummaryLinksLinear(s string) string {

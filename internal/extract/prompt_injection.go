@@ -1,7 +1,6 @@
 package extract
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -18,8 +17,8 @@ type PromptInjectionResult struct {
 
 type injectionPatternSpecPIGo struct {
 	id        string
-	re        *regexp.Regexp
-	compactRe *regexp.Regexp
+	re        *lazyRegexp
+	compactRe *lazyRegexp
 	weight    int
 	keywords  []string
 	requireCh byte
@@ -28,39 +27,39 @@ type injectionPatternSpecPIGo struct {
 var injectionPatternsPIGo = []injectionPatternSpecPIGo{
 	{
 		id:        "ignore_previous_instructions",
-		re:        regexp.MustCompile(`(?i)\b(?:ignore|disregard|forget|override)\s+(?:(?:all|any|each|every)(?:\s+of)?\s+)?(?:(?:the|your|these|those|my|our)\s+)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)\s+(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)\b`),
-		compactRe: regexp.MustCompile(`(?i)(?:ignore|disregard|forget|override)(?:(?:all|any|each|every)(?:of)?)?(?:the|your|these|those|my|our)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)`),
+		re:        newLazyRegexp(`(?i)\b(?:ignore|disregard|forget|override)\s+(?:(?:all|any|each|every)(?:\s+of)?\s+)?(?:(?:the|your|these|those|my|our)\s+)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)\s+(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)\b`),
+		compactRe: newLazyRegexp(`(?i)(?:ignore|disregard|forget|override)(?:(?:all|any|each|every)(?:of)?)?(?:the|your|these|those|my|our)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)`),
 		weight:    3,
 		keywords:  []string{"ignore", "disregard", "forget", "override"},
 	},
 	{
 		id:        "new_system_role_override",
-		re:        regexp.MustCompile(`(?i)(?:(?:^|\n)[ \t>]{0,20}(?:\[?[ \t]{0,10}system(?:[ \t]{1,10}(?:prompt|override|instruction|message|role))?[ \t]{0,10}\]?|<[ \t]{0,10}system[ \t]{0,10}>|#{1,6}[ \t]{0,10}system(?:[ \t]{1,10}instruction)?)|(?:^|\s)(?:\[[ \t]{0,6}system[ \t]{1,6}(?:prompt|override|instruction|message|role)[ \t]{0,6}\]|<[ \t]{0,6}system[ \t]{0,6}>))[ \t]{0,10}:`),
-		compactRe: regexp.MustCompile(`(?i)(?:(?:^|\s)\[?system(?:prompt|override|instruction|message|role)\]?:|(?:^|\n)[ \t>]{0,10}system:|<system>:|#{1,6}system(?:instruction)?:)`),
+		re:        newLazyRegexp(`(?i)(?:(?:^|\n)[ \t>]{0,20}(?:\[?[ \t]{0,10}system(?:[ \t]{1,10}(?:prompt|override|instruction|message|role))?[ \t]{0,10}\]?|<[ \t]{0,10}system[ \t]{0,10}>|#{1,6}[ \t]{0,10}system(?:[ \t]{1,10}instruction)?)|(?:^|\s)(?:\[[ \t]{0,6}system[ \t]{1,6}(?:prompt|override|instruction|message|role)[ \t]{0,6}\]|<[ \t]{0,6}system[ \t]{0,6}>))[ \t]{0,10}:`),
+		compactRe: newLazyRegexp(`(?i)(?:(?:^|\s)\[?system(?:prompt|override|instruction|message|role)\]?:|(?:^|\n)[ \t>]{0,10}system:|<system>:|#{1,6}system(?:instruction)?:)`),
 		weight:    3,
 		keywords:  []string{"system"},
 		requireCh: ':',
 	},
 	{
 		id:        "exfiltrate_secrets_or_tools",
-		re:        regexp.MustCompile(`(?i)\b(?:send|post|upload|exfiltrate|transmit|forward|leak)\s+(?:(?:the|your|all|my|our)\s+)?(?:api[_\s-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|system\s+prompt|ssh|env)\s+(?:to|via)\s+(?:https?:(?://|\s+[a-z0-9])|\[[^\]]{1,80}\]\(\s*https?://|(?:[a-z0-9-]+\s+){0,3}[a-z0-9-]+(?:\.[a-z0-9-]+)+\b|this\b|here\b)`),
-		compactRe: regexp.MustCompile(`(?i)(?:send|post|upload|exfiltrate|transmit|forward|leak)(?:the|your|all|my|our)?(?:api[_-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|systemprompt|ssh|env)(?:to|via)(?:https?:|[a-z0-9-]+\.[a-z]{2,}|this\b|here\b)`),
+		re:        newLazyRegexp(`(?i)\b(?:send|post|upload|exfiltrate|transmit|forward|leak)\s+(?:(?:the|your|all|my|our)\s+)?(?:api[_\s-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|system\s+prompt|ssh|env)\s+(?:to|via)\s+(?:https?:(?://|\s+[a-z0-9])|\[[^\]]{1,80}\]\(\s*https?://|(?:[a-z0-9-]+\s+){0,3}[a-z0-9-]+(?:\.[a-z0-9-]+)+\b|this\b|here\b)`),
+		compactRe: newLazyRegexp(`(?i)(?:send|post|upload|exfiltrate|transmit|forward|leak)(?:the|your|all|my|our)?(?:api[_-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|systemprompt|ssh|env)(?:to|via)(?:https?:|[a-z0-9-]+\.[a-z]{2,}|this\b|here\b)`),
 		weight:    4,
 		keywords:  []string{"send", "post", "upload", "exfiltrate", "transmit", "forward", "leak"},
 	},
 	{
 		id:        "tool_invocation_hijack",
-		re:        regexp.MustCompile(`(?i)(?:(?:\b(?:immediately|now)\s+call\s+the\s+tool|\binvoke\s+the\s+tool)\s+[a-z][a-z0-9_.:/-]{1,63}\b|\b(?:immediately\s+call(?:\s+the\s+tool)?|now\s+call(?:\s+the\s+tool)?|you\s+must\s+now\s+execute|invoke\s+the\s+tool|execute\s+bash\s+command)\b[^\n]{0,80}\b(?:curl|wget|fetch(?:[_\s]?url)?|read[_\s]?artifact|scrape|extract|interact|bash|rm\s+-?rf)\b)`),
-		compactRe: regexp.MustCompile(`(?i)(?:immediatelycall(?:thetool)?|nowcall(?:thetool)?|youmustnowexecute|invokethetool|executebashcommand)[a-z0-9_:/.-]{0,80}(?:curl|wget|fetch(?:_?url)?|read_?artifact|bash|rm-?rf)`),
+		re:        newLazyRegexp(`(?i)(?:(?:\b(?:immediately|now)\s+call\s+the\s+tool|\binvoke\s+the\s+tool)\s+[a-z][a-z0-9_.:/-]{1,63}\b|\b(?:immediately\s+call(?:\s+the\s+tool)?|now\s+call(?:\s+the\s+tool)?|you\s+must\s+now\s+execute|invoke\s+the\s+tool|execute\s+bash\s+command)\b[^\n]{0,80}\b(?:curl|wget|fetch(?:[_\s]?url)?|read[_\s]?artifact|scrape|extract|interact|bash|rm\s+-?rf)\b)`),
+		compactRe: newLazyRegexp(`(?i)(?:immediatelycall(?:thetool)?|nowcall(?:thetool)?|youmustnowexecute|invokethetool|executebashcommand)[a-z0-9_:/.-]{0,80}(?:curl|wget|fetch(?:_?url)?|read_?artifact|bash|rm-?rf)`),
 		weight:    4,
 		keywords:  []string{"call", "invoke", "execute"},
 	},
 }
 
 var (
-	hiddenStyleTokenRePIGo = regexp.MustCompile(`(?i)(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?:\.0+)?(?:$|[^0-9.])|font-size[ \t]*:[ \t]*0(?:px|em|rem|pt|%)?(?:$|[^0-9.])|clip-path[ \t]*:[ \t]*inset\(\s*100%|clip[ \t]*:[ \t]*rect\(\s*0|(?:left|top|text-indent)[ \t]*:[ \t]*-\d{3,}|height[ \t]*:[ \t]*0(?:px)?[ \t]*;[^;]{0,60}overflow[ \t]*:[ \t]*hidden|color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b.{0,80}font-size[ \t]*:[ \t]*1px|font-size[ \t]*:[ \t]*1px.{0,80}color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b)`)
+	hiddenStyleTokenRePIGo = newLazyRegexp(`(?i)(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?:\.0+)?(?:$|[^0-9.])|font-size[ \t]*:[ \t]*0(?:px|em|rem|pt|%)?(?:$|[^0-9.])|clip-path[ \t]*:[ \t]*inset\(\s*100%|clip[ \t]*:[ \t]*rect\(\s*0|(?:left|top|text-indent)[ \t]*:[ \t]*-\d{3,}|height[ \t]*:[ \t]*0(?:px)?[ \t]*;[^;]{0,60}overflow[ \t]*:[ \t]*hidden|color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b.{0,80}font-size[ \t]*:[ \t]*1px|font-size[ \t]*:[ \t]*1px.{0,80}color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b)`)
 
-	hiddenDirectiveOverrideRePIGo = regexp.MustCompile(`(?i)` + strings.Join([]string{
+	hiddenDirectiveOverrideRePIGo = newLazyRegexp(`(?i)` + strings.Join([]string{
 		`\b(?:ignore|disregard|forget|override|bypass)\s+(?:(?:all|any|each|every|the|your|these|those|my|our|previous|prior|above|earlier|system|developer|safety)\s+){0,4}(?:instructions?|rules?|prompts?|directives?|guidelines?|constraints?|guardrails?|system)\b`,
 		`\bsystem\s+(?:prompt|override|instruction|directive|role)\b`,
 		`\b(?:assistant|ai|model|agent)\s*:\s*(?:ignore|disregard|forget|override|execute|call|invoke|send|leak|reveal|output|do\s+not)\b`,
@@ -69,9 +68,9 @@ var (
 		`\bdo\s+not\s+(?:tell|inform|mention\s+to|reveal\s+to|show)\s+the\s+user\b`,
 	}, "|"))
 
-	compactSpacedOverrideRePIGo = regexp.MustCompile(`(?i)(?:ignore|disregard|forget|override)(?:(?:all|any|each|every)(?:of)?)?(?:the|your|these|those|my|our)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)`)
+	compactSpacedOverrideRePIGo = newLazyRegexp(`(?i)(?:ignore|disregard|forget|override)(?:(?:all|any|each|every)(?:of)?)?(?:the|your|these|those|my|our)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)`)
 
-	cssClassRuleRePIGo = regexp.MustCompile(`\.([A-Za-z_-][A-Za-z0-9_-]{0,63})\s*\{([^}]{1,240})\}`)
+	cssClassRuleRePIGo = newLazyRegexp(`\.([A-Za-z_-][A-Za-z0-9_-]{0,63})\s*\{([^}]{1,240})\}`)
 )
 
 var hiddenDirectiveKeywordsPIGo = []string{
@@ -1699,7 +1698,7 @@ func makeVariantPIGo(s string) variantWithLowerPIGo {
 	}
 }
 
-func matchRegexBoundedByKeywordsPIGo(re *regexp.Regexp, v variantWithLowerPIGo, keywords []string, requireCh byte, postMargin int) bool {
+func matchRegexBoundedByKeywordsPIGo(re *lazyRegexp, v variantWithLowerPIGo, keywords []string, requireCh byte, postMargin int) bool {
 	if v.raw == "" {
 		return false
 	}

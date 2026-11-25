@@ -27,7 +27,10 @@ const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
 const EMPTY_BYTES = new Uint8Array(0);
 
-// Shared edge WASM input & isolate concurrency budgets (`PR #73`):
+// Shared edge WASM input & isolate concurrency budgets (`PR #73` + `PR #74`):
+//   - Fresh reactor baseline (after build-tagging `crypto/*` out of `wasip1` to eliminate Go 1.26's 32 MiB
+//     `fips140/drbg.memory` BSS + lazy-compiling 641 package-level regexes via `sync.Once`):
+//     `initialMemoryBytes ≈ 7.25 MiB` (`initial_pages = 92`, `initHeapAlloc ≈ 141 KiB`, down `-43.75 MiB` from `51.00 MiB`).
 //   - `MAX_WASM_INPUT_BYTES = 4 MiB` enforced in every shared writer below so all ~30 raw/JSON/RE2 ops are bounded in one place.
 //   - `MAX_ISOLATE_IN_FLIGHT_BYTES = 12 MiB` semaphore caps concurrent multi-MiB requests sharing one 128 MiB Worker isolate.
 //   - Evict `cachedReactor` only when I/O exceeds `8 MiB` (`WASM_EVICT_IO_BYTES`) or total linear memory exceeds `96 MiB`

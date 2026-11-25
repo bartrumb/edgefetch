@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -127,5 +130,31 @@ func TestWasmReactorExportsRoundTrip(t *testing.T) {
 	strLen := efCallRawStr(uint32(len(strMeta)), uint32(len(strMeta)+len(strBody)))
 	if strLen == 0 || strings.Contains(string(wasmOutBuf[:strLen]), "<script") || !strings.HasPrefix(string(wasmOutBuf[:strLen]), "Hi") {
 		t.Fatalf("unexpected efCallRawStr output: %q", string(wasmOutBuf[:strLen]))
+	}
+}
+
+func TestWasip1DepsExcludeStdlibCrypto(t *testing.T) {
+	if runtime.GOOS == "wasip1" {
+		t.Skip("go toolchain subprocess not available inside wasip1")
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go binary not on PATH")
+	}
+	cmd := exec.Command(goBin, "list", "-deps", ".")
+	cmd.Env = append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm", "CGO_ENABLED=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps failed: %v\n%s", err, string(out))
+	}
+	var forbidden []string
+	for _, line := range strings.Split(string(out), "\n") {
+		pkg := strings.TrimSpace(line)
+		if pkg == "crypto" || strings.HasPrefix(pkg, "crypto/") {
+			forbidden = append(forbidden, pkg)
+		}
+	}
+	if len(forbidden) > 0 {
+		t.Fatalf("GOOS=wasip1 GOARCH=wasm ./cmd/edgefetch-wasm must NOT import stdlib crypto/ (pulls in 32 MiB fips140/drbg.memory BSS): %v", forbidden)
 	}
 }

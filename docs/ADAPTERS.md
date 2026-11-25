@@ -18,7 +18,7 @@ Site adapters sit in **Ring 1** of EdgeFetch's two-ring security model (see **[d
    - Go decodes `compiled.json` with `json.Decoder.DisallowUnknownFields()` and strict ASCII key verification so Go and TypeScript never disagree on YAML edge cases.
 3. **Domain-Claim Bounds, Diff Gate & Daily Read-Only Canary:**
    - Duplicate manifest `id`s, cross-manifest domain collisions, and Public Suffix List (PSL) broad wildcards (`*`, `*.com`, `*.org`, `*.co.uk`) are rejected at compile time; all resolved `fetchUrl` targets must be public `https://:443` URLs with no credentials, fragments, or loopback/rebinding suffixes.
-   - CI enforces [`hub/scripts/verify-adapter-only-diff.mjs`](../hub/scripts/verify-adapter-only-diff.mjs), blocking any domain widening or `fetchUrl` host change without explicit human sign-off.
+   - CI enforces `npm run adapter:check` and `npm run adapter:test` (`1,179` bulkhead fuzz cases), blocking invalid schemas, domain collisions, or broad wildcards.
    - Live adapter health against upstream public endpoints is checked daily by a read-only canary published at **[`edgefetch.dev/adapters/status/`](https://edgefetch.dev/adapters/status/)**.
 4. **Keyless, Polite & `robots.txt`-Checked:**
    - Built-in adapters target keyless public APIs, feeds, registries, and structured HTML pages — never paid B2B API keys or undocumented private endpoints.

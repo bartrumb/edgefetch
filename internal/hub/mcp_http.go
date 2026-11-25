@@ -178,6 +178,12 @@ func (h *RouteHandler) HandleMCP(w http.ResponseWriter, r *http.Request) {
 				replies = append(replies, mcpJSONRPCError(nil, -32600, "Invalid Request", nil))
 				continue
 			}
+			if needed := missingMCPToolScope(msg, p); needed != "" {
+				w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+needed+`"`)
+				w.Header().Set("Mcp-Protocol-Version", firstNonEmpty(hdrVer, defaultMCPProtocolVer))
+				writeJSON(w, http.StatusForbidden, mcpJSONRPCError(msg.parsedID(), -32001, "Insufficient OAuth scope: "+needed+" is required.", map[string]any{"required": needed}))
+				return
+			}
 			rep, _ := h.dispatchMCPMessage(r.Context(), r.Header, msg, p, isModern)
 			if rep != nil {
 				replies = append(replies, rep)
@@ -233,20 +239,11 @@ func (h *RouteHandler) HandleMCP(w http.ResponseWriter, r *http.Request) {
 
 	effectiveVer := firstNonEmpty(metaVer, hdrVer, defaultMCPProtocolVer)
 	isModern := effectiveVer == modernMCPProtocolVer || msg.Method == "server/discover"
-	if msg.Method == "tools/call" {
-		var cp struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments"`
-		}
-		if json.Unmarshal(msg.Params, &cp) == nil && cp.Name != "" {
-			needed := requiredScopeForMCPTool(cp.Name, cp.Arguments)
-			if needed != "" && !p.HasScope(needed) && !(needed == "crawl:read" && p.HasScope("mcp:call") && (cp.Name == "call_connected_mcp" || cp.Name == "query_mcp")) {
-				w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+needed+`"`)
-				w.Header().Set("Mcp-Protocol-Version", effectiveVer)
-				writeJSON(w, http.StatusForbidden, mcpJSONRPCError(msg.parsedID(), -32001, "Insufficient OAuth scope: "+needed+" is required.", map[string]any{"required": needed}))
-				return
-			}
-		}
+	if needed := missingMCPToolScope(msg, p); needed != "" {
+		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+needed+`"`)
+		w.Header().Set("Mcp-Protocol-Version", effectiveVer)
+		writeJSON(w, http.StatusForbidden, mcpJSONRPCError(msg.parsedID(), -32001, "Insufficient OAuth scope: "+needed+" is required.", map[string]any{"required": needed}))
+		return
 	}
 	rep, httpStatus := h.dispatchMCPMessage(r.Context(), r.Header, msg, p, isModern)
 	if rep == nil {
@@ -255,6 +252,24 @@ func (h *RouteHandler) HandleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Mcp-Protocol-Version", effectiveVer)
 	writeJSON(w, httpStatus, rep)
+}
+
+func missingMCPToolScope(msg jsonRPCRequest, p AuthPrincipal) string {
+	if msg.Method != "tools/call" {
+		return ""
+	}
+	var cp struct {
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
+	}
+	if json.Unmarshal(msg.Params, &cp) != nil || cp.Name == "" {
+		return ""
+	}
+	needed := requiredScopeForMCPTool(cp.Name, cp.Arguments)
+	if needed != "" && !p.HasScope(needed) && !(needed == "crawl:read" && p.HasScope("mcp:call") && (cp.Name == "call_connected_mcp" || cp.Name == "query_mcp")) {
+		return needed
+	}
+	return ""
 }
 
 func extractMetaProtocolVersion(rawParams json.RawMessage) string {

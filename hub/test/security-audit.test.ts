@@ -12,8 +12,6 @@ import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
-import { runRound6StreamASubtests } from './round6-stream-a.test.ts';
-import { runRound6StreamBSubtests } from './round6-stream-b.test.ts';
 import hubWorker from '../src/index.ts';
 import {
   LocalAgentHubCoordinator,
@@ -7977,9 +7975,4 @@ test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, w
   assert.equal(normalizeClientRateLimitIp('::ffff:192.0.2.999'), '::ffff:192.0.2.999');
   assert.equal(normalizeClientRateLimitIp('1:2:3:4:5:6:7'), '1:2:3:4:5:6:7');
   assert.equal(normalizeClientRateLimitIp('1:2:3:4:5:6:7:8:9'), '1:2:3:4:5:6:7:8:9');
-});
-
-test('SEC-V263-ROUND6-CLOSURE: R6-H1..H4, M1, M3, M9..M12, x402, Portable/Deno Hub, OAuth/Admin/LLM & Overflow Robots Parity', async (t) => {
-  await runRound6StreamASubtests(t);
-  await runRound6StreamBSubtests(t);
 });

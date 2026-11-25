@@ -53,6 +53,7 @@ func (h *RouteHandler) requireScope(w http.ResponseWriter, r *http.Request, scop
 		return p, false
 	}
 	if !p.HasScope(scope) {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer error=\"insufficient_scope\", scope=%q", scope))
 		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "insufficient_scope", "required": scope})
 		return p, false
 	}

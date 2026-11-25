@@ -448,6 +448,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin, validHost := hubauth.ResolveRequestPublicOrigin(r, s.configuredOrigin, fallbackOrigin, s.cfg.TrustProxy)
 	hubauth.ApplySecurityHeaders(w, strings.HasPrefix(origin, "https://"))
 	if !validHost && strings.TrimSpace(s.cfg.CallerToken) != "" {
+		httpSpan.Suppress()
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_host"})
 		return
 	}
@@ -482,11 +483,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case strings.HasPrefix(r.URL.Path, "/agent/artifacts/") && r.Method == http.MethodPut:
-		s.handleAgentArtifactPut(w, r)
+		if s.handleAgentArtifactPut(w, r) == http.StatusUnauthorized {
+			httpSpan.Suppress()
+		}
 		return
 
 	case r.URL.Path == "/agent/reply" && r.Method == http.MethodPost:
-		s.handleAgentReply(w, r)
+		if s.handleAgentReply(w, r) == http.StatusUnauthorized {
+			httpSpan.Suppress()
+		}
 		return
 
 	case r.URL.Path == "/v1/ingest-tab" && r.Method == http.MethodOptions:
@@ -499,6 +504,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.authMgr.HandleAdmin(w, r, origin) {
+			if sw.status == http.StatusUnauthorized {
+				httpSpan.Suppress()
+			}
 			return
 		}
 	}
@@ -825,11 +833,11 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) int {
 	siteID, ok := s.authorizeAgent(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
+		return http.StatusUnauthorized
 	}
 	blobSHA := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/agent/artifacts/")))
 	jobID := strings.TrimSpace(r.Header.Get("X-Job-Id"))
@@ -837,24 +845,24 @@ func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) 
 	contentSHA := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Content-Sha256")))
 	if !reSHA256.MatchString(blobSHA) || !reJobID.MatchString(jobID) || !reJobID.MatchString(jobNonce) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_artifact_headers"})
-		return
+		return http.StatusBadRequest
 	}
 	releaseUpload, acquireCode := s.acquirePendingJobArtifactSlot(jobID, jobNonce, siteID)
 	if acquireCode != 0 {
 		writeJSON(w, acquireCode, map[string]string{"error": "artifact_upload_rejected"})
-		return
+		return acquireCode
 	}
 	defer releaseUpload("")
 
 	gzBytes, err := io.ReadAll(io.LimitReader(r.Body, crawl.MaxMaxBytes+1024))
 	if err != nil || len(gzBytes) > crawl.MaxMaxBytes {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "artifact_too_large"})
-		return
+		return http.StatusRequestEntityTooLarge
 	}
 	sum := sha256.Sum256(gzBytes)
 	if hex.EncodeToString(sum[:]) != blobSHA {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "blob_sha256_mismatch"})
-		return
+		return http.StatusBadRequest
 	}
 
 	s.storeBlob(storedBlob{
@@ -868,6 +876,7 @@ func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) 
 	}
 	releaseUpload(blobSHA)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "blobSha256": blobSHA})
+	return http.StatusOK
 }
 
 func (s *Server) storeBlob(b storedBlob) {
@@ -919,22 +928,22 @@ func (s *Server) hydrateArtifacts(reply *crawl.FetchReply) {
 	}
 }
 
-func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) int {
 	siteID, ok := s.authorizeAgent(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
+		return http.StatusUnauthorized
 	}
 	jobID := strings.TrimSpace(r.Header.Get("X-Job-Id"))
 	jobNonce := strings.TrimSpace(r.Header.Get("X-Job-Nonce"))
 	if !reJobID.MatchString(jobID) || !reJobID.MatchString(jobNonce) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_job_headers"})
-		return
+		return http.StatusBadRequest
 	}
 	dispatchedReqs, allowedBlobs, claimed := s.claimPendingJobReply(jobID, jobNonce, siteID)
 	if !claimed {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_or_already_claimed_job"})
-		return
+		return http.StatusNotFound
 	}
 
 	var reader io.Reader = io.LimitReader(r.Body, maxGzipReplyBytes+1)
@@ -942,7 +951,7 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 	if err != nil || len(rawCompressed) > maxGzipReplyBytes {
 		s.completePending(jobID, jobNonce, siteID, jobOutcome{err: errors.New("reply_too_large")})
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "too_large"})
-		return
+		return http.StatusRequestEntityTooLarge
 	}
 
 	decoded := rawCompressed
@@ -951,14 +960,14 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 		if gzErr != nil {
 			s.completePending(jobID, jobNonce, siteID, jobOutcome{err: gzErr})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_gzip"})
-			return
+			return http.StatusBadRequest
 		}
 		decBytes, rErr := io.ReadAll(io.LimitReader(zr, maxDecodedReplyBytes+1))
 		_ = zr.Close()
 		if rErr != nil || len(decBytes) > maxDecodedReplyBytes {
 			s.completePending(jobID, jobNonce, siteID, jobOutcome{err: errors.New("decompressed_too_large")})
 			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "too_large"})
-			return
+			return http.StatusRequestEntityTooLarge
 		}
 		decoded = decBytes
 	}
@@ -967,12 +976,12 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(decoded, &reply); err != nil {
 		s.completePending(jobID, jobNonce, siteID, jobOutcome{err: err})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_reply_json"})
-		return
+		return http.StatusBadRequest
 	}
 	if len(reply.Results) != len(dispatchedReqs) {
 		s.completePending(jobID, jobNonce, siteID, jobOutcome{err: errors.New("mismatched_result_count")})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mismatched_result_count"})
-		return
+		return http.StatusBadRequest
 	}
 	for i := range reply.Results {
 		reply.Results[i].ID = dispatchedReqs[i].ID
@@ -990,6 +999,7 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 
 	s.completePending(jobID, jobNonce, siteID, jobOutcome{reply: reply, raw: string(decoded)})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	return http.StatusOK
 }
 
 func (s *Server) acquirePendingJobArtifactSlot(jobID, jobNonce, siteID string) (func(uploadedSHA string), int) {
@@ -1219,6 +1229,9 @@ func (s *Server) DispatchOrFallback(
 	if target == "auto" || target == "agent" {
 		for attempt := 0; attempt < 3; attempt++ {
 			sess := s.pickAgent(primaryHost, preferredSite, needsBrowser, triedSites)
+			if sess == nil && s.cfg.FallbackCrawler == nil && len(triedSites) == 0 && s.hasConnectedCandidate(preferredSite, needsBrowser) {
+				sess = s.waitForIdleAgent(dispCtx, primaryHost, preferredSite, needsBrowser, triedSites)
+			}
 			if sess == nil {
 				break
 			}
@@ -1285,6 +1298,41 @@ func replyHitStopOrChallenge(rep crawl.FetchReply) bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) hasConnectedCandidate(preferredSite string, needsBrowser bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sess := range s.agents {
+		if preferredSite != "" && sess.siteID != preferredSite {
+			continue
+		}
+		if needsBrowser && !sess.hasCapability("browser-v1") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (s *Server) waitForIdleAgent(ctx context.Context, host, preferredSite string, needsBrowser bool, exclude map[string]bool) *agentSession {
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return nil
+		case <-ticker.C:
+			if sess := s.pickAgent(host, preferredSite, needsBrowser, exclude); sess != nil {
+				return sess
+			}
+			if !s.hasConnectedCandidate(preferredSite, needsBrowser) {
+				return nil
+			}
+		}
+	}
 }
 
 func (s *Server) tryPeerHandoff(ctx context.Context, call crawl.FetchCall, primaryHost string, traceMap map[string]string) (crawl.FetchReply, string, bool) {

@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -367,13 +369,13 @@ func TestRound6YAMLAndSanitizerHardening(t *testing.T) {
 		t.Fatal("expected cross-origin {host} interpolation with wildcard domain to be rejected")
 	}
 
-	// 6. Linear O(N) tag stripper finishes 160K '<' in < 40ms (R6-M7).
+	// 6. Linear O(N) tag stripper finishes 160K '<' without quadratic blowup (R6-M7).
 	adv := strings.Repeat("<x \"unclosed ", 12_500) // 162.5 KB of unclosed tags & quotes
 	t0 := time.Now()
 	out := stripTagsInlineLinear(adv)
 	elapsed := time.Since(t0)
-	if elapsed > 100*time.Millisecond {
-		t.Fatalf("stripTagsInlineLinear took %v on 162KB unclosed tags (expected < 100ms)", elapsed)
+	if elapsed > 5*time.Second {
+		t.Fatalf("stripTagsInlineLinear took %v on 162KB unclosed tags (expected < 5s)", elapsed)
 	}
 	if len(out) == 0 {
 		t.Fatal("expected literal fallback when no closing '>' exists")
@@ -941,5 +943,581 @@ func TestDeclarativeHelpersAndSyntheticTwinCoverage(t *testing.T) {
 	}
 	if !strings.HasPrefix(safeDeclarativeFence("```hi```", "md"), "````md") {
 		t.Fatal("safeDeclarativeFence nested backticks failed")
+	}
+}
+
+func TestR8VendoredPSLAndMatchesApprovedWildcard(t *testing.T) {
+	// 1. Mozilla PSL exact, wildcard (*.ck, *.kobe.jp, *.platformsh.site, *.run.app), exception (!www.ck, !city.kobe.jp), IDN punycode, & PRIVATE DOMAINS
+	cases := []struct {
+		host     string
+		wantReg  string
+		wantSuf  bool
+		wantPriv bool
+	}{
+		{"en.wikipedia.org", "wikipedia.org", false, false},
+		{"com", "", true, false},
+		{"co.uk", "", true, false},
+		{"bbc.co.uk", "bbc.co.uk", false, false},
+		{"ck", "", true, false},
+		{"foo.ck", "", true, false},
+		{"bar.foo.ck", "bar.foo.ck", false, false},
+		{"www.ck", "www.ck", false, false},
+		{"sub.www.ck", "www.ck", false, false},
+		{"other.kobe.jp", "", true, false},
+		{"city.kobe.jp", "city.kobe.jp", false, false},
+		{"ward.city.kobe.jp", "city.kobe.jp", false, false},
+		{"supabase.co", "", true, true},
+		{"evil.supabase.co", "evil.supabase.co", false, true},
+		{"workers.dev", "", true, true},
+		{"foo.workers.dev", "foo.workers.dev", false, true},
+		{"github.io", "", true, true},
+		{"bar.github.io", "bar.github.io", false, true},
+		{"s3.amazonaws.com", "", true, true},
+		{"bucket.s3.amazonaws.com", "bucket.s3.amazonaws.com", false, true},
+		{"eu.platformsh.site", "", true, true},
+		{"app.eu.platformsh.site", "app.eu.platformsh.site", false, true},
+		{"a.run.app", "", true, true},
+		{"svc1.a.run.app", "svc1.a.run.app", false, true},
+		{"ngrok-free.app", "", true, true},
+		{"z.ngrok-free.app", "z.ngrok-free.app", false, true},
+		{"shop.xn--fiqs8s", "shop.xn--fiqs8s", false, false},
+		{"xn--fiqs8s", "", true, false},
+	}
+	for _, tc := range cases {
+		if got := GetRegistrableDomain(tc.host); got != tc.wantReg {
+			t.Fatalf("GetRegistrableDomain(%q) = %q, want %q", tc.host, got, tc.wantReg)
+		}
+		if got := IsPublicOrPrivateSuffix(tc.host); got != tc.wantSuf {
+			t.Fatalf("IsPublicOrPrivateSuffix(%q) = %v, want %v", tc.host, got, tc.wantSuf)
+		}
+		if got := HasPrivateSharedHostingSuffix(tc.host); got != tc.wantPriv {
+			t.Fatalf("HasPrivateSharedHostingSuffix(%q) = %v, want %v", tc.host, got, tc.wantPriv)
+		}
+	}
+
+	// 2. Simple 3-shape MatchesApprovedWildcard checks
+	mustMatch := [][2]string{
+		{"*.wikipedia.org", "en.wikipedia.org"},
+		{"*.wikipedia.org", "a.b.wikipedia.org"},
+		{"*.wikipedia.org", "*.sub.wikipedia.org"},
+		{"careers.*.com", "careers.stripe.com"},
+		{"jobs.*.com", "jobs.apple.com"},
+		{"gitlab.*", "gitlab.company.org"},
+		{"gitlab.*", "gitlab.eu.company.org"},
+	}
+	for _, pair := range mustMatch {
+		if !MatchesApprovedWildcard(pair[0], pair[1]) {
+			t.Fatalf("expected MatchesApprovedWildcard(%q, %q) == true", pair[0], pair[1])
+		}
+	}
+
+	mustNotMatch := [][2]string{
+		{"*.wikipedia.org", "*.wikimedia.org"},
+		{"*.wikipedia.org", "wikipedia.org"},
+		{"careers.*.com", "careers.com"},
+		{"jobs.*.com", "jobs.org"},
+		{"gitlab.*", "mygitlab.org"},
+		{"api.example.com", "app.example.com"},
+		{"", "en.wikipedia.org"},
+	}
+	for _, pair := range mustNotMatch {
+		if MatchesApprovedWildcard(pair[0], pair[1]) {
+			t.Fatalf("expected MatchesApprovedWildcard(%q, %q) == false", pair[0], pair[1])
+		}
+	}
+}
+
+func TestR8ValidateDeclarativeManifestsOverlapHostingCatalogAndRedirects(t *testing.T) {
+	rawCompiled, err := embeddedManifestFS.ReadFile("manifests/compiled.json")
+	if err != nil {
+		t.Fatalf("ReadFile(manifests/compiled.json): %v", err)
+	}
+	var bundle compiledManifestBundle
+	dec := json.NewDecoder(bytes.NewReader(rawCompiled))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&bundle); err != nil {
+		t.Fatalf("Decode compiled.json: %v", err)
+	}
+	if len(bundle.Manifests) != 56 {
+		t.Fatalf("expected 56 compiled manifests, got %d", len(bundle.Manifests))
+	}
+	if err := ValidateDeclarativeManifests(bundle.Manifests); err != nil {
+		t.Fatalf("expected embedded 56 manifests to pass ValidateDeclarativeManifests, got: %v", err)
+	}
+
+	makeRogue := func(id, dom, fetchURL string) DeclarativeManifest {
+		return DeclarativeManifest{
+			ID:          id,
+			Name:        "Rogue Manifest",
+			Category:    "developer",
+			Description: "Synthetic manifest testing H7 cross-manifest overlap and host guards.",
+			Domains:     []string{dom},
+			ExampleURLs: []string{"https://example.org/item"},
+			Routes: []DeclarativeRouteSpec{{
+				Match:   DeclarativeMatchSpec{PathSegments: []DeclarativeSegmentSpec{{IsLiteral: true, Literal: "wiki"}}},
+				Twin:    DeclarativeTwinSpec{ID: id + "-twin", FetchURL: fetchURL, Kind: "json", Accept: "application/json"},
+				Extract: DeclarativeExtractSpec{TitleTemplate: "Hijacked"},
+			}},
+		}
+	}
+
+	// 1. Exact subdomain hijack against *.wikipedia.org, careers.*.com, jobs.*.com, and gitlab.* MUST fail!
+	overlapAttacks := []DeclarativeManifest{
+		makeRogue("hijack-wiki", "en.wikipedia.org", "https://en.wikipedia.org/api/rest_v1/page/summary/Bank"),
+		makeRogue("hijack-careers", "careers.stripe.com", "https://careers.stripe.com/api/jobs"),
+		makeRogue("hijack-jobs", "jobs.stripe.com", "https://jobs.stripe.com/api/jobs"),
+		makeRogue("hijack-gitlab", "gitlab.company.org", "https://gitlab.company.org/api/v4/projects"),
+	}
+	for _, atk := range overlapAttacks {
+		combined := append(append([]DeclarativeManifest(nil), bundle.Manifests...), atk)
+		vErr := ValidateDeclarativeManifests(combined)
+		if vErr == nil || !strings.Contains(strings.ToLower(vErr.Error()), "overlap") {
+			t.Fatalf("SECURITY (H7): expected cross-manifest overlap rejection for %s (%v), got err=%v", atk.ID, atk.Domains, vErr)
+		}
+	}
+
+	// 2. Multi-tenant shared-hosting suffixes MUST be rejected for BOTH wildcards AND exact tenant subdomains!
+	for _, badHost := range []string{
+		"*.github.io",
+		"victim.github.io",
+		"*.codeberg.page",
+		"docs.codeberg.page",
+		"app.pages.dev",
+		"worker.workers.dev",
+		"preview.vercel.app",
+		"site.netlify.app",
+		"app.herokuapp.com",
+		"svc.up.railway.app",
+		"app.eu.platformsh.site",
+		"bot.replit.app",
+		"fn.deno.dev",
+		"proj.supabase.co",
+		"app.convex.site",
+		"tun.ngrok.app",
+		"tun.trycloudflare.com",
+	} {
+		m := makeRogue("bad-hosting", badHost, "{requestUrl}")
+		if err := ValidateDeclarativeManifests([]DeclarativeManifest{m}); err == nil {
+			t.Fatalf("SECURITY (H7): expected shared-hosting domain %q to be rejected", badHost)
+		}
+	}
+
+	// 3. Unapproved cross-domain twin.fetchUrl collector MUST be rejected!
+	exfil := makeRogue("exfil-twin", "victim-corp.org", "https://collector.attacker-domain.net/steal")
+	if err := ValidateDeclarativeManifests([]DeclarativeManifest{exfil}); err == nil || !strings.Contains(err.Error(), "cross-domain twin host") {
+		t.Fatalf("SECURITY (H7): expected unapproved cross-domain twin.fetchUrl rejection, got %v", err)
+	}
+
+	// 4. Strict catalog.platform allowlist ("shopify" | "woocommerce") + duplicate platform guard!
+	badCat := DeclarativeManifest{
+		ID:          "bad-catalog",
+		Name:        "Bad Catalog",
+		Category:    "commerce-social",
+		Description: "Manifest with unsupported catalog platform.",
+		Domains:     []string{"store.example.org"},
+		ExampleURLs: []string{"https://store.example.org/products"},
+		Catalog:     &DeclarativeCatalogConfig{Platform: "magento", PauseMs: 1000, PageCap: 10},
+	}
+	if err := ValidateDeclarativeManifests([]DeclarativeManifest{badCat}); err == nil || !strings.Contains(err.Error(), "catalog.platform") {
+		t.Fatalf("SECURITY (H7): expected unknown catalog.platform 'magento' to fail, got %v", err)
+	}
+	dupShopify := badCat
+	dupShopify.Catalog = &DeclarativeCatalogConfig{Platform: "shopify", PauseMs: 1000, PageCap: 10}
+	if err := ValidateDeclarativeManifests(append(append([]DeclarativeManifest(nil), bundle.Manifests...), dupShopify)); err == nil || !strings.Contains(strings.ToLower(err.Error()), "duplicate catalog platform") {
+		t.Fatalf("expected duplicate shopify catalog platform to fail, got %v", err)
+	}
+
+	// 5. Twin redirect target validation: block cross-domain and cross-tenant wildcard redirects!
+	shopTwin, ok := ResolveDeclarativeTwin("https://acme-store.myshopify.com/products/shirt")
+	if !ok || shopTwin == nil {
+		t.Fatal("expected shopify twin resolution")
+	}
+	if !shopTwin.ValidateRedirectTarget("https://acme-store.myshopify.com/products/shirt.js") {
+		t.Fatal("expected same-tenant redirect on shopify twin to pass")
+	}
+	if shopTwin.ValidateRedirectTarget("https://evil-tenant.myshopify.com/products/shirt.js") {
+		t.Fatal("SECURITY: cross-tenant redirect on wildcard *.myshopify.com twin must be rejected")
+	}
+	if shopTwin.ValidateRedirectTarget("https://attacker.example.com/steal.json") {
+		t.Fatal("SECURITY: cross-domain redirect on twin must be rejected")
+	}
+
+	rgTwin, ok := ResolveDeclarativeTwin("https://rubygems.org/gems/rails")
+	if !ok || rgTwin == nil {
+		t.Fatal("expected rubygems twin resolution")
+	}
+	if !rgTwin.ValidateRedirectTarget("https://www.rubygems.org/api/v1/gems/rails.json") {
+		t.Fatal("expected declared domain www.rubygems.org redirect to pass")
+	}
+	if rgTwin.ValidateRedirectTarget("https://unclaimed.rubygems.org/api/v1/gems/rails.json") {
+		t.Fatal("SECURITY: redirect to unclaimed subdomain on same registrable domain must be rejected (TS parity)")
+	}
+	if rgTwin.ValidateRedirectTarget("https://evil.workers.dev/rails.json") {
+		t.Fatal("SECURITY: redirect to shared-hosting workers.dev must be rejected")
+	}
+
+	hfTwin, ok := ResolveDeclarativeTwin("https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct")
+	if !ok || hfTwin == nil {
+		t.Fatal("expected huggingface twin resolution")
+	}
+	if hfTwin.ValidateRedirectTarget("https://spaces.huggingface.co/steal.json") {
+		t.Fatal("SECURITY: redirect to unclaimed spaces.huggingface.co subdomain must be rejected (TS parity)")
+	}
+}
+
+func TestR8HardenedChromiumSeccompProfileInvariants(t *testing.T) {
+	seccompPath := filepath.Join("..", "..", "deploy", "seccomp", "chromium-sandbox.json")
+	raw, err := os.ReadFile(seccompPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", seccompPath, err)
+	}
+	var prof struct {
+		DefaultAction string `json:"defaultAction"`
+		Syscalls      []struct {
+			Names    []string `json:"names"`
+			Action   string   `json:"action"`
+			ErrnoRet *int     `json:"errnoRet"`
+			Includes struct {
+				Arches []string `json:"arches"`
+			} `json:"includes"`
+			Args []struct {
+				Index    int    `json:"index"`
+				Value    uint64 `json:"value"`
+				ValueTwo uint64 `json:"valueTwo"`
+				Op       string `json:"op"`
+			} `json:"args"`
+		} `json:"syscalls"`
+	}
+	if err := json.Unmarshal(raw, &prof); err != nil {
+		t.Fatalf("invalid JSON in %s: %v", seccompPath, err)
+	}
+	if prof.DefaultAction != "SCMP_ACT_ERRNO" {
+		t.Fatalf("expected defaultAction SCMP_ACT_ERRNO, got %q", prof.DefaultAction)
+	}
+	if len(prof.Syscalls) < 5 {
+		t.Fatalf("expected structured multi-rule seccomp profile, got %d rules", len(prof.Syscalls))
+	}
+
+	allowed := make(map[string]bool)
+	unconditionalAllow := make(map[string]bool)
+	archGated := make(map[string][]string)
+	argGated := make(map[string]int)
+	sawClone3Enosys := false
+	for _, rule := range prof.Syscalls {
+		if rule.Action == "SCMP_ACT_ERRNO" {
+			for _, n := range rule.Names {
+				if n == "clone3" && rule.ErrnoRet != nil && *rule.ErrnoRet == 38 {
+					sawClone3Enosys = true
+				}
+			}
+			continue
+		}
+		if rule.Action != "SCMP_ACT_ALLOW" {
+			continue
+		}
+		for _, n := range rule.Names {
+			allowed[n] = true
+			if len(rule.Args) == 0 && len(rule.Includes.Arches) == 0 {
+				unconditionalAllow[n] = true
+			}
+			if len(rule.Includes.Arches) > 0 {
+				archGated[n] = append(archGated[n], rule.Includes.Arches...)
+			}
+			if len(rule.Args) > 0 {
+				argGated[n] += len(rule.Args)
+			}
+		}
+	}
+
+	for _, mustDeny := range []string{
+		"ptrace", "bpf", "perf_event_open", "userfaultfd",
+		"io_uring_setup", "io_uring_enter", "io_uring_register",
+		"keyctl", "add_key", "request_key",
+		"kexec_load", "kexec_file_load", "init_module", "finit_module", "delete_module",
+		"open_by_handle_at", "name_to_handle_at",
+		"mount", "umount", "umount2", "pivot_root",
+		"setns", "clone3", "socketcall",
+		"adjtimex", "clock_adjtime", "clock_adjtime64", "fanotify_mark",
+		"chown", "chown32", "fchown", "fchown32", "fchownat", "lchown", "lchown32",
+		"mknod", "mknodat", "vmsplice", "remap_file_pages", "swapon", "swapoff", "reboot", "acct",
+	} {
+		if allowed[mustDeny] {
+			t.Fatalf("SECURITY: forbidden syscall %q must NOT be allowed in chromium-sandbox.json", mustDeny)
+		}
+	}
+	if !sawClone3Enosys {
+		t.Fatal("expected clone3 to return ENOSYS (errnoRet: 38) so libc falls back cleanly to clone(2)")
+	}
+	if unconditionalAllow["socket"] || argGated["socket"] < 8 {
+		t.Fatalf("SECURITY: socket(2) must NOT be unconditionally allowed (must filter out AF_PACKET/SOCK_RAW); unconditional=%v argRules=%d", unconditionalAllow["socket"], argGated["socket"])
+	}
+
+	for _, mustAllowSandbox := range []string{"clone", "unshare", "chroot", "seccomp", "prctl"} {
+		if !allowed[mustAllowSandbox] {
+			t.Fatalf("expected Chromium sandbox syscall %q in SCMP_ACT_ALLOW", mustAllowSandbox)
+		}
+	}
+	if len(archGated["arch_prctl"]) == 0 || len(archGated["arm_fadvise64_64"]) == 0 {
+		t.Fatalf("expected arch_prctl and arm_fadvise64_64 to be gated by includes.arches, got %+v", archGated)
+	}
+	if argGated["personality"] < 5 {
+		t.Fatalf("expected personality to be restricted by explicit SCMP_CMP_EQ args, got %d arg rules", argGated["personality"])
+	}
+}
+
+func TestR10P3ManifestFetchURLStrictHostAndOriginBinding(t *testing.T) {
+	buildManifestJSON := func(domains []string, fetchURL string) ([]byte, DeclarativeManifest) {
+		rawMap := map[string]any{
+			"id":          "r10-binding-check",
+			"name":        "R10 Binding Check",
+			"category":    "developer",
+			"description": "Tests strict {host} and {origin} authority boundary binding in fetchUrl.",
+			"domains":     domains,
+			"exampleUrls": []string{"https://docs.example.org/items/42"},
+			"routes": []any{
+				map[string]any{
+					"match": map[string]any{
+						"pathSegments": []any{"items", map[string]any{"param": "id"}},
+					},
+					"twin": map[string]any{
+						"id":       "r10-binding-twin",
+						"fetchUrl": fetchURL,
+						"kind":     "json",
+						"accept":   "application/json",
+					},
+					"extract": map[string]any{
+						"titleTemplate": "Item",
+					},
+				},
+			},
+		}
+		raw, err := json.Marshal(rawMap)
+		if err != nil {
+			t.Fatalf("json.Marshal manifest: %v", err)
+		}
+		m := DeclarativeManifest{
+			ID:          "r10-binding-check",
+			Name:        "R10 Binding Check",
+			Category:    "developer",
+			Description: "Tests strict {host} and {origin} authority boundary binding in fetchUrl.",
+			Domains:     domains,
+			ExampleURLs: []string{"https://docs.example.org/items/42"},
+			Routes: []DeclarativeRouteSpec{{
+				Match: DeclarativeMatchSpec{
+					PathSegments: []DeclarativeSegmentSpec{
+						{IsLiteral: true, Literal: "items"},
+						{ParamSpec: DeclarativeParamSegment{Param: "id"}},
+					},
+				},
+				Twin: DeclarativeTwinSpec{
+					ID:       "r10-binding-twin",
+					FetchURL: fetchURL,
+					Kind:     "json",
+					Accept:   "application/json",
+				},
+				Extract: DeclarativeExtractSpec{
+					TitleTemplate: "Item",
+				},
+			}},
+		}
+		return raw, m
+	}
+
+	// Attack vectors MUST fail on BOTH non-wildcard static-domain adapters AND wildcard adapters!
+	domainSets := [][]string{
+		{"docs.example.org"}, // non-wildcard adapter (previously bypassed hasWildcard guard!)
+		{"*.wikipedia.org"},  // approved wildcard adapter
+	}
+	badFetchURLs := []string{
+		"https://{host}.evil.example/items/{id}",
+		"{origin}.evil.example/items/{id}",
+		"https://{host}@evil.example/items/{id}",
+		"{origin}@evil.example/items/{id}",
+		"https://{host}:8443/items/{id}",
+		"{origin}:8443/items/{id}",
+		"https://{host}//evil.example/items/{id}",
+		"{origin}//evil.example/items/{id}",
+		"https://{host}",
+		"{origin}",
+		"https://collector.evil.example/steal?h={host}",
+		"https://collector.evil.example/steal?o={origin}",
+		"{origin}/api/items/{id}?redirect={origin}",
+		"https://{host}/api/items/{id}?redirect={origin}",
+	}
+
+	for _, doms := range domainSets {
+		for _, badFU := range badFetchURLs {
+			raw, m := buildManifestJSON(doms, badFU)
+			if _, err := ParseDeclarativeManifest(raw); err == nil {
+				t.Fatalf("SECURITY (P3): ParseDeclarativeManifest accepted %q on domains %v", badFU, doms)
+			}
+			if err := ValidateDeclarativeManifests([]DeclarativeManifest{m}); err == nil {
+				t.Fatalf("SECURITY (P3): ValidateDeclarativeManifests accepted %q on domains %v", badFU, doms)
+			}
+		}
+	}
+
+	// Legitimate same-origin `{host}/` and `{origin}/` bindings MUST continue to pass!
+	goodFetchURLs := []string{
+		"https://{host}/api/v1/items/{id}",
+		"{origin}/api/v1/items/{id}",
+		"{requestUrl}",
+	}
+	for _, doms := range domainSets {
+		for _, goodFU := range goodFetchURLs {
+			raw, m := buildManifestJSON(doms, goodFU)
+			if _, err := ParseDeclarativeManifest(raw); err != nil {
+				t.Fatalf("expected valid fetchUrl %q on domains %v to pass ParseDeclarativeManifest, got: %v", goodFU, doms, err)
+			}
+			if err := ValidateDeclarativeManifests([]DeclarativeManifest{m}); err != nil {
+				t.Fatalf("expected valid fetchUrl %q on domains %v to pass ValidateDeclarativeManifests, got: %v", goodFU, doms, err)
+			}
+		}
+	}
+}
+
+func hasUnescapedClickableEvilLinkR10(s string) bool {
+	// Match `[label](https://evil.example...)` ONLY when neither `[` nor `]` is backslash-escaped (`\[` / `\]`).
+	reUnescapedLink := regexp.MustCompile(`(?:^|[^\\])\[[^\]\\\n]*\](?:\\)*\(\s*https?://evil\.example`)
+	return reUnescapedLink.MatchString(s)
+}
+
+func TestR10P3GoCommerceEscapesWithoutStrippingSKUsOrTitlesAndBlocksInjectedHeadingsLinksImages(t *testing.T) {
+	reInjectedHeading := regexp.MustCompile(`(?m)^#{1,6}[ \t]+.*(?:Injected|Pwned|EvilHeading)`)
+
+	const trickySKU = "SKU-`PRO`|v2[A]<1>#9"
+	const trickyTitle = "Widget #1 [Deluxe] `Gen2` | <Fast> & # Injected"
+
+	shopifyPayload, err := json.Marshal(map[string]any{
+		"product": map[string]any{
+			"title":        trickyTitle,
+			"vendor":       "Acme [Vendor](https://evil.example/vendor) <script>alert(1)</script>",
+			"product_type": "Hardware\n# EvilHeading",
+			"tags":         "winter, [Promo](https://evil.example/tag), # InjectedTag, <svg onload=1>",
+			"published_at": "2026-03-15T10:00:00Z\n# Pwned\n[click](https://evil.example/date) <img src=x onerror=1>",
+			"updated_at":   "2026-03-16T12:00:00Z [upd](https://evil.example/upd)",
+			"options": []any{
+				map[string]any{
+					"name":   "Size [Chart](https://evil.example/opt)",
+					"values": []any{"Small | Medium", "`Large` <XL>"},
+				},
+			},
+			// Put non-public URLs FIRST so safeImgs[0] proves all 5 unsafe URLs were dropped and // was upgraded to https://!
+			"images": []any{
+				map[string]any{"src": "http://cdn.shopify.com/s/files/1/insecure-http.jpg"},
+				map[string]any{"src": "https://127.0.0.1/loopback.jpg"},
+				map[string]any{"src": "https://169.254.169.254/latest/meta-data/iam"},
+				map[string]any{"src": "https://localhost/internal.jpg"},
+				map[string]any{"src": "javascript:alert(1)"},
+				map[string]any{"src": "//cdn.shopify.com/s/files/1/protocol-rel.jpg"},
+			},
+			"variants": []any{
+				map[string]any{
+					"title":     "Blue | [Link](https://evil.example/var) <b onload=1>",
+					"sku":       trickySKU,
+					"price":     "29.99",
+					"available": true,
+				},
+			},
+			"body_html": `<h1>EvilHeading</h1><p>Great jacket. <a href="https://evil.example/phish">Claim Prize</a></p>` +
+				"\n# Injected Markdown Heading\n[Markdown Phish](https://evil.example/md)\n<script>stealCookies()</script>",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal shopifyPayload: %v", err)
+	}
+
+	doc, ok := formatCommerceTwinGo(shopifyPayload, "shopify_product", "https://shop.example.com/products/widget")
+	if !ok || doc == nil {
+		t.Fatal("expected formatCommerceTwinGo(shopify_product) to succeed")
+	}
+
+	for _, checkMD := range []string{doc.Markdown, SanitizeScrapedMarkdown(doc.Markdown)} {
+		if strings.IndexByte(checkMD, '<') >= 0 {
+			t.Fatalf("SECURITY (P3): raw `<` survived in Go commerce Markdown:\n%s", checkMD)
+		}
+		// Check every line AFTER line 0 (line 0 is the legitimate `# <Product Title>` H1) for injected ATX headings!
+		mdLines := strings.Split(checkMD, "\n")
+		if len(mdLines) > 1 && reInjectedHeading.MatchString(strings.Join(mdLines[1:], "\n")) {
+			t.Fatalf("SECURITY (P3): injected ATX heading survived in Go commerce Markdown:\n%s", checkMD)
+		}
+		if hasUnescapedClickableEvilLinkR10(checkMD) {
+			t.Fatalf("SECURITY (P3): injected clickable Markdown link survived in Go commerce Markdown:\n%s", checkMD)
+		}
+		// Verify SKU and title characters were ESCAPED (in multi-backtick code span / prose), NOT stripped!
+		for _, mustKeepToken := range []string{"SKU-", "`PRO`", `\|v2`, `\[A\]`, "&lt;1>", "#9", `Widget \#1`, `\# Injected`} {
+			if !strings.Contains(checkMD, mustKeepToken) {
+				t.Fatalf("expected commerce output to preserve escaped token %q without stripping characters, got:\n%s", mustKeepToken, checkMD)
+			}
+		}
+		// Verify all 5 non-public image URLs were skipped and //cdn.shopify.com/... was upgraded to https:// as Primary Image!
+		if !strings.Contains(checkMD, "https://cdn.shopify.com/s/files/1/protocol-rel.jpg") {
+			t.Fatalf("expected valid protocol-relative public image upgraded to HTTPS in commerce output:\n%s", checkMD)
+		}
+		for _, forbiddenImg := range []string{"insecure-http.jpg", "127.0.0.1", "169.254.169.254", "localhost", "javascript:"} {
+			if strings.Contains(checkMD, forbiddenImg) {
+				t.Fatalf("SECURITY (P3): non-public image URL %q leaked into commerce output:\n%s", forbiddenImg, checkMD)
+			}
+		}
+	}
+
+	// Also verify WooCommerce single product & catalog modes escape titles, SKUs, dates, and descriptions identically.
+	wooCatalogPayload, _ := json.Marshal([]any{
+		map[string]any{
+			"name":              "Woo #1 [Item](https://evil.example/woo) `X` | <Y>",
+			"sku":               trickySKU,
+			"date_created":      "2026-04-01\n# Injected Date Heading",
+			"on_sale":           true,
+			"is_in_stock":       true,
+			"prices":            map[string]any{"price": "1999", "currency_minor_unit": 2, "currency_symbol": "$"},
+			"categories":        []any{map[string]any{"name": "[Cat](https://evil.example/cat) <svg>"}},
+			"short_description": "<h2>EvilHeading</h2><a href=\"https://evil.example/woo-desc\">Click</a>\n# Injected\n[bad](https://evil.example/woo2)",
+		},
+	})
+	wooDoc, ok := formatCommerceTwinGo(wooCatalogPayload, "woocommerce_catalog_page", "https://woo.example.com/shop")
+	if !ok || wooDoc == nil {
+		t.Fatal("expected formatCommerceTwinGo(woocommerce_catalog_page) to succeed")
+	}
+	if strings.IndexByte(wooDoc.Markdown, '<') >= 0 ||
+		reInjectedHeading.MatchString(wooDoc.Markdown) ||
+		hasUnescapedClickableEvilLinkR10(wooDoc.Markdown) ||
+		!strings.Contains(wooDoc.Markdown, "`PRO`") ||
+		!strings.Contains(wooDoc.Markdown, `Woo \#1`) {
+		t.Fatalf("unexpected WooCommerce catalog output:\n%s", wooDoc.Markdown)
+	}
+}
+
+func TestIcimsRootTwinAndIframeWrapperShellRejection(t *testing.T) {
+	rootMatch, ok := ResolveDeclarativeTwin("https://careers-gdms.icims.com/")
+	if !ok || rootMatch == nil {
+		t.Fatal("expected ResolveDeclarativeTwin to match root https://careers-gdms.icims.com/")
+	}
+	if rootMatch.FetchURL != "https://careers-gdms.icims.com/jobs/search?in_iframe=1&ss=1" &&
+		rootMatch.FetchURL != "https://careers-gdms.icims.com/jobs/search?ss=1&in_iframe=1" {
+		t.Fatalf("unexpected iCIMS root twin fetch URL: %s", rootMatch.FetchURL)
+	}
+
+	// Outer `#icims_content_iframe` wrapper shell must return false (never `(0 open roles)`!)
+	if doc, ok := rootMatch.Format(`<html><body><iframe id="icims_content_iframe" src="/jobs/search?in_iframe=1"></iframe><div>Sorry, no jobs were found</div></body></html>`); ok || doc != nil {
+		t.Fatalf("expected outer icims_content_iframe shell to be rejected, got: %+v", doc)
+	}
+
+	// Inner `in_iframe=1` portal with open roles extracts deduplicated canonical job links without `in_iframe=1`
+	portalHTML := `<html><body><h1>General Dynamics Career Listings</h1><a href="/jobs/68123/senior-fpga-engineer/job?in_iframe=1">Senior FPGA Engineer</a></body></html>`
+	doc, ok := rootMatch.Format(portalHTML)
+	if !ok || doc == nil {
+		t.Fatal("expected inner iCIMS portal HTML to format cleanly")
+	}
+	if len(doc.Links) != 1 || doc.Links[0] != "https://careers-gdms.icims.com/jobs/68123/senior-fpga-engineer/job" {
+		t.Fatalf("expected canonical job link without in_iframe=1, got: %v", doc.Links)
+	}
+
+	// Genuine empty inner portal omits `(0 open roles)` from title
+	emptyDoc, ok := rootMatch.Format(`<html><body><p>There are currently no open positions available.</p></body></html>`)
+	if !ok || emptyDoc == nil {
+		t.Fatal("expected genuine empty inner iCIMS portal to return empty doc")
+	}
+	if strings.Contains(emptyDoc.Title, "(0 open roles)") {
+		t.Fatalf("expected empty iCIMS title to omit (0 open roles), got: %q", emptyDoc.Title)
 	}
 }

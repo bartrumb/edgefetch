@@ -2,7 +2,7 @@
 
 ## Overview
 
-`scripts` contains the POSIX shell container entrypoint (`all-in-one-entrypoint.sh`) for the all-in-one EdgeFetch image. It bootstraps the Node.js Hub server (`/app/hub/dist/portable-server.mjs`) alongside an optional sandboxed local Go agent (`/usr/local/bin/edgefetch --mode=agent`) with environment isolation and signal forwarding.
+`scripts` contains the POSIX shell container entrypoint (`all-in-one-entrypoint.sh`) for the all-in-one EdgeFetch image (`Dockerfile.all-in-one`). It bootstraps the Pure-Go Hub server (`/usr/local/bin/edgefetch --mode=hub` as UID `1000:1000`, with `EDGEFETCH_DISABLE_FALLBACK_CRAWLER=1` when the worker is active) alongside an optional sandboxed local Go agent (`/usr/local/bin/edgefetch --mode=agent` as UID `65532:65532`) with `env -i` secret isolation and signal forwarding.
 
 ## Interface
 
@@ -31,7 +31,7 @@
 
 - `[all-in-one-entrypoint.sh:PORT]` — Exports `PORT` (and conditionally `CALLER_TOKEN` and `AGENT_TOKEN`) in the shell environment.
 - `[all-in-one-entrypoint.sh:/dev/urandom]` — Reads 24 random bytes from `/dev/urandom` via `head`, `od`, and `tr` when `AGENT_TOKEN` is unset or empty.
-- `[all-in-one-entrypoint.sh:HUB_PID]` — Spawns `node /app/hub/dist/portable-server.mjs` in the background.
+- `[all-in-one-entrypoint.sh:HUB_PID]` — Spawns `/usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}"` under `su-exec 1000:1000` in the background.
 - `[all-in-one-entrypoint.sh:trap]` — Installs `INT` and `TERM` signal handlers on the entrypoint shell.
 - `[all-in-one-entrypoint.sh:AGENT_PID]` — Sleeps 1 second (`sleep 1`) and spawns `/usr/local/bin/edgefetch --mode=agent` in the background connecting to `http://127.0.0.1:${PORT}` unless `EDGEFETCH_DISABLE_LOCAL_AGENT="1"`.
 - `[all-in-one-entrypoint.sh:cleanup]` — Sends `SIGTERM` (`kill -TERM`) to `$HUB_PID` and `$AGENT_PID` upon termination signals.

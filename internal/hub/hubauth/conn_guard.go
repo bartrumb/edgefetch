@@ -269,7 +269,16 @@ func parseNormalizedAddr(raw string) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
-// ResolveClientIP extracts the canonical client IP for rate limiting and audit logging.
+func formatRateLimitAddr(addr netip.Addr) string {
+	if addr.Is6() && !addr.IsLoopback() {
+		if pfx, err := addr.Prefix(64); err == nil {
+			return pfx.Masked().Addr().String()
+		}
+	}
+	return addr.String()
+}
+
+// ResolveClientIP extracts the canonical client IP (or IPv6 /64 prefix) for rate limiting and audit logging.
 func ResolveClientIP(r *http.Request, trustProxy, trustFly bool) string {
 	if r == nil {
 		return "127.0.0.1"
@@ -278,7 +287,7 @@ func ResolveClientIP(r *http.Request, trustProxy, trustFly bool) string {
 		if vals := r.Header.Values("Fly-Client-IP"); len(vals) > 0 {
 			if last := strings.TrimSpace(vals[len(vals)-1]); last != "" && !strings.Contains(last, ",") {
 				if addr, ok := parseNormalizedAddr(last); ok {
-					return addr.String()
+					return formatRateLimitAddr(addr)
 				}
 			}
 		}
@@ -292,14 +301,14 @@ func ResolveClientIP(r *http.Request, trustProxy, trustFly bool) string {
 					continue
 				}
 				if addr, ok := parseNormalizedAddr(cand); ok {
-					return addr.String()
+					return formatRateLimitAddr(addr)
 				}
 				break
 			}
 		}
 	}
 	if addr, ok := parseNormalizedAddr(r.RemoteAddr); ok {
-		return addr.String()
+		return formatRateLimitAddr(addr)
 	}
 	return "127.0.0.1"
 }

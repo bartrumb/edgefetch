@@ -8,7 +8,7 @@ Straight answers to common architectural, operational, security, and ethical que
 
 | Question | **EdgeFetch** | **Firecrawl (Self-Hosted)** | **Crawl4AI** |
 |---|---|---|---|
-| **What do I have to run?** | **1 `~8 MB` static Go binary** (`edgefetch scrape` / `edgefetch mcp`) *or* **1 container** (`node:sqlite` + `/data` — no Redis, Postgres, or RabbitMQ) | Docker Compose with Redis, PostgreSQL, RabbitMQ, Playwright, and API (`2–4 GB+` RAM) | Python 3.10+ environment + Playwright (`600 MB–1.5 GB` RAM) |
+| **What do I have to run?** | **1 `~8 MB` static Go binary** (`edgefetch scrape` / `edgefetch mcp` / `edgefetch --mode=hub`) *or* **1 Pure-Go container** (`/data` — zero Node.js, no Redis, Postgres, or RabbitMQ) | Docker Compose with Redis, PostgreSQL, RabbitMQ, Playwright, and API (`2–4 GB+` RAM) | Python 3.10+ environment + Playwright (`600 MB–1.5 GB` RAM) |
 | **License** | **Open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)** | AGPL-3.0 (core) | Apache-2.0 (+ attribution) |
 | **Network model** | Workers dial **outbound** over `WSS /agent/ws` to **your own Hub** (`0` open inbound ports on home/NAS/RPi boxes) | Inbound HTTP service + optional paid proxy pool | Local Python library or inbound Docker API |
 | **Anti-bot stance** | **Enforces `robots.txt` & `Retry-After` on every hop; stops immediately at CAPTCHAs** | Paid cloud tier offers stealth/proxy escalation | Optional stealth / undetected-browser plugins |
@@ -43,7 +43,7 @@ Unthrottled stealth scraping through shared residential proxy pools is abusive �
 **Yes — EdgeFetch was built with coding agents and audited across 8 adversarial security review rounds.**
 
 - **Two-ring change control:**
-  - **Ring 1 — Declarative YAML Site Adapters (`internal/extract/manifests/*.yaml`):** Pure data (no executable code), compiled by [`hub/scripts/compile-manifests.mjs`](../hub/scripts/compile-manifests.mjs), monitored by a daily read-only live canary ([`edgefetch.dev/adapters/status/`](https://edgefetch.dev/adapters/status/)), and gated by [`hub/scripts/verify-adapter-only-diff.mjs`](../hub/scripts/verify-adapter-only-diff.mjs) so domain claims or `fetchUrl` hosts cannot widen without human sign-off.
+  - **Ring 1 — Declarative YAML Site Adapters (`internal/extract/manifests/*.yaml`):** Pure data (no executable code), compiled by [`hub/scripts/compile-manifests.mjs`](../hub/scripts/compile-manifests.mjs), monitored by a daily read-only live canary ([`edgefetch.dev/adapters/status/`](https://edgefetch.dev/adapters/status/)), and gated by `npm run adapter:check` + `npm run adapter:test`.
   - **Ring 0 — Core Engine, Auth, Vault, Sanitizer & SSRF (`cmd/`, `internal/`, `hub/src/`, `.github/`):** Human-approved merges, human-gated `release` environment before Ed25519 binary signing, and executed local PoC regression suites.
 - **Public engineering bug log:** Read **[docs/SECURITY-LOG.md](SECURITY-LOG.md)** for a candid breakdown of real bugs caught and fixed across Rounds 1–8 (including Markdown sanitizer vs. `marked`/`micromark+GFM` parser differentials, multi-user session/cache edge cases, ReDoS/quadratic scanner inputs, and CDP browser header isolation).
 - **Contributor expectations:** Issues, reproducible bug reports, WAF false-positive samples, and adapter requests are welcome; code pull requests are by invitation ([`.github/VOUCHED.td`](../.github/VOUCHED.td)). See **[CONTRIBUTING.md](../CONTRIBUTING.md)**.
@@ -63,7 +63,7 @@ Unthrottled stealth scraping through shared residential proxy pools is abusive �
 **You run your own Hub (if you even need one) — there is no vendor cloud, and Cloudflare is optional:**
 
 1. **Local `stdio` MCP (`edgefetch mcp`):** No Hub or Docker required — coding agents spawn `edgefetch mcp` locally over `stdio` (`0` open ports).
-2. **Self-Hosted Docker (`docker compose up -d` or Fly.io / Railway / Render):** Runs the 17-tool Hub, `57` declarative YAML adapters, `/admin` UI, and `node:sqlite` FTS5 + `/data` disk artifacts with zero cloud accounts.
+2. **Self-Hosted Docker (`docker compose up -d` or Fly.io / Railway / Render):** Runs the full-parity 17-tool Pure-Go Hub (`edgefetch --mode=hub`, zero Node.js), `56` declarative YAML adapters, `/admin` UI, and persistent `/data` BM25 search & disk/S3 artifacts with zero cloud accounts.
 3. **Standalone Go Hub (`edgefetch --mode=hub`):** Single static Go binary on any Linux/BSD VPS or Tailscale node.
 4. **Cloudflare Workers (`hub/`):** Hibernating WebSocket Durable Object (`AgentHubDO`) that sleeps at `$0` idle while keeping outbound worker WebSockets connected via edge auto-ping/pong, with optional R2 + D1 FTS5 storage.
 
@@ -97,5 +97,5 @@ Web pages are untrusted input. Before returning Markdown, EdgeFetch:
 
 ## 10. Why a linear HTML-to-Markdown pipeline instead of JSDOM + Readability + Turndown?
 
-- **Small, portable runtime:** `hub/` runs identically across Cloudflare Workers (`workerd`), Deno, and Node.js with `6` runtime npm packages in `hub/package.json` (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`), and the Go binary uses `1` external Go module (`github.com/coder/websocket`).
-- **Technical `<T>` generic & fence fidelity:** Naive HTML tag strippers corrupt `<T>` or `Promise<Array<string>>` as unknown HTML tags or leave `<script>`/`<nav>` noise in context. Verify locally in `< 3` seconds with `node bench/compare.mjs` (offline) or `node bench/compare.mjs --live` (**[bench/RESULTS.md](../bench/RESULTS.md)**).
+- **Small, Go-First runtime:** All pure-CPU HTML/Markdown/YAML/JSON extraction runs once in Go (`internal/extract`), powering both the single static Go binary (`1` external Go module: `github.com/coder/websocket`) and `edgefetch-core.wasm` inside the Cloudflare Worker Hub (`2` runtime npm packages: `jose`, `oauth4webapi`).
+- **Technical `<T>` generic & fence fidelity:** Naive HTML tag strippers corrupt `<T>` or `Promise<Array<string>>` as unknown HTML tags or leave `<script>`/`<nav>` noise in context. Verify locally in `< 3` seconds with `node bench/run-bench.mjs` (**[bench/RESULTS.md](../bench/RESULTS.md)**).

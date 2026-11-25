@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 type ScrapeCacheLookup struct {
@@ -199,10 +201,31 @@ func NewMemoryRouteStore() *MemoryRouteStore {
 }
 
 type RouteHandler struct {
-	deps  RouteDeps
-	mem   *MemoryRouteStore
-	catSt *catalog.CatalogStore
-	opCli *http.Client
+	deps   RouteDeps
+	mem    *MemoryRouteStore
+	catSt  *catalog.CatalogStore
+	opCli  *http.Client
+	pubCli *http.Client
+}
+
+func newPublicEgressClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   politeness.RejectNonPublicPeer,
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy:                 nil,
+			DialContext:           dialer.DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 25 * time.Second,
+			MaxIdleConnsPerHost:   2,
+			IdleConnTimeout:       60 * time.Second,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func NewRouteHandler(deps RouteDeps) *RouteHandler {
@@ -210,14 +233,19 @@ func NewRouteHandler(deps RouteDeps) *RouteHandler {
 	if catSt == nil {
 		catSt = catalog.NewCatalogStore()
 	}
+	pubCli := newPublicEgressClient()
 	opCli := deps.OperatorClient
 	if opCli == nil {
-		opCli = &http.Client{
-			Timeout:       30 * time.Second,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+		opCli = pubCli
 	}
-	return &RouteHandler{deps: deps, mem: NewMemoryRouteStore(), catSt: catSt, opCli: opCli}
+	return &RouteHandler{deps: deps, mem: NewMemoryRouteStore(), catSt: catSt, opCli: opCli, pubCli: pubCli}
+}
+
+func (h *RouteHandler) safeOutboundClientFor(u *url.URL) *http.Client {
+	if u != nil && isLoopbackHostnameOnly(u.Hostname()) && h.deps.OperatorClient != nil {
+		return h.opCli
+	}
+	return h.pubCli
 }
 
 func NewServerRouteDeps(s *Server) RouteDeps {

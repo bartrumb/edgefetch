@@ -761,39 +761,86 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	if modes.hub {
 		defaultOtelSvc = "edgefetch-go-hub"
 	}
-	crawler := crawl.NewCrawler(crawlTr, allow, ua, log)
-	defer func() { _ = crawler.Close() }()
+	disableFallback := isTruthyEnv(deps.getenv("EDGEFETCH_DISABLE_FALLBACK_CRAWLER"))
+	var crawler *crawl.Crawler
+	if !(modes.hub && !modes.agent && disableFallback) {
+		crawler = crawl.NewCrawler(crawlTr, allow, ua, log)
+		defer func() { _ = crawler.Close() }()
+	}
 	bypassHosts := splitCSV(firstNonEmpty(deps.getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS"), deps.getenv("ROBOTS_BYPASS_HOSTS"), deps.getenv("CRAWLER_ROBOTS_BYPASS_HOSTS")))
 	if len(bypassHosts) == 0 && len(agentCfg.RobotsBypassHosts) > 0 {
 		bypassHosts = agentCfg.RobotsBypassHosts
 	}
-	crawler.SetRobotsBypassHosts(bypassHosts)
-	crawler.SetAllowNoSandboxBrowser(agentCfg.AllowNoSandboxBrowser || isTruthyEnv(deps.getenv("EDGEFETCH_ALLOW_NO_SANDBOX")))
 	otelExp := otel.NewExporterFromEnv(deps.getenv, defaultOtelSvc, agent.Version, hubTr)
-	crawler.SetOtelExporter(otelExp)
+	if modes.hub && otelExp == nil && !otel.IsDoNotTrack(deps.getenv("DO_NOT_TRACK")) {
+		otelExp = otel.NewStandbyDevTelemetryExporter(deps.getenv, defaultOtelSvc, agent.Version, hubTr)
+	}
+	if otelExp != nil {
+		defer func() { _ = otelExp.Close() }()
+	}
+	if crawler != nil {
+		crawler.SetRobotsBypassHosts(bypassHosts)
+		crawler.SetAllowNoSandboxBrowser(agentCfg.AllowNoSandboxBrowser || isTruthyEnv(deps.getenv("EDGEFETCH_ALLOW_NO_SANDBOX")))
+		crawler.SetOtelExporter(otelExp)
+	}
 	botSigner, botErr := configureCrawlerBotAuth(crawler, agentCfg.HubURLs, deps.getenv, log)
 	if botErr != nil {
+		return 2
+	}
+
+	var agentTokensMap map[string]string
+	var sharedAgentTok, mcpToken string
+	if modes.hub {
+		var tokErr error
+		agentTokensMap, tokErr = hub.ParseAgentTokensJSON(firstNonEmpty(deps.getenv("EDGEFETCH_AGENT_TOKENS"), deps.getenv("AGENT_TOKENS")))
+		if tokErr != nil {
+			log.Error("hub_agent_tokens_config", slog.String("error", tokErr.Error()))
+			return 2
+		}
+		sharedAgentTok = firstNonEmpty(deps.getenv("EDGEFETCH_AGENT_TOKEN"), deps.getenv("AGENT_TOKEN"))
+		if sharedAgentTok != "" && len(sharedAgentTok) < agent.MinTokenLength {
+			log.Error("hub_agent_token_config", slog.String("error", "EDGEFETCH_AGENT_TOKEN must be at least 24 characters"))
+			return 2
+		}
+		mcpToken = strings.TrimSpace(deps.getenv("MCP_TOKEN"))
+		if mcpToken != "" && len(mcpToken) < agent.MinTokenLength {
+			log.Error("hub_mcp_token_config", slog.String("error", "MCP_TOKEN must be at least 24 characters"))
+			return 2
+		}
+	}
+
+	ln, listenErr := net.Listen("tcp", addr)
+	if listenErr != nil {
+		log.Error("listen", slog.String("addr", addr), slog.String("error", listenErr.Error()))
+		return 1
+	}
+	if modes.hub {
+		maxTotal, _ := strconv.Atoi(firstNonEmpty(deps.getenv("EDGEFETCH_MAX_TOTAL_SOCKETS"), deps.getenv("EDGEFETCH_MAX_CONNECTIONS_TOTAL")))
+		maxPerIP, _ := strconv.Atoi(firstNonEmpty(deps.getenv("EDGEFETCH_MAX_ESTABLISHED_SOCKETS_PER_IP"), deps.getenv("EDGEFETCH_MAX_CONNECTIONS_PER_IP")))
+		ln = hubauth.WrapListener(ln, hubauth.ConnGuardOptions{
+			MaxTotal: maxTotal,
+			MaxPerIP: maxPerIP,
+		})
+	}
+	if deps.onListen != nil {
+		deps.onListen(ln.Addr())
+	}
+	// Drop root privileges after reading /data/options.json, locking down /data, and binding the TCP listener —
+	// and BEFORE creating Hub DataDir state — so unprivileged UID owns EDGEFETCH_DATA_DIR cleanly!
+	if err := deps.lockDownSecrets(deps.haPath); err != nil {
+		log.Error("lockdown_secrets", slog.String("error", err.Error()))
+		_ = ln.Close()
+		return 2
+	}
+	if err := deps.dropRoot(); err != nil {
+		log.Error("drop_privileges", slog.String("error", err.Error()))
+		_ = ln.Close()
 		return 2
 	}
 
 	var handler http.Handler
 	var goHub *hub.Server
 	if modes.hub {
-		agentTokensMap, tokErr := hub.ParseAgentTokensJSON(firstNonEmpty(deps.getenv("EDGEFETCH_AGENT_TOKENS"), deps.getenv("AGENT_TOKENS")))
-		if tokErr != nil {
-			log.Error("hub_agent_tokens_config", slog.String("error", tokErr.Error()))
-			return 2
-		}
-		sharedAgentTok := firstNonEmpty(deps.getenv("EDGEFETCH_AGENT_TOKEN"), deps.getenv("AGENT_TOKEN"))
-		if sharedAgentTok != "" && len(sharedAgentTok) < agent.MinTokenLength {
-			log.Error("hub_agent_token_config", slog.String("error", "EDGEFETCH_AGENT_TOKEN must be at least 24 characters"))
-			return 2
-		}
-		mcpToken := strings.TrimSpace(deps.getenv("MCP_TOKEN"))
-		if mcpToken != "" && len(mcpToken) < agent.MinTokenLength {
-			log.Error("hub_mcp_token_config", slog.String("error", "MCP_TOKEN must be at least 24 characters"))
-			return 2
-		}
 		operatorClient := &http.Client{
 			Timeout:   35 * time.Second,
 			Transport: hubTr,
@@ -831,35 +878,6 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		handler = goHub
 	} else {
 		handler = crawl.NewAuthenticatedHandler(crawler, allow, serverToken)
-	}
-
-	ln, listenErr := net.Listen("tcp", addr)
-	if listenErr != nil {
-		log.Error("listen", slog.String("addr", addr), slog.String("error", listenErr.Error()))
-		return 1
-	}
-	if modes.hub {
-		maxTotal, _ := strconv.Atoi(firstNonEmpty(deps.getenv("EDGEFETCH_MAX_TOTAL_SOCKETS"), deps.getenv("EDGEFETCH_MAX_CONNECTIONS_TOTAL")))
-		maxPerIP, _ := strconv.Atoi(firstNonEmpty(deps.getenv("EDGEFETCH_MAX_ESTABLISHED_SOCKETS_PER_IP"), deps.getenv("EDGEFETCH_MAX_CONNECTIONS_PER_IP")))
-		ln = hubauth.WrapListener(ln, hubauth.ConnGuardOptions{
-			MaxTotal: maxTotal,
-			MaxPerIP: maxPerIP,
-		})
-	}
-	if deps.onListen != nil {
-		deps.onListen(ln.Addr())
-	}
-	// Drop root privileges after reading /data/options.json, locking down /data, and binding the TCP listener so
-	// hybrid/server/hub modes run unprivileged (65532:65532) just like pure agent mode!
-	if err := deps.lockDownSecrets(deps.haPath); err != nil {
-		log.Error("lockdown_secrets", slog.String("error", err.Error()))
-		_ = ln.Close()
-		return 2
-	}
-	if err := deps.dropRoot(); err != nil {
-		log.Error("drop_privileges", slog.String("error", err.Error()))
-		_ = ln.Close()
-		return 2
 	}
 
 	srv := newHTTPServer(addr, handler)

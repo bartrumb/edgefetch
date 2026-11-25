@@ -239,6 +239,7 @@ func runMockCDPTrackerRender(
 }
 
 func TestAcceptance3_4_5_7_TrackerBlockingInRenderer(t *testing.T) {
+	t.Parallel()
 	allowAll := func(*url.URL) error { return nil }
 
 	// --- Acceptance 7 (part B): Agent with NO tracker list blocks nothing ---
@@ -374,6 +375,7 @@ func TestAcceptance3_4_5_7_TrackerBlockingInRenderer(t *testing.T) {
 }
 
 func TestRetainedSessionCrossOriginBounceTaintsStep2HeadersWhenTrackerBlockingActive(t *testing.T) {
+	t.Parallel()
 	allowAll := func(*url.URL) error { return nil }
 
 	var (
@@ -618,6 +620,7 @@ func TestRetainedSessionCrossOriginBounceTaintsStep2HeadersWhenTrackerBlockingAc
 }
 
 func TestPostCommitRedirectUsesCommittedDocForTrackerScoping(t *testing.T) {
+	t.Parallel()
 	r := NewMockRenderer("ws://127.0.0.1:1", func(*url.URL) error { return nil }, "EdgeFetch/2.7")
 	defer r.Close()
 	r.SetTrackerList("2026112401", []string{"short-tracker.test", "google-analytics.com"})

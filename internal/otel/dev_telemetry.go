@@ -338,7 +338,26 @@ func ScrubSpanToDevErrorReport(s Span, serviceName, serviceVersion string) (DevE
 }
 
 func (e *Exporter) sendDevErrorBatch(ctx context.Context, spans []Span) {
-	if e == nil || e.devTelemetryURL == "" || e.client == nil {
+	if e == nil || e.client == nil {
+		return
+	}
+	if e.getenv != nil && IsDoNotTrack(e.getenv("DO_NOT_TRACK")) {
+		return
+	}
+	rtOpt := e.runtimeDevOptIn.Load()
+	if rtOpt < 0 {
+		return
+	}
+	targetURL := e.devTelemetryURL
+	if targetURL == "" && rtOpt > 0 {
+		targetURL = DefaultDevTelemetryURL
+		if e.getenv != nil {
+			if c := strings.TrimSpace(e.getenv("EDGEFETCH_DEV_TELEMETRY_URL")); c != "" {
+				targetURL = c
+			}
+		}
+	}
+	if targetURL == "" {
 		return
 	}
 	seen := make(map[string]struct{}, len(spans))
@@ -372,7 +391,7 @@ func (e *Exporter) sendDevErrorBatch(ctx context.Context, spans []Span) {
 	if err != nil || len(bodyBytes) > 8192 {
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.devTelemetryURL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return
 	}

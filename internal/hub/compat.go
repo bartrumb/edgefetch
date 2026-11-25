@@ -167,6 +167,11 @@ func (h *RouteHandler) handleFirecrawlV2Compat(w http.ResponseWriter, r *http.Re
 		if !okBody {
 			return
 		}
+		if boolField(payload["scrape"]) && !pr.HasScope("crawl:fetch") {
+			w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="crawl:fetch"`)
+			writeJSON(w, http.StatusForbidden, map[string]any{"success": false, "error": "insufficient_scope"})
+			return
+		}
 		out, status := h.ExecuteSearch(r.Context(), payload, r.Header, pr.EffectiveOwnerID())
 		if status >= 400 {
 			writeJSON(w, status, map[string]any{"success": false, "error": firstNonEmpty(strField(out["error"]), "search_failed")})
@@ -281,6 +286,11 @@ func (h *RouteHandler) handleTavilyCompat(w http.ResponseWriter, r *http.Request
 		q := strings.TrimSpace(strField(payload["query"]))
 		maxRes := intField(payload["max_results"], 5, 1, 20)
 		incRaw := payload["include_raw_content"] == true || strField(payload["include_raw_content"]) == "markdown"
+		if incRaw && !pr.HasScope("crawl:fetch") {
+			w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="crawl:fetch"`)
+			writeJSON(w, http.StatusForbidden, map[string]any{"detail": map[string]any{"error": "insufficient_scope"}})
+			return
+		}
 		out, status := h.ExecuteSearch(r.Context(), map[string]any{
 			"query":  q,
 			"limit":  maxRes,

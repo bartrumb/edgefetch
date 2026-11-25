@@ -597,3 +597,90 @@ func TestGuardedListenerOriginsAndHeaders(t *testing.T) {
 		t.Fatalf("missing security headers")
 	}
 }
+
+func TestRegisterRateLimitAndPersistedTelemetrySync(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	callerTok := "caller_secret_token_abcdefghijklmnopqrstuvwxyz"
+	var toggleCalls []bool
+	mgr, srv := newTestServer(t, Config{
+		DataDir:     dataDir,
+		CallerToken: callerTok,
+		Getenv: func(k string) string {
+			if k == "EDGEFETCH_DEV_TELEMETRY" {
+				return "1"
+			}
+			return ""
+		},
+		Callbacks: Callbacks{
+			OnTelemetryToggle: func(enabled bool) {
+				toggleCalls = append(toggleCalls, enabled)
+			},
+		},
+	})
+	_ = mgr
+
+	// 5 valid dynamic client registrations from the same IP succeed; the 6th returns 429 Retry-After: 600.
+	regPayload := `{"client_name":"cli","redirect_uris":["http://127.0.0.1:53123/cb"]}`
+	for i := range 5 {
+		res, err := http.Post(srv.URL+"/oauth/register", "application/json", strings.NewReader(regPayload))
+		if err != nil {
+			t.Fatalf("register %d: %v", i+1, err)
+		}
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusCreated {
+			t.Fatalf("register %d expected 201, got %d", i+1, res.StatusCode)
+		}
+	}
+	res6, err := http.Post(srv.URL+"/oauth/register", "application/json", strings.NewReader(regPayload))
+	if err != nil {
+		t.Fatalf("register 6: %v", err)
+	}
+	_ = res6.Body.Close()
+	if res6.StatusCode != http.StatusTooManyRequests || res6.Header.Get("Retry-After") != "600" {
+		t.Fatalf("expected 429 Retry-After=600 on 6th /oauth/register, got %d (%q)", res6.StatusCode, res6.Header.Get("Retry-After"))
+	}
+
+	// Admin opts out of telemetry -> persisted to oauth_state.json -> fresh Manager reload calls OnTelemetryToggle(false).
+	noRedir := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	loginRes, err := noRedir.PostForm(srv.URL+"/admin/login", url.Values{"token": {callerTok}})
+	if err != nil || loginRes.StatusCode != http.StatusFound {
+		t.Fatalf("admin login failed: %v status=%v", err, loginRes)
+	}
+	_ = loginRes.Body.Close()
+	cookieVal := regexp.MustCompile(`ef_admin_session=([^;]+)`).FindStringSubmatch(loginRes.Header.Get("Set-Cookie"))[1]
+	csrf := strings.Split(cookieVal, ".")[2]
+	sessionCookie := "ef_admin_session=" + cookieVal
+
+	optOutReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/api/telemetry", strings.NewReader(`{"enabled":false}`))
+	optOutReq.Header.Set("Cookie", sessionCookie)
+	optOutReq.Header.Set("X-CSRF-Token", csrf)
+	optOutRes, _ := http.DefaultClient.Do(optOutReq)
+	_ = optOutRes.Body.Close()
+	if optOutRes.StatusCode != http.StatusOK || len(toggleCalls) != 1 || toggleCalls[0] != false {
+		t.Fatalf("expected live OnTelemetryToggle(false), got status=%d calls=%v", optOutRes.StatusCode, toggleCalls)
+	}
+
+	var startupToggles []bool
+	reloaded, rErr := NewManager(Config{
+		DataDir:     dataDir,
+		CallerToken: callerTok,
+		Getenv: func(k string) string {
+			if k == "EDGEFETCH_DEV_TELEMETRY" {
+				return "1"
+			}
+			return ""
+		},
+		Callbacks: Callbacks{
+			OnTelemetryToggle: func(enabled bool) {
+				startupToggles = append(startupToggles, enabled)
+			},
+		},
+	})
+	if rErr != nil || reloaded == nil {
+		t.Fatalf("reload NewManager: %v", rErr)
+	}
+	if len(startupToggles) != 1 || startupToggles[0] != false {
+		t.Fatalf("expected persisted TelemetryOptIn=false to sync on Hub startup, got %v", startupToggles)
+	}
+}

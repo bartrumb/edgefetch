@@ -55,6 +55,7 @@ func (h *RouteHandler) ExecuteExtract(ctx context.Context, payload map[string]an
 	llmCfgOut := agentloop.ResolveLLMConfig(agentloop.ResolveLLMConfigInput{
 		Env:        h.llmEnvConfig(),
 		RequestLLM: rawJSONField(payload["llm"]),
+		SelfHost:   hostOfURL(h.publicOriginOf(nil)),
 	})
 
 	items := make([]map[string]any, 0, len(urls))

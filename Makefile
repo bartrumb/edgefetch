@@ -36,7 +36,7 @@ doctor: build
 	./edgefetch doctor
 
 hub-test:
-	cd hub && npm ci --no-audit --no-fund && npm run build:portable && npm run type-check && npm test && npm run deploy:dry
+	cd hub && npm ci --no-audit --no-fund && npm run type-check && npm test && npm run deploy:dry
 
 up:
 	docker compose up --build -d

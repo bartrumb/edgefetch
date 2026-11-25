@@ -81,6 +81,7 @@ func (h *RouteHandler) ExecuteAgent(
 	llmOut := agentloop.ResolveLLMConfig(agentloop.ResolveLLMConfigInput{
 		Env:        h.llmEnvConfig(),
 		RequestLLM: rawJSONField(payload["llm"]),
+		SelfHost:   hostOfURL(h.publicOriginOf(nil)),
 	})
 	if !llmOut.OK {
 		statusOut = http.StatusBadRequest
@@ -200,8 +201,13 @@ func (h *RouteHandler) llmTransportFor(parentCtx context.Context, cfg agentloop.
 			span.End(false, "unsupported_llm_kind")
 			return agentloop.LLMTransportResponse{}, fmt.Errorf("unsupported LLM transport kind")
 		}
+		pu, uErr := url.Parse(endpoint)
+		if uErr != nil || pu.Host == "" {
+			span.End(false, "bad_url")
+			return agentloop.LLMTransportResponse{}, fmt.Errorf("invalid LLM endpoint")
+		}
 		if cfg.UseSafePublicFetch && !cfg.IsOfflineLocal {
-			if pu, err := url.Parse(endpoint); err != nil || h.allowURL(pu) != nil {
+			if h.allowURL(pu) != nil {
 				span.End(false, "ssrf_blocked")
 				return agentloop.LLMTransportResponse{}, fmt.Errorf("disallowed LLM endpoint")
 			}
@@ -214,7 +220,7 @@ func (h *RouteHandler) llmTransportFor(parentCtx context.Context, cfg agentloop.
 		for k, v := range req.HTTP.Headers {
 			httpReq.Header.Set(k, v)
 		}
-		resp, err := h.opCli.Do(httpReq)
+		resp, err := h.safeOutboundClientFor(pu).Do(httpReq)
 		if err != nil {
 			span.End(false, "transport_error")
 			return agentloop.LLMTransportResponse{}, fmt.Errorf("LLM transport failed")
@@ -290,6 +296,11 @@ func (h *RouteHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, okBody := readV1JSON(w, r)
 	if !okBody {
+		return
+	}
+	if boolField(payload["scrape"]) && !p.HasScope("crawl:fetch") {
+		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="crawl:fetch"`)
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "insufficient_scope", "required": "crawl:fetch"})
 		return
 	}
 	out, status := h.ExecuteSearch(r.Context(), payload, r.Header, p.EffectiveOwnerID())
@@ -406,7 +417,7 @@ func (h *RouteHandler) ExecuteDiscoverMcpRegistry(ctx context.Context, query str
 			return nil
 		}
 		req.Header.Set("Accept", "application/json")
-		resp, err := h.opCli.Do(req)
+		resp, err := h.safeOutboundClientFor(u).Do(req)
 		if err != nil {
 			return nil
 		}
@@ -501,6 +512,12 @@ func (h *RouteHandler) ExecuteFederatedMcpQuery(ctx context.Context, payload map
 		statusOut = http.StatusBadRequest
 		return map[string]any{"ok": false, "error": "invalid_mcp_endpoint"}, statusOut
 	}
+	if !(isLoopbackHostnameOnly(epURL.Hostname()) && h.deps.OperatorClient != nil) {
+		if !mcpfed.IsSafePublicHTTPSURL(found.EndpointURL, hostOfURL(h.publicOriginOf(nil))).OK {
+			statusOut = http.StatusForbidden
+			return map[string]any{"ok": false, "error": "disallowed_mcp_endpoint"}, statusOut
+		}
+	}
 	remoteOrigin := epURL.Scheme + "://" + epURL.Host
 	secret, okSec := h.resolveMcpSecret(*found, p.EffectiveOwnerID(), remoteOrigin)
 	if !okSec {
@@ -537,7 +554,7 @@ func (h *RouteHandler) ExecuteFederatedMcpQuery(ctx context.Context, payload map
 			httpReq.Header.Set(kv.Key, vs)
 		}
 	}
-	resp, err := h.opCli.Do(httpReq)
+	resp, err := h.safeOutboundClientFor(epURL).Do(httpReq)
 	if err != nil {
 		statusOut = http.StatusBadGateway
 		return map[string]any{"ok": false, "error": "upstream_unreachable"}, statusOut

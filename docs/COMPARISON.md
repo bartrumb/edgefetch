@@ -9,8 +9,8 @@ This document compares **EdgeFetch (`v2.7.7`)** against common open-source and c
 | Capability / Architecture | **EdgeFetch (`v2.7.7`)** | **Firecrawl (Self-Hosted & `firecrawl-local`)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
 |---|---|---|---|---|---|---|
 | **License** | **Open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 | MIT / Apache-2.0 |
-| **Minimum Self-Hosted Stack** | **1 `~8 MB` static Go binary** *or* **1 container** (`node:sqlite` + `/data`, no Redis, Postgres, or RabbitMQ) | Full stack: Redis + PostgreSQL + RabbitMQ + Playwright + API (`2–4 GB+` RAM); `firecrawl-local` requires Node 22 `npx` + Rust/C toolchain | Cloud API key only | Python 3.10+ + Playwright (`~600 MB–1.5 GB` RAM) | Node.js + Puppeteer / Firebase deps | Library / CLI only (no crawler fleet or MCP server) |
-| **Auditable Dependencies** | **Go: `1` module (`github.com/coder/websocket`, `0` transitive); Hub: `6` npm packages (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`)** | Dozens of npm + Rust + system packages | Vendor SaaS | 40+ Python / PyPI packages | Dozens of npm packages | 0–5 library packages |
+| **Minimum Self-Hosted Stack** | **1 `~8 MB` static Go binary** (`edgefetch --mode=hub`) *or* **1 Pure-Go container** (`/data`, zero Node.js, no Redis, Postgres, or RabbitMQ) | Full stack: Redis + PostgreSQL + RabbitMQ + Playwright + API (`2–4 GB+` RAM); `firecrawl-local` requires Node 22 `npx` + Rust/C toolchain | Cloud API key only | Python 3.10+ + Playwright (`~600 MB–1.5 GB` RAM) | Node.js + Puppeteer / Firebase deps | Library / CLI only (no crawler fleet or MCP server) |
+| **Auditable Dependencies** | **Go: `1` module (`github.com/coder/websocket`, `0` transitive); Cloudflare Worker Hub: `2` npm packages (`jose`, `oauth4webapi`) + `edgefetch-core.wasm`** | Dozens of npm + Rust + system packages | Vendor SaaS | 40+ Python / PyPI packages | Dozens of npm packages | 0–5 library packages |
 | **Outbound-Only Edge Workers (`0` Open Ports)** | **Yes — workers dial *your own* Hub over `WSS /agent/ws` (works behind CGNAT, Starlink, Home Assistant OS, NAS)** | No (requires inbound ports, VPN tunnel, or external proxy service) | Managed proxy pool (billed per credit) | No (single-host or DIY queue) | No | N/A |
 | **Local `stdio` MCP (`edgefetch mcp`) & Background Telemetry** | **Yes — `~8 MB` binary; `0` background telemetry or update checks by default (`EDGEFETCH_DEV_TELEMETRY` & `EDGEFETCH_CHECK_UPDATES` opt-in; `DO_NOT_TRACK=1` hard override)** | `firecrawl-local` requires Node 22+ `npx`, sends install telemetry, and disables private-IP blocks in `mcp` mode | Requires cloud API key (`npx firecrawl-mcp` / `tavily-mcp`) | Python + Playwright environment | Cloud URL or Node server | No |
 | **SSRF & Browser Subresource Isolation** | **Dial-time `net.Dialer.Control` `RejectNonPublicPeer` + loopback `CONNECT` `SSRFProxy` (`MAP * ~NOTFOUND`) + fail-closed Linux seccomp sandbox** | Application-level URL blocklist | Vendor-managed | Optional / application-level | Application-level | None (caller fetches) |
@@ -23,7 +23,7 @@ This document compares **EdgeFetch (`v2.7.7`)** against common open-source and c
 
 ## 2. Extraction & Search Capabilities
 
-Reproduce HTML-to-Markdown extraction, `<T>` generic preservation, code-fence balance, and latency locally in `< 3` seconds via `node bench/compare.mjs` (**[bench/RESULTS.md](../bench/RESULTS.md)**).
+Reproduce HTML-to-Markdown extraction, `<T>` generic preservation, code-fence balance, and latency locally in `< 3` seconds via `node bench/run-bench.mjs` (**[bench/RESULTS.md](../bench/RESULTS.md)**).
 
 | Content / RAG Capability | **EdgeFetch (`v2.7.7`)** | **Firecrawl** | **Crawl4AI** | **Jina Reader** | **Tavily** |
 |---|:---:|:---:|:---:|:---:|:---:|
@@ -48,8 +48,8 @@ Self-hosted crawlers usually force a choice between datacenter VPS IPs (which fr
 
 ### 2. Minimal Dependency Surface
 Running Firecrawl self-hosted requires operating Redis, PostgreSQL, RabbitMQ, Playwright, and a Node API under AGPL-3.0.
-- EdgeFetch's worker, CLI, `stdio` MCP, and pure-Go Hub compile into a single `~8 MB` static binary (`go list -m all` -> `1` external Go dependency: `github.com/coder/websocket`).
-- EdgeFetch's optional TypeScript Hub (`hub/package.json`) uses `6` runtime npm packages (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`) and bundles into a single `dist/portable-server.mjs` backed by built-in `node:sqlite` FTS5 + a `/data` directory.
+- EdgeFetch's worker, CLI, `stdio` MCP, and full-parity self-hosted Hub (`edgefetch --mode=hub`) compile into a single `~8 MB` static binary (`go list -m all` -> `1` external Go dependency: `github.com/coder/websocket`, zero Node.js required).
+- EdgeFetch's optional Cloudflare Worker edge router (`hub/package.json`) uses only `2` runtime npm packages (`jose`, `oauth4webapi`) alongside the embedded pure-Go `edgefetch-core.wasm` engine.
 
 ### 3. Defense-in-Depth SSRF & Public Security Bug Log
 Pointing an HTTP client or headless browser at agent-supplied URLs exposes high-severity SSRF, ReDoS, and Markdown XSS surfaces:

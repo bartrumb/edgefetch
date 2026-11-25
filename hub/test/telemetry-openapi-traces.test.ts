@@ -1,34 +1,2273 @@
+/**
+ * Consolidated Portable Runtime, Telemetry/OTel, OpenAPI Contract, Manifests & Live Traces Suite
+ * (Consolidated from Rounds 7–10 telemetry/OpenAPI/manifests/live-traces suites)
+ */
+
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
-import { AgentHubEngine, createMemoryCooldownStore, routeFetchWithFailover, type HubSocketLike } from '../src/agent-hub.ts';
-import { executeCatalogCall, getCatalogRecords, resetCatalogStateForTests } from '../src/catalog.ts';
+import compiledBundleJson from '../../internal/extract/manifests/compiled.json';
+import meta0001 from '../migrations/meta/0001_tracking.sql';
+import search0001 from '../migrations/search/0001_fts.sql';
+import {
+  AgentHubEngine,
+  createMemoryCooldownStore,
+  type HubSocketLike,
+  routeFetchWithFailover,
+} from '../src/agent-hub.ts';
+import {
+  executeCatalogCall,
+  getCatalogRecords,
+  getCatalogStatus,
+  resetCatalogStateForTests,
+} from '../src/catalog.ts';
+import {
+  DEV_TELEMETRY_SETTING_KEY,
+  flushDevErrorTelemetry,
+  isDoNotTrackEnabled,
+  resolveDevTelemetryEndpoint,
+  resolveDevTelemetryState,
+  scrubSpanToDevErrorReport,
+  validateDevErrorReport,
+} from '../src/dev-telemetry.ts';
+import {
+  buildDeclarativeCatalogSpec,
+  type DeclarativeCatalogConfig,
+  VALID_CATALOG_PLATFORMS,
+} from '../src/extractors/commerce-engine.ts';
+import {
+  compileDeclarativeAdapter,
+  type CompiledManifestBundle,
+  compileValidatedManifestSet,
+  DECLARATIVE_SITE_ADAPTERS,
+  type DeclarativeAdapterManifest,
+  parseDeclarativeManifest,
+  matchesApprovedWildcard as runtimeWildcardMatch,
+} from '../src/extractors/declarative.ts';
+import hubWorker from '../src/index.ts';
 import {
   discoverAtsBoardsFromHtml,
   executeJobsCall,
   extractJobPostingJsonLd,
+  matchesAllowedCompanyOrDomain,
   parsePayFromText,
   parseSmartRecruitersBoardScrape,
   resetJobsCacheForTests,
   resolveAtsPreFetchSpec,
+  type StructuredJobRecord,
 } from '../src/jobs.ts';
 import { executeCrawlJob } from '../src/map-crawl.ts';
-import { sanitizeErrorMessageForSpan, sanitizeSpanAttributes } from '../src/otel.ts';
-import { handleMcpRequest } from '../src/mcp.ts';
-import { executeInteractCall, executeScrapeCall } from '../src/scrape.ts';
-import { executeSearchCall, resetSearchProviderPacingForTests } from '../src/web-search.ts';
-import { resetWikipediaStateForTests } from '../src/wikipedia.ts';
+import { buildCanonicalMcpToolSchemas, handleMcpRequest, MCP_TOOL_SCHEMAS } from '../src/mcp.ts';
+import { ADMIN_COOKIE_NAME, createAdminSessionValue, createMemoryOAuthStore } from '../src/oauth.ts';
+import { buildOpenApiSpec } from '../src/openapi.ts';
+import {
+  buildCrawlChildSpans,
+  buildOtlpTracePayload,
+  createRequestTraceContext,
+  MAX_PUBLIC_UNAUTH_INFLIGHT_OTLP,
+  parseOtlpHeaders,
+  parseTraceparent,
+  resetOtlpExportLimitersForTests,
+  resolveOtlpTracesUrl,
+  sanitizeErrorMessageForSpan,
+  sanitizeSpanAttributes,
+  sanitizeUrlForSpan,
+  SECURITY_AUDIT_OTLP_CAPACITY,
+  UNAUTH_OTLP_EXPORT_CAPACITY,
+} from '../src/otel.ts';
+import {
+  cloudflareOverflowFetch,
+  fetchOverflowRobots,
+  isRobotsAllowed,
+  parseOverflowRobotsTxt,
+  resetOverflowRobotsCacheForTests,
+} from '../src/overflow.ts';
+import { getRegistrableDomain, hasPrivateSharedHostingSuffix, isPublicOrPrivateSuffix } from '../src/psl.ts';
 import {
   computeMarkdownSliceCheckpoints,
   sanitizeFullMarkdownDocumentForArtifact,
   sanitizeMarkdownPageSlice,
 } from '../src/scrape-advanced.ts';
+import { executeInteractCall, executeScrapeCall } from '../src/scrape.ts';
 import { ensureD1ColumnIfMissing, executeExtractCall } from '../src/search-index.ts';
 import { isEligibleForExternalSpaFallback } from '../src/spa-fallback.ts';
 import { handleAgentArtifactUpload, resetRecentArtifactUploadsForTests } from '../src/storage.ts';
+import { executeSearchCall, resetSearchProviderPacingForTests } from '../src/web-search.ts';
+import { resetWikipediaStateForTests } from '../src/wikipedia.ts';
+import collectorWorker, {
+  type D1DatabaseLike,
+  type D1PreparedStatementLike,
+  IPV6_PREFIX48_RATE_LIMIT_CAPACITY,
+  MAX_EVENTS_PER_POST,
+  RATE_LIMIT_CAPACITY,
+  resetCollectorRateLimiters,
+} from '../../telemetry/src/index.ts';
+import {
+  getRegistrableDomain as compilerGetReg,
+  hasPrivateSharedHostingSuffix as compilerHasPriv,
+  isPublicOrPrivateSuffix as compilerIsSuffix,
+  matchesApprovedWildcard as compilerWildcardMatch,
+  validateManifestSet,
+} from '../scripts/compile-manifests.mjs';
+import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks.ts';
 
+// ============================================================================
+// Consolidated from round7-portable-telemetry.test.ts
+// ============================================================================
+{
+const CALLER_TOKEN = 'r7-caller-secret-token-0123456789abcdef';
+
+test('R7-OTel: Unauthenticated 401/403 requests emit 0 outbound OTLP/telemetry POSTs, public unauth floods are rate-limited, and OTel parsers block CRLF/NaN/oversized inputs', async () => {
+  resetOtlpExportLimitersForTests();
+  let otlpPosts = 0;
+  let devTelPosts = 0;
+
+  const otlpSink = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (req.url?.includes('/v1/traces')) otlpPosts++;
+      else if (req.url?.includes('/v1/dev-errors')) devTelPosts++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise<void>((r) => otlpSink.listen(0, '127.0.0.1', r));
+  const sinkPort = (otlpSink.address() as net.AddressInfo).port;
+
+  const coordinator = new LocalAgentHubCoordinator(':memory:');
+  const env = {
+    AGENT_HUB: coordinator.asNamespace() as never,
+    CALLER_TOKEN,
+    OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${sinkPort}`,
+    EDGEFETCH_DEV_TELEMETRY: '1',
+    EDGEFETCH_DEV_TELEMETRY_URL: `http://127.0.0.1:${sinkPort}/v1/dev-errors`,
+  };
+
+  try {
+    // 1. 50 unauthenticated `401` requests across `/nope`, `/v1/scrape`, and `/mcp` -> 0 OTLP POSTs & 0 dev-telemetry POSTs!
+    for (let i = 0; i < 50; i++) {
+      const r1 = await hubWorker.fetch(
+        new Request(`https://hub.example.com/nope-${i}`, {
+          headers: { traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01` },
+        }),
+        env,
+      );
+      assert.equal(r1.status, 401);
+      assert.equal(r1.headers.get('x-trace-id'), 'a'.repeat(32));
+    }
+    const rScrapeUnauth = await hubWorker.fetch(
+      new Request('https://hub.example.com/v1/scrape', {
+        method: 'POST',
+        headers: { authorization: 'Bearer wrong-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ url: 'https://example.com' }),
+      }),
+      env,
+    );
+    assert.equal(rScrapeUnauth.status, 401);
+    assert.equal(otlpPosts, 0, 'Unauthenticated 401 requests must emit 0 OTLP POSTs');
+    assert.equal(devTelPosts, 0, 'Unauthenticated 401 requests must emit 0 dev-telemetry POSTs');
+
+    // 2. Public `/health` WITH inbound `traceparent` also emits 0 OTLP POSTs
+    const rHealth = await hubWorker.fetch(
+      new Request('https://hub.example.com/health', {
+        headers: { traceparent: `00-${'c'.repeat(32)}-${'d'.repeat(16)}-01` },
+      }),
+      env,
+    );
+    assert.equal(rHealth.status, 200);
+    assert.equal(otlpPosts, 0);
+
+    // 3. Authenticated `GET /v1/capabilities` DOES emit OTLP span cleanly
+    const rAuthed = await hubWorker.fetch(
+      new Request('https://hub.example.com/v1/capabilities', {
+        headers: { authorization: `Bearer ${CALLER_TOKEN}` },
+      }),
+      env,
+    );
+    assert.equal(rAuthed.status, 200);
+    assert.equal(otlpPosts, 1, 'Authenticated request must export OTLP trace');
+
+    // 4. Hardened OTel helper parsers (`fn.mjs` & `amp.mjs` regression assertions)
+    assert.equal(parseTraceparent(' '.repeat(1024) + `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`), null);
+    const hdrs = parseOtlpHeaders(
+      'Authorization=Bearer%20tok,x-crlf=val%0d%0aX-Evil:%201,__proto__=bad,host=evil.test,content-length=99,bad key=v',
+    );
+    assert.deepEqual(hdrs, { Authorization: 'Bearer tok' });
+    assert.equal(resolveOtlpTracesUrl('https://user:pass@collector.example/otlp'), null);
+    assert.ok(sanitizeUrlForSpan('https://h.example/' + 'a'.repeat(5_000)).length <= 512);
+    assert.equal(sanitizeUrlForSpan('blob:https://h.example/uuid?token=SECRET'), 'blob:https://h.example/uuid');
+
+    const traceCtx = createRequestTraceContext(
+      new Request('https://hub.example/fetch', {
+        headers: { 'x-request-id': '","call":{"requests":[]},"x":"' },
+      }),
+    );
+    assert.equal(traceCtx.headers['x-request-id'], traceCtx.context.spanId);
+
+    const childSpans = buildCrawlChildSpans({
+      traceId: 'e'.repeat(32),
+      parentSpanId: 'f'.repeat(16),
+      via: 'agent:site-a',
+      endTimeMs: 1_700_000_000_000,
+      replyText: JSON.stringify({
+        results: [{ id: '1', url: 'https://example.com', kind: 'page\r\nX:1' + 'k'.repeat(500), status: 'abc', outcome: 'ok', durationMs: 'x' }],
+      }),
+    });
+    assert.equal(childSpans.length, 1);
+    assert.equal(childSpans[0]!.name, 'edgefetch.fetch.page');
+    assert.equal(Number.isFinite(childSpans[0]!.startTimeMs), true);
+    assert.doesNotThrow(() =>
+      buildOtlpTracePayload({
+        spans: [{ ...childSpans[0]!, startTimeMs: Number.NaN, endTimeMs: Number.POSITIVE_INFINITY }],
+      }),
+    );
+  } finally {
+    coordinator.close();
+    otlpSink.close();
+  }
+});
+
+test('R7-DevTelemetry: DO_NOT_TRACK honors all non-disable values, scrubSpanToDevErrorReport strips hostnames/MCP-slugs/buildmeta, and AGENT_HUB admin_opt_out blocks background flushes', async () => {
+  // 1. Console DO_NOT_TRACK compliance (`2`, `enabled`, `y`, `1`, `true`, `ON` -> disabled; `0`, `false`, `no`, `off`, `unset`, `''` -> not DNT)
+  for (const dntOn of ['1', 'true', ' ON ', '2', 'enabled', 'y', 'yes-please']) {
+    assert.equal(isDoNotTrackEnabled(dntOn), true, `Expected DNT active for ${dntOn}`);
+    const st = resolveDevTelemetryState({
+      env: { EDGEFETCH_DEV_TELEMETRY: '1', DO_NOT_TRACK: dntOn },
+      dbSettingValue: '1',
+    });
+    assert.equal(st.enabled, false);
+    assert.equal(st.doNotTrack, true);
+    assert.equal(st.source, 'do_not_track');
+  }
+  for (const dntOff of ['', '0', 'false', 'FALSE', 'no', 'off', 'unset', undefined]) {
+    assert.equal(isDoNotTrackEnabled(dntOff), false, `Expected DNT inactive for ${String(dntOff)}`);
+  }
+
+  // 2. Endpoint validation rejects credentials and cloud metadata IPs while allowing public HTTPS & explicit loopback
+  assert.equal(resolveDevTelemetryEndpoint({ EDGEFETCH_DEV_TELEMETRY_URL: 'https://user:pw@evil.example/x' }), null);
+  assert.equal(resolveDevTelemetryEndpoint({ EDGEFETCH_DEV_TELEMETRY_URL: 'http://169.254.169.254/latest' }), null);
+  assert.equal(resolveDevTelemetryEndpoint({ EDGEFETCH_DEV_TELEMETRY_URL: 'http://127.0.0.1:9999' }), 'http://127.0.0.1:9999/v1/dev-errors');
+
+  // 3. Zero-hostname & zero-MCP-vault-slug scrubbing
+  const baseErrSpan = {
+    traceId: 'a'.repeat(32),
+    spanId: 'b'.repeat(16),
+    name: 'GET intranet.corp.example/admin/users/4711?token=SECRET',
+    startTimeMs: 1,
+    endTimeMs: 2,
+    statusOk: false,
+  };
+  const scrubbedHostSpan = scrubSpanToDevErrorReport(
+    {
+      ...baseErrSpan,
+      attributes: { 'edgefetch.adapter_id': 'shop.private-customer.example' },
+    },
+    { version: 'v2.7.0+host.internal.example' },
+  );
+  assert.ok(scrubbedHostSpan);
+  assert.equal(scrubbedHostSpan.spanName, 'edgefetch.span');
+  assert.equal(scrubbedHostSpan.adapterId, '');
+  assert.equal(scrubbedHostSpan.version, '2.7.0');
+
+  const scrubbedMcpSlug = scrubSpanToDevErrorReport({
+    ...baseErrSpan,
+    name: 'edgefetch.agent.tool',
+    attributes: { 'edgefetch.adapter_id': 'mcp:acme-internal-crm:lookup_customer_by_ssn' },
+  });
+  assert.ok(scrubbedMcpSlug);
+  assert.equal(scrubbedMcpSlug.adapterId, 'mcp-federated');
+  assert.equal(JSON.stringify(scrubbedMcpSlug).includes('acme-internal-crm'), false);
+  assert.equal(JSON.stringify(scrubbedMcpSlug).includes('lookup_customer_by_ssn'), false);
+
+  // Bogus `wafVendor: 'Victim-Example-Com'` on a `statusOk: true` span must be scrubbed to `''` and return `null`!
+  const bogusWafSpan = scrubSpanToDevErrorReport({
+    ...baseErrSpan,
+    name: 'edgefetch.scrape',
+    statusOk: true,
+    attributes: { 'edgefetch.waf.vendor': 'Victim-Example-Com' },
+  });
+  assert.equal(bogusWafSpan, null);
+  assert.equal(
+    validateDevErrorReport({
+      schemaVersion: 1,
+      version: '2.7.0',
+      runtime: 'node',
+      os: 'linux',
+      arch: 'x64',
+      mode: 'hub',
+      spanName: 'intranet.corp.example',
+      adapterId: 'greenhouse',
+      wafVendor: '',
+      httpStatus: 500,
+      errorClass: 'http_5xx',
+    }).ok,
+    false,
+  );
+
+  // 4. `admin_opt_out` (`'0'`) stored in `AGENT_HUB` suppresses background `flushDevErrorTelemetry` calls omitting `dbSettingValue`!
+  const coordinator = new LocalAgentHubCoordinator(':memory:');
+  try {
+    await coordinator.settings.setSetting(DEV_TELEMETRY_SETTING_KEY, '0');
+    let posts = 0;
+    const sent = await flushDevErrorTelemetry({
+      env: {
+        AGENT_HUB: coordinator.asNamespace(),
+        EDGEFETCH_DEV_TELEMETRY: '1',
+        EDGEFETCH_DEV_TELEMETRY_URL: 'http://127.0.0.1:9/v1/dev-errors',
+      } as never,
+      spans: [{ ...baseErrSpan, name: 'edgefetch.fetch.json' }],
+      fetchFn: async () => {
+        posts++;
+        return new Response('{}', { status: 202 });
+      },
+    });
+    assert.equal(sent, false);
+    assert.equal(posts, 0, 'Background flush without explicit dbSettingValue must honor admin_opt_out in AGENT_HUB');
+  } finally {
+    coordinator.close();
+  }
+});
+
+test('R7-Collector: Two-tier IPv6 /64+/48 rate limit, anti-LRU-thrash, strict enum schema, within-POST dedup, and anti-blinding count>=2 eviction protection', async () => {
+  resetCollectorRateLimiters();
+  const hubRoot = process.env.EDGEFETCH_HUB_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const collectorSql = readFileSync(resolve(hubRoot, '../telemetry/migrations/0001_errors.sql'), 'utf8');
+  const sqlite = new DatabaseSync(':memory:');
+  sqlite.exec(collectorSql);
+
+  const coerce = (v: unknown): string | number | bigint | Uint8Array | null => {
+    if (v === undefined || v === null) return null;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    if (typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array) return v;
+    return JSON.stringify(v);
+  };
+  const makeStmt = (sql: string, bound: unknown[] = []): D1PreparedStatementLike => ({
+    bind: (...vals: unknown[]) => makeStmt(sql, vals),
+    all: async <T = Record<string, unknown>>() => {
+      const st = sqlite.prepare(sql);
+      const p = bound.map(coerce);
+      return sql.trimStart().toUpperCase().startsWith('SELECT')
+        ? { results: st.all(...p) as T[] }
+        : (st.run(...p), { results: [] as T[] });
+    },
+    first: async <T = Record<string, unknown>>(col?: string) => {
+      const row = sqlite.prepare(sql).get(...bound.map(coerce)) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return col !== undefined ? ((row[col] as T) ?? null) : (row as T);
+    },
+    run: async () => {
+      sqlite.prepare(sql).run(...bound.map(coerce));
+      return { success: true };
+    },
+  });
+  const d1: D1DatabaseLike = { prepare: (q) => makeStmt(q) };
+  const adminToken = 'collector_r7_admin_token_0123456789abcdef';
+  const env = { DB: d1, TELEMETRY_ADMIN_TOKEN: adminToken, MAX_ERROR_FINGERPRINTS: '10' };
+
+  const makeValidEvent = (overrides: Record<string, unknown> = {}) => ({
+    schemaVersion: 1,
+    version: '2.7.0',
+    runtime: 'node',
+    os: 'linux',
+    arch: 'x64',
+    mode: 'hub',
+    spanName: 'edgefetch.scrape',
+    adapterId: 'greenhouse',
+    wafVendor: '',
+    httpStatus: 500,
+    errorClass: 'http_5xx',
+    ...overrides,
+  });
+
+  const postCollector = (body: unknown, ip: string, extraHeaders: Record<string, string> = {}) =>
+    collectorWorker.fetch(
+      new Request('https://telemetry.edgefetch.dev/v1/dev-errors', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip, ...extraHeaders },
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      }),
+      env,
+    );
+
+  try {
+    // 1. Reject cross-origin simple-POST (`text/plain` -> 415, `Origin` -> 403) and smuggled schema values (`400`)
+    assert.equal((await postCollector(makeValidEvent(), '198.51.100.1', { 'content-type': 'text/plain' })).status, 415);
+    assert.equal((await postCollector(makeValidEvent(), '198.51.100.1', { origin: 'https://evil.example' })).status, 403);
+
+    for (const smuggled of [
+      { spanName: 'intranet.corp.example' },
+      { spanName: '10.20.30.40:8443' },
+      { adapterId: 'shop.private-customer.example' },
+      { adapterId: 'mcp:acme-internal:tool' },
+      { adapterId: 'zz-fake' },
+      { wafVendor: 'victim-example-com' },
+      { errorClass: 'acme-corp:user-4711:pwned' },
+      { version: 'evil.example.com' },
+      { os: 'host-db01-corp' },
+      { arch: 'attacker-was-here' },
+      { mode: 'call,me,at,evil-example' },
+    ]) {
+      const r = await postCollector(makeValidEvent(smuggled), '198.51.100.2');
+      assert.equal(r.status, 400, `Expected 400 for smuggled ${JSON.stringify(smuggled)}`);
+    }
+
+    // Reject `> MAX_EVENTS_PER_POST` (8) items, and deduplicate identical events within one POST + block os/arch/mode overwrite!
+    assert.equal(MAX_EVENTS_PER_POST, 8);
+    const nineEvents = { events: Array.from({ length: 9 }, () => makeValidEvent()) };
+    assert.equal((await postCollector(nineEvents, '198.51.100.3')).status, 400);
+
+    const eightIdentical = {
+      events: Array.from({ length: 8 }, () => makeValidEvent({ adapterId: 'shopify', os: 'linux', arch: 'x64', mode: 'hub' })),
+    };
+    assert.equal((await postCollector(eightIdentical, '198.51.100.4')).status, 202);
+    // Attempt to overwrite os/arch/mode on same fingerprint
+    assert.equal(
+      (await postCollector(makeValidEvent({ adapterId: 'shopify', os: 'darwin', arch: 'arm64', mode: 'cli' }), '198.51.100.4')).status,
+      202,
+    );
+    const shopifyRow = sqlite
+      .prepare("SELECT count, os, arch, mode FROM error_fingerprints WHERE adapter_id = 'shopify'")
+      .get() as { count: number; os: string; arch: string; mode: string };
+    assert.equal(shopifyRow.count, 2, '8 identical events in POST #1 + 1 in POST #2 must equal count=2, not 9!');
+    assert.equal(shopifyRow.os, 'linux', 'Existing row os must not be overwritten');
+    assert.equal(shopifyRow.mode, 'hub', 'Existing row mode must not be overwritten');
+
+    // 2. Two-tier IPv6 `/64` (30/min) AND `/48` (60/min) rate limit across 5,000 rotating `/64` subnets!
+    resetCollectorRateLimiters();
+    let acceptedInSlash48 = 0;
+    let limitedInSlash48 = 0;
+    for (let i = 0; i < 5_000; i++) {
+      const rotatingIp = `2001:db8:7:${i.toString(16)}::1`;
+      const st = (await postCollector(makeValidEvent({ adapterId: 'shopify' }), rotatingIp)).status;
+      if (st === 202) acceptedInSlash48++;
+      else if (st === 429) limitedInSlash48++;
+    }
+    assert.equal(acceptedInSlash48, IPV6_PREFIX48_RATE_LIMIT_CAPACITY, 'Entire IPv6 /48 must be capped at 60 req/min');
+    assert.equal(limitedInSlash48, 5_000 - IPV6_PREFIX48_RATE_LIMIT_CAPACITY);
+    assert.equal(RATE_LIMIT_CAPACITY, 30);
+
+    // 3. Anti-blinding smart eviction (`MAX_ERROR_FINGERPRINTS = 10`):
+    //    Insert 4 genuine multi-hit regressions (`count = 500`), then flood 20 distinct single-hit (`count = 1`) fingerprints!
+    sqlite.exec('DELETE FROM error_fingerprints');
+    resetCollectorRateLimiters();
+    const genuineAdapters = ['greenhouse', 'lever', 'workday-cxs', 'ashby'];
+    for (const a of genuineAdapters) {
+      await postCollector(makeValidEvent({ adapterId: a, errorClass: 'adapter_error' }), '192.0.2.10');
+    }
+    sqlite.exec('UPDATE error_fingerprints SET count = 500');
+
+    const noiseAdapters = [
+      'icims',
+      'rippling',
+      'workable',
+      'pinpoint',
+      'teamtailor',
+      'personio',
+      'smartrecruiters',
+      'recruitee',
+      'bamboohr',
+      'jazzhr',
+      'shopify',
+      'woocommerce',
+      'socrata',
+      'arcgis',
+      'ckan',
+      'sec-edgar',
+      'openfda',
+      'pubchem',
+      'arxiv',
+      'hackernews',
+    ];
+    for (let i = 0; i < noiseAdapters.length; i++) {
+      const res = await postCollector(
+        makeValidEvent({ adapterId: noiseAdapters[i], httpStatus: 502, errorClass: 'http_5xx' }),
+        `203.0.113.${(i % 200) + 1}`,
+      );
+      assert.equal(res.status, 202);
+    }
+
+    // Total rows must stay strictly bounded at `MAX_ERROR_FINGERPRINTS` (10), and ALL 4 `count = 500` genuine rows MUST survive!
+    const totalRows = (sqlite.prepare('SELECT COUNT(*) AS c FROM error_fingerprints').get() as { c: number }).c;
+    assert.equal(totalRows, 10);
+    const survivingGenuine = (
+      sqlite.prepare('SELECT COUNT(*) AS c FROM error_fingerprints WHERE count = 500').get() as { c: number }
+    ).c;
+    assert.equal(survivingGenuine, 4, 'All 4 genuine multi-hit (count=500) regressions must survive single-hit flood!');
+
+    // Verify trailing space on summary Bearer token is rejected (`401`)
+    const badTrailingSpaceAuth = await collectorWorker.fetch(
+      new Request('https://telemetry.edgefetch.dev/v1/dev-errors/summary', {
+        headers: { authorization: `Bearer ${adminToken} extra` },
+      }),
+      env,
+    );
+    assert.equal(badTrailingSpaceAuth.status, 401);
+  } finally {
+    sqlite.close();
+  }
+});
+}
+
+// ============================================================================
+// Consolidated from round8-portable-telemetry-openapi.test.ts
+// ============================================================================
+{
+function sha256Base64Url(input: string): string {
+  return createHash('sha256').update(input).digest('base64url');
+}
+
+test('Round 8 [Live Hub Medium]: Workers hub ignores forged x-ef-verified-auth: 1 header for OTLP & dev-telemetry', async () => {
+  const origFetch = globalThis.fetch;
+  let otlpExports = 0;
+  let devTelemetryPosts = 0;
+
+  globalThis.fetch = (async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+    const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (u.includes('collector.otlp.example')) {
+      otlpExports++;
+      return new Response('{}', { status: 200 });
+    }
+    if (u.includes('telemetry.edgefetch.dev')) {
+      devTelemetryPosts++;
+      return new Response('{"ok":true}', { status: 202 });
+    }
+    return new Response('not found', { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const pending: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil(p: Promise<unknown>) {
+        pending.push(p.catch(() => undefined));
+      },
+      passThroughOnException() {},
+    } as unknown as ExecutionContext;
+
+    const env = {
+      CALLER_TOKEN: 'real-owner-caller-secret-0123456789abcdef',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.otlp.example/v1/traces',
+      EDGEFETCH_DEV_TELEMETRY: '1',
+      EDGEFETCH_DEV_TELEMETRY_ENDPOINT: 'https://telemetry.edgefetch.dev/v1/dev-errors',
+    };
+
+    // 200 unauthenticated requests forging `x-ef-verified-auth: 1` (including error routes) MUST produce 0 OTLP & 0 telemetry posts!
+    for (let i = 0; i < 200; i++) {
+      const targetPath = i % 2 === 0 ? '/v1/scrape' : '/v1/capabilities';
+      const method = i % 2 === 0 ? 'POST' : 'GET';
+      const req = new Request(`https://hub.edgefetch.example${targetPath}`, {
+        method,
+        headers: {
+          'x-ef-verified-auth': '1',
+          'traceparent': '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+          ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(method === 'POST' ? { body: '{"url":"https://example.com"}' } : {}),
+      });
+      const res = await (hubWorker as { fetch(r: Request, e: unknown, c: ExecutionContext): Promise<Response> }).fetch(
+        req,
+        env,
+        ctx,
+      );
+      assert.equal(res.status, 401);
+    }
+    await Promise.allSettled(pending);
+    assert.equal(otlpExports, 0, `Expected 0 OTLP exports from forged header, got ${otlpExports}`);
+    assert.equal(devTelemetryPosts, 0, `Expected 0 dev-telemetry posts from forged header, got ${devTelemetryPosts}`);
+
+    // Sanity check: 1 genuinely authenticated request DOES export OTLP spans!
+    pending.length = 0;
+    const authReq = new Request('https://hub.edgefetch.example/v1/capabilities', {
+      method: 'GET',
+      headers: {
+        authorization: 'Bearer real-owner-caller-secret-0123456789abcdef',
+        traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+      },
+    });
+    const authRes = await (hubWorker as { fetch(r: Request, e: unknown, c: ExecutionContext): Promise<Response> }).fetch(
+      authReq,
+      env,
+      ctx,
+    );
+    assert.equal(authRes.status, 200);
+    await Promise.allSettled(pending);
+    assert.equal(otlpExports, 1, 'Expected 1 OTLP export for genuinely authenticated caller');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('Round 8 [New Medium — Jobs Filter]: matchesAllowedCompanyOrDomain accepts 50/50 legitimate corporate postings & rejects 35/35 impostors', () => {
+  const mkJob = (company: string, url: string, source?: string): StructuredJobRecord => ({
+    title: 'Senior Software Engineer',
+    company,
+    url,
+    applyUrl: url,
+    workplaceType: 'remote',
+    locations: ['Remote'],
+    pay: null,
+    postedAt: null,
+    source: source ?? 'ats',
+  });
+
+  const legitCases: Array<{ label: string; tok: string; job: StructuredJobRecord }> = [
+    // Stripe corporate & international entities
+    { label: 'Stripe exact GH', tok: 'stripe', job: mkJob('Stripe', 'https://boards.greenhouse.io/stripe/jobs/1001') },
+    { label: 'Stripe Inc', tok: 'stripe', job: mkJob('Stripe, Inc.', 'https://boards.greenhouse.io/stripe/jobs/1002') },
+    { label: 'Stripe Payments UK', tok: 'stripe', job: mkJob('Stripe Payments UK', 'https://boards.greenhouse.io/stripe/jobs/1003') },
+    { label: 'Stripe Payments UK Ltd', tok: 'stripe', job: mkJob('Stripe Payments UK, Ltd.', 'https://stripe.com/jobs/listing/eng/1004') },
+    { label: 'Stripe Payments Europe Limited', tok: 'stripe', job: mkJob('Stripe Payments Europe, Limited', 'https://stripe.com/jobs/listing/eng/1005') },
+    { label: 'Stripe Technology Company', tok: 'stripe', job: mkJob('Stripe Technology Company', 'https://careers.stripe.com/jobs/1006') },
+    { label: 'Stripe Japan KK', tok: 'stripe', job: mkJob('Stripe Japan K.K.', 'https://jobs.stripe.co.jp/1007') },
+    { label: 'Stripe Germany GmbH', tok: 'stripe', job: mkJob('Stripe Germany GmbH', 'https://boards.greenhouse.io/stripe/jobs/1008') },
+    { label: 'Stripe Singapore Pte Ltd', tok: 'stripe', job: mkJob('Stripe Singapore Pte. Ltd.', 'https://boards.greenhouse.io/stripe/jobs/1009') },
+    { label: 'Stripe Australia Pty Ltd', tok: 'stripe', job: mkJob('Stripe Australia Pty Ltd', 'https://boards.greenhouse.io/stripe/jobs/1010') },
+    { label: 'Stripe U.K. dotted', tok: 'stripe', job: mkJob('Stripe U.K. Limited', 'https://jobs.stripe.co.uk/roles/1') },
+    { label: 'Stripe Mexico diacritic', tok: 'stripe', job: mkJob('Stripe México', 'https://stripe.com/jobs/1011') },
+    { label: 'Stripe GH embed param', tok: 'stripe', job: mkJob('Stripe', 'https://boards.greenhouse.io/embed/job_app?for=stripe&token=999') },
+    // Notion Labs & HQ slugs
+    { label: 'Notion Labs Inc Ashby', tok: 'notion', job: mkJob('Notion Labs, Inc.', 'https://jobs.ashbyhq.com/notion/abc-1') },
+    { label: 'Notion Labs on notionhq', tok: 'notion', job: mkJob('Notion Labs, Inc.', 'https://jobs.ashbyhq.com/notionhq/abc-2') },
+    { label: 'Notion on notion.so', tok: 'notion', job: mkJob('Notion Labs', 'https://www.notion.so/careers/eng-1') },
+    { label: 'Caller passed Notion Labs, Inc.', tok: 'Notion Labs, Inc.', job: mkJob('Notion', 'https://jobs.ashbyhq.com/notion/abc-3') },
+    // DoorDash & official unhyphenated regional/HQ slugs
+    { label: 'DoorDash on doordashusa', tok: 'doordash', job: mkJob('DoorDash', 'https://boards.greenhouse.io/doordashusa/jobs/2001') },
+    { label: 'DoorDash USA', tok: 'doordash', job: mkJob('DoorDash USA', 'https://boards.greenhouse.io/doordashusa/jobs/2002') },
+    { label: 'DoorDash Technologies Canada', tok: 'doordash', job: mkJob('DoorDash Technologies Canada, Inc.', 'https://careers.doordash.com/jobs/2003') },
+    { label: 'Datadog on datadoghq.com', tok: 'datadog', job: mkJob('Datadog, Inc.', 'https://careers.datadoghq.com/detail/3001') },
+    { label: 'Datadog Federal', tok: 'datadog', job: mkJob('Datadog Federal', 'https://boards.greenhouse.io/datadog/jobs/3002') },
+    { label: 'Datadog on datadoghq GH', tok: 'datadog', job: mkJob('Datadog', 'https://boards.greenhouse.io/datadoghq/jobs/3003') },
+    // PBC, dotted L.L.C., 2-char brands, dba, multi-word brands
+    { label: 'Anthropic PBC', tok: 'anthropic', job: mkJob('Anthropic, PBC', 'https://boards.greenhouse.io/anthropic/jobs/4001') },
+    { label: 'Anthropic P.B.C.', tok: 'anthropic', job: mkJob('Anthropic P.B.C.', 'https://jobs.ashbyhq.com/anthropic/4002') },
+    { label: 'OpenAI L.L.C.', tok: 'openai', job: mkJob('OpenAI, L.L.C.', 'https://jobs.ashbyhq.com/openai/5001') },
+    { label: 'Open AI spaced display', tok: 'openai', job: mkJob('Open AI, Inc.', 'https://openai.com/careers/5002') },
+    { label: 'F5 2-char Workday', tok: 'f5', job: mkJob('F5, Inc.', 'https://f5.wd5.myworkdayjobs.com/F5/job/Seattle/Eng_R1') },
+    { label: 'HP 2-char Workday', tok: 'hp', job: mkJob('HP Inc.', 'https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/1') },
+    { label: '3M 2-char Workday', tok: '3m', job: mkJob('3M Company', 'https://3m.wd1.myworkdayjobs.com/Search/job/1') },
+    { label: 'Instacart dba', tok: 'instacart', job: mkJob('Maplebear Inc. dba Instacart', 'https://boards.greenhouse.io/instacart/jobs/6001') },
+    { label: 'Palo Alto Networks hyphen slug', tok: 'paloaltonetworks', job: mkJob('Palo Alto Networks', 'https://jobs.lever.co/palo-alto-networks/7001') },
+    { label: 'Palo Alto Networks SmartRecruiters', tok: 'paloaltonetworks', job: mkJob('Palo Alto Networks, Inc.', 'https://jobs.smartrecruiters.com/PaloAltoNetworks/7002') },
+    { label: 'Scale AI hyphen slug', tok: 'scaleai', job: mkJob('Scale AI, Inc.', 'https://jobs.lever.co/scale-ai/7003') },
+    { label: 'Hugging Face hyphen slug', tok: 'huggingface', job: mkJob('Hugging Face', 'https://apply.workable.com/hugging-face/j/1') },
+    // Rippling localized URL, EU boards, enterprise corporate names
+    { label: 'Rippling localized en-US URL', tok: 'rippling', job: mkJob('Rippling People Center Inc.', 'https://ats.rippling.com/en-US/rippling/jobs/8001') },
+    { label: 'Rippling direct URL', tok: 'rippling', job: mkJob('Rippling', 'https://ats.rippling.com/rippling/jobs/8002') },
+    { label: 'Cloudflare UK Limited', tok: 'cloudflare', job: mkJob('Cloudflare UK Limited', 'https://boards.greenhouse.io/cloudflare/jobs/9001') },
+    { label: 'Cloudflare Germany GmbH', tok: 'cloudflare', job: mkJob('Cloudflare Germany GmbH', 'https://boards.eu.greenhouse.io/cloudflare/jobs/9002') },
+    { label: 'Lever EU board', tok: 'klarna', job: mkJob('Klarna Bank AB', 'https://jobs.eu.lever.co/klarna/9003') },
+    { label: 'Palantir Technologies', tok: 'palantir', job: mkJob('Palantir Technologies Inc.', 'https://jobs.lever.co/palantir/9004') },
+    { label: 'Anduril Industries', tok: 'anduril', job: mkJob('Anduril Industries, Inc.', 'https://boards.greenhouse.io/anduril/jobs/9005') },
+    { label: 'Coinbase Global', tok: 'coinbase', job: mkJob('Coinbase Global, Inc.', 'https://boards.greenhouse.io/coinbase/jobs/9006') },
+    { label: 'Robinhood Markets', tok: 'robinhood', job: mkJob('Robinhood Markets, Inc.', 'https://boards.greenhouse.io/robinhood/jobs/9007') },
+    { label: 'Block Inc', tok: 'block', job: mkJob('Block, Inc.', 'https://boards.greenhouse.io/block/jobs/9008') },
+    { label: 'Snowflake Computing', tok: 'snowflake', job: mkJob('Snowflake Inc.', 'https://jobs.ashbyhq.com/snowflake/9009') },
+    { label: 'Amazon .jobs TLD', tok: 'amazon', job: mkJob('Amazon Web Services, Inc.', 'https://www.amazon.jobs/en/jobs/25001') },
+    { label: 'Fly.io first-party', tok: 'fly', job: mkJob('Fly.io', 'https://fly.io/jobs/infra-eng') },
+    { label: 'Linear.app first-party', tok: 'linear', job: mkJob('Linear, Inc.', 'https://linear.app/careers/eng') },
+    { label: 'Curated WWR feed with verified source', tok: 'tailscale', job: mkJob('Tailscale Inc.', 'https://weworkremotely.com/remote-jobs/tailscale-eng', 'weworkremotely') },
+  ];
+
+  assert.equal(legitCases.length, 50);
+  for (const lc of legitCases) {
+    assert.equal(
+      matchesAllowedCompanyOrDomain(lc.job, new Set([lc.tok]), []),
+      true,
+      `Expected legitimate posting "${lc.label}" (${lc.job.company} @ ${lc.job.url}) to match "${lc.tok}"`,
+    );
+  }
+
+  const impostorCases: Array<{ label: string; tok: string; job: StructuredJobRecord }> = [
+    // Multi-tenant ATS hyphenated/underscored legal & generic suffix impostors (the 26 that previously leaked!)
+    { label: 'lever stripe-inc', tok: 'stripe', job: mkJob('Stripe, Inc.', 'https://jobs.lever.co/stripe-inc/1') },
+    { label: 'gh stripe-llc', tok: 'stripe', job: mkJob('Stripe LLC', 'https://boards.greenhouse.io/stripe-llc/jobs/1') },
+    { label: 'ashby stripe-corp', tok: 'stripe', job: mkJob('Stripe Corp', 'https://jobs.ashbyhq.com/stripe-corp/1') },
+    { label: 'workable stripe-gmbh', tok: 'stripe', job: mkJob('Stripe GmbH', 'https://apply.workable.com/stripe-gmbh/j/1') },
+    { label: 'gem stripe-plc', tok: 'stripe', job: mkJob('Stripe PLC', 'https://jobs.gem.com/stripe-plc/1') },
+    { label: 'rippling stripe-incorporated', tok: 'stripe', job: mkJob('Stripe Incorporated', 'https://ats.rippling.com/stripe-incorporated/jobs/1') },
+    { label: 'smartrecruiters stripe-corporation', tok: 'stripe', job: mkJob('Stripe Corporation', 'https://jobs.smartrecruiters.com/stripe-corporation/1') },
+    { label: 'lever stripe_inc underscore', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.lever.co/stripe_inc/1') },
+    { label: 'lever stripe-ltd', tok: 'stripe', job: mkJob('Stripe Ltd', 'https://jobs.lever.co/stripe-ltd/1') },
+    { label: 'lever stripe-co', tok: 'stripe', job: mkJob('Stripe Co', 'https://jobs.lever.co/stripe-co/1') },
+    { label: 'lever stripe-jobs', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.lever.co/stripe-jobs/1') },
+    { label: 'gh stripe-careers', tok: 'stripe', job: mkJob('Stripe', 'https://boards.greenhouse.io/stripe-careers/jobs/1') },
+    { label: 'ashby stripe-hq', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.ashbyhq.com/stripe-hq/1') },
+    { label: 'lever stripe-usa hyphen', tok: 'stripe', job: mkJob('Stripe USA', 'https://jobs.lever.co/stripe-usa/1') },
+    { label: 'lever stripe-uk hyphen', tok: 'stripe', job: mkJob('Stripe UK', 'https://jobs.lever.co/stripe-uk/1') },
+    { label: 'lever stripe-ai', tok: 'stripe', job: mkJob('Stripe AI', 'https://jobs.lever.co/stripe-ai/1') },
+    { label: 'lever stripe-labs', tok: 'stripe', job: mkJob('Stripe Labs', 'https://jobs.lever.co/stripe-labs/1') },
+    { label: 'lever official-stripe', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.lever.co/official-stripe/1') },
+    { label: 'lever s-t-r-i-p-e', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.lever.co/s-t-r-i-p-e/1') },
+    // Unhyphenated lookalike/impostor ATS slugs
+    { label: 'lever stripeinc', tok: 'stripe', job: mkJob('Stripe Inc', 'https://jobs.lever.co/stripeinc/1') },
+    { label: 'lever stripejobs', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.lever.co/stripejobs/1') },
+    { label: 'lever stripecareers', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.lever.co/stripecareers/1') },
+    { label: 'lever stripeai startup', tok: 'stripe', job: mkJob('Stripe AI', 'https://jobs.lever.co/stripeai/1') },
+    { label: 'lever stripelabs startup', tok: 'stripe', job: mkJob('Stripe Labs', 'https://jobs.lever.co/stripelabs/1') },
+    // Phishing / third-party / aggregator domains claiming `company: "Stripe"`!
+    { label: 'evil.com claiming Stripe', tok: 'stripe', job: mkJob('Stripe', 'https://evil-phishing.com/jobs/1') },
+    { label: 'stripe.evil.com subdomain spoof', tok: 'stripe', job: mkJob('Stripe, Inc.', 'https://stripe.evil.com/jobs/1') },
+    { label: 'stripecareers.com typosquat', tok: 'stripe', job: mkJob('Stripe', 'https://stripecareers.com/jobs/1') },
+    { label: 'stripejobs.com typosquat', tok: 'stripe', job: mkJob('Stripe', 'https://stripejobs.com/jobs/1') },
+    { label: 'stripe-careers.com typosquat', tok: 'stripe', job: mkJob('Stripe', 'https://stripe-careers.com/jobs/1') },
+    { label: 'jobvite impostor org', tok: 'stripe', job: mkJob('Stripe', 'https://jobs.jobvite.com/othercorp/job/1') },
+    { label: 'linkedin unverified aggregator', tok: 'stripe', job: mkJob('Stripe', 'https://www.linkedin.com/jobs/view/12345') },
+    // Display-name spoofing / negations / homoglyphs even on matching domain
+    { label: 'Not Stripe negation', tok: 'stripe', job: mkJob('Not Stripe', 'https://stripe.com/jobs/1') },
+    { label: 'Ex-Stripe agency', tok: 'stripe', job: mkJob('Ex-Stripe Recruiting', 'https://stripe.com/jobs/1') },
+    { label: 'Cyrillic homoglyph Fаke', tok: 'stripe', job: mkJob('Stripe F\u0430ke', 'https://boards.greenhouse.io/stripe/jobs/1') },
+    { label: 'Dotted S.T.R.I.P.E spoof', tok: 'stripe', job: mkJob('S.T.R.I.P.E.', 'https://boards.greenhouse.io/stripe/jobs/1') },
+  ];
+
+  assert.equal(impostorCases.length, 35);
+  for (const ic of impostorCases) {
+    assert.equal(
+      matchesAllowedCompanyOrDomain(ic.job, new Set([ic.tok]), []),
+      false,
+      `SECURITY: impostor posting "${ic.label}" (${ic.job.company} @ ${ic.job.url}) must be REJECTED for "${ic.tok}"`,
+    );
+  }
+});
+
+test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token gets 403 insufficient_scope on ALL non-MCP /v1/* & /v2/* endpoints', async () => {
+  const { createHash } = await import('node:crypto');
+  const tmpData = mkdtempSync(join(tmpdir(), 'ef-r8-scopes-'));
+  const ownerToken = 'owner-secret-token-0123456789abcdef';
+  const coordinator = new LocalAgentHubCoordinator(join(tmpData, 'hub.sqlite'));
+  const metaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+  const searchDb = new NodeSqliteD1Database(':memory:', [{ name: 'search/0001_fts.sql', sql: search0001 }]);
+  const artifacts = new NodeFsR2Bucket(join(tmpData, 'r2'));
+  const workerEnv = {
+    AGENT_HUB: coordinator.asNamespace() as never,
+    META: metaDb as never,
+    SEARCH: searchDb as never,
+    ARTIFACTS: artifacts as never,
+    CALLER_TOKEN: ownerToken,
+    SAFE_PUBLIC_FETCH: async () => new Response('User-agent: *\nAllow: /\n', { status: 200 }),
+    SAFE_FETCH: async () => new Response('User-agent: *\nAllow: /\n', { status: 200 }),
+  };
+  const baseUrl = 'https://hub.edgefetch.example';
+  const dispatch = (path: string, init?: RequestInit) =>
+    hubWorker.fetch(new Request(`${baseUrl}${path}`, init), workerEnv);
+
+  try {
+    const regRes = await dispatch('/oauth/register', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Round 8 Scope Tester',
+        redirect_uris: ['http://127.0.0.1:9999/cb'],
+      }),
+    });
+    assert.equal(regRes.status, 201);
+    const { client_id: clientId } = (await regRes.json()) as { client_id: string };
+
+    const mintScopedToken = async (scope: string): Promise<string> => {
+      const verifier = `pkce_verifier_${scope.replace(/[^a-z]/g, '')}_0123456789abcdef0123456789abcdef`;
+      const challenge = createHash('sha256').update(verifier).digest('base64url');
+      const authGet = await dispatch(
+        `/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent('http://127.0.0.1:9999/cb')}&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&scope=${encodeURIComponent(scope)}&state=st1`,
+      );
+      assert.equal(authGet.status, 200);
+      const html = await authGet.text();
+      const csrfCookie = authGet.headers.get('set-cookie')?.split(';')[0] ?? '';
+      const csrfVal = /name="csrf"\s+value="([^"]+)"/.exec(html)?.[1] ?? '';
+      const sealedVal = /name="sealed"\s+value="([^"]+)"/.exec(html)?.[1] ?? '';
+      const authPost = await dispatch('/oauth/authorize', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          cookie: csrfCookie,
+          origin: baseUrl,
+        },
+        body: new URLSearchParams({
+          decision: 'approve',
+          owner_token: ownerToken,
+          csrf: csrfVal,
+          sealed: sealedVal,
+        }).toString(),
+      });
+      assert.ok(authPost.status === 302 || authPost.status === 303, `Expected OAuth redirect, got ${authPost.status}`);
+      const loc = new URL(authPost.headers.get('location')!);
+      const code = loc.searchParams.get('code')!;
+      assert.ok(code);
+
+      const tokRes = await dispatch('/oauth/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: 'http://127.0.0.1:9999/cb',
+          client_id: clientId,
+          code_verifier: verifier,
+        }).toString(),
+      });
+      assert.equal(tokRes.status, 200);
+      const tokJson = (await tokRes.json()) as { access_token: string };
+      return tokJson.access_token;
+    };
+
+    const mcpOnlyPlain = await mintScopedToken('mcp:call');
+    const readOnlyPlain = await mintScopedToken('crawl:read');
+
+    const nonMcpEndpoints: Array<{ method: string; path: string; body?: string; readAllowed?: boolean }> = [
+      // The 7 previously un-scoped endpoints flagged by Reviewer #3:
+      { method: 'GET', path: '/v1/capabilities', readAllowed: true },
+      { method: 'GET', path: '/v1/extractors', readAllowed: true },
+      { method: 'GET', path: `/v1/artifacts/${'a'.repeat(64)}`, readAllowed: true },
+      { method: 'POST', path: '/v1/crawl/params-preview', body: '{"url":"https://example.com","prompt":"docs"}', readAllowed: true },
+      { method: 'GET', path: '/v1/batch/scrape/bat_nonexistent', readAllowed: true },
+      { method: 'GET', path: '/v1/agent/agt_nonexistent', readAllowed: true },
+      { method: 'GET', path: '/v1/agent/agt_nonexistent/trace', readAllowed: true },
+      // All remaining /v1/* & /v2/* endpoints:
+      { method: 'GET', path: '/v1/hosts', readAllowed: true },
+      { method: 'GET', path: '/v1/mcp/registry?q=github', readAllowed: true },
+      { method: 'GET', path: '/v1/crawl/crw_nonexistent', readAllowed: true },
+      { method: 'GET', path: '/v1/collections/default/search?q=test', readAllowed: true },
+      { method: 'GET', path: '/v1/catalog/cat_nonexistent', readAllowed: true },
+      { method: 'GET', path: '/v1/catalog/cat_nonexistent/records', readAllowed: true },
+      { method: 'POST', path: '/v1/scrape', body: '{"url":"https://example.com"}' },
+      { method: 'POST', path: '/v1/batch/scrape', body: '{"urls":["https://example.com"]}' },
+      { method: 'DELETE', path: '/v1/batch/scrape/bat_nonexistent' },
+      { method: 'POST', path: '/v1/extract', body: '{"urls":["https://example.com"],"query":"test"}' },
+      { method: 'POST', path: '/v1/interact', body: '{"url":"https://example.com"}' },
+      { method: 'POST', path: '/v1/map', body: '{"url":"https://example.com"}' },
+      { method: 'POST', path: '/v1/crawl', body: '{"url":"https://example.com"}' },
+      { method: 'DELETE', path: '/v1/crawl/crw_nonexistent' },
+      { method: 'POST', path: '/v1/ingest-tab', body: '{"url":"https://example.com","markdown":"# hi"}' },
+      { method: 'POST', path: '/v1/jobs', body: '{"query":"engineer"}' },
+      { method: 'POST', path: '/v1/catalog', body: '{"url":"https://example.com"}' },
+      { method: 'POST', path: '/v1/agent', body: '{"prompt":"research"}' },
+      { method: 'DELETE', path: '/v1/agent/agt_nonexistent' },
+      { method: 'POST', path: '/v2/scrape', body: '{"url":"https://example.com"}' },
+      { method: 'GET', path: '/v2/batch/scrape/bat_nonexistent' },
+    ];
+
+    for (const ep of nonMcpEndpoints) {
+      const res = await dispatch(ep.path, {
+        method: ep.method,
+        headers: {
+          authorization: `Bearer ${mcpOnlyPlain}`,
+          ...(ep.body ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(ep.body ? { body: ep.body } : {}),
+      });
+      assert.equal(
+        res.status,
+        403,
+        `SECURITY: mcp:call-only token on ${ep.method} ${ep.path} returned ${res.status}, expected 403 insufficient_scope!`,
+      );
+
+      if (ep.readAllowed) {
+        const readRes = await dispatch(ep.path, {
+          method: ep.method,
+          headers: {
+            authorization: `Bearer ${readOnlyPlain}`,
+            ...(ep.body ? { 'content-type': 'application/json' } : {}),
+          },
+          ...(ep.body ? { body: ep.body } : {}),
+        });
+        assert.notEqual(
+          readRes.status,
+          403,
+          `crawl:read token should be permitted past scope gate on ${ep.method} ${ep.path}, got 403`,
+        );
+      } else {
+        const readDeniedRes = await dispatch(ep.path, {
+          method: ep.method,
+          headers: {
+            authorization: `Bearer ${readOnlyPlain}`,
+            ...(ep.body ? { 'content-type': 'application/json' } : {}),
+          },
+          ...(ep.body ? { body: ep.body } : {}),
+        });
+        assert.equal(
+          readDeniedRes.status,
+          403,
+          `crawl:read-only token on mutation route ${ep.method} ${ep.path} must return 403`,
+        );
+      }
+    }
+
+    // Meanwhile `POST /v1/mcp/query` (`list_connected`) DOES allow `mcp:call`-only tokens!
+    const mcpQueryRes = await dispatch('/v1/mcp/query', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${mcpOnlyPlain}`, 'content-type': 'application/json' },
+      body: '{"action":"list_connected"}',
+    });
+    assert.equal(mcpQueryRes.status, 200);
+  } finally {
+    coordinator.close();
+    metaDb.close();
+    searchDb.close();
+    rmSync(tmpData, { recursive: true, force: true });
+  }
+});
+
+test('Round 8 [Catalog Memory-Only Tenant Isolation]: User B running 40 memory-only catalog jobs cannot evict User A runs, records, or diff baseline', async () => {
+  resetCatalogStateForTests();
+  try {
+    let priceCents = 1999;
+    const mockCatalogFetch = async ({ url }: { url: string }) => {
+      const pageMatch = /[?&]page=(\d+)/.exec(url);
+      const page = pageMatch ? Number(pageMatch[1]) : 1;
+      if (page > 1) {
+        return { results: [{ status: 200, outcome: 'ok', headers: {}, body: '{"products":[]}' }] };
+      }
+      return {
+        results: [
+          {
+            status: 200,
+            outcome: 'ok',
+            headers: {},
+            body: JSON.stringify({
+              products: [
+                {
+                  id: 101,
+                  title: 'Widget Pro',
+                  handle: 'widget-pro',
+                  vendor: 'Acme',
+                  product_type: 'Hardware',
+                  tags: ['pro'],
+                  variants: [
+                    {
+                      id: 501,
+                      title: 'Default',
+                      sku: 'W-PRO-1',
+                      price: (priceCents / 100).toFixed(2),
+                      available: true,
+                    },
+                  ],
+                },
+              ],
+            }),
+          },
+        ],
+      };
+    };
+
+    // 1. User A runs 2 catalog jobs in pure memory-only mode (`env = {}`)
+    const userARun1 = await executeCatalogCall({
+      payload: { url: 'https://shop-a.example.com', platform: 'shopify', sync: true, pauseMs: 0 },
+      env: {},
+      executeHubFetch: mockCatalogFetch,
+      sleepFn: async () => {},
+      principal: 'oauth:user-a',
+      userId: 'user_alice',
+    });
+    assert.equal(userARun1.status, 200);
+    const aliceCatalogId = String(userARun1.body.catalogId);
+    assert.ok(aliceCatalogId.startsWith('cat_'));
+
+    // 2. User B floods 40 catalog jobs in pure memory-only mode (`env = {}`)!
+    for (let i = 0; i < 40; i++) {
+      const bRes = await executeCatalogCall({
+        payload: { url: `https://shop-b-${i}.example.com`, platform: 'shopify', sync: true, pauseMs: 0 },
+        env: {},
+        executeHubFetch: mockCatalogFetch,
+        sleepFn: async () => {},
+        principal: 'oauth:user-b',
+        userId: 'user_bob',
+      });
+      assert.equal(bRes.status, 200);
+    }
+
+    // 3. User A's status AND full records AND diff baseline MUST all still be intact!
+    const aliceStatus = await getCatalogStatus({ catalogId: aliceCatalogId, userId: 'user_alice', env: {} });
+    assert.equal(aliceStatus.status, 200, 'User A catalog status must NOT be wiped by User B');
+
+    const aliceRecords = await getCatalogRecords({ catalogId: aliceCatalogId, userId: 'user_alice', env: {} });
+    assert.equal(aliceRecords.status, 200, 'User A in-memory catalog records must NOT be evicted by User B');
+    assert.equal((aliceRecords.body.records as unknown[])?.length, 1);
+
+    // Cross-tenant read by User B still gets 404
+    const bobSnooping = await getCatalogRecords({ catalogId: aliceCatalogId, userId: 'user_bob', env: {} });
+    assert.equal(bobSnooping.status, 404);
+
+    // User A's next snapshot on `shop-a.example.com` still computes an exact `changed: 1` diff against User A's baseline!
+    priceCents = 2499;
+    const userARun2 = await executeCatalogCall({
+      payload: { url: 'https://shop-a.example.com', platform: 'shopify', sync: true, pauseMs: 0 },
+      env: {},
+      executeHubFetch: mockCatalogFetch,
+      sleepFn: async () => {},
+      principal: 'oauth:user-a',
+      userId: 'user_alice',
+    });
+    assert.equal(userARun2.status, 200);
+    const run2Diff = userARun2.body.diff as { added: number; removed: number; changed: number };
+    assert.equal(run2Diff.added, 0);
+    assert.equal(run2Diff.removed, 0);
+    assert.equal(run2Diff.changed, 1);
+  } finally {
+    resetCatalogStateForTests();
+  }
+});
+
+test('Round 8 [Robots Parity + Redirect-to-NXDOMAIN Low]: /robots.txt redirect to DNS-failing host blocks SPA fallback & shared Go/TS corpus matches 100%', async () => {
+  resetOverflowRobotsCacheForTests();
+  const hubDir = process.env.EDGEFETCH_HUB_ROOT ?? process.cwd();
+  const corpus = JSON.parse(
+    readFileSync(resolve(hubDir, 'test', 'fixtures', 'robots-parity-corpus.json'), 'utf8'),
+  ) as Array<{
+    id: string;
+    robots: string;
+    ua: string;
+    crawlDelayMs: number;
+    disallowAiInput: boolean;
+    checks: Array<{ path: string; allowed: boolean }>;
+  }>;
+
+  // 1. Shared Go/TS corpus check (`internal/politeness/parity_corpus_test.go` runs this exact JSON file in Go!)
+  let totalChecks = 0;
+  for (const tc of corpus) {
+    const parsed = parseOverflowRobotsTxt(tc.robots, tc.ua);
+    assert.equal(parsed.crawlDelayMs, tc.crawlDelayMs, `[${tc.id}] crawlDelayMs`);
+    assert.equal(Boolean(parsed.disallowAiInput), tc.disallowAiInput, `[${tc.id}] disallowAiInput`);
+    for (const chk of tc.checks) {
+      totalChecks++;
+      assert.equal(isRobotsAllowed(parsed, chk.path), chk.allowed, `[${tc.id}] isRobotsAllowed(${JSON.stringify(chk.path)})`);
+    }
+  }
+  assert.ok(totalChecks >= 60);
+
+  // Also check 1 MiB (`1_048_576` bytes) partial-line truncation parity in `parseOverflowRobotsTxt`!
+  const hdr = 'User-agent: *\nDisallow: /\n';
+  const padLen = 1_048_576 - hdr.length - 'Allow: /'.length;
+  const truncBody = `${hdr}${'#'.repeat(padLen - 1)}\nAllow: /public-docs`;
+  const truncParsed = parseOverflowRobotsTxt(truncBody, 'edgefetch');
+  assert.equal(
+    isRobotsAllowed(truncParsed, '/secret'),
+    false,
+    'Partial Allow line split across 1 MiB boundary must be dropped identically to Go ParseRobotsTxt',
+  );
+
+  // 2. `/robots.txt` redirecting (`302`) to a host with no DNS (`ENOTFOUND`) MUST be `unreachable: true` (disallowed!)
+  let crawl4AiCalled = 0;
+  const mockPublicFetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (u === 'https://spa-origin.example/robots.txt') {
+      return new Response(null, {
+        status: 302,
+        headers: { location: 'https://missing-cdn.example/robots.txt' },
+      });
+    }
+    if (u === 'https://missing-cdn.example/robots.txt') {
+      throw new Error('getaddrinfo ENOTFOUND missing-cdn.example');
+    }
+    if (u.includes('crawl4ai.example')) {
+      crawl4AiCalled++;
+      return Response.json({ success: true, results: [{ markdown: '# External Rendered', status_code: 200 }] });
+    }
+    return new Response('<html><head><script src="/app.js"></script></head><body><div id="root"></div></body></html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }) as typeof fetch;
+
+  const robRedirectNx = await fetchOverflowRobots(
+    'https://spa-origin.example',
+    'EdgeFetch/2.7.3',
+    mockPublicFetch,
+    Date.now() + 5_000,
+  );
+  assert.equal(robRedirectNx.unreachable, true, 'Redirect of /robots.txt to NXDOMAIN host must set unreachable: true');
+  assert.equal(Boolean(robRedirectNx.dnsNotFound), false, 'Origin itself exists; redirect target NXDOMAIN must not set dnsNotFound');
+  assert.equal(isRobotsAllowed(robRedirectNx, '/app'), false, 'isRobotsAllowed must return false when /robots.txt redirect target has no DNS');
+
+  const ovRes = await cloudflareOverflowFetch(
+    JSON.stringify({
+      requests: [{ id: 'r1', url: 'https://spa-origin.example/app', kind: 'page' }],
+      options: { includeBody: true, respectRobots: true },
+    }),
+    'EdgeFetch/2.7.3',
+    'hub.local',
+    { fetchFn: mockPublicFetch, useSharedRobotsCache: false },
+  );
+  const ovBody = (await ovRes.json()) as { results: Array<{ outcome: string }> };
+  assert.equal(ovBody.results[0]?.outcome, 'stop', 'Overflow fetch must halt with outcome="stop" when /robots.txt redirects to NXDOMAIN');
+
+  // External SPA fallback (`Crawl4AI`) MUST ALSO refuse to render when `/robots.txt` redirects to NXDOMAIN!
+  const scrapeOut = await executeScrapeCall({
+    payload: { url: 'https://spa-origin.example/app', renderMode: 'always', spaFallback: 'crawl4ai' },
+    env: {
+      CRAWL4AI_API_URL: 'https://crawl4ai.example',
+      SAFE_PUBLIC_FETCH: mockPublicFetch,
+      SAFE_FETCH: mockPublicFetch,
+    } as Record<string, unknown>,
+    executeHubFetch: async () => ({
+      status: 503,
+      via: 'hub',
+      bodyText: JSON.stringify({ error: 'fat_agent_required', message: 'No browser-capable worker connected' }),
+    }),
+  });
+  assert.equal(crawl4AiCalled, 0, 'External SPA fallback must NEVER be called when /robots.txt redirects to NXDOMAIN!');
+  assert.equal(scrapeOut.status, 503);
+});
+
+// ── Real Mutation-Verified OpenAPI 3.1.0 Contract Validator ──────────────────────────────────────────────────────────
+
+interface ExtractedSourceRoute {
+  path: string;
+  methods: Set<string>;
+  securityKind: 'public' | 'owner_bearer' | 'oauth_read' | 'oauth_fetch' | 'oauth_mcp_query' | 'oauth_mcp_rpc';
+  pathParams: string[];
+  queryParams: Set<string>;
+}
+
+function extractCanonicalRoutesFromSource(sources: {
+  indexSrc: string;
+  compatSrc: string;
+  botAuthSrc: string;
+  oauthSrc: string;
+  githubAuthSrc: string;
+  adminSrc?: string;
+}): Map<string, ExtractedSourceRoute> {
+  const routes = new Map<string, ExtractedSourceRoute>();
+  const upsert = (
+    path: string,
+    method: string,
+    securityKind: ExtractedSourceRoute['securityKind'],
+    queryParams: string[] = [],
+  ) => {
+    const pathParams = [...path.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]!);
+    const existing = routes.get(path);
+    if (existing) {
+      existing.methods.add(method.toLowerCase());
+      // When a path has both GET (`oauth_read`) and DELETE (`oauth_fetch`), track per-method below
+      for (const qp of queryParams) existing.queryParams.add(qp);
+      return;
+    }
+    routes.set(path, {
+      path,
+      methods: new Set([method.toLowerCase()]),
+      securityKind,
+      pathParams,
+      queryParams: new Set(queryParams),
+    });
+  };
+
+  // 1. Public Discovery & OAuth 2.1 / GitHub Auth routes verified in source files
+  if (/request\.method\s*===\s*'GET'\s*&&\s*url\.pathname\s*===\s*'\/health'/.test(sources.indexSrc)) {
+    upsert('/health', 'get', 'public');
+  }
+  if (/handleOpenApiRoute/.test(sources.indexSrc)) {
+    upsert('/openapi.json', 'get', 'public');
+  }
+  if (sources.botAuthSrc.includes("'/.well-known/edgefetch-bot.json'")) {
+    upsert('/.well-known/edgefetch-bot.json', 'get', 'public');
+  }
+  if (sources.botAuthSrc.includes("'/.well-known/http-message-signatures-directory'")) {
+    upsert('/.well-known/http-message-signatures-directory', 'get', 'public');
+  }
+  if (sources.oauthSrc.includes("'/.well-known/oauth-protected-resource'")) {
+    upsert('/.well-known/oauth-protected-resource', 'get', 'public');
+  }
+  if (sources.oauthSrc.includes("'/.well-known/oauth-authorization-server'")) {
+    upsert('/.well-known/oauth-authorization-server', 'get', 'public');
+  }
+  const ghRouteSrc = sources.adminSrc ?? sources.githubAuthSrc;
+  if (ghRouteSrc.includes("'/admin/auth/github'") || sources.githubAuthSrc.includes('/admin/auth/github/callback')) {
+    if (!sources.adminSrc || sources.adminSrc.includes("'/admin/auth/github'")) {
+      upsert('/admin/auth/github', 'get', 'public', ['return_to']);
+    }
+    if (!sources.adminSrc || sources.adminSrc.includes("'/admin/auth/github/callback'")) {
+      upsert('/admin/auth/github/callback', 'get', 'public', ['code', 'state']);
+    }
+  }
+  if (/url\.pathname\s*===\s*'\/mcp'/.test(sources.indexSrc)) {
+    upsert('/mcp', 'post', 'oauth_mcp_rpc');
+  }
+  if (/request\.method\s*===\s*'GET'\s*&&\s*url\.pathname\s*===\s*'\/agents'/.test(sources.indexSrc)) {
+    upsert('/agents', 'get', 'owner_bearer');
+  }
+  if (/request\.method\s*===\s*'POST'\s*&&\s*\(?url\.pathname\s*===\s*'\/fetch'/.test(sources.indexSrc)) {
+    upsert('/fetch', 'post', 'owner_bearer', ['target', 'site', 'artifacts', 'hydrate']);
+  }
+
+  // 2. Parse every `/v1/*` route handler block directly from `hub/src/index.ts` and inspect its real method + scope checks!
+  const normalizeV1Path = (raw: string) =>
+    raw
+      .replace('/batch/scrape/([^/]+)', '/batch/scrape/{batchId}')
+      .replace('/agent/([^/]+)/trace', '/agent/{agentId}/trace')
+      .replace('/agent/([^/]+)', '/agent/{agentId}')
+      .replace('/crawl/([^/]+)', '/crawl/{crawlId}')
+      .replace('/collections/([^/]+)/search', '/collections/{collectionId}/search')
+      .replace('/catalog/([^/]+)/records', '/catalog/{catalogId}/records')
+      .replace('/catalog/([^/]+)', '/catalog/{catalogId}');
+
+  const lines = sources.indexSrc.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    let detectedPath: string | null = null;
+    const exactM = /url\.pathname\s*===\s*'(\/v1\/[^']+)'/.exec(line);
+    const startsM = /url\.pathname\.startsWith\('(\/v1\/[^']+)'\)/.exec(line);
+    const regexM = /const\s+(\w+)\s*=\s*\/\^\\\/v1\\\/([^$]+)\$\/\.exec\(url\.pathname\)/.exec(line);
+    if (exactM) {
+      detectedPath = exactM[1]!;
+    } else if (startsM) {
+      detectedPath = startsM[1] === '/v1/artifacts/' ? '/v1/artifacts/{blobSha256}' : `${startsM[1]}{id}`;
+    } else if (regexM) {
+      detectedPath = normalizeV1Path(`/v1/${regexM[2]!.replace(/\\\//g, '/')}`);
+    }
+    if (!detectedPath) continue;
+
+    // Slice the route handler block up to the next top-level route check
+    let depth = 0;
+    let entered = false;
+    const blockLines: string[] = [];
+    for (let j = i; j < Math.min(lines.length, i + 160); j++) {
+      const l = lines[j]!;
+      blockLines.push(l);
+      for (const ch of l) {
+        if (ch === '{') {
+          depth++;
+          entered = true;
+        } else if (ch === '}') {
+          depth--;
+        }
+      }
+      if (entered && depth <= 0 && j > i) break;
+    }
+    const block = blockLines.join('\n');
+    const qParams = [...block.matchAll(/url\.searchParams\.(?:get|getAll)\('([^']+)'\)/g)].map((m) => m[1]!);
+
+    // Determine HTTP methods handled in this block
+    const methodsInBlock: string[] = [];
+    for (const m of ['GET', 'POST', 'DELETE']) {
+      if (new RegExp(`request\\.method\\s*===\\s*'${m}'`).test(block)) {
+        methodsInBlock.push(m.toLowerCase());
+      }
+    }
+
+    for (const m of methodsInBlock) {
+      let methodSubBlock = block;
+      if (methodsInBlock.length > 1) {
+        const subIdx = block.indexOf(`request.method === '${m.toUpperCase()}'`);
+        if (subIdx >= 0) {
+          methodSubBlock = block.slice(subIdx, subIdx + 900);
+        }
+      }
+      let sec: ExtractedSourceRoute['securityKind'];
+      if (detectedPath === '/v1/mcp/query') {
+        sec = methodSubBlock.includes("includes('mcp:call')") ? 'oauth_mcp_query' : 'public';
+      } else if (
+        methodSubBlock.includes("includes('crawl:read')") ||
+        (block.includes("includes('crawl:read')") && m === 'get')
+      ) {
+        sec = 'oauth_read';
+      } else if (methodSubBlock.includes("includes('crawl:fetch')") || block.includes("includes('crawl:fetch')")) {
+        sec = 'oauth_fetch';
+      } else {
+        // Un-scoped route bug! Mark as `'public'` so contract validation against `oauth2Pkce` immediately FAILS!
+        sec = 'public';
+      }
+      upsert(detectedPath, m, sec, m === 'get' ? qParams : []);
+      // Store exact per-method security on multi-method paths
+      (routes.get(detectedPath) as ExtractedSourceRoute & { methodSecurity?: Record<string, string> }).methodSecurity ??= {};
+      (routes.get(detectedPath) as ExtractedSourceRoute & { methodSecurity?: Record<string, string> }).methodSecurity![m] = sec;
+    }
+  }
+
+  // 3. Parse `/v2/*` documented compatibility routes from `hub/src/compat.ts`
+  for (const fcMatch of sources.compatSrc.matchAll(/fcSubpath\s*===\s*'\/(scrape|crawl|map|search|extract|agent)'\s*&&\s*request\.method\s*===\s*'([A-Z]+)'/g)) {
+    const sub = fcMatch[1]!;
+    const method = fcMatch[2]!.toLowerCase();
+    const hasFetchScope = sources.compatSrc.includes("auth.scopes.includes('crawl:fetch')");
+    upsert(`/v2/${sub}`, method, hasFetchScope ? 'oauth_fetch' : 'public');
+  }
+
+  return routes;
+}
+
+function validateJsonValueAgainstSchema(
+  value: unknown,
+  schema: Record<string, unknown>,
+  allSchemas: Record<string, Record<string, unknown>>,
+  atPath: string,
+): void {
+  if (typeof schema.$ref === 'string') {
+    const prefix = '#/components/schemas/';
+    assert.ok(schema.$ref.startsWith(prefix), `${atPath}: unsupported $ref "${schema.$ref}"`);
+    const refName = schema.$ref.slice(prefix.length);
+    const target = allSchemas[refName];
+    assert.ok(target, `${atPath}: broken $ref "${schema.$ref}" (schema missing from components.schemas)`);
+    validateJsonValueAgainstSchema(value, target, allSchemas, `${atPath}($ref:${refName})`);
+    return;
+  }
+
+  if (schema.const !== undefined) {
+    assert.equal(value, schema.const, `${atPath}: expected const ${JSON.stringify(schema.const)}, got ${JSON.stringify(value)}`);
+  }
+
+  if (Array.isArray(schema.enum)) {
+    assert.ok(schema.enum.includes(value), `${atPath}: value ${JSON.stringify(value)} not in enum ${JSON.stringify(schema.enum)}`);
+  }
+
+  const rawType = schema.type;
+  if (rawType !== undefined) {
+    const allowedTypes = Array.isArray(rawType) ? rawType : [rawType];
+    const actualType =
+      value === null
+        ? 'null'
+        : Array.isArray(value)
+          ? 'array'
+          : typeof value === 'number' && Number.isInteger(value)
+            ? 'integer'
+            : typeof value;
+    const typeMatches =
+      allowedTypes.includes(actualType) || (actualType === 'integer' && allowedTypes.includes('number'));
+    assert.ok(
+      typeMatches,
+      `${atPath}: expected type ${JSON.stringify(allowedTypes)}, got ${actualType} (${JSON.stringify(value)})`,
+    );
+  }
+
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    if (Array.isArray(schema.required)) {
+      for (const reqKey of schema.required as string[]) {
+        assert.ok(
+          Object.prototype.hasOwnProperty.call(obj, reqKey),
+          `${atPath}: missing required response property "${reqKey}"`,
+        );
+      }
+    }
+    const props = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (v !== undefined && props[k]) {
+        validateJsonValueAgainstSchema(v, props[k]!, allSchemas, `${atPath}.${k}`);
+      }
+    }
+  } else if (Array.isArray(value) && schema.items && typeof schema.items === 'object') {
+    for (let i = 0; i < Math.min(value.length, 5); i++) {
+      validateJsonValueAgainstSchema(value[i], schema.items as Record<string, unknown>, allSchemas, `${atPath}[${i}]`);
+    }
+  }
+}
+
+function assertOpenApiSourceAndSchemaContract(params: {
+  spec: Record<string, unknown>;
+  indexSrc: string;
+  compatSrc: string;
+  botAuthSrc: string;
+  oauthSrc: string;
+  githubAuthSrc: string;
+  mcpTools?: ReturnType<typeof buildCanonicalMcpToolSchemas>;
+}): void {
+  const { spec } = params;
+  assert.equal(spec.openapi, '3.1.0');
+  const specPaths = spec.paths as Record<string, Record<string, Record<string, unknown>>>;
+  const components = spec.components as {
+    securitySchemes: Record<string, Record<string, unknown>>;
+    schemas: Record<string, Record<string, unknown>>;
+  };
+  assert.ok(specPaths && typeof specPaths === 'object');
+  assert.ok(components?.schemas && typeof components.schemas === 'object');
+
+  // 1. Verify EVERY `$ref` anywhere in the entire OpenAPI spec resolves to an existing schema in `components.schemas`!
+  const walkRefs = (node: unknown, loc: string) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach((item, idx) => walkRefs(item, `${loc}[${idx}]`));
+      return;
+    }
+    const rec = node as Record<string, unknown>;
+    if (typeof rec.$ref === 'string') {
+      const prefix = '#/components/schemas/';
+      assert.ok(rec.$ref.startsWith(prefix), `${loc}: invalid $ref prefix "${rec.$ref}"`);
+      const name = rec.$ref.slice(prefix.length);
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(components.schemas, name),
+        `${loc}: dangling $ref "${rec.$ref}" not found in components.schemas`,
+      );
+    }
+    for (const [k, v] of Object.entries(rec)) {
+      walkRefs(v, `${loc}.${k}`);
+    }
+  };
+  walkRefs(specPaths, 'paths');
+  walkRefs(components.schemas, 'components.schemas');
+
+  // 2. Bidirectional 1:1 Route + HTTP Method + Security Scope + Path/Query Parameter Parity against source!
+  const sourceRoutes = extractCanonicalRoutesFromSource(params);
+  const specRouteKeys = Object.keys(specPaths).sort();
+  const sourceRouteKeys = [...sourceRoutes.keys()].sort();
+  assert.deepEqual(
+    specRouteKeys,
+    sourceRouteKeys,
+    'OpenAPI spec.paths and Hub source routes drifted (phantom or missing route)!',
+  );
+
+  const validHttpMethods = new Set(['get', 'post', 'put', 'delete', 'patch']);
+  for (const [routePath, srcInfo] of sourceRoutes.entries()) {
+    const specItem = specPaths[routePath]!;
+    const specMethods = Object.keys(specItem)
+      .filter((k) => validHttpMethods.has(k.toLowerCase()))
+      .map((k) => k.toLowerCase())
+      .sort();
+    const expectedMethods = [...srcInfo.methods].sort();
+    assert.deepEqual(
+      specMethods,
+      expectedMethods,
+      `HTTP method drift on "${routePath}": spec has [${specMethods.join(',')}], source has [${expectedMethods.join(',')}]`,
+    );
+
+    for (const method of expectedMethods) {
+      const op = specItem[method]!;
+      assert.ok(typeof op.operationId === 'string' && op.operationId.length > 0, `${method.toUpperCase()} ${routePath} missing operationId`);
+
+      // Verify path parameters match `{param}` placeholders 1:1
+      const opParams = (Array.isArray(op.parameters) ? op.parameters : []) as Array<{
+        name: string;
+        in: string;
+        required?: boolean;
+      }>;
+      const specPathParams = opParams
+        .filter((p) => p.in === 'path')
+        .map((p) => {
+          assert.equal(p.required, true, `Path param ${p.name} on ${routePath} must have required: true`);
+          return p.name;
+        });
+      assert.deepEqual(
+        specPathParams,
+        srcInfo.pathParams,
+        `Path parameter drift on ${method.toUpperCase()} ${routePath}`,
+      );
+
+      // Verify query parameters read in `index.ts` are documented in `op.parameters`
+      if (method === 'get' && srcInfo.queryParams.size > 0) {
+        const specQueryParams = new Set(opParams.filter((p) => p.in === 'query').map((p) => p.name));
+        for (const qp of srcInfo.queryParams) {
+          assert.ok(
+            specQueryParams.has(qp),
+            `Query parameter "${qp}" read by ${method.toUpperCase()} ${routePath} in source is missing from OpenAPI parameters!`,
+          );
+        }
+      }
+
+      // Verify OAuth security scopes match actual handler enforcement!
+      const methodSec =
+        (srcInfo as ExtractedSourceRoute & { methodSecurity?: Record<string, string> }).methodSecurity?.[method] ??
+        srcInfo.securityKind;
+      const specSec = op.security as Array<Record<string, string[]>> | undefined;
+      assert.ok(Array.isArray(specSec), `${method.toUpperCase()} ${routePath} must declare explicit security array`);
+
+      if (methodSec === 'public') {
+        assert.deepEqual(
+          specSec,
+          [],
+          `Security drift on ${method.toUpperCase()} ${routePath}: source enforces NO scope/auth, while spec claims ${JSON.stringify(specSec)}`,
+        );
+      } else if (methodSec === 'owner_bearer') {
+        assert.deepEqual(specSec, [{ bearerAuth: [] }], `Expected owner bearerAuth on ${method.toUpperCase()} ${routePath}`);
+      } else if (methodSec === 'oauth_read') {
+        const oauthEntry = specSec.find((s) => 'oauth2Pkce' in s);
+        assert.deepEqual(
+          oauthEntry?.oauth2Pkce,
+          ['crawl:read'],
+          `Expected oauth2Pkce: ['crawl:read'] on ${method.toUpperCase()} ${routePath}, got ${JSON.stringify(specSec)}`,
+        );
+      } else if (methodSec === 'oauth_fetch') {
+        const oauthEntry = specSec.find((s) => 'oauth2Pkce' in s);
+        assert.deepEqual(
+          oauthEntry?.oauth2Pkce,
+          ['crawl:fetch'],
+          `Expected oauth2Pkce: ['crawl:fetch'] on ${method.toUpperCase()} ${routePath}, got ${JSON.stringify(specSec)}`,
+        );
+      } else if (methodSec === 'oauth_mcp_query') {
+        const oauthEntry = specSec.find((s) => 'oauth2Pkce' in s);
+        assert.deepEqual(oauthEntry?.oauth2Pkce, ['crawl:read', 'mcp:call']);
+      } else if (methodSec === 'oauth_mcp_rpc') {
+        const oauthEntry = specSec.find((s) => 'oauth2Pkce' in s);
+        assert.deepEqual(oauthEntry?.oauth2Pkce, ['crawl:read', 'crawl:fetch', 'mcp:call']);
+      }
+    }
+  }
+
+  // 3. Verify ALL 17 canonical MCP tool schemas match `McpTool_*Input` AND shared REST request schemas!
+  const mcpTools = params.mcpTools ?? buildCanonicalMcpToolSchemas();
+  assert.equal(mcpTools.length, 17);
+  for (const tool of mcpTools) {
+    const pascal = tool.name
+      .split('_')
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join('');
+    const key = `McpTool_${pascal}Input`;
+    const inSpec = components.schemas[key];
+    assert.ok(inSpec, `Missing MCP tool schema ${key} in OpenAPI components.schemas`);
+    const { title: _t, description: _d, ...restSchema } = inSpec;
+    assert.deepEqual(restSchema, tool.inputSchema, `MCP tool "${tool.name}" inputSchema drifted from OpenAPI ${key}`);
+  }
+  assert.deepEqual(components.schemas.ScrapeRequest, MCP_TOOL_SCHEMAS.scrape);
+  assert.deepEqual(components.schemas.ExtractRequest, MCP_TOOL_SCHEMAS.extract);
+  assert.deepEqual(components.schemas.InteractRequest, MCP_TOOL_SCHEMAS.interact);
+  assert.deepEqual(components.schemas.MapRequest, MCP_TOOL_SCHEMAS.map);
+  assert.deepEqual(components.schemas.SearchRequest, MCP_TOOL_SCHEMAS.search);
+  assert.deepEqual(components.schemas.JobsRequest, MCP_TOOL_SCHEMAS.jobs);
+  assert.deepEqual(components.schemas.CatalogRequest, MCP_TOOL_SCHEMAS.catalog);
+}
+
+test('Round 8 [Mutation-Proof OpenAPI Contract]: validates source parity, live response schemas & catches 10/10 synthetic mutations', async () => {
+  const hubDir = process.env.EDGEFETCH_HUB_ROOT ?? process.cwd();
+  const pkg = JSON.parse(readFileSync(resolve(hubDir, 'package.json'), 'utf8')) as { version: string };
+  const indexSrc = readFileSync(resolve(hubDir, 'src', 'index.ts'), 'utf8');
+  const compatSrc = readFileSync(resolve(hubDir, 'src', 'compat.ts'), 'utf8');
+  const botAuthSrc = readFileSync(resolve(hubDir, 'src', 'bot-auth.ts'), 'utf8');
+  const oauthSrc = readFileSync(resolve(hubDir, 'src', 'oauth.ts'), 'utf8');
+  const githubAuthSrc = readFileSync(resolve(hubDir, 'src', 'github-auth.ts'), 'utf8');
+
+  const spec = buildOpenApiSpec({ origin: 'https://edgefetch.dev', version: pkg.version });
+
+  // 1. Baseline contract MUST pass 100% cleanly!
+  assertOpenApiSourceAndSchemaContract({
+    spec,
+    indexSrc,
+    compatSrc,
+    botAuthSrc,
+    oauthSrc,
+    githubAuthSrc,
+  });
+
+  // 2. Validate LIVE HTTP responses from `hubWorker.fetch` against OpenAPI `responses[status]` JSON Schemas!
+  const tmpData = mkdtempSync(join(tmpdir(), 'ef-r8-oa-live-'));
+  const callerToken = 'r8-openapi-live-secret-0123456789abcdef';
+  const oaCoordinator = new LocalAgentHubCoordinator(join(tmpData, 'hub.sqlite'));
+  const oaMetaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+  const oaSearchDb = new NodeSqliteD1Database(':memory:', [{ name: 'search/0001_fts.sql', sql: search0001 }]);
+  const oaArtifacts = new NodeFsR2Bucket(join(tmpData, 'r2'));
+  const oaEnv = {
+    AGENT_HUB: oaCoordinator.asNamespace() as never,
+    META: oaMetaDb as never,
+    SEARCH: oaSearchDb as never,
+    ARTIFACTS: oaArtifacts as never,
+    CALLER_TOKEN: callerToken,
+  };
+
+  try {
+    const specPaths = spec.paths as Record<string, Record<string, Record<string, unknown>>>;
+    const allSchemas = (spec.components as { schemas: Record<string, Record<string, unknown>> }).schemas;
+
+    const liveProbes: Array<{
+      specPath: string;
+      actualPath: string;
+      method: 'GET' | 'POST';
+      auth?: boolean;
+      body?: unknown;
+      expectedStatus: number;
+    }> = [
+      { specPath: '/health', actualPath: '/health', method: 'GET', expectedStatus: 200 },
+      { specPath: '/.well-known/edgefetch-bot.json', actualPath: '/.well-known/edgefetch-bot.json', method: 'GET', expectedStatus: 200 },
+      { specPath: '/.well-known/oauth-protected-resource', actualPath: '/.well-known/oauth-protected-resource', method: 'GET', expectedStatus: 200 },
+      { specPath: '/.well-known/oauth-authorization-server', actualPath: '/.well-known/oauth-authorization-server', method: 'GET', expectedStatus: 200 },
+      { specPath: '/v1/capabilities', actualPath: '/v1/capabilities', method: 'GET', auth: true, expectedStatus: 200 },
+      { specPath: '/v1/capabilities', actualPath: '/v1/capabilities', method: 'GET', auth: false, expectedStatus: 401 },
+      { specPath: '/v1/extractors', actualPath: '/v1/extractors', method: 'GET', auth: true, expectedStatus: 200 },
+      { specPath: '/v1/hosts', actualPath: '/v1/hosts', method: 'GET', auth: true, expectedStatus: 200 },
+      { specPath: '/agents', actualPath: '/agents', method: 'GET', auth: true, expectedStatus: 200 },
+      {
+        specPath: '/v1/crawl/params-preview',
+        actualPath: '/v1/crawl/params-preview',
+        method: 'POST',
+        auth: true,
+        body: { url: 'https://example.com', prompt: 'only /docs' },
+        expectedStatus: 200,
+      },
+      {
+        specPath: '/v1/ingest-tab',
+        actualPath: '/v1/ingest-tab',
+        method: 'POST',
+        auth: true,
+        body: { url: 'https://example.com/guide', markdown: '# Guide\n\nHello world.' },
+        expectedStatus: 200,
+      },
+      {
+        specPath: '/v1/collections/{collectionId}/search',
+        actualPath: '/v1/collections/browser-clips/search?q=Guide',
+        method: 'GET',
+        auth: true,
+        expectedStatus: 200,
+      },
+      {
+        specPath: '/mcp',
+        actualPath: '/mcp',
+        method: 'POST',
+        auth: true,
+        body: { jsonrpc: '2.0', id: 1, method: 'ping' },
+        expectedStatus: 200,
+      },
+    ];
+
+    for (const probe of liveProbes) {
+      const res = await hubWorker.fetch(
+        new Request(`https://edgefetch.dev${probe.actualPath}`, {
+          method: probe.method,
+          headers: {
+            ...(probe.auth ? { authorization: `Bearer ${callerToken}` } : {}),
+            ...(probe.body !== undefined ? { 'content-type': 'application/json' } : {}),
+          },
+          ...(probe.body !== undefined ? { body: JSON.stringify(probe.body) } : {}),
+        }),
+        oaEnv,
+      );
+      assert.equal(res.status, probe.expectedStatus, `${probe.method} ${probe.actualPath} status`);
+      const jsonBody = await res.json();
+      const op = specPaths[probe.specPath]![probe.method.toLowerCase()]!;
+      const responses = op.responses as Record<string, { content?: Record<string, { schema?: Record<string, unknown> }> }>;
+      const respSchema = responses[String(probe.expectedStatus)]?.content?.['application/json']?.schema;
+      assert.ok(respSchema, `Missing response schema for ${probe.method} ${probe.specPath} -> ${probe.expectedStatus}`);
+      validateJsonValueAgainstSchema(jsonBody, respSchema!, allSchemas, `${probe.method} ${probe.specPath}[${probe.expectedStatus}]`);
+    }
+  } finally {
+    oaCoordinator.close();
+    oaMetaDb.close();
+    oaSearchDb.close();
+    rmSync(tmpData, { recursive: true, force: true });
+  }
+
+  // 3. 10-Mutation Self-Test: prove EVERY SINGLE ONE of 10 synthetic contract drifts FAILS `assertOpenApiSourceAndSchemaContract`
+  //    or `validateJsonValueAgainstSchema` (`0/10` false passes)!
+  const cloneSpec = () => JSON.parse(JSON.stringify(spec)) as Record<string, unknown>;
+
+  const mutations: Array<{ name: string; run: () => void }> = [
+    {
+      name: '1. Missing /v1/jobs route in spec.paths',
+      run: () => {
+        const s = cloneSpec();
+        delete (s.paths as Record<string, unknown>)['/v1/jobs'];
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '2. Phantom /v1/ghost-endpoint route added to spec.paths',
+      run: () => {
+        const s = cloneSpec();
+        (s.paths as Record<string, unknown>)['/v1/ghost-endpoint'] = {
+          get: { operationId: 'ghost', security: [], responses: { '200': { description: 'ok' } } },
+        };
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '3. Wrong HTTP method (DELETE missing from /v1/crawl/{crawlId})',
+      run: () => {
+        const s = cloneSpec();
+        delete ((s.paths as Record<string, Record<string, unknown>>)['/v1/crawl/{crawlId}'])!.delete;
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '4. Weakened OAuth scope in spec (/v1/scrape changed from crawl:fetch to crawl:read)',
+      run: () => {
+        const s = cloneSpec();
+        const op = ((s.paths as Record<string, Record<string, Record<string, unknown>>>)['/v1/scrape'])!.post!;
+        op.security = [{ bearerAuth: [] }, { oauth2Pkce: ['crawl:read'] }];
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '5. Missing scope check in index.ts source (/v1/capabilities drops crawl:read guard)',
+      run: () => {
+        const mutatedIndex = indexSrc.replace(
+          /if \(request\.method === 'GET' && url\.pathname === '\/v1\/capabilities'\) \{[\s\S]*?return Response\.json\(buildCapabilities/,
+          `if (request.method === 'GET' && url.pathname === '/v1/capabilities') {\n  return withRouteSpan('edgefetch.capabilities', {}, async () => {\n    return Response.json(buildCapabilities`,
+        );
+        assertOpenApiSourceAndSchemaContract({ spec, indexSrc: mutatedIndex, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '6. Path parameter name drift ({crawlId} documented as {id})',
+      run: () => {
+        const s = cloneSpec();
+        const params = (((s.paths as Record<string, Record<string, Record<string, unknown>>>)['/v1/crawl/{crawlId}'])!.get!.parameters as Array<{ name: string }>);
+        params[0]!.name = 'id';
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '7. Undocumented query parameter (category removed from /v1/extractors)',
+      run: () => {
+        const s = cloneSpec();
+        (((s.paths as Record<string, Record<string, Record<string, unknown>>>)['/v1/extractors'])!.get!).parameters = [];
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '8. Dangling $ref in response schema',
+      run: () => {
+        const s = cloneSpec();
+        (((s.paths as Record<string, Record<string, Record<string, unknown>>>)['/health'])!.get!.responses as Record<string, unknown>)['200'] = {
+          description: 'broken',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/NonExistentSchema' } } },
+        };
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '9. MCP tool inputSchema drift vs OpenAPI McpTool_SearchInput',
+      run: () => {
+        const s = cloneSpec();
+        const schemas = (s.components as { schemas: Record<string, Record<string, unknown>> }).schemas;
+        const props = schemas.McpTool_SearchInput!.properties as Record<string, unknown>;
+        delete props.maxResults;
+        assertOpenApiSourceAndSchemaContract({ spec: s, indexSrc, compatSrc, botAuthSrc, oauthSrc, githubAuthSrc });
+      },
+    },
+    {
+      name: '10. Live response body violates OpenAPI HealthResponse schema (wrong type / missing required field)',
+      run: () => {
+        const allSchemas = (spec.components as { schemas: Record<string, Record<string, unknown>> }).schemas;
+        validateJsonValueAgainstSchema({ ok: 'yes' }, { $ref: '#/components/schemas/HealthResponse' }, allSchemas, 'GET /health');
+      },
+    },
+  ];
+
+  assert.equal(mutations.length, 10);
+  for (const m of mutations) {
+    assert.throws(
+      () => m.run(),
+      `Mutation "${m.name}" MUST fail the OpenAPI contract validator, but it passed!`,
+    );
+  }
+});
+}
+
+// ============================================================================
+// Consolidated from round8-manifests-commerce.test.ts
+// ============================================================================
+{
+const COMPILED_BUNDLE = compiledBundleJson as unknown as CompiledManifestBundle;
+const hubRoot = process.env.EDGEFETCH_HUB_ROOT
+  ? resolve(process.env.EDGEFETCH_HUB_ROOT)
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const datPath = join(hubRoot, '..', 'internal', 'extract', 'manifests', 'public_suffix_list.dat');
+
+test('R8-PSL-1: Vendored public_suffix_list.dat enforces exact, wildcard, exception, IDN, and PRIVATE DOMAINS rules via Go WASM', () => {
+  const onDiskDat = readFileSync(datPath, 'utf8').replace(/\r\n/g, '\n');
+  assert.ok(onDiskDat.includes('// ===BEGIN ICANN DOMAINS==='));
+  assert.ok(onDiskDat.includes('// ===BEGIN PRIVATE DOMAINS==='));
+
+  const cases: Array<[string, string | null, boolean, boolean]> = [
+    ['en.wikipedia.org', 'wikipedia.org', false, false],
+    ['com', null, true, false],
+    ['co.uk', null, true, false],
+    ['bbc.co.uk', 'bbc.co.uk', false, false],
+    ['ck', null, true, false],
+    ['foo.ck', null, true, false],
+    ['bar.foo.ck', 'bar.foo.ck', false, false],
+    ['www.ck', 'www.ck', false, false],
+    ['sub.www.ck', 'www.ck', false, false],
+    ['other.kobe.jp', null, true, false],
+    ['city.kobe.jp', 'city.kobe.jp', false, false],
+    ['ward.city.kobe.jp', 'city.kobe.jp', false, false],
+    ['supabase.co', null, true, true],
+    ['evil.supabase.co', 'evil.supabase.co', false, true],
+    ['workers.dev', null, true, true],
+    ['foo.workers.dev', 'foo.workers.dev', false, true],
+    ['github.io', null, true, true],
+    ['bar.github.io', 'bar.github.io', false, true],
+    ['s3.amazonaws.com', null, true, true],
+    ['bucket.s3.amazonaws.com', 'bucket.s3.amazonaws.com', false, true],
+    ['eu.platformsh.site', null, true, true],
+    ['app.eu.platformsh.site', 'app.eu.platformsh.site', false, true],
+    ['vercel.app', null, true, true],
+    ['x.vercel.app', 'x.vercel.app', false, true],
+    ['fly.dev', null, true, true],
+    ['y.fly.dev', 'y.fly.dev', false, true],
+    ['ngrok-free.app', null, true, true],
+    ['z.ngrok-free.app', 'z.ngrok-free.app', false, true],
+    ['食狮.com.cn', 'xn--85x722f.com.cn', false, false],
+    ['食狮.中国', 'xn--85x722f.xn--fiqs8s', false, false],
+    ['中国', null, true, false],
+  ];
+
+  for (const [host, wantReg, wantSuf, wantPriv] of cases) {
+    assert.equal(getRegistrableDomain(host), wantReg, `runtime getRegistrableDomain(${host})`);
+    assert.equal(compilerGetReg(host), wantReg, `compiler getRegistrableDomain(${host})`);
+    assert.equal(isPublicOrPrivateSuffix(host), wantSuf, `runtime isPublicOrPrivateSuffix(${host})`);
+    assert.equal(compilerIsSuffix(host), wantSuf, `compiler isPublicOrPrivateSuffix(${host})`);
+    assert.equal(hasPrivateSharedHostingSuffix(host), wantPriv, `runtime hasPrivateSharedHostingSuffix(${host})`);
+    assert.equal(compilerHasPriv(host), wantPriv, `compiler hasPrivateSharedHostingSuffix(${host})`);
+  }
+});
+
+test('R8-H7-1: matchesApprovedWildcard matches identically in compiler and runtime across all 3 allowlisted shapes', () => {
+  const mustMatch: Array<[string, string]> = [
+    ['*.wikipedia.org', 'en.wikipedia.org'],
+    ['*.wikipedia.org', 'a.b.wikipedia.org'],
+    ['*.wikipedia.org', '*.sub.wikipedia.org'],
+    ['careers.*.com', 'careers.stripe.com'],
+    ['jobs.*.com', 'jobs.stripe.com'],
+    ['gitlab.*', 'gitlab.company.org'],
+    ['gitlab.*', 'gitlab.eu.company.org'],
+  ];
+  for (const [w, cand] of mustMatch) {
+    assert.equal(compilerWildcardMatch(w, cand), true, `compiler expected match for ${w} vs ${cand}`);
+    assert.equal(runtimeWildcardMatch(w, cand), true, `runtime expected match for ${w} vs ${cand}`);
+  }
+
+  const mustNotMatch: Array<[string, string]> = [
+    ['*.wikipedia.org', '*.wikimedia.org'],
+    ['*.wikipedia.org', 'wikipedia.org'],
+    ['careers.*.com', 'careers.com'],
+    ['jobs.*.com', 'jobs.org'],
+    ['gitlab.*', 'mygitlab.org'],
+    ['api.example.com', 'app.example.com'],
+  ];
+  for (const [w, cand] of mustNotMatch) {
+    assert.equal(compilerWildcardMatch(w, cand), false, `compiler expected NO match for ${w} vs ${cand}`);
+    assert.equal(runtimeWildcardMatch(w, cand), false, `runtime expected NO match for ${w} vs ${cand}`);
+  }
+});
+
+test('R8-H7-2: Compiler & runtime reject exact-subdomain hijack of *.wikipedia.org, careers.*.com, jobs.*.com, and gitlab.*', () => {
+  assert.equal(DECLARATIVE_SITE_ADAPTERS.length, 56);
+  assert.doesNotThrow(() =>
+    validateManifestSet(COMPILED_BUNDLE.manifests.map((obj) => ({ obj, label: `${obj.id}.yaml` }))),
+  );
+
+  const makeRogue = (id: string, domain: string, fetchUrl: string): DeclarativeAdapterManifest => ({
+    id,
+    name: 'Rogue Hijack Adapter',
+    category: 'developer',
+    description: 'Attempts to hijack an existing wildcard adapter domain.',
+    domains: [domain],
+    exampleUrls: ['https://example.org/wiki/Bank_account'],
+    match: { pathSegments: ['wiki', { param: 'title', charset: 'pkg' }] },
+    twin: { id: `${id}-twin`, fetchUrl, kind: 'json', accept: 'application/json' },
+    extract: { titleTemplate: 'Hijacked', vars: { b: { paths: ['body'] } }, bodyVar: 'b' },
+  });
+
+  const attacks: DeclarativeAdapterManifest[] = [
+    makeRogue('evil-wiki', 'en.wikipedia.org', 'https://en.wikipedia.org/api/rest_v1/page/summary/{title}'),
+    makeRogue('evil-careers', 'careers.stripe.com', 'https://careers.stripe.com/api/jobs'),
+    makeRogue('evil-jobs', 'jobs.stripe.com', 'https://jobs.stripe.com/api/jobs'),
+    makeRogue('evil-gitlab', 'gitlab.company.org', 'https://gitlab.company.org/api/v4/projects'),
+  ];
+
+  for (const atk of attacks) {
+    assert.throws(
+      () => compileValidatedManifestSet([...COMPILED_BUNDLE.manifests, atk]),
+      /overlap|collides/i,
+      `Runtime compileValidatedManifestSet must reject ${atk.id} (${atk.domains[0]})`,
+    );
+    assert.throws(
+      () =>
+        validateManifestSet([
+          ...COMPILED_BUNDLE.manifests.map((obj) => ({ obj, label: `${obj.id}.yaml` })),
+          { obj: atk, label: `${atk.id}.yaml` },
+        ]),
+      /overlap/i,
+      `Compiler validateManifestSet must reject ${atk.id} (${atk.domains[0]})`,
+    );
+  }
+
+  // Unapproved cross-domain twin.fetchUrl collector host rejected in both compiler and runtime
+  const exfil = makeRogue('exfil-collector', 'victim-bank.org', 'https://collector.attacker-host.net/steal');
+  assert.throws(() => compileValidatedManifestSet([exfil]), /cross-domain twin host/i);
+  assert.throws(() => validateManifestSet([{ obj: exfil, label: 'exfil.yaml' }]), /cross-domain twin host/i);
+});
+
+test('R8-H7-3: PSL PRIVATE DOMAINS shared multi-tenant PaaS/BaaS/tunnel suffixes are rejected for both wildcards and exact tenant subdomains', () => {
+  const forbiddenDomains = [
+    '*.github.io',
+    'victim.github.io',
+    '*.gitlab.io',
+    'docs.gitlab.io',
+    '*.bitbucket.io',
+    '*.codeberg.page',
+    'org.codeberg.page',
+    '*.pages.dev',
+    'app.pages.dev',
+    '*.workers.dev',
+    'fn.workers.dev',
+    'pub.r2.dev',
+    'tun.trycloudflare.com',
+    'site.vercel.app',
+    'old.now.sh',
+    'demo.netlify.app',
+    'web.herokuapp.com',
+    'api.fly.dev',
+    'svc.onrender.com',
+    'web.up.railway.app',
+    'bot.replit.app',
+    'bot.repl.co',
+    'edge.deno.dev',
+    'db.supabase.co',
+    'db.supabase.in',
+    'fn.convex.site',
+    'fn.convex.cloud',
+    'static.surge.sh',
+    'ui.web.app',
+    'ui.firebaseapp.com',
+    'gae.appspot.com',
+    'fn.cloudfunctions.net',
+    'svc.run.app',
+    'svc1.a.run.app',
+    'bucket.s3.amazonaws.com',
+    'd111.cloudfront.net',
+    'app.azurewebsites.net',
+    'ui.azurestaticapps.net',
+    'tun.ngrok.io',
+    'tun.ngrok-free.app',
+    'tun.ngrok.app',
+    'blog.blogspot.com',
+    'app.eu.platformsh.site',
+  ];
+
+  for (const dom of forbiddenDomains) {
+    const m: DeclarativeAdapterManifest = {
+      id: 'bad-shared-host',
+      name: 'Bad Shared Host',
+      category: 'developer',
+      description: 'Attempts to claim a multi-tenant shared-hosting domain.',
+      domains: [dom],
+      exampleUrls: ['https://example.org/x'],
+      match: { pathSegments: ['x'] },
+      twin: { fetchUrl: '{requestUrl}', kind: 'json', accept: 'application/json' },
+      extract: { titleTemplate: 'T', vars: { x: { paths: ['x'] } }, bodyVar: 'x' },
+    };
+    assert.throws(() => parseDeclarativeManifest(m), /forbidden/i, `Expected runtime rejection for ${dom}`);
+    assert.throws(
+      () => validateManifestSet([{ obj: m, label: 'bad.yaml' }]),
+      /forbidden/i,
+      `Expected compiler rejection for ${dom}`,
+    );
+  }
+});
+
+test('R8-H7-4: Strict catalog.platform allowlist rejects unknown platforms instead of silently falling through to WooCommerce', () => {
+  assert.deepEqual([...VALID_CATALOG_PLATFORMS].sort(), ['shopify', 'woocommerce']);
+
+  const shopSpec = buildDeclarativeCatalogSpec({ platform: 'shopify', pauseMs: 1000, pageCap: 5 });
+  assert.equal(shopSpec.platform, 'shopify');
+
+  const wooSpec = buildDeclarativeCatalogSpec({ platform: 'woocommerce', pauseMs: 1000, pageCap: 5 });
+  assert.equal(wooSpec.platform, 'woocommerce');
+
+  for (const badPlatform of ['magento', 'bigcommerce', 'prestashop', '', undefined, null]) {
+    assert.throws(
+      () =>
+        buildDeclarativeCatalogSpec({
+          platform: badPlatform as unknown as DeclarativeCatalogConfig['platform'],
+          pauseMs: 1000,
+          pageCap: 5,
+        }),
+      /Unsupported declarative catalog platform/i,
+    );
+
+    const badManifest = {
+      id: 'bad-commerce',
+      name: 'Bad Commerce',
+      category: 'commerce-social',
+      description: 'Manifest with an unsupported catalog platform.',
+      domains: ['shop.example.org'],
+      exampleUrls: ['https://shop.example.org/products'],
+      catalog: {
+        platform: badPlatform as unknown as 'shopify',
+        pauseMs: 1000,
+        pageCap: 5,
+      },
+    } satisfies DeclarativeAdapterManifest;
+
+    assert.throws(() => parseDeclarativeManifest(badManifest), /catalog\.platform/i);
+    assert.throws(() => compileDeclarativeAdapter(badManifest), /catalog\.platform/i);
+    assert.throws(() => compileValidatedManifestSet([badManifest]), /catalog\.platform/i);
+    assert.throws(() => validateManifestSet([{ obj: badManifest, label: 'bad-commerce.yaml' }]), /catalog\.platform/i);
+  }
+});
+}
+
+// ============================================================================
+// Consolidated from round9-portable-otel.test.ts
+// ============================================================================
+{
+const CALLER_TOKEN = 'r9-owner-caller-secret-0123456789abcdef';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+test('Round 9 [OTel Security Audit Spans]: traceparent -00 cannot suppress owner login/admin/OAuth/MCP audit spans & public floods cannot drain audit budget', async () => {
+  resetOtlpExportLimitersForTests();
+  assert.equal(UNAUTH_OTLP_EXPORT_CAPACITY, 30);
+  assert.equal(SECURITY_AUDIT_OTLP_CAPACITY, 120);
+  assert.equal(MAX_PUBLIC_UNAUTH_INFLIGHT_OTLP, 8);
+  // Pure W3C parser contract remains intact (`-00` -> `sampled: false` at parser level)
+  assert.equal(parseTraceparent('00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00')?.sampled, false);
+
+  interface CapturedSpan {
+    traceId: string;
+    spanId: string;
+    parentSpanId?: string;
+    name: string;
+    attributes: Record<string, string | number | boolean>;
+  }
+
+  const exportedSpans: CapturedSpan[] = [];
+  let holdPublicExports = false;
+  const heldPublicExportResolvers: Array<() => void> = [];
+
+  const collector = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let hasAuditOrAuth = false;
+      try {
+        const parsed = JSON.parse(raw) as {
+          resourceSpans?: Array<{
+            scopeSpans?: Array<{
+              spans?: Array<{
+                traceId: string;
+                spanId: string;
+                parentSpanId?: string;
+                name: string;
+                attributes?: Array<{
+                  key: string;
+                  value?: { stringValue?: string; intValue?: string; doubleValue?: number; boolValue?: boolean };
+                }>;
+              }>;
+            }>;
+          }>;
+        };
+        const batchSpans = parsed.resourceSpans?.[0]?.scopeSpans?.[0]?.spans ?? [];
+        for (const s of batchSpans) {
+          const attrMap: Record<string, string | number | boolean> = {};
+          for (const a of s.attributes ?? []) {
+            if (a.value?.stringValue !== undefined) attrMap[a.key] = a.value.stringValue;
+            else if (a.value?.intValue !== undefined) attrMap[a.key] = Number(a.value.intValue);
+            else if (a.value?.doubleValue !== undefined) attrMap[a.key] = a.value.doubleValue;
+            else if (a.value?.boolValue !== undefined) attrMap[a.key] = a.value.boolValue;
+          }
+          if (s.name.startsWith('edgefetch.admin.') || s.name.startsWith('edgefetch.oauth.') || s.name === 'edgefetch.mcp.tool') {
+            hasAuditOrAuth = true;
+          }
+          exportedSpans.push({
+            traceId: s.traceId,
+            spanId: s.spanId,
+            ...(s.parentSpanId ? { parentSpanId: s.parentSpanId } : {}),
+            name: s.name,
+            attributes: attrMap,
+          });
+        }
+      } catch {
+        // ignore
+      }
+      const finishResp = () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      };
+      if (holdPublicExports && !hasAuditOrAuth) {
+        heldPublicExportResolvers.push(finishResp);
+      } else {
+        finishResp();
+      }
+    });
+  });
+
+  await new Promise<void>((r) => collector.listen(0, '127.0.0.1', r));
+  const collectorPort = (collector.address() as net.AddressInfo).port;
+  const collectorEndpoint = `http://127.0.0.1:${collectorPort}`;
+
+  const coordinator = new LocalAgentHubCoordinator(':memory:');
+
+  try {
+    const workerEnv = {
+      AGENT_HUB: coordinator.asNamespace() as never,
+      CALLER_TOKEN,
+      OTEL_EXPORTER_OTLP_ENDPOINT: collectorEndpoint,
+      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
+    };
+
+    // 1. Public unauthenticated flood: 120 `/openapi.json` + 120 `/.well-known/*` + 100 `/health` + 100 `401 /v1/scrape`
+    //    (completely exhausting `UNAUTH_OTLP_EXPORT_CAPACITY = 30`!)
+    for (let i = 0; i < 120; i++) {
+      await hubWorker.fetch(new Request('https://hub.example.com/openapi.json'), workerEnv);
+      await hubWorker.fetch(new Request('https://hub.example.com/.well-known/oauth-authorization-server'), workerEnv);
+      if (i < 100) {
+        await hubWorker.fetch(
+          new Request('https://hub.example.com/health', {
+            headers: { traceparent: `00-${'1'.repeat(32)}-${'2'.repeat(16)}-01` },
+          }),
+          workerEnv,
+        );
+        await hubWorker.fetch(
+          new Request('https://hub.example.com/v1/scrape', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', traceparent: `00-${'3'.repeat(32)}-${'4'.repeat(16)}-01` },
+            body: '{"url":"https://example.com"}',
+          }),
+          workerEnv,
+        );
+      }
+    }
+
+    // ALSO hold `MAX_PUBLIC_UNAUTH_INFLIGHT_OTLP` slow public OTLP collector exports open concurrently
+    // (after refilling unauth budget just enough to launch slow public exports) to verify inflight isolation too!
+    resetOtlpExportLimitersForTests();
+    holdPublicExports = true;
+    const stalledPublicFlushes: Promise<Response>[] = [];
+    for (let i = 0; i < 20; i++) {
+      stalledPublicFlushes.push(hubWorker.fetch(new Request('https://hub.example.com/openapi.json'), workerEnv));
+    }
+    await sleep(60);
+    // Drain the remaining `unauthOtlpTokens` completely as well
+    holdPublicExports = false;
+    for (let i = 0; i < 40; i++) {
+      await hubWorker.fetch(new Request('https://hub.example.com/openapi.json'), workerEnv);
+    }
+
+    exportedSpans.length = 0;
+
+    // 2. Exact Round 9 reproduction on Workers Hub:
+    //    Successful owner `POST /admin/login` WITH `traceparent: ...-00` MUST emit `edgefetch.admin.login` (`authenticated`)!
+    const loginTraceUnsampled = 'aaaa1111bbbb2222cccc3333dddd4444';
+    const loginParentId = '1122334455667788';
+    const loginWith00 = await hubWorker.fetch(
+      new Request('https://hub.example.com/admin/login', {
+        method: 'POST',
+        headers: {
+          origin: 'https://hub.example.com',
+          'content-type': 'application/x-www-form-urlencoded',
+          traceparent: `00-${loginTraceUnsampled}-${loginParentId}-00`,
+        },
+        body: new URLSearchParams({ token: CALLER_TOKEN }).toString(),
+      }),
+      workerEnv,
+    );
+    assert.equal(loginWith00.status, 302);
+    assert.match(
+      loginWith00.headers.get('traceparent') ?? '',
+      new RegExp(`^00-${loginTraceUnsampled}-[0-9a-f]{16}-01$`),
+      'Promoted audit trace must advertise sampled -01 in response traceparent',
+    );
+
+    const loginAuditSpan = exportedSpans.find(
+      (s) => s.name === 'edgefetch.admin.login' && s.traceId === loginTraceUnsampled,
+    );
+    assert.ok(loginAuditSpan, 'Owner login with traceparent -00 MUST emit edgefetch.admin.login audit span');
+    assert.equal(loginAuditSpan.attributes['admin.outcome'], 'authenticated');
+    const loginHttpSpan = exportedSpans.find(
+      (s) => s.name === 'edgefetch.http' && s.traceId === loginTraceUnsampled,
+    );
+    assert.ok(loginHttpSpan, 'Enclosing edgefetch.http span must also be exported with parentSpanId stitched');
+    assert.equal(loginHttpSpan.parentSpanId, loginParentId);
+
+    // 3. Failed `POST /admin/login` (401) WITH `traceparent: ...-00` AFTER public traffic drained `unauthOtlpTokens`
+    //    MUST ALSO emit `edgefetch.admin.login` (`unauthorized`) via isolated `security_audit` budget!
+    const badLoginTrace = 'bbbb2222cccc3333dddd4444eeee5555';
+    const badLoginWith00 = await hubWorker.fetch(
+      new Request('https://hub.example.com/admin/login', {
+        method: 'POST',
+        headers: {
+          origin: 'https://hub.example.com',
+          'content-type': 'application/x-www-form-urlencoded',
+          'cf-connecting-ip': '198.51.100.77',
+          traceparent: `00-${badLoginTrace}-${loginParentId}-00`,
+        },
+        body: 'token=wrong-secret-guess',
+      }),
+      workerEnv,
+    );
+    assert.equal(badLoginWith00.status, 401);
+    const badLoginSpan = exportedSpans.find(
+      (s) => s.name === 'edgefetch.admin.login' && s.traceId === badLoginTrace,
+    );
+    assert.ok(badLoginSpan, 'Failed admin login with traceparent -00 must emit security_audit span even after public flood');
+    assert.equal(badLoginSpan.attributes['admin.outcome'], 'unauthorized');
+
+    // 4. OAuth `/oauth/register`, `/admin/api/grants/revoke`, `/mcp` tool call, and Portable Hub `/admin/login` with `-00`!
+    const oauthRegTrace = 'cccc3333dddd4444eeee5555ffff6666';
+    const regRes = await hubWorker.fetch(
+      new Request('https://hub.example.com/oauth/register', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'cf-connecting-ip': '198.51.100.88',
+          traceparent: `00-${oauthRegTrace}-${loginParentId}-00`,
+        },
+        body: JSON.stringify({
+          client_name: 'Audit Test Client',
+          redirect_uris: ['http://127.0.0.1:8910/cb'],
+        }),
+      }),
+      workerEnv,
+    );
+    assert.equal(regRes.status, 201);
+    assert.ok(
+      exportedSpans.some((s) => s.name === 'edgefetch.oauth.register' && s.traceId === oauthRegTrace),
+      'OAuth client registration with traceparent -00 must emit edgefetch.oauth.register audit span',
+    );
+
+    const mintedAdmin = await createAdminSessionValue(CALLER_TOKEN);
+    const adminRevokeTrace = 'dddd4444eeee5555ffff666600001111';
+    const revokeRes = await hubWorker.fetch(
+      new Request('https://hub.example.com/admin/api/grants/revoke', {
+        method: 'POST',
+        headers: {
+          origin: 'https://hub.example.com',
+          cookie: `${ADMIN_COOKIE_NAME}=${mintedAdmin.value}`,
+          'x-csrf-token': mintedAdmin.csrf,
+          'content-type': 'application/json',
+          traceparent: `00-${adminRevokeTrace}-${loginParentId}-00`,
+        },
+        body: JSON.stringify({ grantId: 'grant_test_123' }),
+      }),
+      workerEnv,
+    );
+    assert.equal(revokeRes.status, 200);
+    assert.ok(
+      exportedSpans.some((s) => s.name === 'edgefetch.admin.grant_revoke' && s.traceId === adminRevokeTrace),
+      'Admin grant_revoke with traceparent -00 must emit edgefetch.admin.grant_revoke audit span',
+    );
+
+    const mcpTrace = 'eeee5555ffff66660000111122223333';
+    const mcpRes = await hubWorker.fetch(
+      new Request('https://hub.example.com/mcp', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${CALLER_TOKEN}`,
+          'content-type': 'application/json',
+          traceparent: `00-${mcpTrace}-${loginParentId}-00`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'find_extractors', arguments: { query: 'stripe', limit: 2 } },
+        }),
+      }),
+      workerEnv,
+    );
+    assert.equal(mcpRes.status, 200);
+    assert.ok(
+      exportedSpans.some((s) => s.name === 'edgefetch.mcp.tool' && s.traceId === mcpTrace),
+      'MCP tools/call with traceparent -00 must emit edgefetch.mcp.tool span',
+    );
+
+    for (const finishHeld of heldPublicExportResolvers.splice(0)) finishHeld();
+    await Promise.allSettled(stalledPublicFlushes);
+  } finally {
+    for (const finishHeld of heldPublicExportResolvers.splice(0)) finishHeld();
+    coordinator.close();
+    collector.close();
+  }
+});
+}
+
+// ============================================================================
+// Consolidated from round10-live-traces.test.ts
+// ============================================================================
+{
 function createSqliteD1Tracker(sqlite: DatabaseSync) {
   const executedSql: string[] = [];
   const alterErrors: string[] = [];
@@ -2524,3 +4763,4 @@ test('Job-Hunt-Kit Parity Retest (Items A–E) & Clean-Room Security Audit (F1�
   });
   assert.equal(quotedGtPiRes.status, 403, 'data-x=">" on JSON-LD script must not desync checkPromptInjection');
 });
+}

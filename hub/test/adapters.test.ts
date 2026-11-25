@@ -4719,3 +4719,77 @@ test('ADAPTER-20: Round 6 Hardening — 100% YAML Zero-TS Providers, M1 Selector
     /Duplicate twin id/i,
   );
 });
+
+test('ADAPTER-21: JSR <pre><code><button><code></code> preservation & Product offers / fenced-JSON heuristic schema extraction', async () => {
+  const { extractHtmlDocument, extractStructuredJsonFromPageWithDiagnostics } = await import('../src/scrape');
+
+  const jsrExtracted = extractHtmlDocument(
+    `<html><body><main><h2>Path Properties</h2><pre class="highlight"><code>const ok = path.isAbsolute("/a");</code><button class="copyButton" data-copy="const ok = path.isAbsolute(&quot;/a&quot;);"><svg></svg></button><code></code></pre></main></body></html>`,
+    { baseUrl: 'https://jsr.io/@std/path', onlyMainContent: true },
+  );
+  assert.ok(jsrExtracted.markdown.includes('const ok = path.isAbsolute("/a");'));
+  assert.ok(!jsrExtracted.markdown.includes('```\n\n```'));
+
+  const shopifyHtml = `<html><head><title>Wool Runner NZ</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Wool Runner NZ","brand":{"@type":"Brand","name":"Allbirds"},"offers":{"@type":"Offer","price":"112.00","priceCurrency":"USD","availability":"https://schema.org/InStock"}}</script></head><body><main><h1>Wool Runner NZ</h1></main></body></html>`;
+  const shopifyDoc = extractHtmlDocument(shopifyHtml, {
+    baseUrl: 'https://www.allbirds.com/products/wool-runner-nz',
+    onlyMainContent: true,
+  });
+  const shopifyDiag = extractStructuredJsonFromPageWithDiagnostics(shopifyHtml, shopifyDoc, {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      brand: { type: 'string' },
+      price: { type: 'number' },
+      currency: { type: 'string' },
+      inStock: { type: 'boolean' },
+    },
+  });
+  assert.equal(shopifyDiag.unmatchedFields.length, 0);
+  assert.equal(shopifyDiag.data.price, 112);
+  assert.equal(shopifyDiag.data.brand, 'Allbirds');
+  assert.equal(shopifyDiag.data.currency, 'USD');
+  assert.equal(shopifyDiag.data.inStock, true);
+
+  // `json` output runs `sanitizeRecordUrlsDeep` so JSON-LD `url` / `@id` values percent-encode `)`, `[`, `]`, `<`, `>`
+  const { executeScrapeCall } = await import('../src/scrape');
+  const unsafeJsonLdHtml = `<html><head><title>Widget</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Widget","url":"https://shop.example.com/item(1)<x>","manufacturer":{"@id":"https://shop.example.com/brand[alpha)<y>"}}</script></head><body><main><h1>Widget</h1></main></body></html>`;
+  const jsonScrapeRes = await executeScrapeCall({
+    payload: {
+      url: 'https://shop.example.com/products/widget',
+      formats: [
+        {
+          type: 'json',
+          schema: {
+            type: 'object',
+            properties: {
+              url: { type: 'string' },
+              manufacturer: { type: 'string' },
+            },
+          },
+        },
+      ],
+    },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'cloudflare',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: '1',
+            url: 'https://shop.example.com/products/widget',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            body: unsafeJsonLdHtml,
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(jsonScrapeRes.status, 200);
+  const jsonOut = jsonScrapeRes.body.json as { url?: string; manufacturer?: string };
+  assert.equal(jsonOut.url, 'https://shop.example.com/item%281%29%3Cx%3E');
+  assert.equal(jsonOut.manufacturer, 'https://shop.example.com/brand%5Balpha%29%3Cy%3E');
+});

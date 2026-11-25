@@ -285,6 +285,17 @@ func (a *ActiveSpan) SetAttribute(k string, v any) {
 	a.attrs[k] = v
 }
 
+// Suppress marks the span ended without exporting it (used to prevent unauthenticated 401/pre-auth scanner traffic
+// from amplifying OTLP collector billing while preserving response W3C trace correlation headers).
+func (a *ActiveSpan) Suppress() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.ended = true
+	a.mu.Unlock()
+}
+
 // End finishes the span once and records it to the exporter when non-nil and sampled.
 func (a *ActiveSpan) End(statusOK bool, errMsg string) {
 	if a == nil {
@@ -458,6 +469,11 @@ func newExporterFromEnv(
 	}
 	if tickInterval <= 0 {
 		tickInterval = time.Second
+	}
+	if rawDelay := strings.TrimSpace(getenv("OTEL_BSP_SCHEDULE_DELAY")); rawDelay != "" {
+		if ms, err := strconv.Atoi(rawDelay); err == nil && ms >= 10 && ms <= 60_000 {
+			tickInterval = time.Duration(ms) * time.Millisecond
+		}
 	}
 	e := &Exporter{
 		tracesURL:       tracesURL,

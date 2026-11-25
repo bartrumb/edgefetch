@@ -114,6 +114,7 @@ type Result struct {
 	ContentType       string                         `json:"contentType,omitempty"`
 	ContentSource     string                         `json:"contentSource,omitempty"`
 	ResponseHeaders   map[string]string              `json:"headers,omitempty"`
+	PaymentHeaders    map[string]string              `json:"paymentHeaders,omitempty"`
 	CfMitigated       string                         `json:"cfMitigated,omitempty"`
 	WAF               *classify.WAFMatch             `json:"waf,omitempty"`
 	ETag              string                         `json:"etag,omitempty"`

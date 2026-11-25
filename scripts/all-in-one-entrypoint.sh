@@ -78,7 +78,7 @@ if [ "$CUR_UID" != "0" ] && [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ] && 
   exit 1
 fi
 if [ "$CUR_UID" = "0" ]; then
-  # H3 UID Isolation: keep Hub SQLite + artifacts inside `0700` `node:node` `/data/hub` (with `0710` `root:node` `/data`
+  # H3 UID Isolation: keep Hub state + artifacts inside `0700` `1000:1000` `/data/hub` (with `0710` `root:1000` `/data`
   # so UID `65532` has zero `---` traverse/read/write bits on `/data` itself, even across upgrades from older volumes).
   if [ -z "${EDGEFETCH_DATA_DIR:-}" ] || [ "${EDGEFETCH_DATA_DIR}" = "/data" ]; then
     EDGEFETCH_DATA_DIR="/data/hub"
@@ -90,18 +90,18 @@ if [ "$CUR_UID" = "0" ]; then
       [ -e "$legacy" ] && mv "$legacy" /data/hub/
     done
   fi
-  chown root:node /data
+  chown root:1000 /data
   chmod 0710 /data
-  chown -R node:node "$EDGEFETCH_DATA_DIR"
+  chown -R 1000:1000 "$EDGEFETCH_DATA_DIR"
   chmod 0700 "$EDGEFETCH_DATA_DIR"
 
-  su-exec node:node node /app/hub/dist/portable-server.mjs &
+  su-exec 1000:1000 /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
   HUB_PID=$!
 else
   EDGEFETCH_DATA_DIR="${EDGEFETCH_DATA_DIR:-/data/hub}"
   export EDGEFETCH_DATA_DIR
   mkdir -p "$EDGEFETCH_DATA_DIR" 2>/dev/null || true
-  node /app/hub/dist/portable-server.mjs &
+  /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
   HUB_PID=$!
 fi
 
@@ -117,7 +117,7 @@ trap cleanup INT TERM
 if [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ]; then
   sleep 1
   # H3 + H9 + M7 Security Invariant: Launch the local worker as isolated UID `65532:65532` with `env -i` so Hub
-  # secrets (`CALLER_TOKEN`, LLM API keys, `BOT_SIGNING_PRIVATE_KEY`, `TURSO_AUTH_TOKEN`, S3 keys) are NEVER present
+  # secrets (`CALLER_TOKEN`, LLM API keys, `BOT_SIGNING_PRIVATE_KEY`, `VAULT_MASTER_KEY`) are NEVER present
   # in the worker or Chromium `/proc/self/environ`, while forwarding explicit worker-scoped settings cleanly.
   set -- \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \

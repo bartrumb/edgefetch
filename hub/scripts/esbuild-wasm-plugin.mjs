@@ -2,10 +2,9 @@ import { resolve } from 'node:path';
 
 /**
  * esbuild plugin for Node 22 ESM test/bench bundles: resolves `*.wasm` imports to a pre-compiled
- * `WebAssembly.Module` loaded via `node:fs` `readFileSync` from `wasmAbsPath` (or `./edgefetch-core.wasm`
- * next to `import.meta.url` when `portableRelative` is true).
+ * `WebAssembly.Module` loaded via `node:fs` `readFileSync` from `wasmAbsPath`.
  */
-export function createNodeWasmPlugin({ wasmAbsPath, portableRelative = false }) {
+export function createNodeWasmPlugin({ wasmAbsPath }) {
   const resolvedWasm = wasmAbsPath ? resolve(wasmAbsPath) : '';
   return {
     name: 'edgefetch-node-wasm',
@@ -15,9 +14,7 @@ export function createNodeWasmPlugin({ wasmAbsPath, portableRelative = false }) 
         namespace: 'ef-wasm-ns',
       }));
       build.onLoad({ filter: /.*/, namespace: 'ef-wasm-ns' }, () => {
-        const pathExpr = portableRelative
-          ? 'new URL("./edgefetch-core.wasm", import.meta.url)'
-          : JSON.stringify(resolvedWasm);
+        const pathExpr = JSON.stringify(resolvedWasm);
         return {
           contents: [
             'import { readFileSync } from "node:fs";',

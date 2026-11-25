@@ -10,7 +10,7 @@ import test from 'node:test';
 import metaSchema0001 from '../migrations/meta/0001_tracking.sql';
 import metaSchema0002 from '../migrations/meta/0002_multiuser.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
-import { NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
+import { NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks.ts';
 import workerEntry from '../src/index.ts';
 import { mintSessionJwt, verifySessionJwt } from '../src/github-auth.ts';
 import { createSqliteOAuthStore, isAdminSessionRevoked, sha256Base64Url, verifyAdminSessionCookie } from '../src/oauth.ts';

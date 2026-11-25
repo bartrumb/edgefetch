@@ -10,7 +10,7 @@ import metaSql3 from '../migrations/meta/0003_round7_multiuser_hardening.sql';
 import searchSql1 from '../migrations/search/0001_fts.sql';
 
 import hubWorker from '../src/index.ts';
-import { LocalAgentHubCoordinator } from '../portable/node-adapters.ts';
+import { LocalAgentHubCoordinator } from './stubs/cf-storage-mocks.ts';
 import {
   buildCanonicalMcpToolSchemas,
   handleMcpRequest,

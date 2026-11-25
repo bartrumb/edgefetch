@@ -1,7 +1,11 @@
 # hub
 
 ## Overview
-Package `hub` implements EdgeFetch's self-hosted multi-node WebSocket controller and hybrid local-fallback HTTP/MCP server, coordinating outbound standby agents, single-hop peer hubs, sticky host affinity, bounded in-memory artifact hydration, declarative JSON/text site-adapter upgrades, Firecrawl-compatible scrape/map endpoints, and Streamable HTTP Model Context Protocol (`POST /mcp`).
+Package `hub` implements EdgeFetch's full-parity Pure-Go self-hosted Hub (`edgefetch --mode=hub`) and hybrid local-fallback HTTP/MCP server (`edgefetch serve`), coordinating outbound standby agents over WebSockets, single-hop peer hubs, sticky host affinity, filesystem/S3-backed artifacts and BM25/SQLite metadata (`hubstore`), OAuth 2.1 + PKCE + GitHub OAuth + `/admin` AES-256-GCM MCP vault (`hubauth`), all `/v1/*` domain routes (`scrape`, `extract`, `map`, `crawl`, `batch/scrape`, `search`, `collections`, `ingest-tab`, `interact`, `jobs`, `catalog`, `agent`, `artifacts`, `hosts`, `mcp/registry`, `mcp/query`), Firecrawl v2 & Tavily compatibility routes, and the 17-tool Streamable HTTP Model Context Protocol (`POST /mcp`, `2026-07-28` & `2025-03-26`).
+
+## Subdirectories & Boundaries
+- `hubstore`: [./hubstore/EGM.md](./hubstore/EGM.md) - Zero-CGO persistent Hub storage, AWS SigV4 S3/R2 artifact store, inverted BM25 collection search index, multi-provider web search fan-out, and tracker blocklist manager.
+- `hubauth`: [./hubauth/EGM.md](./hubauth/EGM.md) - OAuth 2.1 + PKCE authorization server, GitHub OAuth multi-tenant identity, `/admin` dashboard + AES-256-GCM vault, and loopback-exempt connection guard (`ConnGuard`).
 
 ## Interface
 - `[hub.go:Config]`, `[hub.go:AgentInfo]`, `[hub.go:Server]`, `[hub.go:NewServer]`, `[hub.go:Server.Close]`: Hub configuration and `http.Handler` server lifecycle (`Close` sends `websocket.StatusGoingAway` to connected agents).

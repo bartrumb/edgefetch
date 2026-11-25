@@ -50,7 +50,7 @@ import {
   LocalAgentHubCoordinator,
   NodeFsR2Bucket,
   NodeSqliteD1Database,
-} from '../portable/node-adapters';
+} from './stubs/cf-storage-mocks';
 
 const TEST_OWNER_TOKEN = 'ef_r10_owner_secret_token_32chars_minimum_xyz';
 const TEST_MCP_TOKEN = 'ef_r10_mcp_secret_token_32chars_minimum_abcde';

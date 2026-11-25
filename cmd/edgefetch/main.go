@@ -31,6 +31,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/botauth"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/hub"
+	"github.com/bartrumb/edgefetch/v2/internal/hub/hubauth"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 	"github.com/bartrumb/edgefetch/v2/internal/priv"
@@ -732,7 +733,7 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		return 2
 	}
 
-	ua := firstNonEmpty(deps.getenv("EDGEFETCH_USER_AGENT"), deps.getenv("CRAWLER_USER_AGENT"), crawl.DefaultUserAgent)
+	ua := firstNonEmpty(deps.getenv("EDGEFETCH_USER_AGENT"), deps.getenv("USER_AGENT"), deps.getenv("CRAWLER_USER_AGENT"), crawl.DefaultUserAgent)
 	if err := crawl.ValidateUserAgent(ua); err != nil {
 		log.Error("invalid_user_agent", slog.String("error", err.Error()))
 		return 2
@@ -762,7 +763,7 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	}
 	crawler := crawl.NewCrawler(crawlTr, allow, ua, log)
 	defer func() { _ = crawler.Close() }()
-	bypassHosts := splitCSV(firstNonEmpty(deps.getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS"), deps.getenv("CRAWLER_ROBOTS_BYPASS_HOSTS")))
+	bypassHosts := splitCSV(firstNonEmpty(deps.getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS"), deps.getenv("ROBOTS_BYPASS_HOSTS"), deps.getenv("CRAWLER_ROBOTS_BYPASS_HOSTS")))
 	if len(bypassHosts) == 0 && len(agentCfg.RobotsBypassHosts) > 0 {
 		bypassHosts = agentCfg.RobotsBypassHosts
 	}
@@ -788,19 +789,43 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 			log.Error("hub_agent_token_config", slog.String("error", "EDGEFETCH_AGENT_TOKEN must be at least 24 characters"))
 			return 2
 		}
+		mcpToken := strings.TrimSpace(deps.getenv("MCP_TOKEN"))
+		if mcpToken != "" && len(mcpToken) < agent.MinTokenLength {
+			log.Error("hub_mcp_token_config", slog.String("error", "MCP_TOKEN must be at least 24 characters"))
+			return 2
+		}
+		operatorClient := &http.Client{
+			Timeout:   35 * time.Second,
+			Transport: hubTr,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		goHub = hub.NewServer(hub.Config{
-			CallerToken:     serverToken,
-			AgentToken:      sharedAgentTok,
-			AgentTokens:     agentTokensMap,
-			PeerURLs:        splitCSV(deps.getenv("EDGEFETCH_PEERS")),
-			PeerToken:       firstNonEmpty(deps.getenv("EDGEFETCH_PEER_TOKEN"), serverToken),
-			FallbackCrawler: crawler,
-			BotSigner:       botSigner,
-			BotContactURL:   deps.getenv("BOT_CONTACT_URL"),
-			UserAgent:       ua,
-			Allow:           allow,
-			Logger:          log,
-			OtelExporter:    otelExp,
+			CallerToken:        serverToken,
+			McpToken:           mcpToken,
+			AgentToken:         sharedAgentTok,
+			AgentTokens:        agentTokensMap,
+			PeerURLs:           splitCSV(deps.getenv("EDGEFETCH_PEERS")),
+			PeerToken:          firstNonEmpty(deps.getenv("EDGEFETCH_PEER_TOKEN"), serverToken),
+			OperatorClient:     operatorClient,
+			FallbackCrawler:    crawler,
+			BotSigner:          botSigner,
+			BotContactURL:      deps.getenv("BOT_CONTACT_URL"),
+			UserAgent:          ua,
+			Allow:              allow,
+			Logger:             log,
+			OtelExporter:       otelExp,
+			DataDir:            strings.TrimSpace(deps.getenv("EDGEFETCH_DATA_DIR")),
+			SessionSecret:      firstNonEmpty(deps.getenv("EDGEFETCH_SESSION_SECRET"), deps.getenv("SESSION_SECRET")),
+			VaultMasterKey:     firstNonEmpty(deps.getenv("EDGEFETCH_VAULT_MASTER_KEY"), deps.getenv("VAULT_MASTER_KEY")),
+			PublicOrigin:       strings.TrimSpace(deps.getenv("EDGEFETCH_PUBLIC_ORIGIN")),
+			TrustProxy:         isTruthyEnv(deps.getenv("EDGEFETCH_TRUST_PROXY")),
+			TrustFly:           isTruthyEnv(deps.getenv("EDGEFETCH_TRUST_FLY_CLIENT_IP")),
+			DisableUpdateCheck: isTruthyEnv(deps.getenv("EDGEFETCH_DISABLE_UPDATE_CHECK")),
+			RobotsBypassHosts:  bypassHosts,
+			RedirectAllowlist:  hubauth.ParseRedirectAllowlist(deps.getenv("OAUTH_REDIRECT_ALLOWLIST")),
+			Getenv:             deps.getenv,
 		})
 		defer func() { _ = goHub.Close() }()
 		handler = goHub
@@ -812,6 +837,14 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	if listenErr != nil {
 		log.Error("listen", slog.String("addr", addr), slog.String("error", listenErr.Error()))
 		return 1
+	}
+	if modes.hub {
+		maxTotal, _ := strconv.Atoi(firstNonEmpty(deps.getenv("EDGEFETCH_MAX_TOTAL_SOCKETS"), deps.getenv("EDGEFETCH_MAX_CONNECTIONS_TOTAL")))
+		maxPerIP, _ := strconv.Atoi(firstNonEmpty(deps.getenv("EDGEFETCH_MAX_ESTABLISHED_SOCKETS_PER_IP"), deps.getenv("EDGEFETCH_MAX_CONNECTIONS_PER_IP")))
+		ln = hubauth.WrapListener(ln, hubauth.ConnGuardOptions{
+			MaxTotal: maxTotal,
+			MaxPerIP: maxPerIP,
+		})
 	}
 	if deps.onListen != nil {
 		deps.onListen(ln.Addr())
@@ -833,6 +866,7 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	if modes.hub {
 		// Long-lived /agent/ws WebSockets must not be killed by a 30s HTTP ReadTimeout!
 		srv.ReadTimeout = 0
+		hubauth.TrackConnState(srv, hubauth.ConnGuardOptions{})
 	}
 
 	serveErrCh := make(chan error, 1)

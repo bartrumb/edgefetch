@@ -17,12 +17,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import http from 'node:http';
-import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { startPortableHub } from '../portable/portable-server';
+import meta0001 from '../migrations/meta/0001_tracking.sql';
+import search0001 from '../migrations/search/0001_fts.sql';
+import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks';
 import { executeCatalogCall, getCatalogRecords, getCatalogStatus, resetCatalogStateForTests } from '../src/catalog';
 import hubWorker from '../src/index';
 import { matchesAllowedCompanyOrDomain, type StructuredJobRecord } from '../src/jobs';
@@ -40,45 +40,6 @@ import { executeScrapeCall } from '../src/scrape';
 
 function sha256Base64Url(input: string): string {
   return createHash('sha256').update(input).digest('base64url');
-}
-
-function sendRawHttpOverBoundAddress(params: {
-  port: number;
-  localAddress: string;
-  path: string;
-  headers?: Record<string, string>;
-  timeoutMs?: number;
-}): Promise<{ status: number; body: string }> {
-  return new Promise((resolveReq, rejectReq) => {
-    const req = http.request(
-      {
-        host: '127.0.0.1',
-        port: params.port,
-        localAddress: params.localAddress,
-        method: 'GET',
-        path: params.path,
-        agent: false,
-        headers: {
-          Host: `127.0.0.1:${params.port}`,
-          Connection: 'close',
-          ...(params.headers ?? {}),
-        },
-        timeout: params.timeoutMs ?? 5_000,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c: Buffer) => chunks.push(c));
-        res.on('end', () => {
-          resolveReq({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') });
-        });
-      },
-    );
-    req.on('timeout', () => {
-      req.destroy(new Error('HTTP request timed out'));
-    });
-    req.on('error', rejectReq);
-    req.end();
-  });
 }
 
 test('Round 8 [Live Hub Medium]: Workers hub ignores forged x-ef-verified-auth: 1 header for OTLP & dev-telemetry', async () => {
@@ -158,183 +119,6 @@ test('Round 8 [Live Hub Medium]: Workers hub ignores forged x-ef-verified-auth: 
     assert.equal(otlpExports, 1, 'Expected 1 OTLP export for genuinely authenticated caller');
   } finally {
     globalThis.fetch = origFetch;
-  }
-});
-
-test('Round 8 [New High + Mediums]: Portable Hub survives 33-IP 1-byte pre-header eviction attack, 8-conn burst, shared-NAT 153 clients & unauth starvation', async () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'ef-r8-portable-'));
-  const callerToken = 'valid-portable-caller-token-0123456789abcdef';
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    maxGlobalPreHeaderSockets: 128,
-    maxPreHeaderSocketsPerIp: 8,
-    maxInflightTotal: 16,
-    envOverrides: { CALLER_TOKEN: callerToken },
-  });
-
-  const attackSockets = new Set<net.Socket>();
-  let attackRunning = true;
-
-  const openOneByteAttackerSocket = (addrIdx: number) => {
-    if (!attackRunning) return;
-    const localAddr = `127.0.1.${addrIdx}`;
-    const sock = net.connect({ host: '127.0.0.1', port: hub.port, localAddress: localAddr });
-    attackSockets.add(sock);
-    sock.on('connect', () => {
-      if (!sock.destroyed) {
-        // Send 1 byte (`'G'`) so `socket.bytesRead === 1 > 0`, without completing HTTP headers!
-        sock.write('G');
-      }
-    });
-    sock.on('error', () => undefined);
-    sock.on('close', () => {
-      attackSockets.delete(sock);
-      if (attackRunning) {
-        // Immediately reconnect whenever evicted to try to assassinate newly arriving legitimate clients!
-        const t = setTimeout(() => openOneByteAttackerSocket(addrIdx), 2);
-        t.unref?.();
-      }
-    });
-  };
-
-  try {
-    // 1. Sub-test A (8-connection fresh burst from 1 non-loopback client address -> 8/8 succeed!)
-    const burstResults = await Promise.all(
-      Array.from({ length: 8 }, () =>
-        sendRawHttpOverBoundAddress({
-          port: hub.port,
-          localAddress: '127.0.2.10',
-          path: '/v1/capabilities',
-          headers: { Authorization: `Bearer ${callerToken}` },
-        }),
-      ),
-    );
-    assert.equal(burstResults.filter((r) => r.status === 200).length, 8, '8/8 fresh burst connections must succeed');
-
-    // 2. Sub-test B (New High: 33 attacker addresses × 4 1-byte sockets = 132 > 128 global pool + continuous reconnects;
-    //    valid-token client on `127.0.2.50` sends 40 requests -> 40/40 MUST succeed!)
-    for (let ipIdx = 1; ipIdx <= 33; ipIdx++) {
-      for (let s = 0; s < 4; s++) {
-        openOneByteAttackerSocket(ipIdx);
-      }
-    }
-    await new Promise((r) => setTimeout(r, 80));
-
-    let legitSucceeded = 0;
-    for (let reqIdx = 0; reqIdx < 40; reqIdx++) {
-      const out = await sendRawHttpOverBoundAddress({
-        port: hub.port,
-        localAddress: '127.0.2.50',
-        path: '/v1/capabilities',
-        headers: { Authorization: `Bearer ${callerToken}` },
-      });
-      if (out.status === 200) legitSucceeded++;
-    }
-    assert.equal(legitSucceeded, 40, `Expected 40/40 valid-token requests to survive 33-IP 1-byte attack, got ${legitSucceeded}/40`);
-
-    // Loopback `/health` continues passing too
-    const healthRes = await fetch(`http://127.0.0.1:${hub.port}/health`);
-    assert.equal(healthRes.status, 200);
-
-    attackRunning = false;
-    for (const s of attackSockets) s.destroy();
-    attackSockets.clear();
-    await new Promise((r) => setTimeout(r, 60));
-
-    // 3. Sub-test C (Shared NAT: fill ALL 8 per-IP pre-header slots on `127.0.3.77` with idle/1-byte sockets, wait 60ms,
-    //    then send 153 legitimate requests from that SAME `127.0.3.77` shared NAT address -> 153/153 MUST succeed!)
-    const natSquatters: net.Socket[] = [];
-    for (let i = 0; i < 8; i++) {
-      const sq = net.connect({ host: '127.0.0.1', port: hub.port, localAddress: '127.0.3.77' });
-      sq.on('error', () => undefined);
-      sq.on('connect', () => {
-        if (i % 2 === 0 && !sq.destroyed) sq.write('G');
-      });
-      natSquatters.push(sq);
-    }
-    await new Promise((r) => setTimeout(r, 75));
-
-    let natPeersSucceeded = 0;
-    for (let c = 0; c < 153; c++) {
-      const out = await sendRawHttpOverBoundAddress({
-        port: hub.port,
-        localAddress: '127.0.3.77',
-        path: '/v1/capabilities',
-        headers: { Authorization: `Bearer ${callerToken}` },
-      });
-      if (out.status === 200) natPeersSucceeded++;
-    }
-    for (const sq of natSquatters) sq.destroy();
-    assert.equal(natPeersSucceeded, 153, `Expected 153/153 shared-NAT clients to succeed despite idle squatters, got ${natPeersSucceeded}/153`);
-  } finally {
-    attackRunning = false;
-    for (const s of attackSockets) s.destroy();
-    await hub.close();
-    rmSync(dataDir, { recursive: true, force: true });
-  }
-});
-
-test('Round 8 [Public Discovery Headroom & fly.toml]: Public routes survive unauth saturation & fly.toml auto-derives renamed FLY_APP_NAME origin', async () => {
-  const hubDir = process.env.EDGEFETCH_HUB_ROOT ?? process.cwd();
-  const flyToml = readFileSync(resolve(hubDir, '..', 'fly.toml'), 'utf8');
-  assert.doesNotMatch(
-    flyToml,
-    /^\s*EDGEFETCH_PUBLIC_ORIGIN\s*=/m,
-    'fly.toml must NOT hardcode EDGEFETCH_PUBLIC_ORIGIN so renamed Fly apps auto-derive https://${FLY_APP_NAME}.fly.dev',
-  );
-
-  const dataDir = mkdtempSync(join(tmpdir(), 'ef-r8-fly-'));
-  const callerToken = 'fly-renamed-app-caller-secret-0123456789';
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    envOverrides: {
-      CALLER_TOKEN: callerToken,
-      FLY_APP_NAME: 'acme-custom-edgefetch',
-      EDGEFETCH_TRUST_PROXY: '1',
-      EDGEFETCH_TRUST_FLY_CLIENT_IP: '1',
-      EDGEFETCH_PUBLIC_ORIGIN: undefined,
-    },
-  });
-
-  try {
-    // 1. Verify OAuth metadata & `/admin/login` CSRF honor `https://acme-custom-edgefetch.fly.dev`!
-    const metaRes = await fetch(`http://127.0.0.1:${hub.port}/.well-known/oauth-authorization-server`, {
-      headers: { 'Fly-Client-IP': '203.0.113.9' },
-    });
-    assert.equal(metaRes.status, 200);
-    const metaJson = (await metaRes.json()) as { issuer: string; authorization_endpoint: string };
-    assert.equal(metaJson.issuer, 'https://acme-custom-edgefetch.fly.dev');
-    assert.equal(metaJson.authorization_endpoint, 'https://acme-custom-edgefetch.fly.dev/oauth/authorize');
-
-    const loginRes = await fetch(`http://127.0.0.1:${hub.port}/admin/login`, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Origin: 'https://acme-custom-edgefetch.fly.dev',
-        'Fly-Client-IP': '203.0.113.9',
-      },
-      body: `token=${encodeURIComponent(callerToken)}`,
-    });
-    assert.ok(
-      loginRes.status === 302 || loginRes.status === 303,
-      `Admin login on renamed Fly app must succeed (302/303 redirect, NOT 403 CSRF!), got ${loginRes.status}`,
-    );
-
-    // 2. Verify public discovery routes (`/openapi.json`, `/.well-known/*`, `/admin`) stay 200 OK
-    for (const pubPath of ['/openapi.json', '/.well-known/edgefetch-bot.json', '/.well-known/oauth-protected-resource', '/admin']) {
-      const r = await fetch(`http://127.0.0.1:${hub.port}${pubPath}`, {
-        headers: { 'Fly-Client-IP': '198.51.100.88' },
-      });
-      assert.equal(r.status, 200, `Public route ${pubPath} should return 200`);
-    }
-  } finally {
-    await hub.close();
-    rmSync(dataDir, { recursive: true, force: true });
   }
 });
 
@@ -474,16 +258,25 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
   const { createHash } = await import('node:crypto');
   const tmpData = mkdtempSync(join(tmpdir(), 'ef-r8-scopes-'));
   const ownerToken = 'owner-secret-token-0123456789abcdef';
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpData,
-    envOverrides: { CALLER_TOKEN: ownerToken },
-  });
+  const coordinator = new LocalAgentHubCoordinator(join(tmpData, 'hub.sqlite'));
+  const metaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+  const searchDb = new NodeSqliteD1Database(':memory:', [{ name: 'search/0001_fts.sql', sql: search0001 }]);
+  const artifacts = new NodeFsR2Bucket(join(tmpData, 'r2'));
+  const workerEnv = {
+    AGENT_HUB: coordinator.asNamespace() as never,
+    META: metaDb as never,
+    SEARCH: searchDb as never,
+    ARTIFACTS: artifacts as never,
+    CALLER_TOKEN: ownerToken,
+    SAFE_PUBLIC_FETCH: async () => new Response('User-agent: *\nAllow: /\n', { status: 200 }),
+    SAFE_FETCH: async () => new Response('User-agent: *\nAllow: /\n', { status: 200 }),
+  };
+  const baseUrl = 'https://hub.edgefetch.example';
+  const dispatch = (path: string, init?: RequestInit) =>
+    hubWorker.fetch(new Request(`${baseUrl}${path}`, init), workerEnv);
 
   try {
-    const baseUrl = `http://127.0.0.1:${hub.port}`;
-    const regRes = await fetch(`${baseUrl}/oauth/register`, {
+    const regRes = await dispatch('/oauth/register', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -497,17 +290,16 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
     const mintScopedToken = async (scope: string): Promise<string> => {
       const verifier = `pkce_verifier_${scope.replace(/[^a-z]/g, '')}_0123456789abcdef0123456789abcdef`;
       const challenge = createHash('sha256').update(verifier).digest('base64url');
-      const authGet = await fetch(
-        `${baseUrl}/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent('http://127.0.0.1:9999/cb')}&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&scope=${encodeURIComponent(scope)}&state=st1`,
+      const authGet = await dispatch(
+        `/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent('http://127.0.0.1:9999/cb')}&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&scope=${encodeURIComponent(scope)}&state=st1`,
       );
       assert.equal(authGet.status, 200);
       const html = await authGet.text();
       const csrfCookie = authGet.headers.get('set-cookie')?.split(';')[0] ?? '';
       const csrfVal = /name="csrf"\s+value="([^"]+)"/.exec(html)?.[1] ?? '';
       const sealedVal = /name="sealed"\s+value="([^"]+)"/.exec(html)?.[1] ?? '';
-      const authPost = await fetch(`${baseUrl}/oauth/authorize`, {
+      const authPost = await dispatch('/oauth/authorize', {
         method: 'POST',
-        redirect: 'manual',
         headers: {
           'content-type': 'application/x-www-form-urlencoded',
           cookie: csrfCookie,
@@ -525,7 +317,7 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
       const code = loc.searchParams.get('code')!;
       assert.ok(code);
 
-      const tokRes = await fetch(`${baseUrl}/oauth/token`, {
+      const tokRes = await dispatch('/oauth/token', {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
@@ -578,7 +370,7 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
     ];
 
     for (const ep of nonMcpEndpoints) {
-      const res = await fetch(`${baseUrl}${ep.path}`, {
+      const res = await dispatch(ep.path, {
         method: ep.method,
         headers: {
           authorization: `Bearer ${mcpOnlyPlain}`,
@@ -593,7 +385,7 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
       );
 
       if (ep.readAllowed) {
-        const readRes = await fetch(`${baseUrl}${ep.path}`, {
+        const readRes = await dispatch(ep.path, {
           method: ep.method,
           headers: {
             authorization: `Bearer ${readOnlyPlain}`,
@@ -607,7 +399,7 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
           `crawl:read token should be permitted past scope gate on ${ep.method} ${ep.path}, got 403`,
         );
       } else {
-        const readDeniedRes = await fetch(`${baseUrl}${ep.path}`, {
+        const readDeniedRes = await dispatch(ep.path, {
           method: ep.method,
           headers: {
             authorization: `Bearer ${readOnlyPlain}`,
@@ -624,14 +416,16 @@ test('Round 8 [New Medium — 7 Un-Scoped Endpoints]: mcp:call-only OAuth token 
     }
 
     // Meanwhile `POST /v1/mcp/query` (`list_connected`) DOES allow `mcp:call`-only tokens!
-    const mcpQueryRes = await fetch(`${baseUrl}/v1/mcp/query`, {
+    const mcpQueryRes = await dispatch('/v1/mcp/query', {
       method: 'POST',
       headers: { authorization: `Bearer ${mcpOnlyPlain}`, 'content-type': 'application/json' },
       body: '{"action":"list_connected"}',
     });
     assert.equal(mcpQueryRes.status, 200);
   } finally {
-    await hub.close();
+    coordinator.close();
+    metaDb.close();
+    searchDb.close();
     rmSync(tmpData, { recursive: true, force: true });
   }
 });
@@ -1261,15 +1055,20 @@ test('Round 8 [Mutation-Proof OpenAPI Contract]: validates source parity, live r
     githubAuthSrc,
   });
 
-  // 2. Validate LIVE HTTP responses from `startPortableHub` against OpenAPI `responses[status]` JSON Schemas!
+  // 2. Validate LIVE HTTP responses from `hubWorker.fetch` against OpenAPI `responses[status]` JSON Schemas!
   const tmpData = mkdtempSync(join(tmpdir(), 'ef-r8-oa-live-'));
   const callerToken = 'r8-openapi-live-secret-0123456789abcdef';
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpData,
-    envOverrides: { CALLER_TOKEN: callerToken },
-  });
+  const oaCoordinator = new LocalAgentHubCoordinator(join(tmpData, 'hub.sqlite'));
+  const oaMetaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+  const oaSearchDb = new NodeSqliteD1Database(':memory:', [{ name: 'search/0001_fts.sql', sql: search0001 }]);
+  const oaArtifacts = new NodeFsR2Bucket(join(tmpData, 'r2'));
+  const oaEnv = {
+    AGENT_HUB: oaCoordinator.asNamespace() as never,
+    META: oaMetaDb as never,
+    SEARCH: oaSearchDb as never,
+    ARTIFACTS: oaArtifacts as never,
+    CALLER_TOKEN: callerToken,
+  };
 
   try {
     const specPaths = spec.paths as Record<string, Record<string, Record<string, unknown>>>;
@@ -1326,14 +1125,17 @@ test('Round 8 [Mutation-Proof OpenAPI Contract]: validates source parity, live r
     ];
 
     for (const probe of liveProbes) {
-      const res = await fetch(`http://127.0.0.1:${hub.port}${probe.actualPath}`, {
-        method: probe.method,
-        headers: {
-          ...(probe.auth ? { authorization: `Bearer ${callerToken}` } : {}),
-          ...(probe.body !== undefined ? { 'content-type': 'application/json' } : {}),
-        },
-        ...(probe.body !== undefined ? { body: JSON.stringify(probe.body) } : {}),
-      });
+      const res = await hubWorker.fetch(
+        new Request(`https://edgefetch.dev${probe.actualPath}`, {
+          method: probe.method,
+          headers: {
+            ...(probe.auth ? { authorization: `Bearer ${callerToken}` } : {}),
+            ...(probe.body !== undefined ? { 'content-type': 'application/json' } : {}),
+          },
+          ...(probe.body !== undefined ? { body: JSON.stringify(probe.body) } : {}),
+        }),
+        oaEnv,
+      );
       assert.equal(res.status, probe.expectedStatus, `${probe.method} ${probe.actualPath} status`);
       const jsonBody = await res.json();
       const op = specPaths[probe.specPath]![probe.method.toLowerCase()]!;
@@ -1343,7 +1145,9 @@ test('Round 8 [Mutation-Proof OpenAPI Contract]: validates source parity, live r
       validateJsonValueAgainstSchema(jsonBody, respSchema!, allSchemas, `${probe.method} ${probe.specPath}[${probe.expectedStatus}]`);
     }
   } finally {
-    await hub.close();
+    oaCoordinator.close();
+    oaMetaDb.close();
+    oaSearchDb.close();
     rmSync(tmpData, { recursive: true, force: true });
   }
 
@@ -1450,73 +1254,5 @@ test('Round 8 [Mutation-Proof OpenAPI Contract]: validates source parity, live r
       () => m.run(),
       `Mutation "${m.name}" MUST fail the OpenAPI contract validator, but it passed!`,
     );
-  }
-});
-
-test('Round 8 [Pre-Header Aged-First Eviction]: 60 stalled single-IP sockets (>= 300ms) never cause a 12-connection legitimate burst to self-cannibalize', async () => {
-  const tmpData = mkdtempSync(join(tmpdir(), 'ef-r8-aged-evict-'));
-  const callerTok = 'tok_aged_evict_secret_1234567890abcdef';
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpData,
-    trustProxy: false,
-    maxGlobalPreHeaderSockets: 64,
-    maxPreHeaderSocketsPerIp: 32,
-    envOverrides: { CALLER_TOKEN: callerTok },
-  });
-  const stalledAttackers: net.Socket[] = [];
-  try {
-    for (let i = 2; i <= 61; i++) {
-      const sock = net.connect({ host: '127.0.0.1', port: hub.port, localAddress: `127.0.3.${i}` });
-      sock.on('error', () => undefined);
-      await new Promise<void>((resOpen, rejOpen) => {
-        sock.once('connect', () => {
-          sock.write('G');
-          resOpen();
-        });
-        sock.once('error', rejOpen);
-      });
-      stalledAttackers.push(sock);
-    }
-    // Let all 60 single-socket attacker IPs age past `FRESH_PREHEADER_GRACE_MS` (`250ms`)
-    await new Promise((r) => setTimeout(r, 320));
-
-    // Now open a 12-connection simultaneous legitimate burst from `127.0.3.200`!
-    const burstResults = await Promise.all(
-      Array.from({ length: 12 }, () =>
-        new Promise<number>((resolveStatus, rejectErr) => {
-          const s = net.connect({ host: '127.0.0.1', port: hub.port, localAddress: '127.0.3.200' });
-          let buf = '';
-          s.on('data', (chunk) => {
-            buf += chunk.toString('utf8');
-          });
-          s.on('connect', () => {
-            // 5ms stagger before sending headers so all 12 coexist in `remotePreHeaderSockets` simultaneously!
-            setTimeout(() => {
-              if (!s.destroyed) {
-                s.write(
-                  `GET /v1/capabilities HTTP/1.1\r\nHost: 127.0.0.1:${hub.port}\r\nAuthorization: Bearer ${callerTok}\r\nConnection: close\r\n\r\n`,
-                );
-              }
-            }, 5);
-          });
-          s.on('end', () => {
-            const m = /^HTTP\/1\.1 (\d{3})/.exec(buf);
-            resolveStatus(m ? Number(m[1]) : 0);
-          });
-          s.on('error', rejectErr);
-        }),
-      ),
-    );
-    assert.deepEqual(
-      burstResults,
-      Array.from({ length: 12 }, () => 200),
-      `All 12 concurrent burst requests from 127.0.3.200 must succeed (200) by evicting aged stalled attacker sockets, got ${JSON.stringify(burstResults)}`,
-    );
-  } finally {
-    for (const s of stalledAttackers) s.destroy();
-    await hub.close();
-    rmSync(tmpData, { recursive: true, force: true });
   }
 });

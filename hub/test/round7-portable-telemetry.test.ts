@@ -2,12 +2,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
-import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { mkdtemp, rm } from 'node:fs/promises';
 import collectorWorker, {
   IPV6_PREFIX48_RATE_LIMIT_CAPACITY,
   MAX_EVENTS_PER_POST,
@@ -16,14 +14,7 @@ import collectorWorker, {
   type D1DatabaseLike,
   type D1PreparedStatementLike,
 } from '../../telemetry/src/index.ts';
-import { LocalAgentHubCoordinator } from '../portable/node-adapters.ts';
-import {
-  FIRST_BYTE_PREHEADER_TIMEOUT_MS,
-  MAX_PREHEADER_SOCKETS_PER_IP,
-  PRE_HEADER_TIMEOUT_MS,
-  resolveConfiguredPublicOrigin,
-  startPortableHub,
-} from '../portable/portable-server.ts';
+import { LocalAgentHubCoordinator } from './stubs/cf-storage-mocks.ts';
 import {
   DEV_TELEMETRY_SETTING_KEY,
   flushDevErrorTelemetry,
@@ -34,320 +25,18 @@ import {
   validateDevErrorReport,
 } from '../src/dev-telemetry.ts';
 import hubWorker from '../src/index.ts';
-import { ADMIN_COOKIE_NAME, createAdminSessionValue } from '../src/oauth.ts';
 import {
   buildCrawlChildSpans,
   buildOtlpTracePayload,
   createRequestTraceContext,
   parseOtlpHeaders,
   parseTraceparent,
-  RequestTracer,
   resetOtlpExportLimitersForTests,
   resolveOtlpTracesUrl,
   sanitizeUrlForSpan,
 } from '../src/otel.ts';
 
 const CALLER_TOKEN = 'r7-caller-secret-token-0123456789abcdef';
-const MCP_TOKEN = 'r7-mcp-secret-token-0123456789abcdefXYZ';
-const AGENT_TOKEN = 'r7-agent-secret-token-0123456789abcdef';
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function rawTcpHttpRequest(
-  port: number,
-  payload: string,
-  localAddress = '127.0.0.1',
-  timeoutMs = 2_000,
-): Promise<string> {
-  return new Promise((res) => {
-    const sock = net.connect({ port, host: '127.0.0.1', localAddress });
-    let out = '';
-    const timer = setTimeout(() => {
-      sock.destroy();
-      res(out || 'TIMEOUT');
-    }, timeoutMs);
-    sock.on('data', (chunk) => {
-      out += chunk.toString('latin1');
-    });
-    sock.on('error', (err: NodeJS.ErrnoException) => {
-      clearTimeout(timer);
-      res(out || `SOCKERR:${err.code ?? err.message}`);
-    });
-    sock.on('close', () => {
-      clearTimeout(timer);
-      res(out || 'CLOSED');
-    });
-    sock.on('connect', () => {
-      sock.write(payload);
-    });
-  });
-}
-
-test('R7-H8: Portable Hub exempts loopback /health & /readyz (100/100) under 132+ silent remote sockets, caps per-IP pre-header at 4, and FIFO-evicts global pre-header sockets with zero drift', async () => {
-  assert.equal(MAX_PREHEADER_SOCKETS_PER_IP, 32);
-  assert.equal(FIRST_BYTE_PREHEADER_TIMEOUT_MS, 5_000);
-  assert.equal(PRE_HEADER_TIMEOUT_MS, 10_000);
-
-  const dataDir = await mkdtemp(join(tmpdir(), 'ef-r7-h8-'));
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    maxGlobalPreHeaderSockets: 16,
-    envOverrides: {
-      CALLER_TOKEN,
-      AGENT_TOKEN,
-      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
-    },
-  });
-
-  const silentKeepers: Array<{ stop: () => void }> = [];
-  const startSilentKeeper = (fromIp: string, count: number) => {
-    let stopped = false;
-    const live = new Set<net.Socket>();
-    const openOne = () => {
-      if (stopped) return;
-      const s = net.connect({ port: hub.port, host: '127.0.0.1', localAddress: fromIp });
-      live.add(s);
-      s.on('error', () => undefined);
-      s.resume();
-      s.on('close', () => {
-        live.delete(s);
-        if (!stopped) {
-          const t = setTimeout(openOne, 25);
-          t.unref?.();
-        }
-      });
-    };
-    for (let i = 0; i < count; i++) openOne();
-    const keeper = {
-      stop: () => {
-        stopped = true;
-        for (const s of live) s.destroy();
-      },
-    };
-    silentKeepers.push(keeper);
-    return keeper;
-  };
-
-  try {
-    // 1. Reproduce `s7.mjs` `prehdr` + global saturation:
-    //    6 remote IPs (`127.0.0.2`..`127.0.0.7`) opening 33 silent zero-byte sockets each (`198` silent sockets > `maxGlobalPreHeaderSockets=16`)!
-    for (const n of [2, 3, 4, 5, 6, 7]) {
-      startSilentKeeper(`127.0.0.${n}`, 33);
-    }
-    await sleep(150);
-
-    // Verify 100/100 loopback `/health` & `/readyz` probes succeed AND remote `127.0.0.99` probes succeed via FIFO eviction!
-    let loopbackOk = 0;
-    let readyzOk = 0;
-    let remoteOk = 0;
-    for (let i = 0; i < 100; i++) {
-      const h = await rawTcpHttpRequest(
-        hub.port,
-        'GET /health HTTP/1.1\r\nHost: hub.local\r\nConnection: close\r\n\r\n',
-        '127.0.0.1',
-      );
-      if (h.startsWith('HTTP/1.1 200 OK')) loopbackOk++;
-
-      if (i < 25) {
-        const rz = await rawTcpHttpRequest(
-          hub.port,
-          'GET /readyz HTTP/1.1\r\nHost: hub.local\r\nConnection: close\r\n\r\n',
-          '127.0.0.1',
-        );
-        if (rz.startsWith('HTTP/1.1 200 OK')) readyzOk++;
-
-        const rem = await rawTcpHttpRequest(
-          hub.port,
-          `GET /v1/hosts HTTP/1.1\r\nHost: hub.local\r\nAuthorization: Bearer ${CALLER_TOKEN}\r\nConnection: close\r\n\r\n`,
-          '127.0.0.99',
-        );
-        if (rem.startsWith('HTTP/1.1 200 OK')) remoteOk++;
-      }
-    }
-
-    assert.equal(loopbackOk, 100, 'Loopback 127.0.0.1 /health must succeed 100/100 under silent pre-header flood');
-    assert.equal(readyzOk, 25, 'Loopback 127.0.0.1 /readyz must succeed 25/25 under silent pre-header flood');
-    assert.equal(remoteOk, 25, 'Legitimate remote client must evict silent pre-header sockets and succeed 25/25');
-
-    for (const k of silentKeepers) k.stop();
-    silentKeepers.length = 0;
-    await sleep(150);
-
-    // 2. Verify zero counter drift across rapid RST, half-open FIN, partial headers, clientError, and WS upgrade rejections (`127.0.0.12`)
-    const quickExit = (data: string, halfOpen = false) =>
-      new Promise<void>((res) => {
-        const s = net.connect({ port: hub.port, host: '127.0.0.1', localAddress: '127.0.0.12', allowHalfOpen: true });
-        s.on('error', () => res());
-        s.on('close', () => res());
-        s.on('connect', () => {
-          if (data) s.write(data);
-          if (halfOpen) {
-            s.end();
-            setTimeout(() => s.destroy(), 50).unref?.();
-          } else {
-            setTimeout(() => s.destroy(), 5).unref?.();
-          }
-        });
-      });
-
-    for (let i = 0; i < 40; i++) {
-      await Promise.all([
-        quickExit(''),
-        quickExit('', true),
-        quickExit('GET /health HTTP/1.1\r\nHo'),
-        quickExit('NOT_HTTP\r\n\r\n'),
-        quickExit('GET /agent/ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'),
-      ]);
-    }
-    await sleep(150);
-
-    // All 10 fresh silent sockets from `127.0.0.12` (within `maxGlobalPreHeaderSockets = 16` and `MAX_PREHEADER_SOCKETS_PER_IP = 32`) should be admitted with zero counter drift
-    const probeIdle: Array<net.Socket & { _closed?: boolean }> = await Promise.all(
-      Array.from({ length: 10 }, () =>
-        new Promise<net.Socket & { _closed?: boolean }>((r) => {
-          const s: net.Socket & { _closed?: boolean } = net.connect({
-            port: hub.port,
-            host: '127.0.0.1',
-            localAddress: '127.0.0.12',
-          });
-          s.on('error', () => undefined);
-          s.on('close', () => {
-            s._closed = true;
-          });
-          s.on('connect', () => r(s));
-          setTimeout(() => r(s), 300).unref?.();
-        }),
-      ),
-    );
-    await sleep(150);
-    const openIdleCount = probeIdle.filter((s) => !s._closed).length;
-    for (const s of probeIdle) s.destroy();
-    assert.equal(openIdleCount, Math.min(10, MAX_PREHEADER_SOCKETS_PER_IP, 16), 'Zero pre-header counter drift after rapid aborts');
-  } finally {
-    for (const k of silentKeepers) k.stop();
-    await hub.close();
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test('R7-AuthSlots: Bogus Authorization/X-Api-Key/Cookie headers cannot claim reserved authenticated concurrency slots on Portable or Deno Hub', async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), 'ef-r7-slots-'));
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    maxInflightPerIp: 8,
-    maxInflightTotal: 8, // maxUnauthInflight = 8 - 2 = 6; 2 slots strictly reserved for verified callers
-    envOverrides: {
-      CALLER_TOKEN,
-      MCP_TOKEN,
-      AGENT_TOKEN,
-      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
-    },
-  });
-
-  const stalledSockets: net.Socket[] = [];
-  try {
-    // Open 6 stalled POST requests carrying bogus `Authorization`, `X-Api-Key`, and `Cookie` headers across `127.0.0.2` & `127.0.0.3`
-    for (let i = 0; i < 6; i++) {
-      const fromIp = i < 3 ? '127.0.0.2' : '127.0.0.3';
-      const s = await new Promise<net.Socket>((r) => {
-        const sock = net.connect({ port: hub.port, host: '127.0.0.1', localAddress: fromIp });
-        sock.on('error', () => undefined);
-        sock.on('connect', () => {
-          sock.write(
-            `POST /oauth/token HTTP/1.1\r\nHost: hub.local\r\nAuthorization: Bearer bogus-token-${i}\r\nX-Api-Key: fake-key-${i}\r\nCookie: ${ADMIN_COOKIE_NAME}=bogus.cookie.val\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 500\r\n\r\n`,
-          );
-          r(sock);
-        });
-      });
-      stalledSockets.push(s);
-    }
-    await sleep(100);
-
-    // 7th bogus-auth request from a fresh IP (`127.0.0.4`) MUST be rejected with 429 (cannot eat reserved authenticated slots!)
-    const bogus7 = await rawTcpHttpRequest(
-      hub.port,
-      'GET /openapi.json HTTP/1.1\r\nHost: hub.local\r\nAuthorization: Bearer completely-bogus-secret-token-value\r\nConnection: close\r\n\r\n',
-      '127.0.0.4',
-    );
-    assert.match(bogus7, /^HTTP\/1\.1 429 /, 'Bogus Authorization header must hit unauthenticated slot ceiling (429)');
-
-    // Genuine CALLER_TOKEN request from `127.0.0.5` MUST succeed (200) via reserved authenticated slot!
-    const validCaller = await rawTcpHttpRequest(
-      hub.port,
-      `GET /v1/hosts HTTP/1.1\r\nHost: hub.local\r\nAuthorization: Bearer ${CALLER_TOKEN}\r\nConnection: close\r\n\r\n`,
-      '127.0.0.5',
-    );
-    assert.match(validCaller, /^HTTP\/1\.1 200 /, 'Verified CALLER_TOKEN must succeed using reserved authenticated slot');
-
-    // Genuine signed `ef_admin_session` cookie request MUST also succeed (200)!
-    const mintedSession = await createAdminSessionValue(CALLER_TOKEN);
-    const validAdmin = await rawTcpHttpRequest(
-      hub.port,
-      `GET /admin/api/state HTTP/1.1\r\nHost: hub.local\r\nCookie: ${ADMIN_COOKIE_NAME}=${mintedSession.value}\r\nConnection: close\r\n\r\n`,
-      '127.0.0.6',
-    );
-    assert.match(validAdmin, /^HTTP\/1\.1 200 /, 'Verified signed admin cookie must succeed using reserved slot');
-  } finally {
-    for (const s of stalledSockets) s.destroy();
-    await hub.close();
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test('R7-Origin: Fly.io, Render, and Railway 1-click deploy env vars resolve canonical HTTPS origin for /admin login CSRF & Secure cookies while blocking Host spoofing', async () => {
-  assert.equal(resolveConfiguredPublicOrigin({ FLY_APP_NAME: 'myhub' }), 'https://myhub.fly.dev');
-  assert.equal(resolveConfiguredPublicOrigin({ RENDER_EXTERNAL_URL: 'https://myhub.onrender.com/ignored' }), 'https://myhub.onrender.com');
-  assert.equal(resolveConfiguredPublicOrigin({ RAILWAY_PUBLIC_DOMAIN: 'myhub.up.railway.app' }), 'https://myhub.up.railway.app');
-
-  const dataDir = await mkdtemp(join(tmpdir(), 'ef-r7-fly-'));
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    envOverrides: {
-      CALLER_TOKEN,
-      EDGEFETCH_TRUST_PROXY: '1',
-      FLY_APP_NAME: 'myhub',
-      EDGEFETCH_PUBLIC_ORIGIN: undefined,
-      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
-    },
-  });
-
-  try {
-    const body = `token=${CALLER_TOKEN}`;
-    // 1. Legitimate Fly.io `/admin/login` succeeds (302) with `Secure` cookie + `HSTS`, even if `X-Forwarded-Proto: https, http` is sent!
-    const okLogin = await rawTcpHttpRequest(
-      hub.port,
-      `POST /admin/login HTTP/1.1\r\nHost: myhub.fly.dev\r\nX-Forwarded-Proto: https, http\r\nX-Forwarded-For: 203.0.113.10\r\nOrigin: https://myhub.fly.dev\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`,
-    );
-    assert.match(okLogin, /^HTTP\/1\.1 302 /);
-    assert.match(okLogin, /set-cookie: (?:__Host-)?ef_admin_session=[^;]+;[^\r\n]*;\s*Secure/i);
-    assert.match(okLogin, /strict-transport-security:/i);
-
-    // 2. Spoofed `Host: evil.test` + `Origin: https://evil.test` is rejected with 403!
-    const spoofedLogin = await rawTcpHttpRequest(
-      hub.port,
-      `POST /admin/login HTTP/1.1\r\nHost: evil.test\r\nX-Forwarded-Proto: https\r\nX-Forwarded-For: 203.0.113.11\r\nOrigin: https://evil.test\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`,
-    );
-    assert.match(spoofedLogin, /^HTTP\/1\.1 403 /);
-
-    // 3. OAuth metadata issuer stays pinned to `https://myhub.fly.dev` under `Host: evil.test`
-    const oauthMeta = await rawTcpHttpRequest(
-      hub.port,
-      'GET /.well-known/oauth-authorization-server HTTP/1.1\r\nHost: evil.test\r\nX-Forwarded-Host: evil.test\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n',
-    );
-    assert.ok(oauthMeta.includes('"issuer":"https://myhub.fly.dev"'));
-  } finally {
-    await hub.close();
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
 
 test('R7-OTel: Unauthenticated 401/403 requests emit 0 outbound OTLP/telemetry POSTs, public unauth floods are rate-limited, and OTel parsers block CRLF/NaN/oversized inputs', async () => {
   resetOtlpExportLimitersForTests();

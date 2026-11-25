@@ -22,7 +22,7 @@ try {
     banner: {
       js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);",
     },
-    alias: { 'cloudflare:workers': resolve(hubRoot, 'portable', 'cloudflare-shim.ts') },
+    alias: { 'cloudflare:workers': resolve(hubRoot, 'test', 'cloudflare-workers-stub.ts') },
     loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text' },
   });
 

@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 
-import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
+import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks.ts';
 import { handleAdminRoute } from '../src/admin.ts';
 import { startOrExecuteAgentCall } from '../src/agent-runner.ts';
 import { executeCatalogCall, getCatalogRecords, getCatalogStatus } from '../src/catalog.ts';

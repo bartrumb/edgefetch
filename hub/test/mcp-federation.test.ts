@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { startPortableHub } from '../portable/portable-server.ts';
+import hubWorker from '../src/index.ts';
+import { LocalAgentHubCoordinator } from './stubs/cf-storage-mocks.ts';
 import { handleAdminRoute } from '../src/admin.ts';
 import { loadAgentRun, startOrExecuteAgentCall } from '../src/agent-runner.ts';
 import {
@@ -1011,31 +1012,31 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     assert.equal(r2PutCount, 0);
   }
 
-  // 3. Live Portable Hub E2E: `/v1/mcp/registry`, `/v1/mcp/query`, `/mcp` (`discover_mcps` & `query_mcp`), and cross-client OAuth isolation
+  // 3. Live Worker Hub E2E: `/v1/mcp/registry`, `/v1/mcp/query`, `/mcp` (`discover_mcps` & `query_mcp`), and cross-client OAuth isolation
   const tmpData = mkdtempSync(join(tmpdir(), 'ef-mcp-fed-hub-'));
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpData,
-    envOverrides: {
-      CALLER_TOKEN: TEST_OWNER_TOKEN,
-      VAULT_MASTER_KEY: TEST_VAULT_KEY,
-    },
-  });
+  const coordinator = new LocalAgentHubCoordinator(join(tmpData, 'hub.sqlite'));
+  const workerEnv = {
+    AGENT_HUB: coordinator.asNamespace() as never,
+    CALLER_TOKEN: TEST_OWNER_TOKEN,
+    VAULT_MASTER_KEY: TEST_VAULT_KEY,
+  };
 
   try {
-    const base = `http://127.0.0.1:${hub.port}`;
+    const base = 'https://hub.edgefetch.dev';
     const authHeaders = {
       authorization: `Bearer ${TEST_OWNER_TOKEN}`,
       'content-type': 'application/json',
     };
 
     // Query connected MCPs via `POST /v1/mcp/query`
-    const listRes = await fetch(`${base}/v1/mcp/query`, {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({ action: 'list_connected' }),
-    });
+    const listRes = await hubWorker.fetch(
+      new Request(`${base}/v1/mcp/query`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ action: 'list_connected' }),
+      }),
+      workerEnv,
+    );
     assert.equal(listRes.status, 200);
     assert.match(String(listRes.headers.get('cache-control')), /private,\s*no-store/i);
     const listJson = (await listRes.json()) as { ok: boolean; visibility: string; userId: string; count: number };
@@ -1045,16 +1046,19 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     assert.equal(listJson.count, 0);
 
     // Call `query_mcp` over `POST /mcp` JSON-RPC
-    const mcpCallRes = await fetch(`${base}/mcp`, {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 77,
-        method: 'tools/call',
-        params: { name: 'query_mcp', arguments: { action: 'list_connected' } },
+    const mcpCallRes = await hubWorker.fetch(
+      new Request(`${base}/mcp`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 77,
+          method: 'tools/call',
+          params: { name: 'query_mcp', arguments: { action: 'list_connected' } },
+        }),
       }),
-    });
+      workerEnv,
+    );
     assert.equal(mcpCallRes.status, 200);
     const mcpCallJson = (await mcpCallRes.json()) as {
       result: { content: Array<{ text: string }>; structuredContent?: { visibility?: string } };
@@ -1078,14 +1082,12 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     assert.equal(bidiClean.detected, false);
     assert.equal(bidiClean.text, 'Safe title hidden-rtl text');
   } finally {
-    await hub.close();
+    coordinator.close();
     rmSync(tmpData, { recursive: true, force: true });
   }
 });
 
 test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (gh_1001 vs gh_2002 across /admin, /mcp query_mcp, and /v1/mcp/query)', async () => {
-  const { LocalAgentHubCoordinator } = await import('../portable/node-adapters.ts');
-  const hubWorker = (await import('../src/index.ts')).default;
   const { verifyAdminSessionCookie } = await import('../src/oauth.ts');
 
   const tmpDir = mkdtempSync(join(tmpdir(), 'ef-cross-pillar-mcp-'));

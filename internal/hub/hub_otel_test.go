@@ -211,6 +211,7 @@ func TestGoHubSplitTraceIDFixedAndWaterfallCorrelation(t *testing.T) {
 
 	var (
 		httpSpan   *capturedOTLPSpan
+		scrapeSpan *capturedOTLPSpan
 		twinSpan   *capturedOTLPSpan
 		dispatches []capturedOTLPSpan
 		batches    []capturedOTLPSpan
@@ -224,6 +225,8 @@ func TestGoHubSplitTraceIDFixedAndWaterfallCorrelation(t *testing.T) {
 		switch {
 		case sp.Name == "edgefetch.http":
 			httpSpan = sp
+		case sp.Name == "edgefetch.scrape":
+			scrapeSpan = sp
 		case sp.Name == "edgefetch.hub.twin":
 			twinSpan = sp
 		case sp.Name == "edgefetch.dispatch":
@@ -237,31 +240,34 @@ func TestGoHubSplitTraceIDFixedAndWaterfallCorrelation(t *testing.T) {
 	if httpSpan == nil || httpSpan.SpanID != parsedTP.ParentSpanID {
 		t.Fatalf("expected edgefetch.http spanId matching response Traceparent, got httpSpan=%+v tp=%+v", httpSpan, parsedTP)
 	}
-	if twinSpan == nil || twinSpan.ParentSpanID != httpSpan.SpanID {
-		t.Fatalf("expected edgefetch.hub.twin parented under edgefetch.http (%q), got %+v", httpSpan.SpanID, twinSpan)
+	if scrapeSpan == nil || scrapeSpan.ParentSpanID != httpSpan.SpanID {
+		t.Fatalf("expected edgefetch.scrape parented under edgefetch.http (%q), got %+v", httpSpan.SpanID, scrapeSpan)
 	}
-	if twinSpan.Attributes["edgefetch.adapter_id"] != "rubygems" || twinSpan.Attributes["edgefetch.twin.hit"] != false {
+	if twinSpan == nil || twinSpan.ParentSpanID != scrapeSpan.SpanID {
+		t.Fatalf("expected edgefetch.hub.twin parented under edgefetch.scrape (%q), got %+v", scrapeSpan.SpanID, twinSpan)
+	}
+	if twinSpan.Attributes["edgefetch.twin.candidate"] != "rubygems" || twinSpan.Attributes["edgefetch.twin.hit"] != false || twinSpan.Attributes["edgefetch.adapter_id"] != nil {
 		t.Fatalf("unexpected twin span attributes: %+v", twinSpan.Attributes)
 	}
 	if len(dispatches) != 2 || len(batches) != 2 || len(fetches) != 2 {
 		t.Fatalf("expected 2 dispatches, 2 batches, 2 fetches; got dispatches=%d batches=%d fetches=%d", len(dispatches), len(batches), len(fetches))
 	}
 
-	// Verify parentage: one dispatch under twinSpan, one dispatch under httpSpan, and each batch under a dispatch!
+	// Verify parentage: one dispatch under twinSpan, one dispatch under scrapeSpan, and each batch under a dispatch!
 	dispatchByID := make(map[string]capturedOTLPSpan)
 	sawTwinChild := false
-	sawHTTPChild := false
+	sawScrapeChild := false
 	for _, d := range dispatches {
 		dispatchByID[d.SpanID] = d
 		if d.ParentSpanID == twinSpan.SpanID {
 			sawTwinChild = true
 		}
-		if d.ParentSpanID == httpSpan.SpanID {
-			sawHTTPChild = true
+		if d.ParentSpanID == scrapeSpan.SpanID {
+			sawScrapeChild = true
 		}
 	}
-	if !sawTwinChild || !sawHTTPChild {
-		t.Fatalf("expected one dispatch under twin (%q) and one under http (%q), got %+v", twinSpan.SpanID, httpSpan.SpanID, dispatches)
+	if !sawTwinChild || !sawScrapeChild {
+		t.Fatalf("expected one dispatch under twin (%q) and one under scrape (%q), got %+v", twinSpan.SpanID, scrapeSpan.SpanID, dispatches)
 	}
 	batchByID := make(map[string]capturedOTLPSpan)
 	for _, b := range batches {

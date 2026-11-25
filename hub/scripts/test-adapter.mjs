@@ -81,7 +81,6 @@ export {
 export { runAdapterSyncInBulkhead } from ${JSON.stringify(join(hubRoot, 'src', 'adapter-sandbox.ts'))};
 export { extractHtmlDocument } from ${JSON.stringify(join(hubRoot, 'src', 'scrape.ts'))};
 export { fetchOverflowRobots, isRobotsAllowed } from ${JSON.stringify(join(hubRoot, 'src', 'overflow.ts'))};
-export { createSafeOutboundFetch } from ${JSON.stringify(join(hubRoot, 'portable', 'safe-fetch.ts'))};
 `,
   'utf8',
 );
@@ -113,8 +112,24 @@ try {
     extractHtmlDocument,
     fetchOverflowRobots,
     isRobotsAllowed,
-    createSafeOutboundFetch,
   } = mod;
+
+  const createSafeOutboundFetch = () => async (rawUrl, init = {}) => {
+    let cur = String(rawUrl);
+    for (let hop = 0; hop <= 5; hop++) {
+      const parsed = new URL(cur);
+      if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+        throw new Error(`Refusing non-HTTPS or credentialed URL: ${cur}`);
+      }
+      const res = await fetch(cur, { ...init, redirect: 'manual' });
+      if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
+        cur = new URL(res.headers.get('location'), cur).toString();
+        continue;
+      }
+      return res;
+    }
+    throw new Error(`Too many redirects fetching ${rawUrl}`);
+  };
 
   const simpleHtmlToMd = (frag, base) => {
     const doc = extractHtmlDocument(`<!doctype html><html><body>${frag}</body></html>`, {

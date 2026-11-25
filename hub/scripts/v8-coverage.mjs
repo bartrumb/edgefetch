@@ -1112,13 +1112,12 @@ export function collectAndPrintCoverage({
   const canonHubRoot = canonicalizePath(hubRoot);
   const repoRoot = canonicalizePath(resolve(hubRoot, '..'));
   const srcRoot = `${canonHubRoot}/src/`;
-  const portableRoot = `${canonHubRoot}/portable/`;
   const sdkRoot = `${repoRoot}/sdk/ts/`;
 
   const isTargetSourceFile = (canonFile) => {
     if (!canonFile.endsWith('.ts') || canonFile.endsWith('.d.ts')) return false;
     if (canonFile.includes('/node_modules/') || canonFile.startsWith(`${canonHubRoot}/test/`)) return false;
-    if (canonFile.startsWith(srcRoot) || canonFile.startsWith(portableRoot)) return true;
+    if (canonFile.startsWith(srcRoot)) return true;
     if (includeSdk && canonFile.startsWith(sdkRoot)) return true;
     return false;
   };
@@ -1267,7 +1266,6 @@ export function collectAndPrintCoverage({
   // 3. Scan disk for ALL non-type Hub .ts files to seed complete execLines & branches universe
   const diskFiles = [
     ...listTsFilesRecursive(resolve(canonHubRoot, 'src')),
-    ...listTsFilesRecursive(resolve(canonHubRoot, 'portable')),
   ];
   if (includeSdk) {
     diskFiles.push(...listTsFilesRecursive(resolve(repoRoot, 'sdk', 'ts')));

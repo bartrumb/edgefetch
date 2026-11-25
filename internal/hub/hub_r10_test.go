@@ -18,16 +18,21 @@ import (
 )
 
 func TestR10P4HubTwinRedirectEnforcesValidateRedirectTarget(t *testing.T) {
-	// Static guard: verify `isSameTwinOriginDomain` has been deleted from hub.go and `ValidateRedirectTarget` is wired.
+	// Static guard: verify `isSameTwinOriginDomain` has been deleted and `ValidateRedirectTarget` is wired.
 	hubSrc, err := os.ReadFile("hub.go")
 	if err != nil {
 		t.Fatalf("ReadFile(hub.go): %v", err)
 	}
-	if strings.Contains(string(hubSrc), "isSameTwinOriginDomain") {
-		t.Fatal("isSameTwinOriginDomain must be completely removed from internal/hub/hub.go")
+	routesScrapeSrc, err := os.ReadFile("routes_scrape.go")
+	if err != nil {
+		t.Fatalf("ReadFile(routes_scrape.go): %v", err)
 	}
-	if !strings.Contains(string(hubSrc), "ValidateRedirectTarget(") {
-		t.Fatal("expected twin.ValidateRedirectTarget(...) to be wired in internal/hub/hub.go")
+	combinedSrc := string(hubSrc) + "\n" + string(routesScrapeSrc)
+	if strings.Contains(combinedSrc, "isSameTwinOriginDomain") {
+		t.Fatal("isSameTwinOriginDomain must be completely removed from internal/hub")
+	}
+	if !strings.Contains(combinedSrc, "ValidateRedirectTarget(") {
+		t.Fatal("expected twin.ValidateRedirectTarget(...) to be wired in internal/hub")
 	}
 
 	// Spin up a mock multi-host TLS origin serving both declarative JSON twins (with controlled 302 redirects)

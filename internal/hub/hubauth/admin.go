@@ -246,6 +246,20 @@ func (m *Manager) HandleAdmin(w http.ResponseWriter, r *http.Request, origin str
 		return true
 	}
 
+	if p == "/admin/api/tracker-list/refresh" && r.Method == http.MethodPost {
+		if tok, _ := extractPresentedToken(r); tok != "" {
+			callerTok := strings.TrimSpace(m.cfg.CallerToken)
+			if callerTok != "" && constantTimeEqual(tok, callerTok) && strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) != "cross-site" {
+				m.HandleAdminTrackerListRefresh(w, r, verifiedSession{
+					Principal: Principal{Authenticated: true, Kind: "owner", UserID: "owner", Role: "owner", IsOwner: true},
+				}, isHTTPS)
+				return true
+			}
+			writeJSONResp(w, isHTTPS, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return true
+		}
+	}
+
 	if isMutatingMethod(r.Method) && !m.isSameOriginRequest(r, origin) {
 		writeJSONResp(w, isHTTPS, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
 		return true
@@ -275,6 +289,8 @@ func (m *Manager) HandleAdmin(w http.ResponseWriter, r *http.Request, origin str
 		m.HandleAdminMcpServers(w, r, sess, origin, isHTTPS)
 	case p == "/admin/api/telemetry" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 		m.HandleAdminTelemetry(w, r, sess, isHTTPS)
+	case p == "/admin/api/tracker-list/refresh" && r.Method == http.MethodPost:
+		m.HandleAdminTrackerListRefresh(w, r, sess, isHTTPS)
 	default:
 		writeJSONResp(w, isHTTPS, http.StatusNotFound, map[string]string{"error": "not_found"})
 	}

@@ -112,37 +112,39 @@ var (
 	}
 
 	alwaysHiddenOrChromeClassesFullDocGo = map[string]bool{
-		"sr-only":                          true,
-		"visually-hidden":                  true,
-		"screenreader-only":                true,
-		"hideme":                           true,
-		"unitheader-banner":                true,
-		"js-comment-minimize":              true,
-		"js-comment-hide-button":           true,
-		"js-suggestion-button-placeholder": true,
-		"js-clipboard-copy":                true,
-		"zeroclipboard-container":          true,
-		"doc-anchor":                       true,
-		"documentation-idlink":             true,
-		"headerlink":                       true,
-		"pilcrow":                          true,
-		"mw-editsection":                   true,
-		"mw-editsection-bracket":           true,
-		"mw-editsection-divider":           true,
-		"sphinxsidebar":                    true,
-		"katex-html":                       true,
-		"mwe-math-fallback-image-inline":   true,
-		"mwe-math-fallback-image-display":  true,
-		"lnt":                              true,
-		"line-numbers-rows":                true,
-		"line-numbers-wrapper":             true,
-		"hljs-ln-numbers":                  true,
-		"swiper-slide-duplicate":           true,
-		"slick-cloned":                     true,
-		"splide__slide--clone":             true,
-		"flickity-cloned":                  true,
-		"glide__slide--clone":              true,
-		"owl-cloned":                       true,
+		"sr-only":                               true,
+		"visually-hidden":                       true,
+		"screenreader-only":                     true,
+		"hideme":                                true,
+		"unitheader-banner":                     true,
+		"js-comment-minimize":                   true,
+		"js-comment-hide-button":                true,
+		"js-suggestion-button-placeholder":      true,
+		"js-clipboard-copy":                     true,
+		"zeroclipboard-container":               true,
+		"doc-anchor":                            true,
+		"documentation-idlink":                  true,
+		"documentation-examplebuttonscontainer": true,
+		"documentation-exampleerror":            true,
+		"headerlink":                            true,
+		"pilcrow":                               true,
+		"mw-editsection":                        true,
+		"mw-editsection-bracket":                true,
+		"mw-editsection-divider":                true,
+		"sphinxsidebar":                         true,
+		"katex-html":                            true,
+		"mwe-math-fallback-image-inline":        true,
+		"mwe-math-fallback-image-display":       true,
+		"lnt":                                   true,
+		"line-numbers-rows":                     true,
+		"line-numbers-wrapper":                  true,
+		"hljs-ln-numbers":                       true,
+		"swiper-slide-duplicate":                true,
+		"slick-cloned":                          true,
+		"splide__slide--clone":                  true,
+		"flickity-cloned":                       true,
+		"glide__slide--clone":                   true,
+		"owl-cloned":                            true,
 	}
 
 	nonContentRolesFullDocGo = map[string]bool{
@@ -4265,7 +4267,10 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	}
 
 	if !onlyMainContent || len(includeTags) > 0 {
-		work = replacePairedHTMLElementsLinearFullDocGo(work, []string{"span", "a"}, func(full, tag, attrStr, inner string) string {
+		if opts.IsFragment {
+			work = stripHiddenAndChromeSubtreesFullDocGo(work)
+		}
+		work = replacePairedHTMLElementsLinearFullDocGo(work, []string{"span", "a", "button"}, func(full, tag, attrStr, inner string) string {
 			if tag == "span" && (hasClassTokenFullDocGo(attrStr, "mw-editsection") || hasClassTokenFullDocGo(attrStr, "mw-editsection-bracket") || hasClassTokenFullDocGo(attrStr, "mw-editsection-divider")) {
 				return ""
 			}
@@ -4277,6 +4282,9 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 					lbl == "¶" || lbl == "[¶]" {
 					return ""
 				}
+			}
+			if tag == "button" && opts.IsFragment && reChromeButtonFullDocGo.MatchString(cleanInlineHTMLFullDocGo(inner)) {
+				return ""
 			}
 			return full
 		}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)

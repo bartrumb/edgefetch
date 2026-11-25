@@ -121,6 +121,13 @@ func (s *Server) initSubsystems() {
 				}
 				return nil
 			},
+			RefreshTrackerList: func(ctx context.Context) (bool, any, error) {
+				if s.trackerMgr == nil {
+					return false, nil, nil
+				}
+				updated, err := s.trackerMgr.RefreshNow(ctx)
+				return updated, s.trackerMgr.Status(), err
+			},
 			OnTelemetryToggle: func(enabled bool) {
 				if s.cfg.OtelExporter != nil {
 					s.cfg.OtelExporter.SetRuntimeDevTelemetry(enabled)

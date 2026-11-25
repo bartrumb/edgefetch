@@ -1052,6 +1052,95 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
     assert.equal(events.length, 1);
     assert.match(events[0]!.summary, /blocked=5/);
     assert.equal((events[0]!.details as Record<string, unknown>).blockedTrackers, 5);
+
+    // 7. Owner-only `POST /admin/api/tracker-list/refresh` hydrates cold R2, broadcasts over WS, and respects 6h floor
+    const adminRefreshBucket = new NodeFsR2Bucket(join(tmp, 'worker-admin-refresh-r2'));
+    const adminRefreshMetaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+    const adminRefreshCoord = new LocalAgentHubCoordinator(join(tmp, 'worker-admin-refresh.sqlite'));
+    let adminRefreshCalls = 0;
+    const adminRefreshEnv = {
+      AGENT_HUB: adminRefreshCoord.asNamespace() as unknown as DurableObjectNamespace,
+      ARTIFACTS: adminRefreshBucket as unknown as R2Bucket,
+      META: adminRefreshMetaDb as unknown as D1Database,
+      CALLER_TOKEN: OWNER_TOKEN,
+      AGENT_TOKEN,
+      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
+      SAFE_PUBLIC_FETCH: (async (input: RequestInfo | URL) => {
+        if (String(input) === EASYPRIVACY_SOURCE_URL) {
+          adminRefreshCalls++;
+          return new Response(buildEasyPrivacyFixture({ version: '2026112501', hostCount: 6_200 }), {
+            status: 200,
+            headers: { 'content-type': 'text/plain; charset=utf-8', etag: '"etag-2026112501"' },
+          });
+        }
+        return new Response('User-agent: *\nAllow: /\n', { status: 200 });
+      }) as typeof fetch,
+    };
+    const dispatchRefreshWorker = (path: string, init?: RequestInit) =>
+      worker.fetch(new Request(`https://hub.example.com${path}`, init), adminRefreshEnv as never);
+
+    try {
+      const wsVersions: string[] = [];
+      const wsAgent = adminRefreshCoord.connectMockAgent({
+        siteId: 'node-refresh-1',
+        arch: 'amd64',
+        version: '2.8.0',
+        capabilities: 'http2,browser-v1,interact-v1',
+        publicIp: '198.51.100.12',
+        onServerMessage: (raw) => {
+          const msg = JSON.parse(String(raw)) as Record<string, unknown>;
+          if (msg.type === 'tracker_list' && typeof msg.version === 'string') {
+            wsVersions.push(msg.version);
+          }
+        },
+      });
+
+      assert.equal(adminRefreshCalls, 0);
+      const unauthRes = await dispatchRefreshWorker('/admin/api/tracker-list/refresh', { method: 'POST' });
+      assert.equal(unauthRes.status, 401);
+      assert.equal(adminRefreshCalls, 0);
+
+      const wrongTokRes = await dispatchRefreshWorker('/admin/api/tracker-list/refresh', {
+        method: 'POST',
+        headers: { authorization: 'Bearer wrong-token-value-1234567890' },
+      });
+      assert.equal(wrongTokRes.status, 401);
+      assert.equal(adminRefreshCalls, 0);
+
+      const okRes = await dispatchRefreshWorker('/admin/api/tracker-list/refresh', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${OWNER_TOKEN}` },
+      });
+      assert.equal(okRes.status, 200);
+      const okJson = (await okRes.json()) as {
+        ok: boolean;
+        updated: boolean;
+        trackerList: { version: string | null; hostCount: number };
+      };
+      assert.equal(okJson.ok, true);
+      assert.equal(okJson.updated, true);
+      assert.equal(okJson.trackerList.version, '2026112501');
+      assert.ok(okJson.trackerList.hostCount >= 5_000);
+      assert.equal(adminRefreshCalls, 1);
+      assert.deepEqual(wsVersions, ['2026112501']);
+
+      // Immediate second call within 6h floor must be rate-limited without hitting EasyPrivacy origin
+      const secondRes = await dispatchRefreshWorker('/admin/api/tracker-list/refresh', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${OWNER_TOKEN}` },
+      });
+      assert.equal(secondRes.status, 200);
+      const secondJson = (await secondRes.json()) as { ok: boolean; updated: boolean; rateLimited?: boolean };
+      assert.equal(secondJson.ok, true);
+      assert.equal(secondJson.updated, false);
+      assert.equal(secondJson.rateLimited, true);
+      assert.equal(adminRefreshCalls, 1);
+
+      wsAgent.close();
+    } finally {
+      adminRefreshCoord.close();
+      adminRefreshMetaDb.close();
+    }
   } finally {
     process.off('unhandledRejection', onUnhandled);
     rmSync(tmp, { recursive: true, force: true });

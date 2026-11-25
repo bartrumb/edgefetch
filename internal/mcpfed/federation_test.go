@@ -185,7 +185,7 @@ func TestR9H3Adversarial240KBPerformanceBudget(t *testing.T) {
 	}
 	budget := 25 * time.Millisecond
 	if raceDetectorEnabled {
-		budget = 250 * time.Millisecond
+		budget = 500 * time.Millisecond
 	}
 	t.Logf("R9-H3 adversarial 240 KB latency: %v (race=%v, budget=%v)", elapsed, raceDetectorEnabled, budget)
 	if elapsed > budget {

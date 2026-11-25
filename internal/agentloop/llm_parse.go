@@ -7,29 +7,15 @@ import (
 	"strings"
 )
 
-func asciiLowerString(s string) string {
-	hasUpper := false
-	for i := 0; i < len(s); i++ {
-		if s[i] >= 'A' && s[i] <= 'Z' {
-			hasUpper = true
-			break
-		}
-	}
-	if !hasUpper {
-		return s
-	}
-	b := []byte(s)
-	for i := 0; i < len(b); i++ {
-		if b[i] >= 'A' && b[i] <= 'Z' {
-			b[i] |= 0x20
-		}
-	}
-	return string(b)
-}
-
 // StripThinkBlocksLinear strips closed <think>...</think> reasoning blocks in strictly linear O(N) time (M12).
 func StripThinkBlocksLinear(raw string) string {
-	lower := asciiLowerString(raw)
+	if len(raw) < 15 || !strings.Contains(raw, "</") {
+		return raw
+	}
+	lower := strings.ToLower(raw)
+	if !strings.Contains(lower, "</think>") {
+		return raw
+	}
 	hit := strings.Index(lower, "<think>")
 	if hit < 0 {
 		return raw
@@ -97,7 +83,7 @@ func tryUnmarshalJSONObject(s string) map[string]any {
 // ParseLooseJSONObject extracts a JSON object from raw LLM text, stripping <think>...</think> blocks
 // and optional Markdown code fences in O(N) time (M12).
 func ParseLooseJSONObject(raw string) map[string]any {
-	if raw == "" {
+	if raw == "" || strings.IndexByte(raw, '{') < 0 || strings.IndexByte(raw, '}') < 0 {
 		return nil
 	}
 	stripped := strings.TrimSpace(StripThinkBlocksLinear(raw))
@@ -129,33 +115,37 @@ func ParseFallbackTextToolCalls(content string, allowedToolNames map[string]bool
 	if len(allowedToolNames) == 0 || content == "" {
 		return calls
 	}
-	lower := asciiLowerString(content)
-	openIdx := strings.Index(lower, "<tool_call>")
-	for openIdx >= 0 {
-		closeRel := strings.Index(lower[openIdx+11:], "</tool_call>")
-		if closeRel < 0 {
-			break
-		}
-		closeIdx := openIdx + 11 + closeRel
-		rawInner := strings.TrimSpace(content[openIdx+11 : closeIdx])
-		if obj := ParseLooseJSONObject(rawInner); obj != nil {
-			if name, ok := obj["name"].(string); ok && allowedToolNames[name] {
-				args, _ := obj["arguments"].(map[string]any)
-				if args == nil {
-					args = map[string]any{}
+	if len(content) >= 23 && strings.Contains(content, "</") {
+		lower := strings.ToLower(content)
+		if strings.Contains(lower, "</tool_call>") {
+			openIdx := strings.Index(lower, "<tool_call>")
+			for openIdx >= 0 {
+				closeRel := strings.Index(lower[openIdx+11:], "</tool_call>")
+				if closeRel < 0 {
+					break
 				}
-				calls = append(calls, LLMToolCall{
-					ID:        fmt.Sprintf("call_%d", len(calls)+1),
-					Name:      name,
-					Arguments: args,
-				})
+				closeIdx := openIdx + 11 + closeRel
+				rawInner := strings.TrimSpace(content[openIdx+11 : closeIdx])
+				if obj := ParseLooseJSONObject(rawInner); obj != nil {
+					if name, ok := obj["name"].(string); ok && allowedToolNames[name] {
+						args, _ := obj["arguments"].(map[string]any)
+						if args == nil {
+							args = map[string]any{}
+						}
+						calls = append(calls, LLMToolCall{
+							ID:        fmt.Sprintf("call_%d", len(calls)+1),
+							Name:      name,
+							Arguments: args,
+						})
+					}
+				}
+				nextRel := strings.Index(lower[closeIdx+12:], "<tool_call>")
+				if nextRel < 0 {
+					break
+				}
+				openIdx = closeIdx + 12 + nextRel
 			}
 		}
-		nextRel := strings.Index(lower[closeIdx+12:], "<tool_call>")
-		if nextRel < 0 {
-			break
-		}
-		openIdx = closeIdx + 12 + nextRel
 	}
 	if len(calls) > 0 {
 		return calls

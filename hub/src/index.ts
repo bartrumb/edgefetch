@@ -1713,23 +1713,35 @@ export default {
 
       const makeCatalogHubFetch = (sourceLabel: string): CatalogHubFetchFn => {
         const boundTracer = getActiveRequestTracer();
-        return async ({ url: pageUrl, kind = 'json', accept = 'application/json', maxBytes, target: rawTgt, site: rawSite, tracer }) => {
+        return async ({ url: pageUrl, kind = 'json', accept = 'application/json', maxBytes, timeoutMs, target: rawTgt, site: rawSite, tracer }) => {
           const tgt: FetchTarget = rawTgt === 'agent' || rawTgt === 'container' ? rawTgt : 'auto';
           const siteStr = typeof rawSite === 'string' && rawSite.trim() ? rawSite.trim() : undefined;
           const boundedMaxBytes =
             typeof maxBytes === 'number' && Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : undefined;
+          const boundedTimeoutMs =
+            typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : undefined;
+          const maxSeconds =
+            boundedTimeoutMs !== undefined ? Math.max(2, Math.min(30, Math.ceil(boundedTimeoutMs / 1_000))) : 30;
           const callTracer = getActiveRequestTracer(tracer) ?? boundTracer;
           const doFetch = () =>
             executeHubFetch(
               tgt,
               JSON.stringify({
-                maxSeconds: 30,
+                maxSeconds,
                 options: {
                   includeBody: true,
                   respectRobots: true,
                   ...(boundedMaxBytes !== undefined ? { maxBytes: boundedMaxBytes } : {}),
                 },
-                requests: [{ id: 'cat-1', url: pageUrl, kind, accept }],
+                requests: [
+                  {
+                    id: 'cat-1',
+                    url: pageUrl,
+                    kind,
+                    accept,
+                    ...(boundedTimeoutMs !== undefined ? { timeoutMs: boundedTimeoutMs } : {}),
+                  },
+                ],
               }),
               siteStr,
               sourceLabel,

@@ -3306,10 +3306,19 @@ export async function executeScrapeCall(params: {
         true,
         collectionId,
       );
+      const atsVia = atsRes.via;
       if (atsRes.status === 200) {
-        const atsParsed = JSON.parse(atsRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        let atsParsed: { results?: Array<Record<string, unknown>> } | null = JSON.parse(atsRes.bodyText) as {
+          results?: Array<Record<string, unknown>>;
+        };
+        // Drop the multi-MiB raw hub JSON envelope immediately so V8 can reclaim it before WASM formatting.
+        (atsRes as { bodyText: string }).bodyText = '';
         const atsItem = atsParsed.results?.[0];
-        const atsBody = typeof atsItem?.body === 'string' && atsItem.bodyEncoding !== 'base64' ? atsItem.body : '';
+        atsParsed = null;
+        let atsBody = typeof atsItem?.body === 'string' && atsItem.bodyEncoding !== 'base64' ? atsItem.body : '';
+        if (atsItem && 'body' in atsItem) {
+          delete atsItem.body;
+        }
         if (
           atsItem &&
           isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, atsItem, selfHost) &&
@@ -3327,6 +3336,7 @@ export async function executeScrapeCall(params: {
                 })
               : null;
           const formatted = atsSpec.format(atsBody, normalizedUrl, htmlFragToMd);
+          atsBody = '';
           if (filteredBoard || (formatted && formatted.markdown.trim().length > 0)) {
             const rawAtsMd = filteredBoard ? filteredBoard.markdown : formatted!.markdown;
             const cleanAtsMd = redactPii ? redactPiiText(rawAtsMd) : rawAtsMd;
@@ -3380,7 +3390,7 @@ export async function executeScrapeCall(params: {
             setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
             return {
               status: 200,
-              via: atsRes.via,
+              via: atsVia,
               body: {
                 ok: true,
                 cached: false,
@@ -3388,7 +3398,7 @@ export async function executeScrapeCall(params: {
                 url: normalizedUrl,
                 finalUrl: normalizedUrl,
                 status: atsItem.status ?? 200,
-                via: atsRes.via,
+                via: atsVia,
                 extractorId: atsSpec.id,
                 detected: { generators: [], adapter: atsSpec.id },
                 rendered: false,

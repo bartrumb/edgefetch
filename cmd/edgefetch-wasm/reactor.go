@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -18,13 +19,20 @@ import (
 )
 
 const (
-	maxWasmInputBytes   = 48 << 20 // 48 MiB ceiling per call (supports 8 MiB UTF-8 * 3 encodeInto headroom)
-	shrinkBufCapBytes   = 24 << 20 // Shrink buffers back to 256 KiB on small calls after >24 MiB spikes
+	maxWasmInputBytes   = 48 << 20 // 48 MiB ceiling per call (supports large ATS/HTML payloads)
+	shrinkBufCapBytes   = 8 << 20  // Release >8 MiB transient I/O buffers immediately after multi-MiB board/page calls
 	baseBufCapBytes     = 256 << 10
 	re2RingCapacity     = 1024
 	domRingCapacity     = 32
 	wasmRawStrUnchanged = ^uint32(0)
 )
+
+func init() {
+	// Cloudflare Workers shares a hard 128 MiB ceiling across V8 heap + WebAssembly.Memory,
+	// and WebAssembly linear memory pages can never shrink once grown. SetMemoryLimit paces
+	// GC automatically near 48 MiB without penalizing fast <8 MiB hot-path calls.
+	debug.SetMemoryLimit(48 << 20)
+}
 
 type domDocSlot struct {
 	id    int32
@@ -72,13 +80,14 @@ func efInPtr(size uint32) uint32 {
 	if need <= 0 {
 		need = 1
 	}
-	if cap(wasmOutBuf) > shrinkBufCapBytes && need <= baseBufCapBytes {
+	if cap(wasmOutBuf) > shrinkBufCapBytes {
 		wasmOutBuf = make([]byte, 0, baseBufCapBytes)
 	}
 	if cap(wasmInBuf) < need {
 		wasmInBuf = make([]byte, need)
-	} else if cap(wasmInBuf) > shrinkBufCapBytes && need <= baseBufCapBytes {
-		wasmInBuf = make([]byte, baseBufCapBytes)
+	} else if cap(wasmInBuf) > shrinkBufCapBytes && need <= shrinkBufCapBytes {
+		allocCap := max(need, baseBufCapBytes)
+		wasmInBuf = make([]byte, need, allocCap)
 	} else {
 		wasmInBuf = wasmInBuf[:need]
 	}
@@ -231,6 +240,12 @@ func writeWasmJSON(v any) {
 	wasmOutBuf = append(wasmOutBuf[:0], raw...)
 }
 
+func releaseOversizedWasmInBuf() {
+	if cap(wasmInBuf) > shrinkBufCapBytes {
+		wasmInBuf = make([]byte, baseBufCapBytes)
+	}
+}
+
 //go:wasmexport ef_call
 func efCall(inLen uint32) (outLen uint32) {
 	defer func() {
@@ -238,6 +253,7 @@ func efCall(inLen uint32) (outLen uint32) {
 			writeWasmJSON(map[string]any{"error": fmt.Sprintf("wasm_panic: %v", r)})
 			outLen = uint32(len(wasmOutBuf))
 		}
+		releaseOversizedWasmInBuf()
 	}()
 	if inLen > uint32(len(wasmInBuf)) {
 		writeWasmJSON(map[string]any{"error": "invalid_input_length"})
@@ -259,12 +275,17 @@ func efCallRaw(metaLen uint32, totalLen uint32) (outLen uint32) {
 			writeWasmJSON(map[string]any{"error": fmt.Sprintf("wasm_panic: %v", r)})
 			outLen = uint32(len(wasmOutBuf))
 		}
+		releaseOversizedWasmInBuf()
 	}()
 	if totalLen > uint32(len(wasmInBuf)) || metaLen > totalLen {
 		writeWasmJSON(map[string]any{"error": "invalid_input_length"})
 		return uint32(len(wasmOutBuf))
 	}
-	resp, err := dispatchWasmRawRPC(wasmInBuf[:metaLen], string(wasmInBuf[metaLen:totalLen]))
+	var rawStr string
+	if totalLen > metaLen {
+		rawStr = unsafe.String(&wasmInBuf[metaLen], int(totalLen-metaLen))
+	}
+	resp, err := dispatchWasmRawRPC(wasmInBuf[:metaLen], rawStr)
 	if err != nil {
 		writeWasmJSON(map[string]any{"error": err.Error()})
 		return uint32(len(wasmOutBuf))
@@ -280,6 +301,7 @@ func efCallRawStr(metaLen uint32, totalLen uint32) (outLen uint32) {
 			wasmOutBuf = wasmOutBuf[:0]
 			outLen = 0
 		}
+		releaseOversizedWasmInBuf()
 	}()
 	if totalLen > uint32(len(wasmInBuf)) || metaLen > totalLen {
 		wasmOutBuf = wasmOutBuf[:0]

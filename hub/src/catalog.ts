@@ -182,6 +182,8 @@ const R2_RELOAD_LRU_CACHE = new Map<string, { records: CatalogRecord[]; bytes: n
 const INFLIGHT_R2_RELOADS = new Map<string, Promise<unknown>>();
 const SHOPIFY_ORIGIN_CURRENCY_CACHE = new Map<string, { currency: string | null; expiresAt: number }>();
 const SHOPIFY_ORIGIN_CURRENCY_TTL_MS = 30 * 60_000;
+const ORIGIN_UCP_CACHE = new Map<string, { ucp: CatalogUcpMetadata | null; expiresAt: number }>();
+const ORIGIN_UCP_TTL_MS = 30 * 60_000;
 
 let activeR2Reloads = 0;
 let peakR2ReloadsSeen = 0;
@@ -254,6 +256,7 @@ export function resetCatalogStateForTests(): void {
   INFLIGHT_R2_RELOADS.clear();
   ACTIVE_CATALOG_BY_PRINCIPAL.clear();
   SHOPIFY_ORIGIN_CURRENCY_CACHE.clear();
+  ORIGIN_UCP_CACHE.clear();
   activeCatalogGlobal = 0;
   activeCatalogNonOwnerGlobal = 0;
   peakR2ReloadsSeen = 0;
@@ -863,31 +866,60 @@ export async function getCatalogStatus(params: {
   return notFound;
 }
 
-async function resolveShopifyOriginCurrency(origin: string, executeHubFetch: CatalogHubFetchFn, timeoutMs = 3_500): Promise<string | null> {
+function rememberShopifyOriginCurrency(origin: string, currency: string | null, ttlMs: number, now = Date.now()): void {
+  const cleanOrigin = origin.replace(/\/+$/, '');
+  if (!SHOPIFY_ORIGIN_CURRENCY_CACHE.has(cleanOrigin) && SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
+    const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
+    if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
+  }
+  SHOPIFY_ORIGIN_CURRENCY_CACHE.set(cleanOrigin, { currency, expiresAt: now + ttlMs });
+}
+
+async function resolveShopifyOriginCurrency(
+  origin: string,
+  executeHubFetch: CatalogHubFetchFn,
+  timeoutMs = 3_500,
+  options?: {
+    cacheNegative?: boolean;
+    deadlineAt?: number;
+    target?: unknown;
+    site?: unknown;
+    tracer?: RequestTracer | TraceContext;
+  },
+): Promise<string | null> {
+  const cleanOrigin = origin.replace(/\/+$/, '');
   const now = Date.now();
-  const cached = SHOPIFY_ORIGIN_CURRENCY_CACHE.get(origin);
+  const cached = SHOPIFY_ORIGIN_CURRENCY_CACHE.get(cleanOrigin);
   if (cached && now < cached.expiresAt) return cached.currency;
-  const setCache = (currency: string | null, ttl: number) => {
-    if (SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
-      const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
-      if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
-    }
-    SHOPIFY_ORIGIN_CURRENCY_CACHE.set(origin, { currency, expiresAt: now + ttl });
-  };
+
+  const activeTracer = getActiveRequestTracer(options?.tracer);
   for (const probePath of ['/meta.json', '/cart.js']) {
+    const probeNow = Date.now();
+    const remGlobalMs = options?.deadlineAt !== undefined ? options.deadlineAt - probeNow : timeoutMs;
+    if (remGlobalMs < 250) break;
+    const perProbeMs = Math.max(250, Math.min(timeoutMs, remGlobalMs));
     try {
-      const rawResp = await executeHubFetch({
-        url: `${origin.replace(/\/+$/, '')}${probePath}`,
-        kind: 'json',
-        accept: 'application/json',
-        maxBytes: 65_536,
-        timeoutMs,
-      });
-      const normCurr = normalizeHubPageResponse(rawResp);
+      const callProbe = () =>
+        executeHubFetch({
+          url: `${cleanOrigin}${probePath}`,
+          kind: 'json',
+          accept: 'application/json',
+          maxBytes: 65_536,
+          timeoutMs: perProbeMs,
+          ...(options?.target !== undefined ? { target: options.target } : {}),
+          ...(options?.site !== undefined ? { site: options.site } : {}),
+          ...(activeTracer ? { tracer: activeTracer } : {}),
+        });
+      const probeRace = await awaitWithDeadline(
+        Promise.resolve().then(() => (activeTracer ? activeTracer.run(callProbe) : callProbe())),
+        probeNow + perProbeMs,
+      );
+      if (probeRace.timedOut) continue;
+      const normCurr = normalizeHubPageResponse(probeRace.value);
       if (normCurr && normCurr.status === 200 && normCurr.body) {
         const cand = callCoreWasmRaw<{ currency: string | null }>('catalog_parse_currency_probe', null, normCurr.body).currency ?? null;
         if (cand) {
-          setCache(cand, SHOPIFY_ORIGIN_CURRENCY_TTL_MS);
+          rememberShopifyOriginCurrency(cleanOrigin, cand, SHOPIFY_ORIGIN_CURRENCY_TTL_MS);
           return cand;
         }
       }
@@ -895,8 +927,63 @@ async function resolveShopifyOriginCurrency(origin: string, executeHubFetch: Cat
       // ignore failed probe
     }
   }
-  setCache(null, 5 * 60_000);
+  if (options?.cacheNegative !== false) {
+    rememberShopifyOriginCurrency(cleanOrigin, null, 5 * 60_000);
+  }
   return null;
+}
+
+async function resolveOriginUcpFromRobots(
+  origin: string,
+  executeHubFetch: CatalogHubFetchFn,
+  timeoutMs = 4_000,
+  options?: {
+    deadlineAt?: number;
+    target?: unknown;
+    site?: unknown;
+    tracer?: RequestTracer | TraceContext;
+  },
+): Promise<CatalogUcpMetadata | undefined> {
+  const cleanOrigin = origin.replace(/\/+$/, '');
+  const now = Date.now();
+  const cached = ORIGIN_UCP_CACHE.get(cleanOrigin);
+  if (cached && now < cached.expiresAt) return cached.ucp ?? undefined;
+
+  const remGlobalMs = options?.deadlineAt !== undefined ? options.deadlineAt - now : timeoutMs;
+  if (remGlobalMs < 250) return undefined;
+  const perProbeMs = Math.max(250, Math.min(timeoutMs, remGlobalMs));
+  const activeTracer = getActiveRequestTracer(options?.tracer);
+  try {
+    const callRobotsCheck = () =>
+      executeHubFetch({
+        url: `${cleanOrigin}/robots.txt`,
+        kind: 'text',
+        accept: 'text/plain',
+        timeoutMs: perProbeMs,
+        ...(options?.target !== undefined ? { target: options.target } : {}),
+        ...(options?.site !== undefined ? { site: options.site } : {}),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
+      });
+    const ucpRace = await awaitWithDeadline(
+      Promise.resolve().then(() => (activeTracer ? activeTracer.run(callRobotsCheck) : callRobotsCheck())),
+      now + perProbeMs,
+    );
+    if (!ucpRace.timedOut) {
+      const normRobots = normalizeHubPageResponse(ucpRace.value);
+      if (normRobots && normRobots.status === 200) {
+        const found = normRobots.body ? discoverUcpEndpointFromRobots(cleanOrigin, normRobots.body) : null;
+        if (!ORIGIN_UCP_CACHE.has(cleanOrigin) && ORIGIN_UCP_CACHE.size >= 256) {
+          const oldestKey = ORIGIN_UCP_CACHE.keys().next().value;
+          if (oldestKey !== undefined) ORIGIN_UCP_CACHE.delete(oldestKey);
+        }
+        ORIGIN_UCP_CACHE.set(cleanOrigin, { ucp: found, expiresAt: Date.now() + ORIGIN_UCP_TTL_MS });
+        return found ?? undefined;
+      }
+    }
+  } catch {
+    // ignore failed UCP probe
+  }
+  return undefined;
 }
 
 function toStringArrayFilter(v?: string | string[]): string[] {
@@ -1455,68 +1542,31 @@ export async function executeCatalogCall(params: {
       }
 
       const rawFinalRecords = [...byProductId.values()];
-      let detectedCurrency = '';
-      const hasNullShopifyVariantCurrency = activeSpec.platform === 'shopify' && rawFinalRecords.some((rec) => rec.variants.some((v) => !v.currency));
-      if (hasNullShopifyVariantCurrency && !truncatedByBudget && syncDeadlineAt - Date.now() >= 1_500) {
-        for (const probePath of ['/meta.json', '/cart.js']) {
-          const remProbeMs = syncDeadlineAt - Date.now();
-          if (remProbeMs < 1_000) break;
-          const callCurrProbe = () =>
-            executeHubFetch({
-              url: `${plan.origin}${probePath}`,
-              kind: 'json',
-              accept: 'application/json',
-              maxBytes: 65_536,
-              timeoutMs: Math.min(4_000, remProbeMs),
+      const hasNullShopifyVariantCurrency =
+        activeSpec.platform === 'shopify' && rawFinalRecords.some((rec) => rec.variants.some((v) => !v.currency));
+      const wantCurrencyProbe = hasNullShopifyVariantCurrency && !truncatedByBudget && syncDeadlineAt - Date.now() >= 1_500;
+      const wantUcpProbe = (finalStatus === 'complete' || pagesRead > 0) && !truncatedByBudget && syncDeadlineAt - Date.now() >= 1_000;
+
+      const [resolvedCurr, ucpMeta] = await Promise.all([
+        wantCurrencyProbe
+          ? resolveShopifyOriginCurrency(plan.origin, executeHubFetch, 3_500, {
+              cacheNegative: false,
+              deadlineAt: syncDeadlineAt,
               ...(payload.target !== undefined ? { target: payload.target } : {}),
               ...(payload.site !== undefined ? { site: payload.site } : {}),
               ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
-            });
-          const currRace = await awaitWithDeadline(
-            Promise.resolve()
-              .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callCurrProbe) : callCurrProbe()))
-              .catch(() => null),
-            syncDeadlineAt,
-          );
-          if (!currRace.timedOut) {
-            const normCurr = normalizeHubPageResponse(currRace.value);
-            if (normCurr && normCurr.status === 200 && normCurr.body) {
-              const cand = callCoreWasmRaw<{ currency: string | null }>('catalog_parse_currency_probe', null, normCurr.body).currency ?? '';
-              if (cand) {
-                detectedCurrency = cand;
-                break;
-              }
-            }
-          }
-        }
-      }
-
-      let ucpMeta: CatalogUcpMetadata | undefined;
-      const remForUcpMs = syncDeadlineAt - Date.now();
-      if ((finalStatus === 'complete' || pagesRead > 0) && !truncatedByBudget && remForUcpMs >= 1_000) {
-        const callRobotsCheck = () =>
-          executeHubFetch({
-            url: `${plan.origin}/robots.txt`,
-            kind: 'text',
-            accept: 'text/plain',
-            timeoutMs: Math.min(5_000, remForUcpMs),
-            ...(payload.target !== undefined ? { target: payload.target } : {}),
-            ...(payload.site !== undefined ? { site: payload.site } : {}),
-            ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
-          });
-        const ucpRace = await awaitWithDeadline(
-          Promise.resolve()
-            .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callRobotsCheck) : callRobotsCheck()))
-            .catch(() => null),
-          syncDeadlineAt,
-        );
-        if (!ucpRace.timedOut) {
-          const normRobots = normalizeHubPageResponse(ucpRace.value);
-          if (normRobots && normRobots.status === 200 && normRobots.body) {
-            ucpMeta = discoverUcpEndpointFromRobots(plan.origin, normRobots.body) ?? undefined;
-          }
-        }
-      }
+            })
+          : Promise.resolve<string | null>(null),
+        wantUcpProbe
+          ? resolveOriginUcpFromRobots(plan.origin, executeHubFetch, 4_000, {
+              deadlineAt: syncDeadlineAt,
+              ...(payload.target !== undefined ? { target: payload.target } : {}),
+              ...(payload.site !== undefined ? { site: payload.site } : {}),
+              ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+            })
+          : Promise.resolve<CatalogUcpMetadata | undefined>(undefined),
+      ]);
+      const detectedCurrency = resolvedCurr ?? '';
 
       const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, plan.origin, collection, catalogId);
       const r2 = getArtifactsR2(env);

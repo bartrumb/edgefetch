@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"regexp"
@@ -70,46 +71,86 @@ func (s *ATSPreFetchSpec) formatWithNow(rawBody, origURL string, htmlToMD HTMLTo
 	}
 }
 
-func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMDFunc) *ATSFormattedResult {
-	data, _ := SafeJSONParse(rawBody).(map[string]any)
-	var jobs []map[string]any
-	salvaged := false
-	if data != nil {
-		if rawArr, ok := data["jobs"].([]any); ok {
-			jobs = make([]map[string]any, 0, len(rawArr))
-			for _, it := range rawArr {
-				if m, okM := it.(map[string]any); okM {
-					jobs = append(jobs, m)
+func streamAshbyBoardJSON(rawBody string, visit func(j map[string]any)) (orgName string, ok bool) {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(rawBody, "\ufeff"))
+	if !strings.HasPrefix(trimmed, "{") {
+		return "", false
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return "", false
+	}
+	sawJobs := false
+	for dec.More() {
+		kt, err := dec.Token()
+		key, okK := kt.(string)
+		if err != nil || !okK {
+			return "", false
+		}
+		switch key {
+		case "organizationName":
+			var on any
+			if err := dec.Decode(&on); err != nil {
+				return "", false
+			}
+			if s, okS := on.(string); okS && s != "" {
+				orgName = s
+			}
+		case "jobs":
+			jt, err := dec.Token()
+			if err != nil || jt != json.Delim('[') {
+				return "", false
+			}
+			sawJobs = true
+			for dec.More() {
+				var elem any
+				if err := dec.Decode(&elem); err != nil {
+					return "", false
+				}
+				if m, okM := elem.(map[string]any); okM && m != nil {
+					visit(m)
 				}
 			}
-		}
-	}
-	if jobs == nil && strings.Contains(rawBody, `"jobs"`) {
-		if salv := SalvageAshbyBoardFromTruncatedJSON(rawBody); salv != nil {
-			jobs = salv.Jobs
-			salvaged = true
-			if data == nil {
-				data = map[string]any{}
+			if ct, err := dec.Token(); err != nil || ct != json.Delim(']') {
+				return "", false
 			}
-			if salv.OrganizationName != "" {
-				data["organizationName"] = salv.OrganizationName
+		default:
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return "", false
 			}
 		}
 	}
-	if jobs == nil {
-		return nil
+	if ct, err := dec.Token(); err != nil || ct != json.Delim('}') {
+		return "", false
 	}
-	orgTitle := s.org
-	if on, ok := data["organizationName"].(string); ok && on != "" {
-		orgTitle = on
-	}
+	return orgName, sawJobs
+}
 
+func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMDFunc) *ATSFormattedResult {
 	if s.jobID != "" {
 		var match map[string]any
-		for _, j := range jobs {
-			if strings.EqualFold(anyString(j["id"]), s.jobID) {
+		orgTitle := s.org
+		if streamedOrg, ok := streamAshbyBoardJSON(rawBody, func(j map[string]any) {
+			if match == nil && strings.EqualFold(anyString(j["id"]), s.jobID) {
 				match = j
-				break
+			}
+		}); ok {
+			if streamedOrg != "" {
+				orgTitle = streamedOrg
+			}
+		} else if strings.Contains(rawBody, `"jobs"`) {
+			if salv := SalvageAshbyBoardFromTruncatedJSON(rawBody); salv != nil {
+				if salv.OrganizationName != "" {
+					orgTitle = salv.OrganizationName
+				}
+				for _, j := range salv.Jobs {
+					if strings.EqualFold(anyString(j["id"]), s.jobID) {
+						match = j
+						break
+					}
+				}
 			}
 		}
 		if match == nil {
@@ -180,40 +221,34 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		}
 	}
 
-	total := len(jobs)
-	if total == 0 {
-		return &ATSFormattedResult{
-			Title:     fmt.Sprintf("%s Jobs (0)", orgTitle),
-			Markdown:  fmt.Sprintf("# %s — Open Roles (0)\n\nNo open positions currently listed.", orgTitle),
-			Links:     []string{},
-			Jobs:      []StructuredJobRecord{},
-			Total:     intPtr(0),
-			Returned:  intPtr(0),
-			Truncated: boolPtr(false),
-		}
-	}
-
-	linkLimit := min(total, 2000)
-	links := make([]string, 0, linkLimit)
-	for _, j := range jobs[:linkLimit] {
-		jID := anyString(j["id"])
-		links = append(links, normalizeCanonicalAshbyURL(j["jobUrl"], s.org, jID))
-	}
-
-	countLabel := strconv.Itoa(total)
-	if salvaged {
-		countLabel = strconv.Itoa(total) + "+"
-	}
-	lines := []string{fmt.Sprintf("# %s — Open Roles (%s)", orgTitle, countLabel)}
+	const linkLimit = 2_000
 	const maxBoardRecords = 2_500
 	const maxMarkdownBullets = 120
 
-	start := min(s.reqOffset, total)
-	end := min(start+maxBoardRecords, total)
-	records := make([]StructuredJobRecord, 0, end-start)
+	type rawBullet struct {
+		title  string
+		url    string
+		suffix string
+	}
 
-	for _, j := range jobs[start:end] {
+	var links []string
+	var records []StructuredJobRecord
+	var bullets []rawBullet
+	total := 0
+	salvaged := false
+	orgTitle := s.org
+
+	processAshbyItem := func(j map[string]any) {
+		idx := total
+		total++
 		jID := anyString(j["id"])
+		jURL := normalizeCanonicalAshbyURL(j["jobUrl"], s.org, jID)
+		if len(links) < linkLimit {
+			links = append(links, jURL)
+		}
+		if idx < s.reqOffset || len(records) >= maxBoardRecords {
+			return
+		}
 		jTitle := strings.TrimSpace(firstNonEmpty(anyString(j["title"]), "Role"))
 		allLocs := extractAshbyLocations(j)
 		if allLocs == nil {
@@ -237,7 +272,6 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 			}
 		}
 		pay := parseAshbyPay(j, sliceUTF16Max(descPlain, 24_000))
-		jURL := normalizeCanonicalAshbyURL(j["jobUrl"], s.org, jID)
 		applyURL := strings.TrimRight(jURL, "/") + "/application"
 		if rawApply, ok := j["applyUrl"].(string); ok && strings.TrimSpace(rawApply) != "" {
 			applyURL = normalizeCanonicalAshbyURL(rawApply, s.org, jID)
@@ -264,7 +298,7 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 			Source:         "ashby",
 			Snippet:        snippet,
 		})
-		if len(lines)-1 < maxMarkdownBullets {
+		if len(bullets) < maxMarkdownBullets {
 			firstLoc := ""
 			if len(allLocs) > 0 {
 				firstLoc = allLocs[0]
@@ -282,8 +316,70 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 			if meta != "" {
 				suffix = " — " + meta
 			}
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", jTitle, jURL, suffix))
+			bullets = append(bullets, rawBullet{title: jTitle, url: jURL, suffix: suffix})
 		}
+	}
+
+	streamedOrg, streamOK := streamAshbyBoardJSON(rawBody, processAshbyItem)
+	if streamOK {
+		if streamedOrg != "" {
+			orgTitle = streamedOrg
+		}
+	} else {
+		links = nil
+		records = nil
+		bullets = nil
+		total = 0
+		if strings.Contains(rawBody, `"jobs"`) {
+			if salv := SalvageAshbyBoardFromTruncatedJSON(rawBody); salv != nil {
+				salvaged = true
+				if salv.OrganizationName != "" {
+					orgTitle = salv.OrganizationName
+				}
+				for _, j := range salv.Jobs {
+					processAshbyItem(j)
+				}
+			} else {
+				return nil
+			}
+		} else {
+			return nil
+		}
+	}
+
+	if orgTitle != s.org {
+		for i := range records {
+			records[i].Company = orgTitle
+		}
+	}
+
+	if total == 0 {
+		return &ATSFormattedResult{
+			Title:     fmt.Sprintf("%s Jobs (0)", orgTitle),
+			Markdown:  fmt.Sprintf("# %s — Open Roles (0)\n\nNo open positions currently listed.", orgTitle),
+			Links:     []string{},
+			Jobs:      []StructuredJobRecord{},
+			Total:     intPtr(0),
+			Returned:  intPtr(0),
+			Truncated: boolPtr(false),
+		}
+	}
+
+	if links == nil {
+		links = []string{}
+	}
+	if records == nil {
+		records = []StructuredJobRecord{}
+	}
+
+	countLabel := strconv.Itoa(total)
+	if salvaged {
+		countLabel = strconv.Itoa(total) + "+"
+	}
+	lines := make([]string, 0, len(bullets)+4)
+	lines = append(lines, fmt.Sprintf("# %s — Open Roles (%s)", orgTitle, countLabel))
+	for _, b := range bullets {
+		lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", b.title, b.url, b.suffix))
 	}
 
 	returned := len(records)
@@ -557,49 +653,91 @@ func (s *ATSPreFetchSpec) formatWorkdayBoard(rawBody string, now time.Time) *ATS
 	}
 }
 
+func streamGreenhouseBoardJSON(rawBody string, visit func(idx int, elem any)) (metaTotal int, ok bool) {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(rawBody, "\ufeff"))
+	if !strings.HasPrefix(trimmed, "{") {
+		return 0, false
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return 0, false
+	}
+	sawJobs := false
+	idx := 0
+	for dec.More() {
+		kt, err := dec.Token()
+		key, okK := kt.(string)
+		if err != nil || !okK {
+			return 0, false
+		}
+		switch key {
+		case "jobs":
+			jt, err := dec.Token()
+			if err != nil || jt != json.Delim('[') {
+				return 0, false
+			}
+			sawJobs = true
+			for dec.More() {
+				var elem any
+				if err := dec.Decode(&elem); err != nil {
+					return 0, false
+				}
+				visit(idx, elem)
+				idx++
+			}
+			if ct, err := dec.Token(); err != nil || ct != json.Delim(']') {
+				return 0, false
+			}
+		case "meta":
+			var metaVal any
+			if err := dec.Decode(&metaVal); err != nil {
+				return 0, false
+			}
+			if metaObj, okM := metaVal.(map[string]any); okM && metaObj != nil {
+				if mt, okT := metaObj["total"].(float64); okT && !math.IsNaN(mt) && !math.IsInf(mt, 0) && int(mt) > metaTotal {
+					metaTotal = int(mt)
+				}
+			}
+		default:
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return 0, false
+			}
+		}
+	}
+	if ct, err := dec.Token(); err != nil || ct != json.Delim('}') {
+		return 0, false
+	}
+	return metaTotal, sawJobs
+}
+
 func (s *ATSPreFetchSpec) formatGreenhouseBoard(rawBody string) *ATSFormattedResult {
-	data, _ := SafeJSONParse(rawBody).(map[string]any)
-	if data == nil {
-		return nil
-	}
-	jobsAny, ok := data["jobs"].([]any)
-	if !ok {
-		return nil
-	}
-	total := len(jobsAny)
-	if metaObj, okM := data["meta"].(map[string]any); okM && metaObj != nil {
-		if mt, okT := metaObj["total"].(float64); okT && !math.IsNaN(mt) && !math.IsInf(mt, 0) && int(mt) > total {
-			total = int(mt)
-		}
-	}
-	linkCap := min(len(jobsAny), 2500)
-	links := make([]string, 0, linkCap)
-	for _, it := range jobsAny[:linkCap] {
-		j, okJ := it.(map[string]any)
-		if !okJ {
-			continue
-		}
-		jURL := "https://" + s.host + "/" + s.org + "/jobs/" + anyString(j["id"])
-		if abs, okA := j["absolute_url"].(string); okA && strings.HasPrefix(abs, "https://") {
-			jURL = abs
-		}
-		links = append(links, jURL)
-	}
-	lines := []string{fmt.Sprintf("# %s — Greenhouse Job Board (%d open roles)", s.org, total)}
+	const linkCap = 2_500
 	const maxBoardRecords = 2_500
 	const maxMarkdownBullets = 120
-	start := min(s.reqOffset, len(jobsAny))
-	end := min(start+maxBoardRecords, len(jobsAny))
-	records := make([]StructuredJobRecord, 0, end-start)
 
-	for _, it := range jobsAny[start:end] {
+	var links []string
+	var records []StructuredJobRecord
+	var bulletLines []string
+	jobsCount := 0
+
+	metaTotal, ok := streamGreenhouseBoardJSON(rawBody, func(idx int, it any) {
+		jobsCount++
 		j, okJ := it.(map[string]any)
-		if !okJ || j == nil {
-			continue
+		if idx < linkCap && okJ && j != nil {
+			jURL := "https://" + s.host + "/" + s.org + "/jobs/" + anyString(j["id"])
+			if abs, okA := j["absolute_url"].(string); okA && strings.HasPrefix(abs, "https://") {
+				jURL = abs
+			}
+			links = append(links, jURL)
+		}
+		if idx < s.reqOffset || idx >= s.reqOffset+maxBoardRecords || !okJ || j == nil {
+			return
 		}
 		jTitle := strings.TrimSpace(anyString(j["title"]))
 		if jTitle == "" {
-			continue
+			return
 		}
 		ghLocs := extractGreenhouseLocations(j)
 		jURL := "https://" + s.host + "/" + s.org + "/jobs/" + anyString(j["id"])
@@ -639,7 +777,7 @@ func (s *ATSPreFetchSpec) formatGreenhouseBoard(rawBody string) *ATSFormattedRes
 			Source:        "greenhouse",
 			Snippet:       snippet,
 		})
-		if len(lines)-1 < maxMarkdownBullets {
+		if len(bulletLines) < maxMarkdownBullets {
 			locMeta := strings.Join(ghLocs[:min(len(ghLocs), 2)], ", ")
 			wpMeta := ""
 			if wp != WorkplaceUnknown {
@@ -654,9 +792,26 @@ func (s *ATSPreFetchSpec) formatGreenhouseBoard(rawBody string) *ATSFormattedRes
 			if meta != "" {
 				suffix = " — " + meta
 			}
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", jTitle, jURL, suffix))
+			bulletLines = append(bulletLines, fmt.Sprintf("- **[%s](%s)**%s", jTitle, jURL, suffix))
 		}
+	})
+	if !ok {
+		return nil
 	}
+	if links == nil {
+		links = []string{}
+	}
+	if records == nil {
+		records = []StructuredJobRecord{}
+	}
+
+	total := jobsCount
+	if metaTotal > total {
+		total = metaTotal
+	}
+	lines := make([]string, 0, len(bulletLines)+4)
+	lines = append(lines, fmt.Sprintf("# %s — Greenhouse Job Board (%d open roles)", s.org, total))
+	lines = append(lines, bulletLines...)
 
 	returned := len(records)
 	nextOffsetVal := s.reqOffset + returned

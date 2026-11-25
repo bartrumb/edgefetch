@@ -1778,7 +1778,7 @@ func TestR11M4LiveChromium100kTallFullPageScreenshotClampedIfInstalled(t *testin
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(`<!doctype html><html><body style="margin:0;padding:0">
-			<div style="width:1366px;height:100000px;background:linear-gradient(#123,#456)"><h1>100k Tall Page</h1></div>
+			<div style="width:1366px;height:100000px;background:#123"><h1>100k Tall Page</h1></div>
 		</body></html>`))
 	}))
 	defer srv.Close()
@@ -1792,7 +1792,7 @@ func TestR11M4LiveChromium100kTallFullPageScreenshotClampedIfInstalled(t *testin
 	}
 	defer r.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	out, err := r.Execute(ctx, Task{

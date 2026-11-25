@@ -292,11 +292,23 @@ export function salvageAshbyBoardFromTruncatedJson(raw: string): {
   );
 }
 
-export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
+export function resolveAtsPreFetchSpec(urlStr: string, opts?: { liteBoard?: boolean }): AtsPreFetchSpec | null {
   if (!urlStr) return null;
+  let effectiveUrl = String(urlStr);
+  if (opts?.liteBoard) {
+    try {
+      const u = new URL(effectiveUrl);
+      if (u.hostname.toLowerCase().endsWith('.greenhouse.io') && !u.searchParams.has('content')) {
+        u.searchParams.set('content', 'false');
+        effectiveUrl = u.toString();
+      }
+    } catch {
+      // ignore
+    }
+  }
   const spec = callCoreWasm<{
     spec: Omit<AtsPreFetchSpec, 'format'> | null;
-  }>('jobs_resolve_ats_spec', { url: String(urlStr) }).spec;
+  }>('jobs_resolve_ats_spec', { url: effectiveUrl }).spec;
   if (!spec) return null;
   return {
     ...spec,
@@ -305,7 +317,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
       return (
         callCoreWasmRaw<{ result: AtsFormattedDoc | null }>(
           'jobs_format_ats',
-          { specUrl: urlStr, origUrl: String(originalUrl || urlStr), nowMs: Date.now() },
+          { specUrl: effectiveUrl, origUrl: String(originalUrl || urlStr), nowMs: Date.now() },
           rawBody,
         ).result ?? null
       );
@@ -785,7 +797,10 @@ function buildJobsScrapeCacheKey(args: Record<string, unknown>, callerCacheScope
       parts.length === 1 &&
       !u.searchParams.has('offset')
     ) {
-      canonicalUrl = `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}`;
+      const ghLite = u.searchParams.get('content')?.toLowerCase() === 'false';
+      canonicalUrl = ghLite
+        ? `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}?content=false`
+        : `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}`;
     } else if (host === 'jobs.lever.co' && parts.length === 1 && !u.searchParams.has('offset')) {
       canonicalUrl = `https://jobs.lever.co/${parts[0]!.toLowerCase()}`;
     } else if (host === 'ats.rippling.com' && parts.length >= 1) {
@@ -806,7 +821,8 @@ function buildJobsScrapeCacheKey(args: Record<string, unknown>, callerCacheScope
   const fmts = Array.isArray(args.formats) ? [...(args.formats as string[])].sort().join(',') : 'markdown';
   const siteKey = typeof args.site === 'string' ? args.site.trim().toLowerCase() : '';
   const targetKey = typeof args.target === 'string' ? args.target.trim().toLowerCase() : '';
-  return `${callerCacheScope}|${canonicalUrl}|${fmts}|${targetKey}|${siteKey}`;
+  const liteSuffix = args.atsLiteBoard === true ? '|lite' : '';
+  return `${callerCacheScope}|${canonicalUrl}|${fmts}|${targetKey}|${siteKey}${liteSuffix}`;
 }
 
 function readJobsScrapeCache(partition: JobsCachePartition, key: string, now = Date.now()): JobsScrapeResponse | null {
@@ -1016,6 +1032,8 @@ async function executeJobsVerifyMode(params: {
         executeScrape({
           url: grp.boardUrl,
           renderMode: 'auto',
+          ephemeral: true,
+          atsLiteBoard: true,
           formats: ['markdown', 'links'],
           ...(payload.target ? { target: payload.target } : {}),
           ...(payload.site ? { site: payload.site } : {}),
@@ -1030,6 +1048,8 @@ async function executeJobsVerifyMode(params: {
           const fbRes = await executeScrape({
             url: fb.boardUrl,
             renderMode: 'auto',
+            ephemeral: true,
+            atsLiteBoard: true,
             formats: ['markdown', 'links'],
             ...(payload.target ? { target: payload.target } : {}),
             ...(payload.site ? { site: payload.site } : {}),
@@ -1060,6 +1080,8 @@ async function executeJobsVerifyMode(params: {
             const recRes = await executeScrape({
               url: recoveredIdentity.boardUrl,
               renderMode: 'auto',
+              ephemeral: true,
+              atsLiteBoard: true,
               formats: ['markdown', 'links'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -1081,6 +1103,8 @@ async function executeJobsVerifyMode(params: {
       const direct = await executeScrape({
         url: item.url,
         renderMode: 'auto',
+        ephemeral: true,
+        atsLiteBoard: true,
         formats: ['markdown'],
         ...(payload.target ? { target: payload.target } : {}),
         ...(payload.site ? { site: payload.site } : {}),
@@ -1176,6 +1200,8 @@ async function executeJobsVerifyMode(params: {
       const wdCheck = await executeScrape({
         url: item.url,
         renderMode: 'auto',
+        ephemeral: true,
+        atsLiteBoard: true,
         formats: ['markdown'],
         ...(payload.target ? { target: payload.target } : {}),
         ...(payload.site ? { site: payload.site } : {}),
@@ -1327,6 +1353,13 @@ export async function executeJobsCall(params: {
     ): Promise<{ status: number; body: Record<string, unknown> }> => {
       const cacheKey = args.noCache === true ? null : buildJobsScrapeCacheKey(args, callerCacheScope);
       if (cacheKey) {
+        if (args.atsLiteBoard === true) {
+          const fullBoardKey = buildJobsScrapeCacheKey({ ...args, atsLiteBoard: false }, callerCacheScope);
+          if (fullBoardKey) {
+            const fullCached = readJobsScrapeCache(cachePartition, fullBoardKey);
+            if (fullCached) return fullCached;
+          }
+        }
         const cached = readJobsScrapeCache(cachePartition, cacheKey);
         if (cached) return cached;
         const existingFlight = cachePartition.inFlight.get(cacheKey);
@@ -1598,6 +1631,7 @@ export async function executeJobsCall(params: {
                 discoverLlmsTxt: false,
                 preferOriginMarkdown: false,
                 ephemeral: true,
+                atsLiteBoard: true,
                 formats: ['markdown', 'links'],
                 ...(payload.target ? { target: payload.target } : {}),
                 ...(payload.site ? { site: payload.site } : {}),
@@ -1946,6 +1980,7 @@ export async function executeJobsCall(params: {
       const biRes = await executeScrape({
         url: builtInUrl,
         renderMode: 'auto',
+        ephemeral: true,
         formats: ['markdown', 'links'],
       }).catch(() => null);
       const biMd = typeof biRes?.body?.markdown === 'string' ? biRes.body.markdown : '';
@@ -1968,6 +2003,7 @@ export async function executeJobsCall(params: {
           fo: await executeScrape({
             url: feed.url,
             renderMode: 'auto',
+            ephemeral: true,
             formats: ['markdown'],
             ...(payload.target ? { target: payload.target } : {}),
             ...(payload.site ? { site: payload.site } : {}),
@@ -2090,6 +2126,7 @@ export async function executeJobsCall(params: {
     };
 
     const smartRecruitersPostingsToEnrich: StructuredJobRecord[] = [];
+    const unverifiedPayUrls = new Set<string>();
     let anyBoardTruncated = false;
     let primaryNextCursor: string | undefined;
 
@@ -2142,11 +2179,14 @@ export async function executeJobsCall(params: {
               }
             }
             const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
+            const isGhBoard = Boolean(info?.platform.startsWith('greenhouse') && info.isBoard);
             return executeScrape({
               url: scrapeUrl,
               renderMode: srBoard ? 'off' : 'auto',
               discoverLlmsTxt: false,
               preferOriginMarkdown: false,
+              ephemeral: true,
+              ...(isGhBoard ? { atsLiteBoard: true } : {}),
               formats: needLinks ? ['markdown', 'links'] : ['markdown'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -2225,6 +2265,7 @@ export async function executeJobsCall(params: {
                   renderMode: 'off',
                   discoverLlmsTxt: false,
                   preferOriginMarkdown: false,
+                  ephemeral: true,
                   formats: ['markdown'],
                   ...(payload.target ? { target: payload.target } : {}),
                   ...(payload.site ? { site: payload.site } : {}),
@@ -2291,25 +2332,31 @@ export async function executeJobsCall(params: {
                 reqIds,
               });
             }
-            if (smartRecruitersPostingsToEnrich.length < 10) {
-              const seenWdDedup = new Set<string>();
-              const wdCandidates: Array<{ rec: StructuredJobRecord; rank: number }> = [];
+            {
+              const seenDetailDedup = new Set<string>();
+              const detailCandidates: Array<{ rec: StructuredJobRecord; rank: number }> = [];
               for (const r of boardJobs) {
-                if (r.source !== 'workday' || r.pay !== null || !/\/job\//i.test(r.url)) continue;
+                const isWorkdayNeedsPay = r.source === 'workday' && r.pay === null && /\/job\//i.test(r.url);
+                const isLiteGhNeedsDetail = r.source === 'greenhouse' && !r.snippet && /\/jobs\/\d+/i.test(r.url);
+                if (!isWorkdayNeedsPay && !isLiteGhNeedsDetail) continue;
                 if (!matchesPreEnrichJobFilters(r)) continue;
                 const dk = canonicalJobKey(r.company, r.title);
-                if (seenWdDedup.has(dk)) continue;
-                seenWdDedup.add(dk);
+                if (seenDetailDedup.has(dk)) continue;
+                seenDetailDedup.add(dk);
                 const rel = query ? matchesJobQueryRelevance(r.title, r.snippet, query) : 'company_filter';
                 const rank = rel === 'phrase' ? 0 : rel === 'all_tokens' ? 1 : 2;
-                wdCandidates.push({ rec: r, rank });
+                detailCandidates.push({ rec: r, rank });
               }
-              if (wdCandidates.length > 0) {
-                wdCandidates.sort((a, b) => a.rank - b.rank);
-                const maxWdPerCall = minBase !== undefined ? 6 : 5;
-                const wdCap = Math.min(limit, maxWdPerCall, 10 - smartRecruitersPostingsToEnrich.length);
-                for (const { rec: wdRec } of wdCandidates.slice(0, wdCap)) {
-                  smartRecruitersPostingsToEnrich.push(wdRec);
+              if (detailCandidates.length > 0) {
+                detailCandidates.sort((a, b) => a.rank - b.rank);
+                const maxDetailPerCall = minBase !== undefined ? 6 : 5;
+                const remainingEnrichSlots = Math.max(0, 10 - smartRecruitersPostingsToEnrich.length);
+                const detailCap = Math.min(limit, maxDetailPerCall, remainingEnrichSlots);
+                for (const { rec: dRec } of detailCandidates.slice(0, detailCap)) {
+                  smartRecruitersPostingsToEnrich.push(dRec);
+                }
+                for (const { rec: skippedRec } of detailCandidates.slice(detailCap)) {
+                  if (skippedRec.pay === null) unverifiedPayUrls.add(skippedRec.url.toLowerCase());
                 }
               }
             }
@@ -2335,7 +2382,13 @@ export async function executeJobsCall(params: {
               const matchingSr = query
                 ? srRecords.filter((r) => matchesJobQueryRelevance(r.title, r.snippet, query) !== null)
                 : srRecords;
-              for (const r of matchingSr.slice(0, Math.min(limit, 8))) smartRecruitersPostingsToEnrich.push(r);
+              const srCap = Math.min(limit, 8, Math.max(0, 10 - smartRecruitersPostingsToEnrich.length));
+              for (const r of matchingSr.slice(0, srCap)) smartRecruitersPostingsToEnrich.push(r);
+              for (const r of matchingSr.slice(srCap)) {
+                if (r.pay === null && matchesPreEnrichJobFilters(r)) {
+                  unverifiedPayUrls.add(r.url.toLowerCase());
+                }
+              }
               for (const r of srRecords) collected.push(r);
             }
             continue;
@@ -2486,6 +2539,7 @@ export async function executeJobsCall(params: {
               renderMode: 'off',
               discoverLlmsTxt: false,
               preferOriginMarkdown: false,
+              ephemeral: true,
               formats: ['markdown'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -2525,6 +2579,10 @@ export async function executeJobsCall(params: {
           if (jp?.applyUrl) target.applyUrl = jp.applyUrl;
           if (!target.snippet && detMd) target.snippet = detMd.slice(0, 240);
         }
+      }
+    } else if (smartRecruitersPostingsToEnrich.length > 0 && budgetExhausted) {
+      for (const unenriched of smartRecruitersPostingsToEnrich) {
+        if (unenriched.pay === null) unverifiedPayUrls.add(unenriched.url.toLowerCase());
       }
     }
 
@@ -2583,6 +2641,10 @@ export async function executeJobsCall(params: {
       ...(ri.payUnknown ? { payUnknown: true } : {}),
     }));
     const payUnknownCount = minBase !== undefined ? (rankOut.payUnknownCount ?? 0) : undefined;
+    const payUnverifiedCount =
+      minBase !== undefined && strictPay
+        ? collected.filter((c) => c.pay === null && unverifiedPayUrls.has(c.url.toLowerCase())).length
+        : 0;
     const responseTruncated = anyBoardTruncated || rankOut.matchedTotal > limit;
     const resolvedTopCursor = primaryNextCursor;
 
@@ -2593,6 +2655,11 @@ export async function executeJobsCall(params: {
     }
     if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
       notes.push(`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all candidate boards could be checked.`);
+    }
+    if (payUnverifiedCount > 0 && !notes.some((n) => n.includes('pay not verified'))) {
+      notes.push(
+        `${payUnverifiedCount} matching posting(s) past the detail enrichment limit had pay not verified and were excluded under \`strictPay\`.`,
+      );
     }
     if (candidateUrls.size === 0 && collected.length === 0 && domainsInput.length === 0) {
       notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
@@ -2614,7 +2681,14 @@ export async function executeJobsCall(params: {
         ...(companyFilter ? { company: companyFilter } : {}),
         ...(domainsInput.length > 0 ? { domains: domainsInput, discoveredBoards } : {}),
         ...(boardStartOffset > 0 ? { offset: boardStartOffset } : {}),
-        ...(minBase !== undefined ? { minBaseMode, strictPay, payUnknownCount } : {}),
+        ...(minBase !== undefined
+          ? {
+              minBaseMode,
+              strictPay,
+              payUnknownCount,
+              ...(payUnverifiedCount > 0 ? { payUnverifiedCount } : {}),
+            }
+          : {}),
         ...(responseTruncated ? { truncated: true } : {}),
         ...(resolvedTopCursor ? { nextCursor: resolvedTopCursor } : {}),
         ...(budgetExhausted ? { budgetExhausted: true } : {}),

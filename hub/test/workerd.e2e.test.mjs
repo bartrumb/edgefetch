@@ -273,6 +273,50 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
 
     // 8. Admin login + host_windows SQLite growth is bounded <= 512!
     {
+      // 8a. 10 consecutive 2 MB `/v1/scrape` sanitize calls inside `workerd` complete with 0 `exceededMemory` crashes!
+      const twoMbHtmlChunk = '<p>Safe prose &lt;not-a-tag&gt; and raw angle brackets a &lt; b &amp; c < d for 2 MB sanitize steady-state test. </p>\n';
+      const twoMbHtmlDoc =
+        '<!doctype html><html><head><title>2MB Steady Doc</title></head><body><article>' +
+        twoMbHtmlChunk.repeat(Math.ceil((2 * 1024 * 1024) / twoMbHtmlChunk.length)) +
+        '</article></body></html>';
+      for (let i = 0; i < 10; i++) {
+        const a1 = await connectAgent('site-1', S1, async (m) => {
+          const rq = m.call.requests[0];
+          const rep = JSON.stringify({
+            results: [
+              {
+                id: rq.id,
+                url: rq.url,
+                finalUrl: rq.url,
+                status: 200,
+                outcome: 'ok',
+                headers: { 'content-type': 'text/html; charset=utf-8' },
+                body: twoMbHtmlDoc,
+              },
+            ],
+          });
+          await sendReply('site-1', S1, m, gzipSync(rep), { 'content-encoding': 'gzip' });
+        });
+        const sc2mRes = await f('/v1/scrape', {
+          method: 'POST',
+          headers: authz,
+          body: JSON.stringify({
+            url: `https://legal.example.com/2mb-doc-${i}`,
+            target: 'agent',
+            ephemeral: true,
+            formats: ['markdown'],
+          }),
+        });
+        assert.equal(sc2mRes.status, 200, `2 MB workerd scrape #${i + 1} failed with HTTP ${sc2mRes.status}`);
+        const sc2mJson = await sc2mRes.json();
+        assert.equal(sc2mJson.ok, true);
+        assert.ok(typeof sc2mJson.markdown === 'string' && sc2mJson.markdown.length > 1_500_000);
+        assert.equal(/<[a-z!/]/i.test(sc2mJson.markdown), false);
+        a1.ws.close(1000, 'done');
+        await sleep(20);
+      }
+    }
+    {
       const loginRes = await f('/admin/login', {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded', 'cf-connecting-ip': '198.51.100.77' },

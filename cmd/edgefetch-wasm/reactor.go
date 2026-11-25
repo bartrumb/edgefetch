@@ -28,10 +28,15 @@ const (
 )
 
 func init() {
-	// Cloudflare Workers shares a hard 128 MiB ceiling across V8 heap + WebAssembly.Memory,
-	// and WebAssembly linear memory pages can never shrink once grown. SetMemoryLimit paces
-	// GC automatically near 48 MiB without penalizing fast <8 MiB hot-path calls.
+	// Cloudflare Workers shares a hard 128 MiB ceiling across V8 heap + WebAssembly.Memory.
+	// Go's runtime memory limit tracks Go heap + runtime metadata (excluding static WASI data segments),
+	// so keeping it at 48 MiB bounds intra-call peak allocations while wasm-bridge.ts evicts after oversized calls.
 	debug.SetMemoryLimit(48 << 20)
+}
+
+type re2Slot struct {
+	id int32
+	re *regexp.Regexp
 }
 
 type domDocSlot struct {
@@ -44,7 +49,7 @@ var (
 	wasmInBuf  = make([]byte, baseBufCapBytes)
 	wasmOutBuf = make([]byte, 0, baseBufCapBytes)
 
-	re2Table  [re2RingCapacity]*regexp.Regexp
+	re2Table  [re2RingCapacity]re2Slot
 	re2NextID int32 = 1
 
 	domTable  [domRingCapacity]domDocSlot
@@ -123,16 +128,19 @@ func efRe2Compile(patLen uint32) int32 {
 		re2NextID = 1
 	}
 	slot := int((id - 1) % re2RingCapacity)
-	re2Table[slot] = re
+	re2Table[slot] = re2Slot{id: id, re: re}
 	return id
 }
 
 func lookupRe2Handle(id int32) *regexp.Regexp {
-	if id <= 0 || re2NextID-id > re2RingCapacity {
+	if id <= 0 {
 		return nil
 	}
-	slot := int((id - 1) % re2RingCapacity)
-	return re2Table[slot]
+	slot := &re2Table[int((id-1)%re2RingCapacity)]
+	if slot.id != id {
+		return nil
+	}
+	return slot.re
 }
 
 //go:wasmexport ef_re2_test
@@ -474,6 +482,43 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 		return map[string]any{
 			"product": extract.ExtractStructuredProduct(rawStr, p.FinalURL, p.FallbackTitle, p.FallbackDescription),
 		}, nil
+
+	case "format_payload":
+		var p struct {
+			Kind        string `json:"kind"`
+			URL         string `json:"url"`
+			ContentType string `json:"contentType"`
+			Sep         string `json:"sep"`
+			TitleHint   string `json:"titleHint"`
+		}
+		if len(env.Meta) > 0 {
+			if err := json.Unmarshal(env.Meta, &p); err != nil {
+				return nil, err
+			}
+		}
+		switch p.Kind {
+		case "ipynb":
+			return map[string]any{"doc": extract.FormatJupyterNotebookToMarkdown(rawStr, p.URL)}, nil
+		case "openapi":
+			return map[string]any{"doc": extract.FormatOpenAPISpecToMarkdown(rawStr, p.URL)}, nil
+		case "vcard":
+			return map[string]any{"doc": extract.FormatVCardToMarkdown(rawStr)}, nil
+		case "icalendar":
+			return map[string]any{"doc": extract.FormatICalendarToMarkdown(rawStr)}, nil
+		case "git_patch":
+			return map[string]any{"doc": extract.FormatGitPatchToMarkdown(rawStr, p.URL)}, nil
+		case "source_code":
+			return map[string]any{"doc": extract.FormatSourceCodeURLToMarkdown(rawStr, p.URL, p.ContentType)}, nil
+		case "feed_xml":
+			doc, links := extract.FormatFeedXMLToMarkdown(rawStr, p.URL)
+			return map[string]any{"doc": doc, "links": links}, nil
+		case "delimited":
+			return map[string]any{"doc": extract.FormatDelimitedTableToMarkdown(rawStr, p.Sep, p.TitleHint)}, nil
+		case "json_scrape":
+			return map[string]any{"doc": extract.TryParseJSONPayloadForScrape(rawStr, p.URL)}, nil
+		default:
+			return nil, fmt.Errorf("unknown raw format_payload kind %q", p.Kind)
+		}
 
 	case "extract_html_full":
 		var opts extract.FullExtractOptions

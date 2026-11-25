@@ -259,7 +259,7 @@ const SCHEMA_KEYS = {
   splitOnSegment: new Set(['delimiter', 'leftParam', 'leftMinSegs', 'afterLiteral', 'rightParam', 'tailParam']),
   derivedParam: new Set(['fromParam', 'transform']),
   twin: new Set([
-    'id', 'fetchUrl', 'rawPathParams', 'overridePathIf', 'setQueryParams', 'defaultQueryParams', 'kind', 'accept',
+    'id', 'fetchUrl', 'rawPathParams', 'overridePathIf', 'setQueryParams', 'defaultQueryParams', 'kind', 'accept', 'maxBytes',
   ]),
   overridePathIf: new Set(['matchPaths', 'newPath']),
   extract: new Set([
@@ -501,6 +501,12 @@ function validateTwin(manifest, twin, ctxPath) {
   }
   if (twin.id !== undefined && !VALID_ID_RE.test(twin.id)) {
     throw new Error(`${ctxPath}.id: invalid twin id "${twin.id}"`);
+  }
+  if (
+    twin.maxBytes !== undefined &&
+    (!Number.isInteger(twin.maxBytes) || twin.maxBytes < 16_384 || twin.maxBytes > 4 * 1024 * 1024)
+  ) {
+    throw new Error(`${ctxPath}.maxBytes: must be an integer between 16384 and 4194304`);
   }
   if (twin.overridePathIf) {
     assertAllowedKeys(twin.overridePathIf, SCHEMA_KEYS.overridePathIf, `${ctxPath}.overridePathIf`);

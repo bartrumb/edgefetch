@@ -362,6 +362,15 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 	if isOriginMarkdown {
 		res.ContentSource = "origin-markdown"
 	}
+
+	// Step 2: When the caller sets `opts.MaxInlineBodyBytes` (e.g. Hub's 4 MiB WASM input budget) and `rawBody`
+	// exceeds that inline limit, run full native Go extraction in OS memory here on the Go node so the Worker
+	// isolate never receives or parses the >4 MiB raw body (while R2 sink still uploads the raw artifact!).
+	if opts.MaxInlineBodyBytes > 0 && len(rawBody) > opts.MaxInlineBodyBytes && !wantBase64 {
+		c.offloadOverBudgetDocumentOnNode(r, opts, rawBody, onlyMain, wantMarkdown, wantText, wantLinks, wantImages, wantBranding, isOriginMarkdown, res)
+		return
+	}
+
 	isMarkdownOrPlain := isOriginMarkdown || strings.Contains(ct, "text/plain")
 	if isMarkdownOrPlain && (wantMarkdown || wantText) {
 		txt := string(rawBody)
@@ -421,6 +430,166 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 			res.Body = ""
 			res.BodyEncoding = ""
 		}
+	}
+}
+
+func looksLikeHTMLPrefix(raw string) bool {
+	trimmed := strings.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) > 256 {
+		trimmed = trimmed[:256]
+	}
+	low := strings.ToLower(trimmed)
+	return strings.HasPrefix(low, "<!doctype html") ||
+		strings.HasPrefix(low, "<html") ||
+		strings.Contains(low, "<head") ||
+		strings.Contains(low, "<body") ||
+		strings.Contains(low, "<main") ||
+		strings.Contains(low, "<article")
+}
+
+func (c *Crawler) offloadOverBudgetDocumentOnNode(
+	r Request,
+	opts Options,
+	rawBody []byte,
+	onlyMain, wantMarkdown, wantText, wantLinks, wantImages, wantBranding, isOriginMarkdown bool,
+	res *Result,
+) {
+	if !utf8.Valid(rawBody) {
+		return
+	}
+	rawStr := string(rawBody)
+	baseURL := res.FinalURL
+	if baseURL == "" {
+		baseURL = r.URL
+	}
+	ct := strings.ToLower(res.ContentType)
+	res.ExtractedOnNode = true
+
+	applyNodeMd := func(md, text string) {
+		if r.Query != "" && md != "" {
+			md = extract.RerankPassages(md, r.Query, 24_000)
+			if text != "" {
+				text = md
+			}
+		}
+		if r.RedactPII {
+			if md != "" {
+				md = extract.RedactPII(md)
+			}
+			if text != "" {
+				text = extract.RedactPII(text)
+			}
+		}
+		// Never truncate Markdown mid-document/mid-fence before the Hub's authoritative sanitizer pass!
+		// If the extracted Markdown itself exceeds `opts.MaxInlineBodyBytes`, omit it cleanly and set
+		// `MarkdownOverBudget = true` so the Hub returns a clear warning with the stored R2 artifact.
+		if opts.MaxInlineBodyBytes > 0 && len(md) > opts.MaxInlineBodyBytes {
+			res.Markdown = ""
+			res.Text = ""
+			res.MarkdownOverBudget = true
+			return
+		}
+		if wantMarkdown && res.Markdown == "" {
+			res.Markdown = md
+		}
+		if wantText {
+			if text != "" && (opts.MaxInlineBodyBytes <= 0 || len(text) <= opts.MaxInlineBodyBytes) {
+				res.Text = text
+			} else if res.Markdown != "" {
+				res.Text = res.Markdown
+			}
+		}
+	}
+
+	if isOriginMarkdown {
+		applyNodeMd(rawStr, rawStr)
+		return
+	}
+
+	isHTML := !isOriginMarkdown && (strings.Contains(ct, "html") || looksLikeHTMLPrefix(rawStr))
+	if isHTML {
+		full := extract.ExtractHTMLDocumentFull(rawStr, extract.FullExtractOptions{
+			BaseURL:         baseURL,
+			OnlyMainContent: onlyMain,
+			IncludeImages:   wantImages,
+			RedactPII:       r.RedactPII,
+			MaxScanChars:    16 << 20,
+		})
+		res.Title = full.Title
+		res.Description = full.Description
+		res.Favicon = full.Favicon
+		res.ExtractorID = full.ExtractorID
+		if len(full.Records) > 0 {
+			res.Records = full.Records
+		}
+		if wantLinks && len(full.Links) > 0 {
+			res.Links = full.Links
+		}
+		if wantImages && len(full.Images) > 0 {
+			res.Images = full.Images
+		}
+		if wantBranding {
+			bCopy := full.Branding
+			res.Branding = &bCopy
+		}
+		applyNodeMd(full.Markdown, full.Text)
+		return
+	}
+
+	if doc, ok := extract.FormatDeclarativeTwinByURL(baseURL, rawStr, baseURL); ok && doc != nil && strings.TrimSpace(doc.Markdown) != "" {
+		res.Title = doc.Title
+		res.Description = doc.Description
+		if wantLinks && len(doc.Links) > 0 {
+			res.Links = doc.Links
+		}
+		if len(doc.Records) > 0 {
+			res.Records = doc.Records
+		}
+		applyNodeMd(doc.Markdown, doc.Markdown)
+		return
+	}
+	if feedDoc, feedLinks := extract.FormatFeedXMLToMarkdown(rawStr, baseURL); feedDoc != nil && strings.TrimSpace(feedDoc.Markdown) != "" {
+		res.Title = feedDoc.Title
+		res.Description = feedDoc.Description
+		if wantLinks && len(feedLinks) > 0 {
+			res.Links = feedLinks
+		}
+		applyNodeMd(feedDoc.Markdown, feedDoc.Markdown)
+		return
+	}
+	if vcDoc := extract.FormatVCardToMarkdown(rawStr); vcDoc != nil && strings.TrimSpace(vcDoc.Markdown) != "" {
+		res.Title = vcDoc.Title
+		applyNodeMd(vcDoc.Markdown, vcDoc.Markdown)
+		return
+	}
+	if icsDoc := extract.FormatICalendarToMarkdown(rawStr); icsDoc != nil && strings.TrimSpace(icsDoc.Markdown) != "" {
+		res.Title = icsDoc.Title
+		applyNodeMd(icsDoc.Markdown, icsDoc.Markdown)
+		return
+	}
+	if jsonDoc := extract.TryParseJSONPayloadForScrape(rawStr, baseURL); jsonDoc != nil && strings.TrimSpace(jsonDoc.Markdown) != "" {
+		res.Title = jsonDoc.Title
+		res.Description = jsonDoc.Description
+		applyNodeMd(jsonDoc.Markdown, "")
+		return
+	}
+	if csvDoc := extract.FormatDelimitedTableToMarkdown(rawStr, res.ContentType, baseURL); csvDoc != nil && strings.TrimSpace(csvDoc.Markdown) != "" {
+		res.Title = csvDoc.Title
+		applyNodeMd(csvDoc.Markdown, "")
+		return
+	}
+	if patchDoc := extract.FormatGitPatchToMarkdown(rawStr, baseURL); patchDoc != nil && strings.TrimSpace(patchDoc.Markdown) != "" {
+		res.Title = patchDoc.Title
+		applyNodeMd(patchDoc.Markdown, "")
+		return
+	}
+	if srcDoc := extract.FormatSourceCodeURLToMarkdown(rawStr, baseURL, res.ContentType); srcDoc != nil && strings.TrimSpace(srcDoc.Markdown) != "" {
+		res.Title = srcDoc.Title
+		applyNodeMd(srcDoc.Markdown, "")
+		return
+	}
+	if strings.Contains(ct, "text/plain") {
+		applyNodeMd(rawStr, rawStr)
 	}
 }
 

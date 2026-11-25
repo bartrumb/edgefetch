@@ -99,7 +99,11 @@ export function formatShopifyProductsFeedTwin(rawBody: string, origUrl: string):
 
 export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId = 'shopify'): PostFetchSiteResult | null {
   const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
-  const meta = { url: String(ctx.url), currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? ''), extractorId };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
   return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_shopify_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
 }
 
@@ -122,7 +126,11 @@ export function normalizeWooCommerceProductRecord(
 export function enrichWooCommerceProductFromStoreApi(params: {
   rawJson: string; productUrl: string; slug: string; htmlToMd: HtmlFragmentConverter; fallbackBodyMd?: string;
 }): TwinFormattedDoc | null {
-  const meta = { productUrl: String(params.productUrl ?? ''), slug: String(params.slug ?? ''), ...(params.fallbackBodyMd ? { fallbackBodyMd: params.fallbackBodyMd } : {}) };
+  const meta = {
+    productUrl: String(params.productUrl ?? ''),
+    slug: String(params.slug ?? ''),
+    ...(params.fallbackBodyMd ? { fallbackBodyMd: params.fallbackBodyMd.slice(0, 32_768) } : {}),
+  };
   return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_enrich_woocommerce_json', meta, String(params.rawJson ?? '')).doc ?? null;
 }
 
@@ -136,7 +144,11 @@ export function formatWcStoreApiProductTwin(rawBody: string, origUrl: string, _h
 
 export function extractWooCommerceProductHtml(ctx: HtmlExtractContext, extractorId = 'woocommerce'): PostFetchSiteResult | null {
   const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
-  const meta = { url: String(ctx.url), currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? ''), extractorId };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
   return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_woocommerce_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
 }
 

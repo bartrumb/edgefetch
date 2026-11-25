@@ -2325,7 +2325,7 @@ test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify or
       };
     },
   });
-  assert.equal(seenAtsMaxBytes, 16_777_216, 'ATS pre-fetch must request 16 MiB maxBytes so large Ashby boards (OpenAI ~15 MiB) never drop to HTML');
+  assert.equal(seenAtsMaxBytes, 4_194_304, 'ATS pre-fetch on edge must enforce 4 MiB MAX_WASM_INPUT_BYTES (offloading >4 MiB boards to Go node)');
   assert.equal(ashbyScrape.body.extractorId, 'ashby-board');
   assert.equal(ashbyScrape.body.contentState, 'active');
   assert.equal(ashbyScrape.body.total, 3);
@@ -2802,7 +2802,7 @@ test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forge
     sleepFn: async () => {},
     executeHubFetch: async ({ url, maxBytes }) => {
       if (!url.endsWith('/robots.txt')) {
-        assert.equal(maxBytes, 16_777_216);
+        assert.equal(maxBytes, 4_194_304);
       }
       if (url.includes('page=1')) {
         return {

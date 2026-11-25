@@ -2,7 +2,7 @@
  * Schema.org JSON-LD Bridge (`hub/src/extractors/schema-org.ts`) — delegates to Go `internal/extract/schema_org.go` via `edgefetch-core.wasm`.
  */
 
-import { callCoreWasm } from '../wasm-bridge';
+import { callCoreWasm, callCoreWasmRaw } from '../wasm-bridge';
 import type { HtmlFragmentConverter } from './types';
 
 export interface UniversalSchemaOrgResult {
@@ -69,12 +69,17 @@ export function extractUniversalSchemaOrg(
   baseUrl?: string,
   _htmlToMd?: HtmlFragmentConverter,
 ): UniversalSchemaOrgResult | null {
-  return callCoreWasm<{ result: UniversalSchemaOrgResult | null }>('extract_schema_org', {
-    rawHtml: String(rawHtml ?? ''),
-    baseUrl: baseUrl ?? '',
-  }).result;
+  const s = String(rawHtml ?? '');
+  if (!s || !/ld\+json/i.test(s)) return null;
+  return callCoreWasmRaw<{ result: UniversalSchemaOrgResult | null }>(
+    'extract_schema_org',
+    { baseUrl: baseUrl ?? '' },
+    s,
+  ).result;
 }
 
 export function inspectRawSchemaOrgJsonLdLinear(rawHtml: string): string {
-  return callCoreWasm<{ out: string }>('inspect_raw_schema_org', { rawHtml: String(rawHtml ?? '') }).out;
+  const s = String(rawHtml ?? '');
+  if (!s || !/ld\+json/i.test(s)) return '';
+  return callCoreWasmRaw<{ out: string }>('inspect_raw_schema_org', null, s).out;
 }

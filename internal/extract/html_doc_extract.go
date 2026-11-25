@@ -1,9 +1,9 @@
 package extract
 
 import (
+	"regexp"
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +27,7 @@ type FullExtractOptions struct {
 	IsPDF               bool     `json:"isPdf,omitempty"`
 	PreserveOriginMD    bool     `json:"preserveOriginMarkdown,omitempty"`
 	IsFragment          bool     `json:"isFragment,omitempty"`
+	MaxScanChars        int      `json:"maxScanChars,omitempty"`
 }
 
 // ExtractedDocumentFull holds the full-fidelity Markdown, metadata, links, images, branding,
@@ -3791,7 +3792,11 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	excludeTags := opts.ExcludeTags
 	redactPII := opts.RedactPII
 
-	boundedRawHTML := truncateUTF8SafeFullDocGo(rawHTML, maxHTMLScanCharsFullDocGo)
+	scanCap := maxHTMLScanCharsFullDocGo
+	if opts.MaxScanChars > scanCap {
+		scanCap = opts.MaxScanChars
+	}
+	boundedRawHTML := truncateUTF8SafeFullDocGo(rawHTML, scanCap)
 	if strings.IndexByte(boundedRawHTML, 0) >= 0 {
 		boundedRawHTML = strings.ReplaceAll(boundedRawHTML, "\x00", "")
 	}

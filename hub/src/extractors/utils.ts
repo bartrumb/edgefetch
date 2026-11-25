@@ -337,10 +337,11 @@ export function isJsonLdScriptAttrLinear(attrStr: string): boolean {
 
 export function extractJsonLdObjects(rawHtml: string, maxEntities = 100): Array<Record<string, unknown>> {
   if (!rawHtml || !/ld\+json/i.test(rawHtml)) return [];
-  return callCoreWasm<{ objects: Array<Record<string, unknown>> | null }>('extract_jsonld_objects', {
+  return callCoreWasmRaw<{ objects: Array<Record<string, unknown>> | null }>(
+    'extract_jsonld_objects',
+    { maxEntities },
     rawHtml,
-    maxEntities,
-  }).objects ?? [];
+  ).objects ?? [];
 }
 
 export function extractBalancedDivAt(html: string, openTagIndex: number): string | null {

@@ -2682,19 +2682,28 @@ test('Round 8 (H3, H8 & Pre-Ship #3): Linear O(N) CPU budgets + 3 Prompt-Injecti
   });
   assert.ok(msPiBrackets < 35 * covMult, `expected 2MiB '[' in detectPromptInjection < ${35 * covMult}ms, got ${msPiBrackets.toFixed(2)}ms`);
 
-  // 5. H8 TS benchmarks: `'['.repeat(7_000_000)`, `']('.repeat(3_500_000)`, `'<' .repeat(2_000_000)` (< 40 ms)
-  const brackets7m = '['.repeat(7_000_000);
-  const bracketParens35m = ']('.repeat(3_500_000);
+  // 5. H8 TS benchmarks (`brackets7m`, `bracketParens35m`, `lt2m`):
+  //    With `MAX_WASM_INPUT_BYTES = 4 MiB`, a 6.68 MiB input (`brackets7m`, `bracketParens35m`) MUST come back
+  //    cut down or escaped (never raw, zero `<tag` or `javascript:` links), within the exact same `< 40 * covMult` ms limit!
+  const brackets7m = '['.repeat(7_000_000) + '<script>alert(1)</script>[bad](javascript:alert(1))';
+  const bracketParens35m = ']('.repeat(3_500_000) + '<img src=x onerror=alert(1)>';
   const lt2m = '<'.repeat(2_000_000);
+  let outSan7m = '';
   const msSan7m = bestMs(() => {
-    assert.equal(sanitizeInlineHtmlInMarkdown(brackets7m).length, 7_000_000);
+    outSan7m = sanitizeInlineHtmlInMarkdown(brackets7m);
   });
+  let outSan35m = '';
   const msSan35m = bestMs(() => {
-    assert.equal(sanitizeInlineHtmlInMarkdown(bracketParens35m).length, 7_000_000);
+    outSan35m = sanitizeInlineHtmlInMarkdown(bracketParens35m);
   });
   const msSanLt2m = bestMs(() => {
     assert.equal(sanitizeInlineHtmlInMarkdown(lt2m).length, 8_000_000);
   });
+  assert.ok(outSan7m.length > 0 && outSan7m.length < brackets7m.length, '6.68 MiB input must come back cut down or escaped, never raw');
+  assert.equal(/<[A-Za-z!/]/.test(outSan7m), false, '6.68 MiB brackets7m output must contain zero raw <tag');
+  assert.equal(outSan7m.includes('javascript:'), false, '6.68 MiB brackets7m output must contain zero javascript: links');
+  assert.ok(outSan35m.length > 0 && outSan35m.length < bracketParens35m.length, '6.68 MiB bracketParens35m must come back cut down or escaped');
+  assert.equal(/<[A-Za-z!/]/.test(outSan35m), false, '6.68 MiB bracketParens35m output must contain zero raw <tag');
   t.diagnostic(
     `[TS CPU Timings] trim64k=${msTrim64k.toFixed(2)}ms trim2m=${msTrim2m.toFixed(2)}ms underscore200k=${msUnderscore.toFixed(2)}ms hiddenClosed2m=${msClosedHidden.toFixed(2)}ms hiddenUnclosed2m=${msUnclosedHidden.toFixed(2)}ms piBrackets2m=${msPiBrackets.toFixed(2)}ms san7m[=${msSan7m.toFixed(2)}ms san3.5m](=${msSan35m.toFixed(2)}ms san2m<=${msSanLt2m.toFixed(2)}ms`,
   );

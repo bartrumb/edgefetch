@@ -10,6 +10,11 @@
  */
 
 import { resolveSiteExtractorTwin } from './extractors/registry';
+import {
+  acquireIsolateByteBudget,
+  isWasmInputBudgetExceededError,
+  MAX_WASM_INPUT_BYTES,
+} from './wasm-bridge';
 import { distillCapturedJsonResponses } from './extractors/framework-hydration';
 import { extractUniversalSchemaOrg } from './extractors/schema-org';
 import {
@@ -1449,6 +1454,7 @@ export async function executeExtractCall(params: {
       options: {
         includeBody: true,
         respectRobots: true,
+        maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
         discoverLlms: false,
         concurrency: 4,
         pauseMs: isEphemeral ? 500 : 800,
@@ -1467,6 +1473,7 @@ export async function executeExtractCall(params: {
             ...(ats.contentType ? { contentType: ats.contentType } : {}),
             kind: ats.kind,
             accept: ats.accept,
+            maxBytes: MAX_WASM_INPUT_BYTES,
           };
         }
         const twin = effectiveRenderMode !== 'always' ? resolveSiteExtractorTwin(item.url) : null;
@@ -1477,6 +1484,7 @@ export async function executeExtractCall(params: {
             url: twin.fetchUrl,
             kind: twin.kind,
             accept: twin.accept,
+            maxBytes: twin.maxBytes ?? MAX_WASM_INPUT_BYTES,
           };
         }
         const companionMd = effectiveRenderMode !== 'always' ? lookupCompanionMdUrl(item.url, now) : undefined;
@@ -1727,6 +1735,39 @@ export async function executeExtractCall(params: {
 
       let rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
       let finalUrl = typeof r.finalUrl === 'string' && r.finalUrl ? r.finalUrl : item.url;
+      if (
+        r.markdownOverBudget === true ||
+        (rawBodyStr.length > MAX_WASM_INPUT_BYTES) ||
+        (typeof r.markdown === 'string' && r.markdown.length > MAX_WASM_INPUT_BYTES)
+      ) {
+        byUrl.set(item.url, {
+          url: item.url,
+          finalUrl,
+          status: typeof r.status === 'number' ? r.status : 200,
+          cached: false,
+          failedReason: 'Document too large for edge processing (> 4 MiB WASM input budget)',
+        });
+        continue;
+      }
+      const extLease = await acquireIsolateByteBudget(
+        Math.min(
+          MAX_WASM_INPUT_BYTES,
+          Math.max(65_536, rawBodyStr.length > 0 ? rawBodyStr.length : typeof r.markdown === 'string' ? r.markdown.length : 65_536),
+        ),
+        200,
+      );
+      if (!extLease) {
+        byUrl.set(item.url, {
+          url: item.url,
+          finalUrl,
+          status: 429,
+          cached: false,
+          retryable: true,
+          failedReason: 'isolate_memory_busy',
+        });
+        continue;
+      }
+      try {
       let renderedVia: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
         explicitRenderMode === 'always'
           ? 'browser'
@@ -1989,7 +2030,19 @@ export async function executeExtractCall(params: {
         md = redactPii ? redactPiiText(cleanStructured) : cleanStructured;
         title = structuredDoc.title;
       } else {
-        let extracted = isHtml ? extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: true, redactPii }) : undefined;
+        let extracted: ReturnType<typeof extractHtmlDocument> | undefined = isHtml
+          ? extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: true, redactPii })
+          : r.extractedOnNode === true
+            ? {
+                markdown: typeof r.markdown === 'string' ? r.markdown : '',
+                text: typeof r.text === 'string' ? r.text : typeof r.markdown === 'string' ? r.markdown : '',
+                ...(typeof r.title === 'string' && r.title ? { title: r.title } : {}),
+                ...(typeof r.description === 'string' && r.description ? { description: r.description } : {}),
+                links: Array.isArray(r.links) ? (r.links as string[]) : [],
+                images: [],
+                branding: { canonicalUrl: finalUrl },
+              }
+            : undefined;
 
         const universalSchema =
           isHtml && !isPdf && countExtractWords(extracted?.markdown ?? '') < 80
@@ -2188,6 +2241,21 @@ export async function executeExtractCall(params: {
         ...(renderedVia ? { renderedVia } : {}),
         markdown: md,
       });
+      } catch (extWasmErr) {
+        if (isWasmInputBudgetExceededError(extWasmErr)) {
+          byUrl.set(item.url, {
+            url: item.url,
+            finalUrl,
+            status: typeof r.status === 'number' ? r.status : 200,
+            cached: false,
+            failedReason: 'Document too large for edge processing (> 4 MiB WASM input budget)',
+          });
+        } else {
+          throw extWasmErr;
+        }
+      } finally {
+        extLease.release();
+      }
     }
   }
 

@@ -245,7 +245,7 @@ export function inspectRawJobPostingJsonLdLinear(rawHtml: string): {
   descriptionHtml: string;
   rawDecodedStringsForPiCheck: string;
 } {
-  if (!rawHtml) return { descriptionHtml: '', rawDecodedStringsForPiCheck: '' };
+  if (!rawHtml || !/ld\+json/i.test(rawHtml)) return { descriptionHtml: '', rawDecodedStringsForPiCheck: '' };
   return callCoreWasmRaw<{ descriptionHtml: string; rawDecodedStringsForPiCheck: string }>(
     'jobs_inspect_jsonld',
     null,
@@ -258,11 +258,12 @@ export function extractJobPostingJsonLd(
   baseUrl?: string,
   fallbackProse = '',
 ): StructuredJobPosting | null {
-  if (!rawHtml) return null;
+  if (!rawHtml || !/ld\+json/i.test(rawHtml)) return null;
+  const boundedProse = fallbackProse.length > 65_536 ? fallbackProse.slice(0, 65_536) : fallbackProse;
   return (
     callCoreWasmRaw<{ jobPosting: StructuredJobPosting | null }>(
       'jobs_extract_jsonld',
-      { baseUrl: baseUrl ?? '', fallbackProse },
+      { baseUrl: baseUrl ?? '', fallbackProse: boundedProse },
       rawHtml,
     ).jobPosting ?? null
   );
@@ -349,12 +350,14 @@ export function hasExecutableScriptTag(rawHtml: string): boolean {
 }
 
 export function isThinScriptedPage(rawHtml: string, extractedMarkdown: string): boolean {
-  if (!rawHtml) return false;
+  if (!rawHtml || !hasExecutableScriptTag(rawHtml)) return false;
+  const md = String(extractedMarkdown ?? '');
+  const mdBounded = md.length > 524_288 ? md.slice(0, 524_288) : md;
   return callCoreWasmRawMetaPair<{ thin: boolean }>(
     'jobs_is_thin_scripted',
     {},
-    rawHtml,
-    String(extractedMarkdown ?? ''),
+    '<script>1</script>',
+    mdBounded,
   ).thin;
 }
 
@@ -503,7 +506,7 @@ export function discoverAtsBoardsFromHtml(params: {
       {
         sourceUrl: params.sourceUrl,
         finalUrl: params.finalUrl ?? '',
-        links: params.links ?? [],
+        links: (params.links ?? []).slice(0, 500),
       },
       String(params.rawHtml ?? ''),
     ).boards ?? []

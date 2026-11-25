@@ -60,6 +60,19 @@ function headersToRecord(headers: Headers | Record<string, string | undefined> |
   return out;
 }
 
+const MAX_WAF_HTML_SCAN_CHARS = 2 * 1024 * 1024;
+const MAX_CONTENT_STATE_MD_SCAN_CHARS = 131_072;
+
+function sliceSurrogateSafe(raw: string, maxChars: number): string {
+  if (raw.length <= maxChars) return raw;
+  let end = maxChars;
+  if (end > 0) {
+    const tail = raw.charCodeAt(end - 1);
+    if (tail >= 0xd800 && tail <= 0xdbff) end--;
+  }
+  return raw.slice(0, end);
+}
+
 export function classifyWafAndChallenge(params: {
   status: number;
   headers?: Headers | Record<string, string | undefined>;
@@ -71,7 +84,7 @@ export function classifyWafAndChallenge(params: {
       status: params.status,
       headers: headersToRecord(params.headers),
     },
-    String(params.rawBody ?? ''),
+    sliceSurrogateSafe(String(params.rawBody ?? ''), MAX_WAF_HTML_SCAN_CHARS),
   );
   return res.match ?? null;
 }
@@ -82,9 +95,9 @@ export function hasExternalOrWidgetIframeLinear(rawHtml: string): {
   isIcims?: boolean;
 } {
   if (!rawHtml) return { found: false };
-  const res = callCoreWasm<{
+  const res = callCoreWasmRaw<{
     result: { hasExternalIframe: boolean; isIcims?: boolean; iframeSrcs?: string[] };
-  }>('scan_iframes', { rawHtml: String(rawHtml), pageUrl: '' }).result;
+  }>('scan_iframes', { pageUrl: '' }, sliceSurrogateSafe(String(rawHtml), MAX_WAF_HTML_SCAN_CHARS)).result;
   return {
     found: Boolean(res?.hasExternalIframe),
     ...(res?.iframeSrcs?.[0] ? { iframeSrc: res.iframeSrcs[0] } : {}),
@@ -109,13 +122,13 @@ export function classifyContentState(params: {
       status: params.status ?? 200,
       url: params.url ?? '',
       finalUrl: params.finalUrl ?? '',
-      title: params.title ?? '',
-      markdown: String(params.markdown ?? ''),
+      title: sliceSurrogateSafe(String(params.title ?? ''), 2_048),
+      markdown: sliceSurrogateSafe(String(params.markdown ?? ''), MAX_CONTENT_STATE_MD_SCAN_CHARS),
       validThrough: params.validThrough ?? '',
       rendered: Boolean(params.rendered),
       nowMs: params.nowMs ?? Date.now(),
     },
-    params.rawHtml ?? '',
+    sliceSurrogateSafe(params.rawHtml ?? '', MAX_WAF_HTML_SCAN_CHARS),
   ).result;
   return {
     state: res.state,

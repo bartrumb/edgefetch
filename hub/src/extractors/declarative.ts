@@ -160,6 +160,7 @@ export interface DeclarativeTwinSpec {
   defaultQueryParams?: Record<string, string>;
   kind: 'json' | 'text';
   accept: string;
+  maxBytes?: number;
 }
 
 export interface DeclarativeDynamicKeyPath {
@@ -649,6 +650,7 @@ function buildAdapterFromValidatedManifest(manifest: DeclarativeAdapterManifest,
               kind?: 'json' | 'text';
               accept?: string;
               rawAccept?: string;
+              maxBytes?: number;
               commerceMode?: DeclarativeCommerceMode;
             }>('manifest_resolve_twin', { ...manifestSelector, url: reqUrl });
             if (!resolved.matched || !resolved.fetchUrl || !resolved.kind) return null;
@@ -660,6 +662,12 @@ function buildAdapterFromValidatedManifest(manifest: DeclarativeAdapterManifest,
                 resolved.rawAccept ||
                 resolved.accept ||
                 (resolved.kind === 'json' ? 'application/json' : 'text/plain'),
+              maxBytes:
+                typeof resolved.maxBytes === 'number' && resolved.maxBytes > 0
+                  ? resolved.maxBytes
+                  : resolved.kind === 'json'
+                    ? 2 * 1024 * 1024
+                    : 4 * 1024 * 1024,
               formatTwin: (rawBody: string, originalUrl: string, htmlToMd: HtmlFragmentConverter) => {
                 if (resolved.commerceMode) {
                   return formatCommerceTwinDoc(

@@ -63,14 +63,15 @@ const suiteSpecs = [
   ['test/security-audit.test.ts', 'security-audit.test.mjs'],
   ['test/github-auth-multiuser.test.ts', 'github-auth-multiuser.test.mjs'],
   ['test/mcp-federation.test.ts', 'mcp-federation.test.mjs'],
+  ['test/sanitizer-extraction.test.ts', 'sanitizer-extraction.test.mjs'],
   ['test/updates-telemetry.test.ts', 'updates-telemetry.test.mjs'],
   ...(existsSync(resolve('test/sdk-ts.test.ts')) ? [['test/sdk-ts.test.ts', 'sdk-ts.test.mjs']] : []),
   ['test/live-mcp-audit.test.ts', 'live-mcp-audit.test.mjs'],
   ['test/universal-extraction-scale.test.ts', 'universal-extraction-scale.test.mjs'],
   ['test/tracker-blocking.test.ts', 'tracker-blocking.test.mjs'],
-  ['test/sanitizer-extraction.test.ts', 'sanitizer-extraction.test.mjs'],
   ['test/auth-mcp-isolation.test.ts', 'auth-mcp-isolation.test.mjs'],
   ['test/telemetry-openapi-traces.test.ts', 'telemetry-openapi-traces.test.mjs'],
+  ['test/wasm-memory-budget.test.ts', 'wasm-memory-budget.test.mjs'],
 ];
 
 try {

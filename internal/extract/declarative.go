@@ -221,6 +221,7 @@ type DeclarativeTwinSpec struct {
 	DefaultQueryParams map[string]string            `json:"defaultQueryParams,omitempty"`
 	Kind               string                       `json:"kind"`
 	Accept             string                       `json:"accept"`
+	MaxBytes           int                          `json:"maxBytes,omitempty"`
 }
 
 // DeclarativeDynamicKeyPath looks up root[Base][vars[KeyVar]][SubPath].
@@ -704,6 +705,22 @@ func (m *DeclarativeTwinMatch) RawAccept() string {
 	return strings.TrimSpace(m.route.Twin.Accept)
 }
 
+// EffectiveMaxBytes returns the adapter route's configured twin maxBytes ceiling,
+// defaulting to 2 MiB for JSON twins and 4 MiB for text/XML/patch twins so every
+// built-in and community adapter inherits a safe edge WASM memory ceiling automatically.
+func (m *DeclarativeTwinMatch) EffectiveMaxBytes() int {
+	if m == nil {
+		return 4 << 20
+	}
+	if m.route.Twin.MaxBytes > 0 {
+		return m.route.Twin.MaxBytes
+	}
+	if m.Kind == classify.KindJSON {
+		return 2 << 20
+	}
+	return 4 << 20
+}
+
 type declarativeWildcard struct {
 	kind    string // "suffix", "prefix", or "infix"
 	pattern string
@@ -1045,6 +1062,9 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 	}
 
 	hasSingle := m.Match != nil || m.Twin != nil || m.Extract != nil
+	if m.Twin != nil && m.Twin.MaxBytes != 0 && (m.Twin.MaxBytes < 16_384 || m.Twin.MaxBytes > (4<<20)) {
+		return fmt.Errorf("manifest %q twin.maxBytes (%d) must be between 16384 and %d", m.ID, m.Twin.MaxBytes, 4<<20)
+	}
 	if hasSingle && (m.Match == nil || m.Twin == nil || m.Extract == nil) {
 		return fmt.Errorf("manifest %q single-route shorthand requires match, twin, and extract", m.ID)
 	}
@@ -1065,6 +1085,9 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 		}
 		if r.Twin.ID != "" && !isValidAdapterIDGo(r.Twin.ID) {
 			return fmt.Errorf("manifest %q route %d has invalid twin.id %q", m.ID, i, r.Twin.ID)
+		}
+		if r.Twin.MaxBytes != 0 && (r.Twin.MaxBytes < 16_384 || r.Twin.MaxBytes > (4<<20)) {
+			return fmt.Errorf("manifest %q route %d twin.maxBytes (%d) must be between 16384 and %d", m.ID, i, r.Twin.MaxBytes, 4<<20)
 		}
 		fu := r.Twin.FetchURL
 		if fu != "{requestUrl}" {

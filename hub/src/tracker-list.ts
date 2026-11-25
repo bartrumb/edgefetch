@@ -544,12 +544,13 @@ export async function refreshHubTrackerList(params: RefreshTrackerListParams): P
 
   let res: Response;
   let readRes: { ok: true; bytes: Uint8Array } | { ok: false; reason: string };
+  const fetchFn = params.fetchFn;
   try {
     let currentUrl = EASYPRIVACY_SOURCE_URL;
     let hop = 0;
     while (true) {
       try {
-        res = await params.fetchFn(currentUrl, {
+        res = await fetchFn(currentUrl, {
           method: 'GET',
           headers: reqHeaders,
           redirect: 'manual',

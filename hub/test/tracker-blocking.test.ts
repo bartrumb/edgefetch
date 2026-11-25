@@ -1363,7 +1363,7 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
         `Fresh reactor post-eviction memory (${statsFreshInstance.memoryBytes}) must stay within 2 MiB of initial baseline (${statsFreshInstance.initialMemoryBytes})`,
       );
 
-      // Ordinary 2 MB documents (`2M` `<` sanitize -> `~77.5 MiB` total) must NOT trigger reactor rebuilds across
+      // Ordinary 2 MB documents (`2M` `<` sanitize -> `~50 MiB` total) must NOT trigger reactor rebuilds across
       // 12 consecutive calls (`generation` stays constant, zero `~50 ms` rebuild stalls or dual-instance overlap).
       const twoMillionLt = '<'.repeat(2_000_000);
       const genBefore2M = getWasmReactorStats().generation;
@@ -1378,7 +1378,7 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
         genBefore2M,
         '12 consecutive 2M `<` sanitize calls must have 0 reactor rebuilds',
       );
-      assert.ok(statsAfter2M.memoryBytes <= 96 * 1024 * 1024);
+      assert.ok(statsAfter2M.memoryBytes <= 64 * 1024 * 1024);
 
       // Oversized (>4 MiB) WASM inputs are rejected BEFORE touching WASM memory (`0` extra pages, `0` retry instances)!
       const genBeforeOverBudget = getWasmReactorStats().generation;
@@ -1403,7 +1403,7 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
         rawB38MiB,
       );
       assert.equal(typeof metaPairOut.thin, 'boolean');
-      assert.ok(getWasmReactorStats().memoryBytes <= 96 * 1024 * 1024);
+      assert.ok(getWasmReactorStats().memoryBytes <= 64 * 1024 * 1024);
 
       const rawPairOut = callCoreWasmRawPair<{ detected: boolean }>(
         'detect_prompt_injection',
@@ -1411,7 +1411,7 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
         rawB38MiB,
       );
       assert.equal(rawPairOut.detected, false);
-      assert.ok(getWasmReactorStats().memoryBytes <= 96 * 1024 * 1024);
+      assert.ok(getWasmReactorStats().memoryBytes <= 64 * 1024 * 1024);
 
       // Test 3: RE2 matchers (`compileWasmRe2`, `compileLinearRegex`, `compileSafeUserRegex`, `compileSafeUserRegexUnion`)
       // bind the reactor instance reference and never mis-evaluate against recycled handles (`1..k`) after reactor reset/eviction.

@@ -33,14 +33,17 @@ const EMPTY_BYTES = new Uint8Array(0);
 //     `initialMemoryBytes ≈ 7.25 MiB` (`initial_pages = 92`, `initHeapAlloc ≈ 141 KiB`, down `-43.75 MiB` from `51.00 MiB`).
 //   - `MAX_WASM_INPUT_BYTES = 4 MiB` enforced in every shared writer below so all ~30 raw/JSON/RE2 ops are bounded in one place.
 //   - `MAX_ISOLATE_IN_FLIGHT_BYTES = 12 MiB` semaphore caps concurrent multi-MiB requests sharing one 128 MiB Worker isolate.
-//   - Evict `cachedReactor` only when I/O exceeds `8 MiB` (`WASM_EVICT_IO_BYTES`) or total linear memory exceeds `96 MiB`
-//     (`WASM_MAX_TOTAL_MEMORY_BYTES`), keeping `<= 4 MiB` inputs and `2M` `<` (`8.00 MB` out) steady with 0 rebuild stalls.
+//   - Evict `cachedReactor` only when I/O exceeds `8 MiB` (`WASM_EVICT_IO_BYTES`) or total linear memory exceeds `64 MiB`
+//     (`WASM_MAX_TOTAL_MEMORY_BYTES`). Measured with the 7.25 MiB baseline: repeated `2M` `<` sanitizes (`8.00 MB` out)
+//     step 34 -> 42 -> 50 MiB and plateau at `50 MiB` (30-call run, 0 rebuilds). With the old 51 MiB baseline the same
+//     workload plateaued at 93.5 MiB, which is why the ceiling was 96 MiB before this cut. At 64 MiB the worst
+//     old+new instance overlap during an eviction is ~64 + 7.25 MiB, far below the 128 MiB isolate limit.
 export const MAX_WASM_INPUT_BYTES = 4 * 1024 * 1024;
 export const MAX_ISOLATE_IN_FLIGHT_BYTES = 12 * 1024 * 1024;
 export const WASM_EVICT_IN_BYTES = 8 * 1024 * 1024;
 export const WASM_EVICT_IO_BYTES = WASM_EVICT_IN_BYTES;
 export const WASM_EVICT_OUT_BYTES = 8 * 1024 * 1024;
-export const WASM_MAX_TOTAL_MEMORY_BYTES = 96 * 1024 * 1024;
+export const WASM_MAX_TOTAL_MEMORY_BYTES = 64 * 1024 * 1024;
 const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 524_288;
 
 export class WasmInputBudgetExceededError extends Error {

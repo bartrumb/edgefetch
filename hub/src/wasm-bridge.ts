@@ -27,11 +27,14 @@ const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
 const EMPTY_BYTES = new Uint8Array(0);
 
-// WebAssembly linear memory pages (`64 KiB` each) can never shrink once grown. After any oversized I/O call (`> 8 MiB`)
-// or cumulative linear-memory growth (`> 24 MiB` above the freshly initialized reactor baseline), evict `cachedReactor`
-// immediately after decoding its output so V8 garbage-collects the grown `WebAssembly.Memory` instance.
+// WebAssembly linear memory pages (`64 KiB` each) can never shrink once grown.
+// Measured under `debug.SetMemoryLimit(48 << 20)` (`initialMemoryBytes ≈ 50.5–51.0 MiB`):
+//   - Normal `< 8 MiB` sanitizer calls (`7M` `[` -> `+9.0 MiB`, `2M` `<` -> `+25.0 MiB`) peak at `+25.0 MiB`.
+//   - Multi-MiB structured payloads (`6.32 MiB` board -> `+34.5 MiB`, `7.66 MiB` -> `+35.0 MiB`, `9+ MiB` -> `> +35 MiB`).
+// Keep `WASM_MAX_MEMORY_GROWTH_BYTES` at `28 MiB` (do NOT raise to silence slow tests): evicts `cachedReactor` after any
+// `> 8 MiB` I/O call or `> 28 MiB` growth above baseline so V8 reclaims the grown `WebAssembly.Memory` instance.
 const WASM_EVICT_IO_BYTES = 8 * 1024 * 1024;
-const WASM_MAX_MEMORY_GROWTH_BYTES = 24 * 1024 * 1024;
+const WASM_MAX_MEMORY_GROWTH_BYTES = 28 * 1024 * 1024;
 const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 524_288;
 
 let cachedReactor: CoreReactorExports | null = null;
@@ -52,6 +55,10 @@ export function getWasmReactorStats(): WasmReactorStats {
     memoryBytes: cachedReactor ? cachedReactor.memory.buffer.byteLength : 0,
     initialMemoryBytes: cachedReactorInitMemBytes,
   };
+}
+
+export function isWasmReactorGenerationCurrent(generation: number): boolean {
+  return cachedReactor !== null && generation > 0 && reactorGeneration === generation;
 }
 
 export function resetWasmReactor(): void {
@@ -256,7 +263,42 @@ function writeMetaAndRawStrings(
   // For multi-MiB strings (e.g. 10 MiB Greenhouse/Ashby JSON or HTML), pre-encoding with `utf8Encoder.encode`
   // allocates the exact UTF-8 byte length (~1x) in WASM linear memory instead of `length * 3` (~30 MiB),
   // avoiding permanent `WebAssembly.Memory` page growth inside Cloudflare Workers' 128 MiB isolate ceiling.
-  if (rawA.length + rawB.length > EXACT_UTF8_ENCODE_THRESHOLD_CHARS) {
+  const totalChars = rawA.length + rawB.length;
+  if (totalChars > EXACT_UTF8_ENCODE_THRESHOLD_CHARS) {
+    const slack = Math.min(262_144, (totalChars >>> 4) + 4_096);
+    const optimisticSize = metaBytes.byteLength + totalChars + slack;
+    if (optimisticSize <= 48 * 1024 * 1024) {
+      const optPtr = reactor.ef_in_ptr(optimisticSize) >>> 0;
+      if (optPtr !== 0) {
+        const mem = new Uint8Array(reactor.memory.buffer);
+        mem.set(metaBytes, optPtr);
+        let offset = optPtr + metaBytes.byteLength;
+        const endPtr = optPtr + optimisticSize;
+        let fits = true;
+        let firstRawBytes = 0;
+        if (rawA.length > 0) {
+          const encA = utf8Encoder.encodeInto(rawA, mem.subarray(offset, endPtr));
+          if (encA.read !== rawA.length) {
+            fits = false;
+          } else {
+            firstRawBytes = encA.written;
+            offset += firstRawBytes;
+          }
+        }
+        if (fits && rawB.length > 0) {
+          const encB = utf8Encoder.encodeInto(rawB, mem.subarray(offset, endPtr));
+          if (encB.read !== rawB.length) {
+            fits = false;
+          } else {
+            offset += encB.written;
+          }
+        }
+        if (fits) {
+          return { metaLen: metaBytes.byteLength, firstRawBytes, totalLen: offset - optPtr };
+        }
+      }
+    }
+
     const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : null;
     const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : null;
     const lenA = encA ? encA.byteLength : 0;

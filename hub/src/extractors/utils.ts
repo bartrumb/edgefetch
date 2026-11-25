@@ -11,7 +11,13 @@ import {
   stripHtmlTagsLinear,
   stripHtmlTagsQuoteAwareLinear,
 } from '../safe-input';
-import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawString } from '../wasm-bridge';
+import {
+  callCoreWasm,
+  callCoreWasmRaw,
+  callCoreWasmRawString,
+  getWasmReactorStats,
+  isWasmReactorGenerationCurrent,
+} from '../wasm-bridge';
 
 export { compileLinearRegex };
 
@@ -19,22 +25,29 @@ export class HtmlNode {
   readonly tag: string;
   protected readonly docId: number;
   protected readonly nodeId: number;
+  protected readonly reactorGen: number;
 
-  constructor(docId: number, nodeId: number, tag = '') {
+  constructor(docId: number, nodeId: number, tag = '', reactorGen = 0) {
     this.docId = docId;
     this.nodeId = nodeId;
     this.tag = tag;
+    this.reactorGen = reactorGen;
+  }
+
+  private isLive(): boolean {
+    if (this.docId <= 0) return false;
+    return this.reactorGen > 0 ? isWasmReactorGenerationCurrent(this.reactorGen) : false;
   }
 
   select(selector: string, limit = 500): HtmlNode[] {
-    if (this.docId <= 0 || !selector) return [];
+    if (!this.isLive() || !selector) return [];
     const res = callCoreWasm<{ items: Array<{ nodeId: number; tag: string }> }>('dom_select', {
       docId: this.docId,
       nodeId: this.nodeId,
       selector: String(selector),
       limit,
     });
-    return (res.items ?? []).map((it) => new HtmlNode(this.docId, it.nodeId, it.tag));
+    return (res.items ?? []).map((it) => new HtmlNode(this.docId, it.nodeId, it.tag, this.reactorGen));
   }
 
   first(selector: string): HtmlNode | null {
@@ -42,7 +55,7 @@ export class HtmlNode {
   }
 
   text(subSelector?: string): string {
-    if (this.docId <= 0) return '';
+    if (!this.isLive()) return '';
     return (
       callCoreWasm<{ val?: string }>('dom_node_op', {
         docId: this.docId,
@@ -54,7 +67,7 @@ export class HtmlNode {
   }
 
   html(subSelector?: string): string {
-    if (this.docId <= 0) return '';
+    if (!this.isLive()) return '';
     return (
       callCoreWasm<{ val?: string }>('dom_node_op', {
         docId: this.docId,
@@ -66,12 +79,12 @@ export class HtmlNode {
   }
 
   outerHtml(): string {
-    if (this.docId <= 0) return '';
+    if (!this.isLive()) return '';
     return callCoreWasm<{ val?: string }>('dom_node_op', { docId: this.docId, nodeId: this.nodeId, op: 'outerHtml' }).val ?? '';
   }
 
   attr(name: string): string | undefined {
-    if (this.docId <= 0 || !name) return undefined;
+    if (!this.isLive() || !name) return undefined;
     const res = callCoreWasm<{ ok: boolean; val?: string }>('dom_node_op', {
       docId: this.docId,
       nodeId: this.nodeId,
@@ -82,7 +95,7 @@ export class HtmlNode {
   }
 
   attrOf(subSelector: string, name: string): string {
-    if (this.docId <= 0 || !subSelector || !name) return '';
+    if (!this.isLive() || !subSelector || !name) return '';
     return (
       callCoreWasm<{ val?: string }>('dom_node_op', {
         docId: this.docId,
@@ -95,7 +108,7 @@ export class HtmlNode {
   }
 
   dlMap(subSelector?: string): Record<string, string> {
-    if (this.docId <= 0) return {};
+    if (!this.isLive()) return {};
     return (
       callCoreWasm<{ val?: Record<string, string> }>('dom_node_op', {
         docId: this.docId,
@@ -107,7 +120,7 @@ export class HtmlNode {
   }
 
   tableRows(subSelector?: string): string[][] {
-    if (this.docId <= 0) return [];
+    if (!this.isLive()) return [];
     return (
       callCoreWasm<{ val?: string[][] }>('dom_node_op', {
         docId: this.docId,
@@ -120,21 +133,25 @@ export class HtmlNode {
 }
 
 export class HtmlDoc extends HtmlNode {
-  constructor(docId: number, rootNodeId: number) {
-    super(docId, rootNodeId, '');
+  constructor(docId: number, rootNodeId: number, reactorGen = 0) {
+    super(docId, rootNodeId, '', reactorGen);
   }
 }
 
 export function parseHtmlDoc(rawHtml: string, maxChars = 2 * 1024 * 1024): HtmlDoc {
   if (typeof rawHtml !== 'string' || !rawHtml) {
-    return new HtmlDoc(0, 0);
+    return new HtmlDoc(0, 0, 0);
   }
   const bounded = maxChars > 0 && rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
   const res = callCoreWasm<{ docId: number; rootNodeId: number }>('dom_parse', {
     rawHtml: bounded,
     maxChars,
   });
-  return new HtmlDoc(res.docId, res.rootNodeId);
+  const stats = getWasmReactorStats();
+  if (!stats.active || res.docId <= 0) {
+    return new HtmlDoc(0, 0, 0);
+  }
+  return new HtmlDoc(res.docId, res.rootNodeId, stats.generation);
 }
 
 export const CODE_EXT_FENCE_MAP: Record<string, string> = {

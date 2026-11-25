@@ -1346,6 +1346,21 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(statsFreshInstance.generation, statsBeforeOversized.generation + 1);
       assert.equal(statsFreshInstance.memoryBytes, statsFreshInstance.initialMemoryBytes);
 
+      // Sub-8 MiB board (`~6.3 MiB` I/O, below `WASM_EVICT_IO_BYTES`) that expands Go linear memory by >28 MiB
+      // must ALSO evict `cachedReactor` via `WASM_MAX_MEMORY_GROWTH_BYTES` alone!
+      const mediumGhJson = buildLargeGhBoard('mediumco', 385);
+      assert.ok(mediumGhJson.length > 6_000_000 && mediumGhJson.length < 7_500_000);
+      const medFmt = resolveAtsPreFetchSpec('https://boards.greenhouse.io/mediumco')!.format(
+        mediumGhJson,
+        'https://boards.greenhouse.io/mediumco',
+      );
+      assert.equal(medFmt?.total, 385);
+      assert.equal(
+        getWasmReactorStats().active,
+        false,
+        '6.4 MiB board growing WASM memory >28 MiB must evict cachedReactor via growth threshold',
+      );
+
       // Test 2: `callCoreWasmRawMetaPair` and `callCoreWasmRawPair` use exact UTF-8 byte lengths (`0` `rawB.length * 3`).
       // A 17 MiB ASCII `rawB` is <= 48 MiB `maxWasmInputBytes`, whereas `17 MiB * 3 = 51 MiB` would fail `ef_in_ptr`!
       const rawB17MiB = 'x'.repeat(17 * 1024 * 1024);
@@ -1511,6 +1526,115 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.ok(ghSlugProbeCall && ghSlugProbeCall.ephemeral === true, 'runSlugProbeWave must use ephemeral + atsLiteBoard: true');
       assert.ok(ghFullWaveCall && ghFullWaveCall.ephemeral === true, 'runCandidateWave must not reuse |lite cache entry and must fetch full board');
       assert.equal((slugProbeSearch.body.jobs as unknown[]).length, 1, 'Full board fetch in runCandidateWave must supply strictPay compensation');
+
+      // Test 6: `parseHtmlDoc` / `HtmlNode` DOM handles check reactor generation IN JS before calling Go and return empty
+      // across reactor eviction, never instantiating or reading from a recycled `docId` (`1..32`) on a new reactor.
+      const { parseHtmlDoc } = await import('../src/extractors/utils');
+      const preEvictDoc = parseHtmlDoc('<html><body><div class="secret" data-tok="orig">AlphaOriginal</div></body></html>');
+      const preEvictNode = preEvictDoc.first('.secret')!;
+      assert.equal(preEvictNode.text(), 'AlphaOriginal');
+      assert.equal(preEvictNode.attr('data-tok'), 'orig');
+      resetWasmReactor();
+      assert.equal(getWasmReactorStats().active, false);
+      assert.equal(preEvictDoc.select('.secret').length, 0);
+      assert.equal(preEvictNode.text(), '');
+      assert.equal(preEvictNode.attr('data-tok'), undefined);
+      assert.equal(
+        getWasmReactorStats().active,
+        false,
+        'Evicted HtmlDoc/HtmlNode methods must short-circuit in JS before reaching Go',
+      );
+      const postEvictDoc = parseHtmlDoc('<html><body><div class="secret" data-tok="poison">PoisonOtherDoc</div></body></html>');
+      assert.equal(postEvictDoc.first('.secret')?.text(), 'PoisonOtherDoc');
+      assert.equal(preEvictDoc.select('.secret').length, 0, 'Evicted HtmlDoc handle must not read new reactor docId=1');
+      assert.equal(preEvictNode.text(), '', 'Evicted HtmlNode handle must return empty string');
+      assert.equal(preEvictNode.attr('data-tok'), undefined, 'Evicted HtmlNode attr() must return undefined');
+
+      // Test 7: `strictPay` surfaces `payUnverifiedCount` + `notes` when Workday postings exceed the per-call enrichment cap (6).
+      resetJobsCacheForTests();
+      const wdTiers = ['Platform', 'Storage', 'Networking', 'Runtime', 'Security', 'Observability', 'Compiler', 'Consensus'];
+      const wdBoardPostings = wdTiers.map((tier, idx) => ({
+        title: `Staff Systems Engineer, ${tier}`,
+        company: 'WdScaleCo',
+        url: `https://wdscaleco.wd5.myworkdayjobs.com/en-US/External/job/Remote-US/Staff-Systems-Engineer-${tier}_JR${100 + idx}`,
+        applyUrl: `https://wdscaleco.wd5.myworkdayjobs.com/en-US/External/job/Remote-US/Staff-Systems-Engineer-${tier}_JR${100 + idx}`,
+        workplaceType: 'remote' as const,
+        locations: ['Remote - United States'],
+        pay: null,
+        postedAt: '2026-11-24T00:00:00Z',
+        source: 'workday',
+      }));
+      const wdStrictPayRes = await executeJobsCall({
+        payload: {
+          company: 'WdScaleCo',
+          query: 'Staff Systems Engineer',
+          minBase: 180_000,
+          strictPay: true,
+          limit: 10,
+          includeBuiltIn: false,
+        },
+        env: { JOBS_SHARED_CACHE: true },
+        executeSearch: async () => ({
+          status: 200,
+          body: { results: [{ url: 'https://wdscaleco.wd5.myworkdayjobs.com/External' }] },
+        }),
+        executeScrape: async (args) => {
+          const u = String(args.url ?? '');
+          if (u.startsWith('https://wdscaleco.wd5.myworkdayjobs.com/External') && !u.includes('/job/')) {
+            return {
+              status: 200,
+              body: {
+                ok: true,
+                extractorId: 'workday-board',
+                total: 8,
+                returned: 8,
+                truncated: false,
+                jobs: wdBoardPostings.map((p) => ({ ...p })),
+              },
+            };
+          }
+          if (u.includes('/job/')) {
+            return {
+              status: 200,
+              body: {
+                ok: true,
+                markdown: 'Compensation: US Base Salary Range $195,000 - $235,000 USD.',
+              },
+            };
+          }
+          return { status: 404, body: { ok: false } };
+        },
+      });
+      assert.equal(wdStrictPayRes.status, 200);
+      assert.equal((wdStrictPayRes.body.jobs as unknown[]).length, 6);
+      assert.equal(wdStrictPayRes.body.payUnverifiedCount, 2);
+      assert.ok(
+        Array.isArray(wdStrictPayRes.body.notes) &&
+          (wdStrictPayRes.body.notes as string[]).some((n) => n.includes('pay not verified')),
+        'strictPay response must note postings excluded past enrichment cap',
+      );
+
+      // Test 8: Multi-byte CJK & surrogate-pair emoji inputs just above the 512K-char `EXACT_UTF8_ENCODE_THRESHOLD_CHARS`
+      // switch point (`530K+` UTF-16 code units, ~1.6 MiB UTF-8 > `~1.06x` optimistic buffer) verify `enc.read === str.length`
+      // and fall back to exact UTF-8 encoding with zero silent truncation before reaching Go's sanitizer.
+      const { sanitizeInlineHtmlInMarkdown } = await import('../src/scrape');
+      const cjkPrefix = '日本語セキュリティ検証テキスト\n'.repeat(35_500); // ~532,500 chars (~1.56 MiB UTF-8)
+      const emojiPrefix = '🦀🔒🌐'.repeat(108_000); // 540,000 UTF-16 code units (surrogate pairs + BMP, ~1.18 MiB UTF-8)
+      assert.ok(cjkPrefix.length > 524_288 && emojiPrefix.length > 524_288);
+
+      for (const [label, prefix] of [
+        ['cjk-over-512k', cjkPrefix],
+        ['emoji-over-512k', emojiPrefix],
+      ] as const) {
+        const tailAttackAndSentinel = `\n<script>alert("${label}")</script>\n[bad](javascript:alert(1))\nTAIL_SENTINEL_${label}_END`;
+        const sanitizedMultiByte = sanitizeInlineHtmlInMarkdown(prefix + tailAttackAndSentinel, 'https://example.com/');
+        assert.ok(
+          sanitizedMultiByte.endsWith(`TAIL_SENTINEL_${label}_END`),
+          `${label}: encodeInto must never truncate tail characters past optimistic buffer`,
+        );
+        assert.equal(sanitizedMultiByte.includes('<script'), false, `${label}: trailing <script> must be stripped`);
+        assert.equal(sanitizedMultiByte.includes('javascript:'), false, `${label}: trailing javascript: link must be neutralized`);
+      }
 
       wsAgent.close();
     } finally {

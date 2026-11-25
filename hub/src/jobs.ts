@@ -2126,6 +2126,7 @@ export async function executeJobsCall(params: {
     };
 
     const smartRecruitersPostingsToEnrich: StructuredJobRecord[] = [];
+    const unverifiedPayUrls = new Set<string>();
     let anyBoardTruncated = false;
     let primaryNextCursor: string | undefined;
 
@@ -2329,7 +2330,7 @@ export async function executeJobsCall(params: {
                 reqIds,
               });
             }
-            if (smartRecruitersPostingsToEnrich.length < 10) {
+            {
               const seenWdDedup = new Set<string>();
               const wdCandidates: Array<{ rec: StructuredJobRecord; rank: number }> = [];
               for (const r of boardJobs) {
@@ -2345,9 +2346,13 @@ export async function executeJobsCall(params: {
               if (wdCandidates.length > 0) {
                 wdCandidates.sort((a, b) => a.rank - b.rank);
                 const maxWdPerCall = minBase !== undefined ? 6 : 5;
-                const wdCap = Math.min(limit, maxWdPerCall, 10 - smartRecruitersPostingsToEnrich.length);
+                const remainingEnrichSlots = Math.max(0, 10 - smartRecruitersPostingsToEnrich.length);
+                const wdCap = Math.min(limit, maxWdPerCall, remainingEnrichSlots);
                 for (const { rec: wdRec } of wdCandidates.slice(0, wdCap)) {
                   smartRecruitersPostingsToEnrich.push(wdRec);
+                }
+                for (const { rec: skippedWd } of wdCandidates.slice(wdCap)) {
+                  unverifiedPayUrls.add(skippedWd.url.toLowerCase());
                 }
               }
             }
@@ -2373,7 +2378,13 @@ export async function executeJobsCall(params: {
               const matchingSr = query
                 ? srRecords.filter((r) => matchesJobQueryRelevance(r.title, r.snippet, query) !== null)
                 : srRecords;
-              for (const r of matchingSr.slice(0, Math.min(limit, 8))) smartRecruitersPostingsToEnrich.push(r);
+              const srCap = Math.min(limit, 8, Math.max(0, 10 - smartRecruitersPostingsToEnrich.length));
+              for (const r of matchingSr.slice(0, srCap)) smartRecruitersPostingsToEnrich.push(r);
+              for (const r of matchingSr.slice(srCap)) {
+                if (r.pay === null && matchesPreEnrichJobFilters(r)) {
+                  unverifiedPayUrls.add(r.url.toLowerCase());
+                }
+              }
               for (const r of srRecords) collected.push(r);
             }
             continue;
@@ -2565,6 +2576,10 @@ export async function executeJobsCall(params: {
           if (!target.snippet && detMd) target.snippet = detMd.slice(0, 240);
         }
       }
+    } else if (smartRecruitersPostingsToEnrich.length > 0 && budgetExhausted) {
+      for (const unenriched of smartRecruitersPostingsToEnrich) {
+        if (unenriched.pay === null) unverifiedPayUrls.add(unenriched.url.toLowerCase());
+      }
     }
 
     const allowedCompanyTokens = new Set<string>();
@@ -2622,6 +2637,10 @@ export async function executeJobsCall(params: {
       ...(ri.payUnknown ? { payUnknown: true } : {}),
     }));
     const payUnknownCount = minBase !== undefined ? (rankOut.payUnknownCount ?? 0) : undefined;
+    const payUnverifiedCount =
+      minBase !== undefined && strictPay
+        ? collected.filter((c) => c.pay === null && unverifiedPayUrls.has(c.url.toLowerCase())).length
+        : 0;
     const responseTruncated = anyBoardTruncated || rankOut.matchedTotal > limit;
     const resolvedTopCursor = primaryNextCursor;
 
@@ -2632,6 +2651,11 @@ export async function executeJobsCall(params: {
     }
     if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
       notes.push(`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all candidate boards could be checked.`);
+    }
+    if (payUnverifiedCount > 0 && !notes.some((n) => n.includes('pay not verified'))) {
+      notes.push(
+        `${payUnverifiedCount} matching posting(s) past the detail enrichment limit had pay not verified and were excluded under \`strictPay\`.`,
+      );
     }
     if (candidateUrls.size === 0 && collected.length === 0 && domainsInput.length === 0) {
       notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
@@ -2653,7 +2677,14 @@ export async function executeJobsCall(params: {
         ...(companyFilter ? { company: companyFilter } : {}),
         ...(domainsInput.length > 0 ? { domains: domainsInput, discoveredBoards } : {}),
         ...(boardStartOffset > 0 ? { offset: boardStartOffset } : {}),
-        ...(minBase !== undefined ? { minBaseMode, strictPay, payUnknownCount } : {}),
+        ...(minBase !== undefined
+          ? {
+              minBaseMode,
+              strictPay,
+              payUnknownCount,
+              ...(payUnverifiedCount > 0 ? { payUnverifiedCount } : {}),
+            }
+          : {}),
         ...(responseTruncated ? { truncated: true } : {}),
         ...(resolvedTopCursor ? { nextCursor: resolvedTopCursor } : {}),
         ...(budgetExhausted ? { budgetExhausted: true } : {}),

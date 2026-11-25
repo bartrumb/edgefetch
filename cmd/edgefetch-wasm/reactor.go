@@ -29,9 +29,9 @@ const (
 
 func init() {
 	// Cloudflare Workers shares a hard 128 MiB ceiling across V8 heap + WebAssembly.Memory.
-	// Go's WASI binary + static manifests/PSL start linear memory near ~50.5 MiB, so pacing GC near 64 MiB
-	// avoids mid-call GC thrashing on <=8 MiB hot paths while wasm-bridge.ts evicts the reactor after oversized calls.
-	debug.SetMemoryLimit(64 << 20)
+	// Go's runtime memory limit tracks Go heap + runtime metadata (excluding static WASI data segments),
+	// so keeping it at 48 MiB bounds intra-call peak allocations while wasm-bridge.ts evicts after oversized calls.
+	debug.SetMemoryLimit(48 << 20)
 }
 
 type re2Slot struct {

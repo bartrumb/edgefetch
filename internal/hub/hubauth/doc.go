@@ -136,11 +136,12 @@ type AdminFetchRequest struct {
 
 // Callbacks connects /admin endpoints to live Hub operations.
 type Callbacks struct {
-	GetAdminState     func(ctx context.Context) (AdminHubState, error)
-	ExecuteAdminFetch func(ctx context.Context, req AdminFetchRequest) (status int, via string, body []byte, err error)
-	ClearAffinities   func(ctx context.Context, siteID string) error
-	ClearEvents       func(ctx context.Context) error
-	OnTelemetryToggle func(enabled bool)
+	GetAdminState      func(ctx context.Context) (AdminHubState, error)
+	ExecuteAdminFetch  func(ctx context.Context, req AdminFetchRequest) (status int, via string, body []byte, err error)
+	ClearAffinities    func(ctx context.Context, siteID string) error
+	ClearEvents        func(ctx context.Context) error
+	RefreshTrackerList func(ctx context.Context) (updated bool, status any, err error)
+	OnTelemetryToggle  func(enabled bool)
 }
 
 // Config configures a hubauth Manager.

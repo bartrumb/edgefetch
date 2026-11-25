@@ -1521,3 +1521,48 @@ func TestIcimsRootTwinAndIframeWrapperShellRejection(t *testing.T) {
 		t.Fatalf("expected empty iCIMS title to omit (0 open roles), got: %q", emptyDoc.Title)
 	}
 }
+
+func TestPkgGoDevDocumentationStripsPlaygroundToolbarButtons(t *testing.T) {
+	t.Parallel()
+	rawHTML := `<!doctype html><html><head><title>websocket package - github.com/coder/websocket - Go Packages</title></head><body>
+		<div class="UnitReadme-content"><p>Minimal idiomatic WebSocket library for Go.</p></div>
+		<div class="Documentation-content">
+			<h3 id="pkg-overview">Overview <a class="Documentation-idLink" href="#pkg-overview">¶</a></h3>
+			<p>Package websocket implements the RFC 6455 WebSocket protocol.</p>
+			<details tabindex="-1" id="example-package" class="Documentation-exampleDetails js-exampleContainer">
+				<summary class="Documentation-exampleDetailsHeader">Example <a href="#example-package">¶</a></summary>
+				<div class="Documentation-exampleDetailsBody">
+					<pre class="Documentation-exampleCode">package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("connected")
+}</pre>
+					<pre><span class="Documentation-exampleOutputLabel">Output:</span>
+
+connected</pre>
+				</div>
+				<div class="Documentation-exampleButtonsContainer">
+					<p class="Documentation-exampleError" role="alert" aria-atomic="true"></p>
+					<button class="Documentation-exampleShareButton" aria-label="Share Code">Share</button>
+					<button class="Documentation-exampleFormatButton" aria-label="Format Code">Format</button>
+					<button class="Documentation-exampleRunButton" aria-label="Run Code">Run</button>
+				</div>
+			</details>
+		</div>
+	</body></html>`
+
+	res, ok := ExtractHTMLOnValidatedManifest(LookupBuiltInManifest("pkg-go-dev"), rawHTML, "https://pkg.go.dev/github.com/coder/websocket", "", nil)
+	if !ok || res == nil {
+		t.Fatal("expected pkg-go-dev declarative HTML extractor to match")
+	}
+	if !strings.Contains(res.Markdown, `fmt.Println("connected")`) || !strings.Contains(res.Markdown, "Output:") {
+		t.Fatalf("expected Go example code and output to be preserved, got:\n%s", res.Markdown)
+	}
+	for _, leaked := range []string{"\nShare\n", "\nFormat\n", "\nRun\n", "Share Format Run"} {
+		if strings.Contains(res.Markdown+"\n", leaked) {
+			t.Fatalf("expected Go Playground toolbar chrome %q to be stripped, got:\n%s", leaked, res.Markdown)
+		}
+	}
+}

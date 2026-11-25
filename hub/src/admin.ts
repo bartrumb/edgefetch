@@ -143,6 +143,15 @@ export interface AdminPortalDeps {
   revokeGrant: (grantId: string, userId?: string) => Promise<boolean>;
   getUpdateStatus?: (agents: AgentAttachment[]) => Promise<UpdateCheckStatus>;
   getTrackerListStatus?: () => Promise<TrackerListAdminStatus | undefined>;
+  refreshTrackerList?: () => Promise<{
+    ok: boolean;
+    disabled?: boolean;
+    rateLimited?: boolean;
+    notModified?: boolean;
+    updated: boolean;
+    reason?: string;
+    trackerList: TrackerListAdminStatus;
+  }>;
   getTelemetrySettings?: () => Promise<DevTelemetrySettingsView>;
   setTelemetryOptIn?: (enabled: boolean) => Promise<DevTelemetrySettingsView>;
   getHubSetting?: (key: string) => Promise<string | null>;
@@ -605,7 +614,10 @@ function renderDashboardHtml(params: {
         ? `<section class="card" id="tracker-list-card">
       <h2>
         <span>Headless Chromium Third-Party Tracker Blocking (EasyPrivacy)</span>
-        <span class="badge cat" id="tracker-list-badge">Pending daily fetch</span>
+        <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="badge cat" id="tracker-list-badge">Pending daily fetch</span>
+          <button type="button" id="tracker-refresh-btn" style="padding:5px 12px;font-size:0.78rem">Refresh Now</button>
+        </span>
       </h2>
       <p class="muted" style="margin:0 0 8px">Hub-fetched once daily at runtime and distributed over <code>/agent/ws</code> to browser workers (set <code>EDGEFETCH_TRACKER_LIST=off</code> to disable; pass <code>blockTrackers: false</code> per <code>scrape</code>/<code>interact</code> request to bypass). Source: <a href="${escapeHtml(EASYPRIVACY_SOURCE_URL)}" target="_blank" rel="noopener noreferrer"><code>${escapeHtml(EASYPRIVACY_SOURCE_URL)}</code></a> &middot; <a href="${escapeHtml(EASYPRIVACY_LICENCE_URL)}" target="_blank" rel="noopener noreferrer">EasyPrivacy Licence</a>.</p>
       <div class="chips" style="margin-top:6px">
@@ -763,6 +775,7 @@ function renderDashboardHtml(params: {
       const trkCard = el('tracker-list-card');
       if (trkCard && data.viewer && data.viewer.role === 'owner' && trk) {
         const trkBadge = el('tracker-list-badge');
+        const trkBtn = el('tracker-refresh-btn');
         const trkVer = el('tracker-list-version');
         const trkCnt = el('tracker-list-count');
         const trkFet = el('tracker-list-fetched');
@@ -777,6 +790,9 @@ function renderDashboardHtml(params: {
             trkBadge.className = 'badge cat';
             trkBadge.textContent = 'Awaiting daily fetch';
           }
+        }
+        if (trkBtn) {
+          trkBtn.disabled = !trk.enabled;
         }
         if (trkVer) trkVer.textContent = 'version: ' + (trk.version || 'none');
         if (trkCnt) trkCnt.textContent = 'hostCount: ' + Number(trk.hostCount || 0);
@@ -1250,6 +1266,27 @@ function renderDashboardHtml(params: {
 
     el('refresh-btn').addEventListener('click', loadState);
 
+    if (el('tracker-refresh-btn')) {
+      el('tracker-refresh-btn').addEventListener('click', async () => {
+        const btn = el('tracker-refresh-btn');
+        if (!btn || btn.disabled) return;
+        const prevText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Refreshing...';
+        try {
+          await fetch('/admin/api/tracker-list/refresh', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+            body: '{}',
+          });
+          await loadState();
+        } finally {
+          btn.disabled = false;
+          btn.textContent = prevText;
+        }
+      });
+    }
+
     el('telemetry-toggle-btn').addEventListener('click', async () => {
       const btn = el('telemetry-toggle-btn');
       if (btn.disabled) return;
@@ -1409,6 +1446,7 @@ async function withAdminAuditSpan<T>(
     | 'user_role'
     | 'user_delete'
     | 'telemetry_toggle'
+    | 'tracker_refresh'
     | 'fetch'
     | 'mcp_connect'
     | 'mcp_disconnect'
@@ -1709,7 +1747,9 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
                 ? ('user_delete' as const)
                 : path === '/admin/api/telemetry'
                 ? ('telemetry_toggle' as const)
-                : path === '/admin/api/fetch'
+                : path === '/admin/api/tracker-list/refresh'
+                  ? ('tracker_refresh' as const)
+                  : path === '/admin/api/fetch'
                   ? ('fetch' as const)
                   : path === '/admin/api/mcp/connect'
                     ? ('mcp_connect' as const)
@@ -1723,6 +1763,29 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       : null;
 
   if (!session.ok) {
+    if (path === '/admin/api/tracker-list/refresh' && request.method === 'POST') {
+      const rawAuth = (request.headers.get('authorization') ?? '').trim();
+      const bearerToken = /^Bearer\s+(\S+)$/i.exec(rawAuth)?.[1] ?? '';
+      const sfs = (request.headers.get('sec-fetch-site') ?? '').trim().toLowerCase();
+      if (hasOwnerSecret && ownerSecret && bearerToken && sameBytes(bearerToken, ownerSecret) && sfs !== 'cross-site') {
+        return withAdminAuditSpan('tracker_refresh', async (span) => {
+          if (!deps.refreshTrackerList) {
+            span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+            span.setStatus(false, 'unsupported');
+            return adminJson({ error: 'tracker_refresh_unavailable' }, 501);
+          }
+          const out = await deps.refreshTrackerList();
+          span.setAttributes({
+            'admin.user_id': 'owner',
+            'admin.updated': out.updated,
+            'admin.outcome': out.ok ? (out.updated ? 'updated' : 'unchanged') : 'failed',
+            'http.response.status_code': out.ok ? 200 : 502,
+          });
+          if (!out.ok) span.setStatus(false, out.reason ?? 'refresh_failed');
+          return adminJson(out, out.ok ? 200 : 502);
+        });
+      }
+    }
     if (apiOp) {
       return withAdminAuditSpan(apiOp, async (span) => {
         span.setAttributes({ 'admin.outcome': 'unauthorized', 'http.response.status_code': 401 });
@@ -2743,6 +2806,32 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           'http.response.status_code': 200,
         });
         return adminJson({ ok: true, devTelemetry }, 200);
+      });
+    }
+
+    if (path === '/admin/api/tracker-list/refresh') {
+      return withAdminAuditSpan('tracker_refresh', async (span) => {
+        if (!deps.refreshTrackerList) {
+          span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+          span.setStatus(false, 'unsupported');
+          return adminJson({ error: 'tracker_refresh_unavailable' }, 501);
+        }
+        const capped = await readBodyTextCapped(request, 4_096);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        const out = await deps.refreshTrackerList();
+        span.setAttributes({
+          'admin.user_id': session.userId,
+          'admin.updated': out.updated,
+          'admin.outcome': out.ok ? (out.updated ? 'updated' : 'unchanged') : 'failed',
+          'http.response.status_code': out.ok ? 200 : 502,
+        });
+        if (!out.ok) span.setStatus(false, out.reason ?? 'refresh_failed');
+        return adminJson(out, out.ok ? 200 : 502);
       });
     }
 

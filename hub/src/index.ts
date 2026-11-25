@@ -555,6 +555,47 @@ export class AgentHubDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM mcp_oauth_states WHERE expires_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM auth_failures WHERE reset_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM admin_revocations WHERE expires_at <= ?', now);
+
+    // Cold-R2 EasyPrivacy bootstrap: if R2 has no stored tracker list yet when a background DO alarm fires,
+    // hydrate EasyPrivacy once (still strictly obeying the 6-hour MIN_TRACKER_POLL_INTERVAL_MS floor) and
+    // broadcast immediately to connected browser-v1 agents without waiting up to 24h for 04:00 UTC cron.
+    const trackerBucket = this.env.ARTIFACTS ?? this.env.TRACKER_BUCKET;
+    if (trackerBucket && !isTrackerListDisabled(this.env)) {
+      const settingVal = await this.settings.getSetting('tracker_list').catch(() => null);
+      if (!isTrackerListDisabled(this.env, settingVal)) {
+        const stored = await loadStoredTrackerList(trackerBucket);
+        if (!stored) {
+          const refreshed = await refreshHubTrackerList({
+            bucket: trackerBucket,
+            fetchFn: this.env.SAFE_PUBLIC_FETCH ?? this.env.SAFE_FETCH ?? fetch,
+            env: this.env,
+            hubSettingValue: settingVal,
+            publicOrigin: this.env.EDGEFETCH_PUBLIC_ORIGIN,
+          }).catch(() => null);
+          if (refreshed?.current) {
+            const extraAllow = resolveExtraNeverBlockHosts({ publicOrigin: this.env.EDGEFETCH_PUBLIC_ORIGIN });
+            await this.syncTrackerList(
+              refreshed.current.meta.version,
+              buildTrackerListWsFrames(refreshed.current, extraAllow),
+            );
+            await Promise.resolve(
+              this.activity.recordEvent({
+                level: 'info',
+                category: 'agent',
+                event: 'tracker_list_refreshed',
+                summary: `Bootstrapped EasyPrivacy tracker list v${refreshed.current.meta.version} (${refreshed.current.meta.hostCount} hosts) via DO alarm`,
+                details: {
+                  version: refreshed.current.meta.version,
+                  hostCount: refreshed.current.meta.hostCount,
+                  source: 'do_alarm_bootstrap',
+                },
+              }),
+            ).catch(() => undefined);
+          }
+        }
+      }
+    }
+
     await this.ctx.storage.setAlarm(now + DAILY_CLEANUP_INTERVAL_MS);
     this.alarmScheduled = true;
   }
@@ -575,6 +616,10 @@ export class AgentHubDO extends DurableObject<Env> {
     const stored = await loadStoredTrackerList(bucket);
     if (!stored) {
       this.trackerHydrateRetryAt = now + 60_000;
+      const nextAlarm = await this.ctx.storage.getAlarm().catch(() => null);
+      if (!nextAlarm || nextAlarm > now + 60_000) {
+        await this.ctx.storage.setAlarm(now + 10_000).catch(() => undefined);
+      }
       return;
     }
     this.trackerHydrated = true;
@@ -2275,6 +2320,66 @@ export default {
             env,
             hubSettingValue: settingVal,
           });
+        },
+        refreshTrackerList: async () => {
+          const trackerBucket = env.ARTIFACTS ?? env.TRACKER_BUCKET;
+          const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
+          const settingVal =
+            typeof stub.getHubSetting === 'function'
+              ? await stub.getHubSetting('tracker_list').catch(() => null)
+              : null;
+          const refreshed = await refreshHubTrackerList({
+            bucket: trackerBucket,
+            fetchFn: safePublicFetch,
+            env,
+            hubSettingValue: settingVal,
+            selfHost: url.hostname,
+            publicOrigin: env.EDGEFETCH_PUBLIC_ORIGIN ?? url.origin,
+          });
+          if (refreshed.current && env.AGENT_HUB) {
+            const extraAllow = resolveExtraNeverBlockHosts({
+              selfHost: url.hostname,
+              publicOrigin: env.EDGEFETCH_PUBLIC_ORIGIN ?? url.origin,
+            });
+            const frames = buildTrackerListWsFrames(refreshed.current, extraAllow);
+            await Promise.allSettled(
+              shardNames.map((sName) => {
+                const shardStub = hubShard(sName) as unknown as {
+                  syncTrackerList?: (v: string | null, f: string[]) => Promise<void>;
+                };
+                return typeof shardStub.syncTrackerList === 'function'
+                  ? shardStub.syncTrackerList(refreshed.current!.meta.version, frames)
+                  : Promise.resolve();
+              }),
+            );
+          }
+          if (refreshed.updated && refreshed.current) {
+            await activity.recordEvent({
+              level: 'info',
+              category: 'agent',
+              event: 'tracker_list_refreshed',
+              summary: `Refreshed EasyPrivacy tracker list v${refreshed.current.meta.version} (${refreshed.current.meta.hostCount} hosts) via /admin`,
+              details: {
+                version: refreshed.current.meta.version,
+                hostCount: refreshed.current.meta.hostCount,
+                source: 'admin_refresh',
+              },
+            });
+          }
+          const trackerList = await getTrackerListAdminStatus({
+            bucket: trackerBucket,
+            env,
+            hubSettingValue: settingVal,
+          });
+          return {
+            ok: refreshed.ok,
+            ...(refreshed.disabled ? { disabled: true } : {}),
+            ...(refreshed.rateLimited ? { rateLimited: true } : {}),
+            ...(refreshed.notModified ? { notModified: true } : {}),
+            updated: refreshed.updated,
+            ...(refreshed.reason ? { reason: refreshed.reason } : {}),
+            trackerList,
+          };
         },
         getTelemetrySettings: async () => {
           const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };

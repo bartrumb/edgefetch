@@ -142,6 +142,38 @@ func (m *Manager) HandleAdminTelemetry(w http.ResponseWriter, r *http.Request, s
 	writeJSONResp(w, isHTTPS, http.StatusOK, map[string]any{"ok": true, "telemetry": view, "devTelemetry": view})
 }
 
+// HandleAdminTrackerListRefresh serves POST /admin/api/tracker-list/refresh (owner-only).
+func (m *Manager) HandleAdminTrackerListRefresh(w http.ResponseWriter, r *http.Request, sess verifiedSession, isHTTPS bool) {
+	span := m.startSpan(r, "edgefetch.admin.tracker_refresh", nil)
+	finish := func(status int, ok bool) {
+		span.SetAttribute("http.response.status_code", status)
+		span.End(ok, "")
+	}
+	if !sess.IsOwner {
+		finish(http.StatusForbidden, false)
+		writeJSONResp(w, isHTTPS, http.StatusForbidden, map[string]string{"error": "forbidden_role"})
+		return
+	}
+	if _, tooBig, _ := readCappedBody(w, r, 4096); tooBig {
+		finish(http.StatusRequestEntityTooLarge, false)
+		writeJSONResp(w, isHTTPS, http.StatusRequestEntityTooLarge, map[string]string{"error": "payload_too_large"})
+		return
+	}
+	if m.cfg.Callbacks.RefreshTrackerList == nil {
+		finish(http.StatusNotImplemented, false)
+		writeJSONResp(w, isHTTPS, http.StatusNotImplemented, map[string]string{"error": "tracker_refresh_unavailable"})
+		return
+	}
+	updated, trkStatus, err := m.cfg.Callbacks.RefreshTrackerList(r.Context())
+	if err != nil {
+		finish(http.StatusBadGateway, false)
+		writeJSONResp(w, isHTTPS, http.StatusBadGateway, map[string]any{"ok": false, "updated": false, "reason": err.Error(), "trackerList": trkStatus})
+		return
+	}
+	finish(http.StatusOK, true)
+	writeJSONResp(w, isHTTPS, http.StatusOK, map[string]any{"ok": true, "updated": updated, "trackerList": trkStatus})
+}
+
 // CheckHubUpdateStatus returns cached GitHub release status (skipping network when EDGEFETCH_DISABLE_UPDATE_CHECK=1).
 func (m *Manager) CheckHubUpdateStatus(ctx context.Context, agents []FleetAgentVersion) UpdateStatus {
 	curVer := strings.TrimPrefix(strings.TrimSpace(m.cfg.HubVersion), "v")

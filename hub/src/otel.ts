@@ -715,7 +715,7 @@ const inProcessVerifiedRequests = new WeakSet<Request>();
 
 /**
  * Marks a Web `Request` instance in-process (never via an inbound HTTP header!) as having passed front-end
- * cryptographic credential verification in `portable-server.ts` or `deno-server.ts`.
+ * cryptographic credential verification in `portable-server.ts`.
  */
 export function markRequestVerifiedInProcess(request: Request): void {
   inProcessVerifiedRequests.add(request);

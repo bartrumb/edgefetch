@@ -2,7 +2,6 @@ package classify
 
 import (
 	"html"
-	"net/http"
 	"regexp"
 	"strings"
 )
@@ -85,10 +84,10 @@ func hasStructuralContentVeto(status int, rawHTML string) (veto bool, visibleWor
 
 // ClassifyWAF evaluates response status, HTTP headers, and HTML/JSON body against the 7-vendor WAF & Challenge
 // Signature Catalog (`R2`) while enforcing all 4 Anti-False-Positive Guardrails (`R3`).
-func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
+func ClassifyWAF(status int, header map[string][]string, body []byte) *WAFMatch {
 	// --- Layer 1: Authoritative HTTP Response Headers (100% confidence regardless of body length) ---
 	if header != nil {
-		if rawCf := header.Get("cf-mitigated"); rawCf != "" {
+		if rawCf := headerGet(header, "cf-mitigated"); rawCf != "" {
 			cfMit := strings.ToLower(strings.TrimSpace(rawCf))
 			if cfMit == "" {
 				cfMit = "challenge"
@@ -105,7 +104,7 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 				Summary:    "Cloudflare " + cat + " (cf-mitigated)",
 			}
 		}
-		if amzAct := strings.ToLower(strings.TrimSpace(header.Get("x-amzn-waf-action"))); amzAct == "challenge" || amzAct == "captcha" || amzAct == "block" {
+		if amzAct := strings.ToLower(strings.TrimSpace(headerGet(header, "x-amzn-waf-action"))); amzAct == "challenge" || amzAct == "captcha" || amzAct == "block" {
 			cat := "challenge"
 			if amzAct == "block" {
 				cat = "waf_block"
@@ -118,7 +117,7 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 				Summary:    "AWS WAF " + amzAct + " (x-amzn-waf-action)",
 			}
 		}
-		if vMit := strings.ToLower(strings.TrimSpace(header.Get("x-vercel-mitigated"))); vMit != "" {
+		if vMit := strings.ToLower(strings.TrimSpace(headerGet(header, "x-vercel-mitigated"))); vMit != "" {
 			cat := "challenge"
 			if vMit == "deny" || vMit == "block" {
 				cat = "waf_block"
@@ -131,8 +130,8 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 				Summary:    "Vercel Firewall mitigation (" + vMit + ")",
 			}
 		}
-		ddHdr := strings.ToLower(strings.TrimSpace(header.Get("x-datadome")))
-		ddB := strings.TrimSpace(header.Get("x-dd-b"))
+		ddHdr := strings.ToLower(strings.TrimSpace(headerGet(header, "x-datadome")))
+		ddB := strings.TrimSpace(headerGet(header, "x-dd-b"))
 		if (status == 403 || status == 401 || status == 429) && (ddHdr == "protected" || ddB != "") {
 			return &WAFMatch{
 				Vendor:     "datadome",
@@ -142,7 +141,7 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 				Summary:    "DataDome anti-bot interstitial",
 			}
 		}
-		if strings.TrimSpace(header.Get("x-kpsdk-ct")) != "" && (status == 429 || status == 403) {
+		if strings.TrimSpace(headerGet(header, "x-kpsdk-ct")) != "" && (status == 429 || status == 403) {
 			return &WAFMatch{
 				Vendor:     "kasada",
 				Category:   "challenge",
@@ -151,7 +150,7 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 				Summary:    "Kasada anti-bot challenge",
 			}
 		}
-		if strings.TrimSpace(header.Get("x-px-blocked")) == "1" {
+		if strings.TrimSpace(headerGet(header, "x-px-blocked")) == "1" {
 			return &WAFMatch{
 				Vendor:     "perimeterx",
 				Category:   "challenge",
@@ -191,8 +190,8 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 	serverHdr := ""
 	setCookie := ""
 	if header != nil {
-		serverHdr = strings.ToLower(header.Get("server"))
-		setCookie = strings.ToLower(strings.Join(header.Values("set-cookie"), "; "))
+		serverHdr = strings.ToLower(headerGet(header, "server"))
+		setCookie = strings.ToLower(strings.Join(headerValues(header, "set-cookie"), "; "))
 	}
 
 	// 1. Cloudflare interstitial body
@@ -267,7 +266,7 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 	}
 
 	// 7. Fastly WAF 403 block page
-	if status == 403 && (strings.Contains(serverHdr, "fastly") || (header != nil && header.Get("x-served-by") != "")) &&
+	if status == 403 && (strings.Contains(serverHdr, "fastly") || (header != nil && headerGet(header, "x-served-by") != "")) &&
 		!strings.Contains(scrubbedLower, "fastly error: unknown domain") &&
 		strings.Contains(scrubbedLower, "request blocked") && visibleWords < 80 {
 		return &WAFMatch{

@@ -159,8 +159,8 @@ func TestDeclarativeTwinFormatParityAcrossAllTenManifests(t *testing.T) {
 	if !ok || hfTwin.ID != "huggingface-card" || hfTwin.FetchURL != "https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct/raw/main/README.md" {
 		t.Fatalf("huggingface card resolve mismatch: ok=%v twin=%+v", ok, hfTwin)
 	}
-	hfDoc, ok := hfTwin.Format("---\nlicense: apache-2.0\npipeline_tag: text-generation\ntags:\n  - code\n  - qwen2\n---\n\n# Qwen2.5-Coder\n\nSupports `Vec<u8>` generation.")
-	if !ok || !strings.Contains(hfDoc.Markdown, "| **license** | apache-2.0 |") || !strings.Contains(hfDoc.Markdown, "Vec&lt;u8>") {
+	hfDoc, ok := hfTwin.Format("---\nlicense: apache-2.0\npipeline_tag: text-generation\ntags:\n  - code\n  - qwen2\n---\n\n# Qwen2.5-Coder\n\nSupports `Vec<u8>` generation. <script>evil()</script>")
+	if !ok || !strings.Contains(hfDoc.Markdown, "| **license** | apache-2.0 |") || !strings.Contains(hfDoc.Markdown, "`Vec<u8>`") || !strings.Contains(hfDoc.Markdown, "&lt;script>") {
 		t.Fatalf("huggingface card format mismatch: ok=%v doc=%+v", ok, hfDoc)
 	}
 	if _, softOK := hfTwin.Format("<!doctype html><html><body>Not found</body></html>"); softOK {
@@ -681,9 +681,8 @@ func TestDeclarativeHelpersAndSyntheticTwinCoverage(t *testing.T) {
 	}
 
 	// matchDeclarativeRoute: ExactSegments=false short path, literal mismatch, bad percent escape, StripSuffix, QueryParams
-	exactFalse := false
 	spec := DeclarativeMatchSpec{
-		ExactSegments: &exactFalse,
+		ExactSegments: &DeclarativeExactSegments{Bool: false},
 		PathSegments: []DeclarativeSegmentSpec{
 			{IsLiteral: true, Literal: "v1"},
 			{ParamSpec: DeclarativeParamSegment{Param: "id", Charset: "slug", StripSuffix: ".json"}},

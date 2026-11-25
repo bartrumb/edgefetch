@@ -31,7 +31,6 @@ import {
   hasPrivateSharedHostingSuffix,
   isPublicOrPrivateSuffix,
 } from '../src/psl.ts';
-import { PUBLIC_SUFFIX_LIST_DAT } from '../src/psl-data.ts';
 
 const COMPILED_BUNDLE = compiledBundleJson as unknown as CompiledManifestBundle;
 const hubRoot = process.env.EDGEFETCH_HUB_ROOT
@@ -39,9 +38,8 @@ const hubRoot = process.env.EDGEFETCH_HUB_ROOT
   : resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const datPath = join(hubRoot, '..', 'internal', 'extract', 'manifests', 'public_suffix_list.dat');
 
-test('R8-PSL-1: Vendored public_suffix_list.dat and psl-data.ts are byte-identical and enforce exact, wildcard, exception, IDN, and PRIVATE DOMAINS rules', () => {
+test('R8-PSL-1: Vendored public_suffix_list.dat enforces exact, wildcard, exception, IDN, and PRIVATE DOMAINS rules via Go WASM', () => {
   const onDiskDat = readFileSync(datPath, 'utf8').replace(/\r\n/g, '\n');
-  assert.equal(PUBLIC_SUFFIX_LIST_DAT, onDiskDat, 'hub/src/psl-data.ts must match public_suffix_list.dat byte-for-byte');
   assert.ok(onDiskDat.includes('// ===BEGIN ICANN DOMAINS==='));
   assert.ok(onDiskDat.includes('// ===BEGIN PRIVATE DOMAINS==='));
 

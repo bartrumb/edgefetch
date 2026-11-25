@@ -14,7 +14,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { buildSync } from 'esbuild';
+import { build } from 'esbuild';
+import { ensureCoreWasmBuilt } from './build-wasm.mjs';
+import { createNodeWasmPlugin } from './esbuild-wasm-plugin.mjs';
 
 const SAFE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const MAX_FUZZ_MS_PER_PAYLOAD = 50;
@@ -46,8 +48,9 @@ if (targetSlug && !SAFE_ID_RE.test(targetSlug)) {
   process.exit(1);
 }
 
-// Always compile & schema-validate `internal/extract/manifests/*.yaml` -> `compiled.json` first.
+// Always compile & schema-validate `internal/extract/manifests/*.yaml` -> `compiled.json` + `edgefetch-core.wasm` first.
 execFileSync(process.execPath, [join(scriptsDir, 'compile-manifests.mjs')], { stdio: 'inherit' });
+const coreWasmPath = ensureCoreWasmBuilt();
 
 function resolveSafeFixtureWritePath(fixturesRoot, rawId) {
   if (typeof rawId !== 'string' || !SAFE_ID_RE.test(rawId)) {
@@ -84,7 +87,7 @@ export { createSafeOutboundFetch } from ${JSON.stringify(join(hubRoot, 'portable
 );
 
 try {
-  buildSync({
+  await build({
     entryPoints: [harnessEntry],
     bundle: true,
     platform: 'node',
@@ -95,6 +98,7 @@ try {
     },
     alias: { 'cloudflare:workers': join(hubRoot, 'test', 'cloudflare-workers-stub.ts') },
     loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text' },
+    plugins: [createNodeWasmPlugin({ wasmAbsPath: coreWasmPath })],
     external: ['node:*'],
     outfile: harnessBundle,
   });

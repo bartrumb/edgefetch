@@ -124,21 +124,18 @@ if (isMainModule) {
         })();
 
   const compactDat = compileCompactPslDat(rawSource);
-  const tsModule = renderPslDataTsModule(compactDat);
 
   if (checkOnly) {
     const curDat = existsSync(datOutPath) ? readFileSync(datOutPath, 'utf8').replace(/\r\n/g, '\n') : '';
-    const curTs = existsSync(tsOutPath) ? readFileSync(tsOutPath, 'utf8').replace(/\r\n/g, '\n') : '';
-    if (curDat !== compactDat || curTs !== tsModule) {
-      console.error('Vendored PSL files are out of sync. Run: node hub/scripts/update-psl.mjs');
+    if (curDat !== compactDat) {
+      console.error('Vendored PSL file is out of sync. Run: node hub/scripts/update-psl.mjs');
       process.exit(1);
     }
-    console.log('✔ Verified vendored public_suffix_list.dat and hub/src/psl-data.ts.');
+    console.log('✔ Verified vendored public_suffix_list.dat.');
   } else {
     writeFileSync(datOutPath, compactDat, 'utf8');
-    writeFileSync(tsOutPath, tsModule, 'utf8');
     console.log(
-      `✔ Updated internal/extract/manifests/public_suffix_list.dat (${compactDat.length} bytes) & hub/src/psl-data.ts`,
+      `✔ Updated internal/extract/manifests/public_suffix_list.dat (${compactDat.length} bytes)`,
     );
   }
 }

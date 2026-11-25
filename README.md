@@ -54,10 +54,6 @@ docker compose up --build -d
     <img src="https://railway.com/button.svg" alt="Deploy on Railway" height="34">
   </a>
   &nbsp;
-  <a href="https://console.deno.com/new?clone=https://github.com/bartrumb/edgefetch&entrypoint=hub/portable/deno-server.ts">
-    <img src="https://deno.com/button" alt="Deploy on Deno" height="34">
-  </a>
-  &nbsp;
   <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch">
     <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Add EdgeFetch Repository to Home Assistant" height="34">
   </a>
@@ -71,7 +67,7 @@ docker compose up --build -d
 - **Dial-time SSRF & browser subresource isolation:** `politeness.RejectNonPublicPeer` inspects resolved peer IPs inside Go's `net.Dialer.Control` immediately before `connect()` (blocking DNS-rebinding TOCTOU against RFC 1918 LANs, loopback, CGNAT/Tailscale `100.64.0.0/10`, and `169.254.169.254`), while headless Chromium subresources are forced through an in-process loopback `CONNECT` proxy (`--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"`).
 - **Your own hardware, never a shared proxy pool:** Outbound workers (`edgefetch --mode=agent`) dial *only* your own Hub URL using your private `AGENT_TOKEN` over TLS WebSockets (`WSS /agent/ws`), opening zero inbound ports on your LAN. Outbound requests originate from your worker's WAN IP (or Cloudflare's edge when using overflow) and serialize per host with `Retry-After` compliance.
 - **56 readable YAML site adapters ([`internal/extract/manifests/`](internal/extract/manifests)):** Pure-data YAML manifests (`MIT`) upgrade noisy HTML pages to public JSON/XML endpoints, registries, ATS job boards (Greenhouse, Ashby, Lever, Workday CXS), and structured HTML selectors while enforcing `robots.txt` on every hop and failing open to standard HTML extraction if an upstream schema changes. When a site blocks automated access via `robots.txt` or an anti-bot challenge, EdgeFetch stops immediately and returns a structured `blocked.suggestion` pointing to official public APIs or feeds.
-- **Optional Hub coordinator (`hub/`):** For multi-node fleets, remote HTTP `/mcp`, FTS5 search collections, encrypted downstream MCP connector credentials (`AES-256-GCM` via WebCrypto `HKDF-SHA256`), and optional BYO-LLM `/v1/agent` workflows, the Hub runs on Cloudflare Workers (Hibernating Durable Objects + D1 + R2) or self-hosted `node:sqlite` (`dist/portable-server.mjs`) with `6` runtime npm packages in [`hub/package.json`](hub/package.json) (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`). Multi-user GitHub OAuth sign-in is disabled by default until explicitly configured by the operator.
+- **Optional Hub coordinator (`hub/`):** For multi-node fleets, remote HTTP `/mcp`, FTS5 search collections, encrypted downstream MCP connector credentials (`AES-256-GCM` via WebCrypto `HKDF-SHA256`), and optional BYO-LLM `/v1/agent` workflows, the Hub runs on Cloudflare Workers (Hibernating Durable Objects + D1 + R2) or self-hosted `node:sqlite` (`dist/portable-server.mjs`) with `3` runtime npm packages in [`hub/package.json`](hub/package.json) (`jose`, `oauth4webapi`, `ws`) plus the embedded pure-Go `edgefetch-core.wasm` engine. Multi-user GitHub OAuth sign-in is disabled by default until explicitly configured by the operator.
 
 <p align="center">
   <img src="docs/assets/admin-console.jpg" alt="EdgeFetch /admin Web Control Center" width="880">
@@ -83,7 +79,7 @@ docker compose up --build -d
 
 EdgeFetch was built with coding agents and hardened across 8 adversarial security review rounds (using independent LLM reviewers paired with executed local proof-of-concept exploits). Rather than hiding AI authorship, the repository enforces hard privilege boundaries between declarative site rules and privileged engine code:
 
-- **Ring 1 — Declarative YAML Site Adapters ([`internal/extract/manifests/*.yaml`](internal/extract/manifests)):** Pure data with zero executable TypeScript/Go code, zero `eval`, and linear `re2js` regular expressions. Every manifest compiles through a single strict schema compiler ([`compile-manifests.mjs`](hub/scripts/compile-manifests.mjs)), which enforces domain pattern validation, prevents wildcard/subdomain overlap, and rejects unapproved cross-domain `fetchUrl` hosts.
+- **Ring 1 — Declarative YAML Site Adapters ([`internal/extract/manifests/*.yaml`](internal/extract/manifests)):** Pure data with zero executable TypeScript/Go code, zero `eval`, and linear Go RE2 regular expressions (`edgefetch-core.wasm`). Every manifest compiles through a single strict schema compiler ([`compile-manifests.mjs`](hub/scripts/compile-manifests.mjs)), which enforces domain pattern validation, prevents wildcard/subdomain overlap, and rejects unapproved cross-domain `fetchUrl` hosts.
 - **Ring 0 — Core Engine, Auth, Vault, Sanitizer & SSRF (`cmd/`, `internal/`, `hub/src/`, `.github/`):** Protected by human-approved merges, immutable `v*` tag rulesets, and a human-gated GitHub `release` environment before Ed25519 binary signing (`keys/release-signing-pub.pem`). Real sanitizer differentials, auth edge cases, ReDoS vectors, and SSRF bypasses caught and fixed across Rounds 1–8 are documented candidly in **[docs/SECURITY-LOG.md](docs/SECURITY-LOG.md)**.
 - **Contributor model:** EdgeFetch is a maintainer-driven system. **Issues, reproducible bug reports, WAF false-positive samples, and adapter requests are welcome; code pull requests are by invitation ([`.github/VOUCHED.td`](.github/VOUCHED.td))** so untrusted inputs never steer privileged workflows. See **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 

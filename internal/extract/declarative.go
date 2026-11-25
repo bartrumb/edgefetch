@@ -23,7 +23,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
-//go:embed manifests/*
+//go:embed manifests/compiled.json manifests/public_suffix_list.dat
 var embeddedManifestFS embed.FS
 
 // DeclarativeParamSegment defines a strictly validated URL path segment capture.
@@ -46,6 +46,14 @@ type DeclarativeSegmentSpec struct {
 	IsLiteral bool
 	Literal   string
 	ParamSpec DeclarativeParamSegment
+}
+
+// MarshalJSON encodes a literal segment as a JSON string and a parameter segment as a JSON object.
+func (s DeclarativeSegmentSpec) MarshalJSON() ([]byte, error) {
+	if s.IsLiteral {
+		return json.Marshal(s.Literal)
+	}
+	return json.Marshal(s.ParamSpec)
 }
 
 // UnmarshalJSON decodes a string literal segment or an object parameter segment.
@@ -132,6 +140,43 @@ type DeclarativeDerivedParamSpec struct {
 	Transform string `json:"transform"`
 }
 
+// DeclarativeExactSegments accepts either a boolean (`exactSegments: false` alongside `pathSegments`)
+// or a non-negative segment count (`exactSegments: 1`).
+type DeclarativeExactSegments struct {
+	Bool  bool
+	Count *int
+}
+
+// MarshalJSON encodes DeclarativeExactSegments as an integer count when Count is set, or a boolean otherwise.
+func (e DeclarativeExactSegments) MarshalJSON() ([]byte, error) {
+	if e.Count != nil {
+		return json.Marshal(*e.Count)
+	}
+	return json.Marshal(e.Bool)
+}
+
+// UnmarshalJSON decodes either a boolean or a non-negative integer segment count.
+func (e *DeclarativeExactSegments) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("true")) {
+		e.Bool = true
+		e.Count = nil
+		return nil
+	}
+	if bytes.Equal(trimmed, []byte("false")) {
+		e.Bool = false
+		e.Count = nil
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(trimmed, &n); err == nil && n >= 0 {
+		e.Bool = n != 0
+		e.Count = &n
+		return nil
+	}
+	return fmt.Errorf("invalid exactSegments %s: expected boolean or non-negative integer", string(trimmed))
+}
+
 // DeclarativeMatchSpec matches incoming HTTPS URLs without regular-expression backtracking.
 type DeclarativeMatchSpec struct {
 	AnyOf                  []DeclarativeMatchSpec                 `json:"anyOf,omitempty"`
@@ -141,7 +186,7 @@ type DeclarativeMatchSpec struct {
 	HostSubdomain          *DeclarativeHostSubdomainSpec          `json:"hostSubdomain,omitempty"`
 	HostMap                *DeclarativeHostMapSpec                `json:"hostMap,omitempty"`
 	OptionalLeadingLocale  bool                                   `json:"optionalLeadingLocale,omitempty"`
-	ExactSegments          *bool                                  `json:"exactSegments,omitempty"`
+	ExactSegments          *DeclarativeExactSegments              `json:"exactSegments,omitempty"`
 	MinSegments            *int                                   `json:"minSegments,omitempty"`
 	MaxSegments            *int                                   `json:"maxSegments,omitempty"`
 	PathPrefix             string                                 `json:"pathPrefix,omitempty"`
@@ -615,12 +660,17 @@ type DeclarativeAdapterSummary struct {
 
 // DeclarativeFormattedDoc holds the structured Markdown and metadata produced from a declarative twin payload.
 type DeclarativeFormattedDoc struct {
-	Title         string   `json:"title"`
-	Description   string   `json:"description,omitempty"`
-	Author        string   `json:"author,omitempty"`
-	PublishedTime string   `json:"publishedTime,omitempty"`
-	Markdown      string   `json:"markdown"`
-	Links         []string `json:"links,omitempty"`
+	Title         string           `json:"title"`
+	Description   string           `json:"description,omitempty"`
+	Author        string           `json:"author,omitempty"`
+	PublishedTime string           `json:"publishedTime,omitempty"`
+	Markdown      string           `json:"markdown"`
+	Links         []string         `json:"links,omitempty"`
+	Records       []map[string]any `json:"records,omitempty"`
+	Total         *int             `json:"total,omitempty"`
+	Returned      *int             `json:"returned,omitempty"`
+	Truncated     *bool            `json:"truncated,omitempty"`
+	NextCursor    string           `json:"nextCursor,omitempty"`
 }
 
 // DeclarativeTwinMatch represents a resolved 1-hop declarative twin upgrade ready to fetch and format.
@@ -638,6 +688,22 @@ type DeclarativeTwinMatch struct {
 	universalEngine bool
 }
 
+// CommerceMode returns the matched route's commerceMode (if any).
+func (m *DeclarativeTwinMatch) CommerceMode() string {
+	if m == nil {
+		return ""
+	}
+	return m.route.Extract.CommerceMode
+}
+
+// RawAccept returns the raw un-normalized Accept string declared on the matched twin route.
+func (m *DeclarativeTwinMatch) RawAccept() string {
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(m.route.Twin.Accept)
+}
+
 type declarativeWildcard struct {
 	kind    string // "suffix", "prefix", or "infix"
 	pattern string
@@ -647,6 +713,7 @@ type declarativeWildcard struct {
 type declarativeRegistry struct {
 	manifests []*DeclarativeAdapterManifest
 	summaries []DeclarativeAdapterSummary
+	byID      map[string]*DeclarativeAdapterManifest
 	byHost    map[string][]*DeclarativeAdapterManifest
 	wildcards []declarativeWildcard
 	universal []*DeclarativeAdapterManifest
@@ -808,6 +875,14 @@ func validateValueAgainstReflectTypeGo(v any, t reflect.Type, pathLabel string) 
 		}
 		return validateValueAgainstReflectTypeGo(v, reflect.TypeOf(DeclarativeParamSegment{}), pathLabel)
 	}
+	if t == reflect.TypeOf(DeclarativeExactSegments{}) {
+		switch v.(type) {
+		case bool, float64:
+			return nil
+		default:
+			return fmt.Errorf("%s: expected boolean or non-negative integer", pathLabel)
+		}
+	}
 
 	switch t.Kind() {
 	case reflect.Struct:
@@ -898,8 +973,12 @@ func validateValueAgainstReflectTypeGo(v any, t reflect.Type, pathLabel string) 
 }
 
 func validateStrictASCIIJSONKeys(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fmt.Errorf("invalid declarative adapter manifest: root must be a mapping")
+	}
 	var top map[string]any
-	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	if err := dec.Decode(&top); err != nil {
 		return err
 	}
@@ -921,25 +1000,28 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 	for _, rawDom := range m.Domains {
 		pat := strings.ToLower(strings.TrimSpace(rawDom))
 		if pat == "" || pat == "*" || pat == "*.*" || strings.ContainsAny(pat, " \t\r\n/\\:?#@") {
-			return fmt.Errorf("manifest %q has invalid or overly broad domain %q (M2)", m.ID, rawDom)
+			return fmt.Errorf("manifest %q domain %q is forbidden (M2)", m.ID, rawDom)
 		}
 		for idx := 0; idx < len(pat); idx++ {
 			if pat[idx] < 0x20 || pat[idx] > 0x7e {
-				return fmt.Errorf("manifest %q has non-ASCII domain %q", m.ID, rawDom)
+				return fmt.Errorf("manifest %q non-ASCII domain %q is forbidden", m.ID, rawDom)
 			}
+		}
+		if reservedCoreATSDomainsGo[pat] {
+			return fmt.Errorf("manifest %q domain %q is reserved by a built-in core ATS adapter and is forbidden (M2)", m.ID, rawDom)
 		}
 		if strings.Contains(pat, "*") {
 			if strings.HasPrefix(pat, "*.") && !strings.Contains(pat[2:], "*") {
 				rest := pat[2:]
 				isBuiltInShopify := m.ID == "shopify" && pat == "*.myshopify.com"
 				if !isBuiltInShopify && (IsPublicOrPrivateSuffix(rest) || HasPrivateSharedHostingSuffix(rest)) {
-					return fmt.Errorf("manifest %q has overly broad TLD/eTLD/hosting wildcard %q (M2)", m.ID, rawDom)
+					return fmt.Errorf("manifest %q overly broad TLD/eTLD/hosting wildcard %q is forbidden (M2)", m.ID, rawDom)
 				}
 			}
 			if strings.HasSuffix(pat, ".*") {
 				pre := pat[:len(pat)-2]
 				if len(pre) < 3 || strings.Contains(pre, "*") {
-					return fmt.Errorf("manifest %q has invalid prefix wildcard %q (M2)", m.ID, rawDom)
+					return fmt.Errorf("manifest %q invalid prefix wildcard %q is forbidden (M2)", m.ID, rawDom)
 				}
 			}
 		} else if IsPublicOrPrivateSuffix(pat) || HasPrivateSharedHostingSuffix(pat) {
@@ -1038,6 +1120,20 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 	return nil
 }
 
+// CheckApprovedWildcardDomains verifies that every wildcard domain pattern in m is on the pinned M2 allowlist.
+func CheckApprovedWildcardDomains(m *DeclarativeAdapterManifest) error {
+	if m == nil {
+		return nil
+	}
+	for _, rawDom := range m.Domains {
+		normDom := strings.ToLower(strings.TrimSpace(rawDom))
+		if strings.Contains(normDom, "*") && !approvedWildcardDomainPatternsGo[normDom] {
+			return fmt.Errorf("[%s] Unapproved wildcard domain pattern %q is forbidden — must be allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS (M2)", m.ID, rawDom)
+		}
+	}
+	return nil
+}
+
 // ParseDeclarativeManifest parses and strictly validates a single declarative JSON manifest.
 func ParseDeclarativeManifest(raw []byte) (*DeclarativeAdapterManifest, error) {
 	if err := validateStrictASCIIJSONKeys(raw); err != nil {
@@ -1085,7 +1181,7 @@ func ValidateDeclarativeManifests(manifests []DeclarativeAdapterManifest) error 
 			return err
 		}
 		if seenIDs[m.ID] {
-			return fmt.Errorf("duplicate declarative manifest id %q (M2)", m.ID)
+			return fmt.Errorf("duplicate declarative adapter manifest id %q (M2)", m.ID)
 		}
 		seenIDs[m.ID] = true
 
@@ -1100,6 +1196,17 @@ func ValidateDeclarativeManifests(manifests []DeclarativeAdapterManifest) error 
 			catalogOwners[plat] = m.ID
 		}
 
+		for _, r := range m.Routes {
+			tid := r.Twin.ID
+			if tid == "" {
+				tid = m.ID
+			}
+			if prev, exists := twinOwners[tid]; exists && prev != m.ID {
+				return fmt.Errorf("duplicate twin id %q claimed by both %q and %q (M2)", tid, prev, m.ID)
+			}
+			twinOwners[tid] = m.ID
+		}
+
 		manifestRegs := claimedRegistrableDomainsGo(m.Domains)
 		for _, rawDom := range m.Domains {
 			normDom := strings.ToLower(strings.TrimSpace(rawDom))
@@ -1111,7 +1218,7 @@ func ValidateDeclarativeManifests(manifests []DeclarativeAdapterManifest) error 
 					return fmt.Errorf("manifest %q claims unapproved wildcard domain %q (H7)", m.ID, rawDom)
 				}
 				if prev, exists := wildcardOwners[normDom]; exists && prev != m.ID {
-					return fmt.Errorf("manifest %q domain %q overlaps %q already claimed by %q (H7)", m.ID, normDom, normDom, prev)
+					return fmt.Errorf("manifest %q duplicate domain %q overlaps %q already claimed by %q (H7)", m.ID, normDom, normDom, prev)
 				}
 				for prevExact, prevOwner := range exactOwners {
 					if prevOwner == m.ID {
@@ -1148,15 +1255,6 @@ func ValidateDeclarativeManifests(manifests []DeclarativeAdapterManifest) error 
 		}
 
 		for rIdx, r := range m.Routes {
-			tid := r.Twin.ID
-			if tid == "" {
-				tid = m.ID
-			}
-			if prev, exists := twinOwners[tid]; exists && prev != m.ID {
-				return fmt.Errorf("duplicate twin id %q claimed by both %q and %q (M2)", tid, prev, m.ID)
-			}
-			twinOwners[tid] = m.ID
-
 			fu := r.Twin.FetchURL
 			if fu != "{requestUrl}" && !strings.HasPrefix(fu, "https://{host}/") && !strings.HasPrefix(fu, "{origin}/") {
 				sample := expandTemplate(fu, func(string) string { return "sample" })
@@ -1205,6 +1303,10 @@ func registerManifestInRegistry(reg *declarativeRegistry, m *DeclarativeAdapterM
 	}
 
 	reg.manifests = append(reg.manifests, m)
+	if reg.byID == nil {
+		reg.byID = make(map[string]*DeclarativeAdapterManifest)
+	}
+	reg.byID[m.ID] = m
 	reg.summaries = append(reg.summaries, DeclarativeAdapterSummary{
 		ID:              m.ID,
 		Name:            m.Name,
@@ -1659,7 +1761,27 @@ func buildResolvedTwinURLGo(route DeclarativeRouteSpec, u *url.URL, host string,
 			for k, v := range twin.SetQueryParams {
 				q.Set(k, v)
 			}
-			cloned.RawQuery = q.Encode()
+			keys := make([]string, 0, len(q))
+			for k := range q {
+				keys = append(keys, k)
+			}
+			sort.Slice(keys, func(i, j int) bool {
+				if keys[i] == "ss" && keys[j] == "in_iframe" {
+					return true
+				}
+				if keys[i] == "in_iframe" && keys[j] == "ss" {
+					return false
+				}
+				return keys[i] < keys[j]
+			})
+			var qParts []string
+			for _, k := range keys {
+				ek := url.QueryEscape(k)
+				for _, v := range q[k] {
+					qParts = append(qParts, ek+"="+url.QueryEscape(v))
+				}
+			}
+			cloned.RawQuery = strings.Join(qParts, "&")
 		}
 		candidate = cloned.String()
 	} else {
@@ -1726,6 +1848,28 @@ func isSafePublicHostnameGo(h string) bool {
 		return false
 	}
 	return true
+}
+
+// IsSafeDeclarativeTwinURL reports whether raw is a safe public HTTPS declarative twin URL.
+func IsSafeDeclarativeTwinURL(raw string) bool {
+	return isSafePublicTwinURL(raw)
+}
+
+// FormatJSONWithExtractSpec formats a raw JSON/Inertia twin payload against an explicit DeclarativeExtractSpec and route params.
+func FormatJSONWithExtractSpec(rawBody string, ext DeclarativeExtractSpec, params map[string]string, origURL string) (*DeclarativeFormattedDoc, bool) {
+	if params == nil {
+		params = map[string]string{}
+	}
+	tm := &DeclarativeTwinMatch{
+		params:  params,
+		origURL: origURL,
+		route:   DeclarativeRouteSpec{Extract: ext},
+	}
+	doc, ok := tm.formatJSONTwin(rawBody, ext)
+	if !ok || doc == nil {
+		return nil, false
+	}
+	return sanitizeDeclarativeFormattedDocGo(doc)
 }
 
 func isSafePublicTwinURL(raw string) bool {
@@ -2203,6 +2347,12 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 		params[sc.Param] = applyParamTransformGo(dec, sc.Transform)
 	}
 
+	if spec.ExactSegments != nil && spec.ExactSegments.Count != nil && spec.PathSegments == nil {
+		if len(activeParts) != *spec.ExactSegments.Count {
+			return nil, false
+		}
+	}
+
 	if spec.PathSegments != nil {
 		minReq := 0
 		for _, s := range spec.PathSegments {
@@ -2212,7 +2362,7 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 		}
 		exact := true
 		if spec.ExactSegments != nil {
-			exact = *spec.ExactSegments
+			exact = spec.ExactSegments.Bool
 		}
 		hasGreedy := len(spec.PathSegments) > 0 && !spec.PathSegments[len(spec.PathSegments)-1].IsLiteral && spec.PathSegments[len(spec.PathSegments)-1].ParamSpec.Greedy
 		if hasGreedy {
@@ -2602,11 +2752,155 @@ func (m *DeclarativeTwinMatch) Format(rawBody string) (*DeclarativeFormattedDoc,
 	if !ok || doc == nil {
 		return nil, false
 	}
+	return sanitizeDeclarativeFormattedDocGo(doc)
+}
+
+func escapeDangerousRawHTMLInLineDeclGo(line string) string {
+	firstLt := strings.IndexByte(line, '<')
+	hasInline := strings.Contains(line, "](")
+	hasRef := strings.Contains(line, "]:")
+	if firstLt < 0 && !hasInline && !hasRef && !strings.Contains(line, "//") {
+		return line
+	}
+	out := line
+	if firstLt >= 0 {
+		var sb strings.Builder
+		sb.Grow(len(line) + 8)
+		i := 0
+		n := len(line)
+		var scannedByLen [32]int
+		for i < n {
+			ch := line[i]
+			if ch == '`' {
+				tEnd := i + 1
+				for tEnd < n && line[tEnd] == '`' {
+					tEnd++
+				}
+				tickLen := tEnd - i
+				if tickLen < 32 {
+					search := tEnd
+					if scannedByLen[tickLen] > search {
+						search = scannedByLen[tickLen]
+					}
+					closeStart := -1
+					for search < n {
+						rel := strings.IndexByte(line[search:], '`')
+						if rel < 0 {
+							scannedByLen[tickLen] = n
+							break
+						}
+						hit := search + rel
+						cEnd := hit + 1
+						for cEnd < n && line[cEnd] == '`' {
+							cEnd++
+						}
+						if cEnd-hit == tickLen {
+							closeStart = hit
+							scannedByLen[tickLen] = cEnd
+							break
+						}
+						search = cEnd
+						scannedByLen[tickLen] = cEnd
+					}
+					if closeStart >= 0 {
+						sb.WriteString(line[i : closeStart+tickLen])
+						i = closeStart + tickLen
+						continue
+					}
+				}
+				sb.WriteString(line[i:tEnd])
+				i = tEnd
+				continue
+			}
+			if ch == '<' {
+				sb.WriteString("&lt;")
+				i++
+				continue
+			}
+			sb.WriteByte(ch)
+			i++
+		}
+		out = sb.String()
+	}
+	if hasInline || hasRef || strings.Contains(out, "//") {
+		out = neutralizeAllUnsafeMarkdownLinksLinearGo(out)
+	}
+	return out
+}
+
+func escapeDangerousRawHTMLOutsideFencesDeclGo(s string) string {
+	if s == "" {
+		return ""
+	}
+	noNul := stripInvisibleAndNUL(s)
+	noNul = normalizeMarkdownLineEndings(noNul)
+	if strings.IndexByte(noNul, '<') < 0 && !strings.Contains(noNul, "](") && !strings.Contains(noNul, "]:") && !strings.Contains(noNul, "//") {
+		return strings.TrimSpace(noNul)
+	}
+	lines := strings.Split(noNul, "\n")
+	inFence := false
+	var fenceCh byte
+	fenceLen := 0
+	for i, ln := range lines {
+		lead := 0
+		for lead < len(ln) && lead < 4 && ln[lead] == ' ' {
+			lead++
+		}
+		if lead <= 3 && lead+3 <= len(ln) {
+			c0 := ln[lead]
+			if c0 == '`' || c0 == '~' {
+				p := lead
+				for p < len(ln) && ln[p] == c0 {
+					p++
+				}
+				rLen := p - lead
+				if !inFence && rLen >= 3 && !(c0 == '`' && strings.IndexByte(ln[p:], '`') >= 0) {
+					inFence = true
+					fenceCh = c0
+					fenceLen = rLen
+					continue
+				}
+				if inFence && c0 == fenceCh && rLen >= fenceLen && isBlankASCIILineGo(ln[p:]) {
+					inFence = false
+					fenceCh = 0
+					fenceLen = 0
+					continue
+				}
+			}
+		}
+		if inFence {
+			continue
+		}
+		lines[i] = escapeDangerousRawHTMLInLineDeclGo(ln)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func sanitizeDeclarativeFormattedDocGo(doc *DeclarativeFormattedDoc) (*DeclarativeFormattedDoc, bool) {
+	if doc == nil {
+		return nil, false
+	}
 	doc.Title = SanitizeScrapedMeta(doc.Title)
 	doc.Description = SanitizeScrapedMeta(doc.Description)
 	doc.Author = SanitizeScrapedMeta(doc.Author)
 	doc.PublishedTime = SanitizeScrapedMeta(doc.PublishedTime)
-	doc.Markdown = SanitizeScrapedMarkdown(doc.Markdown)
+	doc.Markdown = escapeDangerousRawHTMLOutsideFencesDeclGo(doc.Markdown)
+	if len(doc.Links) > 0 {
+		filtered := make([]string, 0, len(doc.Links))
+		seen := make(map[string]bool, len(doc.Links))
+		for _, l := range doc.Links {
+			clean := strings.TrimSpace(l)
+			if isSafePublicHTTPSFeedURL(clean) && !seen[clean] {
+				seen[clean] = true
+				filtered = append(filtered, clean)
+			}
+		}
+		if len(filtered) > 0 {
+			doc.Links = filtered
+		} else {
+			doc.Links = nil
+		}
+	}
 	return doc, strings.TrimSpace(doc.Markdown) != ""
 }
 
@@ -2726,14 +3020,17 @@ func isSafePublicHTTPSFeedURL(raw string) bool {
 	if err != nil || u.Scheme != "https" || u.User != nil {
 		return false
 	}
-	host := politeness.CanonicalHost(u.Hostname())
-	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+	if port := u.Port(); port != "" && port != "443" {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if !isSafePublicHostnameGo(host) {
 		return false
 	}
 	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
 		return politeness.IsPublicIP(ip)
 	}
-	return strings.IndexByte(host, '.') > 0
+	return true
 }
 
 func sortedMapKeys[V any](m map[string]V) []string {
@@ -2997,82 +3294,29 @@ func extractInertiaDataPageBytesGo(rawHTML string) ([]byte, bool) {
 func (m *DeclarativeTwinMatch) formatTextTwin(rawBody string) (*DeclarativeFormattedDoc, bool) {
 	ext := m.route.Extract
 	if ext.IcimsPortal {
-		if strings.Contains(strings.ToLower(rawBody), "icims_content_iframe") {
+		res := parseIcimsPortalHTMLDeclHTML(rawBody, m.origURL, func(frag, base string) (string, []string) {
+			doc := ExtractHTMLDocumentFull("<!doctype html><html><body>"+frag+"</body></html>", FullExtractOptions{
+				BaseURL:         base,
+				OnlyMainContent: false,
+				IncludeImages:   true,
+			})
+			return doc.Markdown, doc.Links
+		}, m.ID)
+		if res == nil || strings.TrimSpace(res.Markdown) == "" {
 			return nil, false
-		}
-		out := ExtractHTML(rawBody, ExtractOptions{BaseURL: m.origURL, OnlyMainContent: false, IncludeLinks: true})
-		if strings.TrimSpace(out.Markdown) == "" {
-			return nil, false
-		}
-		var jobLinks []string
-		seenJobID := map[string]bool{}
-		for _, lnk := range out.Links {
-			low := strings.ToLower(lnk)
-			idx := strings.Index(low, "/jobs/")
-			if idx < 0 {
-				continue
-			}
-			rest := low[idx+len("/jobs/"):]
-			endDigits := 0
-			for endDigits < len(rest) && rest[endDigits] >= '0' && rest[endDigits] <= '9' {
-				endDigits++
-			}
-			if endDigits > 0 && (endDigits == len(rest) || rest[endDigits] == '/' || rest[endDigits] == '?') {
-				jid := rest[:endDigits]
-				if !seenJobID[jid] {
-					seenJobID[jid] = true
-					cleanLnk := strings.ReplaceAll(strings.ReplaceAll(lnk, "&in_iframe=1", ""), "?in_iframe=1&", "?")
-					cleanLnk = strings.TrimSuffix(cleanLnk, "?in_iframe=1")
-					jobLinks = append(jobLinks, cleanLnk)
-				}
-			}
-		}
-		isSingleJob := false
-		if u, err := url.Parse(m.origURL); err == nil {
-			lp := strings.ToLower(u.Path)
-			if strings.HasPrefix(lp, "/jobs/") {
-				seg := strings.Split(strings.TrimPrefix(lp, "/jobs/"), "/")[0]
-				if seg != "" && seg != "search" && seg != "intro" {
-					allDigits := true
-					for i := 0; i < len(seg); i++ {
-						if seg[i] < '0' || seg[i] > '9' {
-							allDigits = false
-							break
-						}
-					}
-					isSingleJob = allDigits
-				}
-			}
-		}
-		if !isSingleJob && len(jobLinks) == 0 {
-			lowMd := strings.ToLower(out.Markdown)
-			hasExplicitZero := strings.Contains(lowMd, "no results found") ||
-				strings.Contains(lowMd, "sorry, no jobs") ||
-				strings.Contains(lowMd, "currently no open positions") ||
-				strings.Contains(lowMd, "there are currently no open") ||
-				strings.Contains(lowMd, "0 results available")
-			if !hasExplicitZero {
-				return nil, false
-			}
-			hostSlug := m.params["org"]
-			if hostSlug == "" {
-				hostSlug = "icims"
-			}
-			emptyTitle := hostSlug + " — iCIMS Career Portal"
-			return &DeclarativeFormattedDoc{
-				Title:    emptyTitle,
-				Markdown: "# " + emptyTitle + "\n\nNo open positions currently listed.",
-				Links:    []string{},
-			}, true
-		}
-		linksOut := out.Links
-		if len(jobLinks) > 0 {
-			linksOut = jobLinks
 		}
 		return &DeclarativeFormattedDoc{
-			Title:    out.Title,
-			Markdown: out.Markdown,
-			Links:    linksOut,
+			Title:         res.Title,
+			Description:   res.Description,
+			Author:        res.Author,
+			PublishedTime: res.PublishedTime,
+			Markdown:      res.Markdown,
+			Links:         res.Links,
+			Records:       res.Records,
+			Total:         res.Total,
+			Returned:      res.Returned,
+			Truncated:     res.Truncated,
+			NextCursor:    res.NextCursor,
 		}, true
 	}
 	if ext.XML != nil {
@@ -3148,6 +3392,9 @@ func escapeCommerceTextGo(raw string, maxRunes int, unescapeEntities bool) strin
 	clean := strings.TrimSpace(flat.String())
 	if clean == "" {
 		return ""
+	}
+	if strings.Contains(clean, "](") || strings.Contains(clean, "]:") || strings.Contains(clean, "//") {
+		clean = NeutralizeAllUnsafeMarkdownLinks(clean)
 	}
 	if maxRunes > 0 {
 		clean = strings.TrimSpace(sliceRunesMax(clean, maxRunes))
@@ -3227,6 +3474,9 @@ func formatCommerceSKUSpanGo(raw string) string {
 	clean := strings.TrimSpace(sliceRunesMax(flat.String(), 160))
 	if clean == "" {
 		return "`-`"
+	}
+	if strings.Contains(clean, "](") || strings.Contains(clean, "]:") || strings.Contains(clean, "//") {
+		clean = NeutralizeAllUnsafeMarkdownLinks(clean)
 	}
 	// Escape `<`, `[`, `]` without stripping any SKU characters (`|`, `` ` ``, `#`, `<`, `[`, `]` all preserved!).
 	var esc strings.Builder
@@ -5226,7 +5476,15 @@ func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) 
 		if !isS || strings.TrimSpace(s) == "" {
 			return ""
 		}
-		doc := ExtractHTML("<html><body>"+s+"</body></html>", ExtractOptions{BaseURL: origURL, OnlyMainContent: false})
+		if strings.IndexByte(s, '<') < 0 && strings.IndexByte(s, '&') < 0 {
+			return strings.TrimSpace(SanitizeMarkdown(s, origURL))
+		}
+		doc := ExtractHTMLDocumentFull("<!doctype html><html><body>"+s+"</body></html>", FullExtractOptions{
+			BaseURL:         origURL,
+			OnlyMainContent: false,
+			IncludeImages:   true,
+			IsFragment:      true,
+		})
 		if strings.TrimSpace(doc.Markdown) != "" {
 			return strings.TrimSpace(doc.Markdown)
 		}
@@ -5455,7 +5713,13 @@ func jsonScalarToString(v any) string {
 	case string:
 		return t
 	case json.Number:
-		return t.String()
+		s := t.String()
+		if strings.IndexByte(s, '.') >= 0 || strings.IndexByte(s, 'e') >= 0 || strings.IndexByte(s, 'E') >= 0 {
+			if f, err := t.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return strconv.FormatFloat(f, 'f', -1, 64)
+			}
+		}
+		return s
 	case float64:
 		return strconv.FormatFloat(t, 'f', -1, 64)
 	case bool:
@@ -5774,13 +6038,34 @@ func detectDeclarativeFenceLang(filePath string) (string, bool) {
 }
 
 func firstMarkdownH1(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if strings.HasPrefix(line, "# ") {
-			h := strings.TrimSpace(line[2:])
-			if h != "" {
-				return h
+	pos := 0
+	for pos < len(s) {
+		if pos == 0 {
+			if strings.HasPrefix(s, "# ") {
+				nl := strings.IndexByte(s[2:], '\n')
+				lineRest := s[2:]
+				if nl >= 0 {
+					lineRest = lineRest[:nl]
+				}
+				if h := strings.TrimSpace(lineRest); h != "" {
+					return h
+				}
 			}
 		}
+		rel := strings.Index(s[pos:], "\n# ")
+		if rel < 0 {
+			return ""
+		}
+		start := pos + rel + 3
+		nl := strings.IndexByte(s[start:], '\n')
+		lineRest := s[start:]
+		if nl >= 0 {
+			lineRest = lineRest[:nl]
+		}
+		if h := strings.TrimSpace(lineRest); h != "" {
+			return h
+		}
+		pos = start
 	}
 	return ""
 }

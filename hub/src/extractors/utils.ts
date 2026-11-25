@@ -1,19 +1,141 @@
 /**
- * HTML5 DOM parsing (`parseHtmlDoc`), HTML-stripping, JSON-LD, and Markdown table utilities for Site Adapters.
+ * HTML5 DOM parsing (`parseHtmlDoc` via Go WASM `internal/extract/html_dom.go`), HTML-stripping, JSON-LD,
+ * and Markdown table utilities for Site Adapters.
  */
 
 import {
   compileLinearRegex,
   escapeResidualHtmlTagsOutsideCode,
   findTagOpenEndQuoteAware,
-  replaceHtmlTagBlocksLinear,
   scanHtmlTagsLinear,
   stripHtmlTagsLinear,
   stripHtmlTagsQuoteAwareLinear,
 } from '../safe-input';
+import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawString } from '../wasm-bridge';
 
 export { compileLinearRegex };
-export { HtmlDoc, HtmlNode, parseHtmlDoc } from './html-doc';
+
+export class HtmlNode {
+  readonly tag: string;
+  protected readonly docId: number;
+  protected readonly nodeId: number;
+
+  constructor(docId: number, nodeId: number, tag = '') {
+    this.docId = docId;
+    this.nodeId = nodeId;
+    this.tag = tag;
+  }
+
+  select(selector: string, limit = 500): HtmlNode[] {
+    if (this.docId <= 0 || !selector) return [];
+    const res = callCoreWasm<{ items: Array<{ nodeId: number; tag: string }> }>('dom_select', {
+      docId: this.docId,
+      nodeId: this.nodeId,
+      selector: String(selector),
+      limit,
+    });
+    return (res.items ?? []).map((it) => new HtmlNode(this.docId, it.nodeId, it.tag));
+  }
+
+  first(selector: string): HtmlNode | null {
+    return this.select(selector, 1)[0] ?? null;
+  }
+
+  text(subSelector?: string): string {
+    if (this.docId <= 0) return '';
+    return (
+      callCoreWasm<{ val?: string }>('dom_node_op', {
+        docId: this.docId,
+        nodeId: this.nodeId,
+        op: 'text',
+        ...(subSelector !== undefined ? { subSelector } : {}),
+      }).val ?? ''
+    );
+  }
+
+  html(subSelector?: string): string {
+    if (this.docId <= 0) return '';
+    return (
+      callCoreWasm<{ val?: string }>('dom_node_op', {
+        docId: this.docId,
+        nodeId: this.nodeId,
+        op: 'html',
+        ...(subSelector !== undefined ? { subSelector } : {}),
+      }).val ?? ''
+    );
+  }
+
+  outerHtml(): string {
+    if (this.docId <= 0) return '';
+    return callCoreWasm<{ val?: string }>('dom_node_op', { docId: this.docId, nodeId: this.nodeId, op: 'outerHtml' }).val ?? '';
+  }
+
+  attr(name: string): string | undefined {
+    if (this.docId <= 0 || !name) return undefined;
+    const res = callCoreWasm<{ ok: boolean; val?: string }>('dom_node_op', {
+      docId: this.docId,
+      nodeId: this.nodeId,
+      op: 'attr',
+      attrName: String(name),
+    });
+    return res.ok ? (res.val ?? '') : undefined;
+  }
+
+  attrOf(subSelector: string, name: string): string {
+    if (this.docId <= 0 || !subSelector || !name) return '';
+    return (
+      callCoreWasm<{ val?: string }>('dom_node_op', {
+        docId: this.docId,
+        nodeId: this.nodeId,
+        op: 'attrOf',
+        subSelector: String(subSelector),
+        attrName: String(name),
+      }).val ?? ''
+    );
+  }
+
+  dlMap(subSelector?: string): Record<string, string> {
+    if (this.docId <= 0) return {};
+    return (
+      callCoreWasm<{ val?: Record<string, string> }>('dom_node_op', {
+        docId: this.docId,
+        nodeId: this.nodeId,
+        op: 'dlMap',
+        ...(subSelector !== undefined ? { subSelector } : {}),
+      }).val ?? {}
+    );
+  }
+
+  tableRows(subSelector?: string): string[][] {
+    if (this.docId <= 0) return [];
+    return (
+      callCoreWasm<{ val?: string[][] }>('dom_node_op', {
+        docId: this.docId,
+        nodeId: this.nodeId,
+        op: 'tableRows',
+        ...(subSelector !== undefined ? { subSelector } : {}),
+      }).val ?? []
+    );
+  }
+}
+
+export class HtmlDoc extends HtmlNode {
+  constructor(docId: number, rootNodeId: number) {
+    super(docId, rootNodeId, '');
+  }
+}
+
+export function parseHtmlDoc(rawHtml: string, maxChars = 2 * 1024 * 1024): HtmlDoc {
+  if (typeof rawHtml !== 'string' || !rawHtml) {
+    return new HtmlDoc(0, 0);
+  }
+  const bounded = maxChars > 0 && rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
+  const res = callCoreWasm<{ docId: number; rootNodeId: number }>('dom_parse', {
+    rawHtml: bounded,
+    maxChars,
+  });
+  return new HtmlDoc(res.docId, res.rootNodeId);
+}
 
 export const CODE_EXT_FENCE_MAP: Record<string, string> = {
   ts: 'ts',
@@ -61,30 +183,13 @@ export const CODE_EXT_FENCE_MAP: Record<string, string> = {
 };
 
 export function safeFence(code: string, lang = ''): string {
-  let maxTicks = 2;
-  for (const m of code.matchAll(/`{3,}/g)) {
-    if (m[0].length > maxTicks) maxTicks = m[0].length;
-  }
-  const fence = '`'.repeat(maxTicks + 1);
-  return `${fence}${lang}\n${code.replace(/\r\n/g, '\n').trimEnd()}\n${fence}`;
+  return callCoreWasm<{ out: string }>('make_safe_fence', { code: String(code ?? ''), lang, preferTilde: false }).out;
 }
 
 export function decodeBasicEntities(s: string): string {
-  return s
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) => {
-      const cp = parseInt(hex, 16);
-      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : _m;
-    })
-    .replace(/&#(\d+);/g, (_m, dec: string) => {
-      const cp = parseInt(dec, 10);
-      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : _m;
-    });
+  const str = String(s ?? '');
+  if (!str || !str.includes('&')) return str;
+  return callCoreWasm<{ out: string }>('decode_basic_entities', { input: str }).out;
 }
 
 export function stripTagsInline(html: string): string {
@@ -95,11 +200,6 @@ export function stripTagsInline(html: string): string {
   );
 }
 
-/**
- * Safely unescapes ONLY HTML `&amp;` / `&#38;` / `&#x26;` inside extracted `href` URLs.
- * Never run full HTML entity decoding on query strings — otherwise `&currentTime=` turns into `¤tTime=` (`&curren`)
- * and `&section=` turns into `§ion=` (`&sect`)!
- */
 export function unescapeHrefUrl(rawHref: string): string {
   return rawHref.replace(/&(?:amp|#0*38|#x0*26);/gi, '&').trim();
 }
@@ -134,7 +234,6 @@ export function parseJsonValue(raw: string): unknown {
   }
 }
 
-/** Escapes pipe and newline characters for safe GitHub-Flavored Markdown table cells. */
 export function escapeGfmCell(val: unknown, maxLen = 180): string {
   const str = String(val ?? '')
     .replace(/\r?\n+/g, ' ')
@@ -145,7 +244,6 @@ export function escapeGfmCell(val: unknown, maxLen = 180): string {
   return str.length > maxLen ? `${str.slice(0, maxLen - 1)}…` : str;
 }
 
-/** Builds a clean GitHub-Flavored Markdown table from headers and rows. */
 export function formatGfmTable(headers: string[], rows: Array<Array<unknown>>): string {
   if (headers.length === 0 || rows.length === 0) return '';
   const headLine = `| ${headers.map((h) => escapeGfmCell(h, 80)).join(' | ')} |`;
@@ -159,13 +257,11 @@ function parseMetaTagAttrsLinear(attrChunk: string): Record<string, string> {
   const re = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)[ \t\r\n]*(?:=[ \t\r\n]*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(attrChunk)) !== null) {
-    const k = m[1]!.toLowerCase();
-    attrs[k] = m[2] ?? m[3] ?? m[4] ?? '';
+    attrs[m[1]!.toLowerCase()] = m[2] ?? m[3] ?? m[4] ?? '';
   }
   return attrs;
 }
 
-/** Extracts `<meta name="..." content="...">` or `<meta property="..." content="...">` values from HTML in linear O(N) time (`H1`). */
 export function extractMetaContent(rawHtml: string, key: string): string {
   if (!/<meta[\s/>]/i.test(rawHtml)) return '';
   const targetKey = key.toLowerCase();
@@ -191,7 +287,6 @@ export function extractMetaContent(rawHtml: string, key: string): string {
   return found;
 }
 
-/** Extracts all `<meta name="key" content="...">` values (e.g. multiple `citation_author` tags) in linear O(N) time (`H1`). */
 export function extractAllMetaContents(rawHtml: string, key: string): string[] {
   if (!/<meta[\s/>]/i.test(rawHtml)) return [];
   const targetKey = key.toLowerCase();
@@ -213,83 +308,24 @@ export function extractAllMetaContents(rawHtml: string, key: string): string[] {
   return out;
 }
 
-/**
- * Linear O(N) detector for literal, JSON-escaped (`\udb40\udc69`, `\\udb40\\udc69`, `\u{e0069}`), or
- * HTML-entity-encoded (`&#xE0069;`, `&#917609;`, `&amp;#xE0069;`) Unicode Tag smuggling (`U+E0000..U+E007F`).
- * Operates directly on raw `<script>` / JSON strings with zero tree-node budget so primitive/empty-array
- * padding can never mask smuggled tag characters (`NEW-HIGH-1`).
- */
 export function hasRawOrEncodedUnicodeTagLinear(raw: string): boolean {
   if (!raw) return false;
-  if (raw.includes('\uDB40') && /[\u{E0000}-\u{E007F}]/u.test(raw)) {
-    return true;
-  }
-  if ((raw.includes('db40') || raw.includes('DB40') || raw.includes('e00') || raw.includes('E00')) && raw.includes('\\')) {
-    if (/\\u(?:db40\\{1,16}udc[0-7][0-9a-f]|\{[ \t]{0,4}0{0,8}e00[0-7][0-9a-f][ \t]{0,4}\})/i.test(raw)) {
-      return true;
-    }
-  }
-  if (raw.includes('&') && raw.includes('#')) {
-    if (
-      /&(?:amp;|#0{0,6}38;?|#[xX]0{0,6}26;?){0,4}#(?:[xX]0{0,8}[eE]00[0-7][0-9a-fA-F]|0{0,8}917(?:50[4-9]|5[1-9]\d|6[0-2]\d|63[01]));?/.test(
-        raw,
-      )
-    ) {
-      return true;
-    }
-  }
-  return false;
+  return callCoreWasmRaw<{ hit: boolean }>('has_unicode_tag', null, String(raw)).hit;
 }
 
-/**
- * Linear predicate matching `<script type="application/ld+json">` attribute strings (quoted or unquoted,
- * with optional MIME parameters such as `;charset=utf-8`), shared across `extractJsonLdObjects`,
- * `schema-org.ts`, and `jobs.ts` so extraction and `checkPromptInjection` never desync (`HIGH-3`).
- */
 export function isJsonLdScriptAttrLinear(attrStr: string): boolean {
-  return /\btype[ \t\r\n]*=[ \t\r\n]*(?:["']application\/ld\+json(?:[ \t]*;[^"']*)?[ \t]*["']|application\/ld\+json(?:;[^ \t\r\n"'>]*)?(?=[ \t\r\n/>]|$))/i.test(
-    attrStr,
-  );
+  if (!attrStr) return false;
+  return callCoreWasm<{ ok: boolean }>('is_jsonld_script_attr', { attrStr }).ok;
 }
 
-/** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks in linear O(N) time (`H1`). */
 export function extractJsonLdObjects(rawHtml: string, maxEntities = 100): Array<Record<string, unknown>> {
-  if (!/ld\+json/i.test(rawHtml)) return [];
-  const cap = Math.max(1, Math.min(250, Math.floor(maxEntities)));
-  const results: Array<Record<string, unknown>> = [];
-  replaceHtmlTagBlocksLinear(rawHtml, 'script', (_full, attrStr, inner) => {
-    if (results.length >= cap) return '';
-    if (!isJsonLdScriptAttrLinear(attrStr)) {
-      return '';
-    }
-    const raw = inner.trim();
-    if (!raw || raw.length > 2 * 1024 * 1024) return '';
-    const parsed = parseJsonValue(raw) ?? (raw.includes('&') ? parseJsonValue(decodeBasicEntities(raw)) : null);
-    const pushItem = (item: unknown, depth: number) => {
-      if (!item || typeof item !== 'object' || depth > 16 || results.length >= cap) return;
-      if (Array.isArray(item)) {
-        for (const el of item) {
-          if (results.length >= cap) break;
-          pushItem(el, depth + 1);
-        }
-        return;
-      }
-      const obj = item as Record<string, unknown>;
-      results.push(obj);
-      if (Array.isArray(obj['@graph'])) {
-        for (const g of obj['@graph']) {
-          if (results.length >= cap) break;
-          pushItem(g, depth + 1);
-        }
-      }
-    };
-    pushItem(parsed, 0);
-    return '';
-  });
-  return results;
+  if (!rawHtml || !/ld\+json/i.test(rawHtml)) return [];
+  return callCoreWasm<{ objects: Array<Record<string, unknown>> | null }>('extract_jsonld_objects', {
+    rawHtml,
+    maxEntities,
+  }).objects ?? [];
 }
 
-/** Extracts balanced `<div ...>...</div>` inner HTML starting right at the matched opening `<div ...>` index (`H1`). */
 export function extractBalancedDivAt(html: string, openTagIndex: number): string | null {
   const deadRef: { mask?: Uint8Array } = {};
   const openTagEnd = findTagOpenEndQuoteAware(html, openTagIndex + 4, deadRef);
@@ -329,102 +365,30 @@ export function formatUsdCompact(n: unknown): string {
   return `${sign}$${abs.toFixed(2)}`;
 }
 
-/** Parses YAML model/dataset card frontmatter (e.g. Hugging Face `README.md`) into a GFM metadata table + clean Markdown body. */
 export function formatYamlFrontmatterCard(rawMd: string, fallbackTitle: string): {
   title: string;
   description?: string;
   markdown: string;
 } {
-  const boundedRaw = rawMd.length > 2 * 1024 * 1024 ? rawMd.slice(0, 2 * 1024 * 1024) : rawMd;
-  const normalized = boundedRaw.includes('\r') ? boundedRaw.replace(/\r\n/g, '\n') : boundedRaw;
-  let yamlBlock = '';
-  let body = '';
-  let hasFrontmatter = false;
-  if (normalized.startsWith('---\n')) {
-    const headWindow = normalized.slice(0, 8_200);
-    const closeMarker = headWindow.indexOf('\n---\n', 4);
-    if (closeMarker >= 4 && closeMarker <= 8_004) {
-      yamlBlock = normalized.slice(4, closeMarker);
-      let bodyStart = closeMarker + 5;
-      while (bodyStart < normalized.length && normalized.charCodeAt(bodyStart) === 10) bodyStart++;
-      body = normalized.slice(bodyStart).trim();
-      hasFrontmatter = true;
-    }
+  const packed = callCoreWasmRawString(
+    'format_yaml_card',
+    { fallbackTitle: String(fallbackTitle ?? '') },
+    String(rawMd ?? ''),
+  );
+  if (!packed) {
+    return { title: fallbackTitle, markdown: '' };
   }
-  if (!hasFrontmatter) {
-    const h1Window = normalized.slice(0, 4_096);
-    const h1 = /^#[ \t]+([^\n]{1,500})$/m.exec(h1Window)?.[1]?.trim();
-    const title = h1 || fallbackTitle;
-    const trimmedNorm = normalized.trim();
-    const md = trimmedNorm.startsWith('# ') ? trimmedNorm : `# ${title}\n\n${trimmedNorm}`;
-    return { title, markdown: md };
+  const sep1 = packed.indexOf('\0');
+  const sep2 = sep1 >= 0 ? packed.indexOf('\0', sep1 + 1) : -1;
+  if (sep1 < 0 || sep2 < 0) {
+    return { title: fallbackTitle, markdown: packed };
   }
-  const kvPairs: Array<[string, string]> = [];
-  let currentKey = '';
-  let listItems: string[] = [];
-
-  const flushList = () => {
-    if (currentKey && listItems.length > 0) {
-      kvPairs.push([currentKey, listItems.slice(0, 12).join(', ')]);
-    }
-    currentKey = '';
-    listItems = [];
-  };
-
-  for (const line of yamlBlock.split('\n')) {
-    const listMatch = /^\s*-\s+(.+)$/.exec(line);
-    if (listMatch && currentKey) {
-      const item = listMatch[1]!.replace(/^["']|["']$/g, '').trim();
-      if (item && !item.includes(':')) listItems.push(item);
-      continue;
-    }
-    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-    if (kv) {
-      flushList();
-      const k = kv[1]!;
-      const v = kv[2]!.replace(/^["']|["']$/g, '').trim();
-      if (!v) {
-        currentKey = k;
-      } else if (v.length <= 140 && !v.startsWith('{')) {
-        kvPairs.push([k, v]);
-      }
-    }
-  }
-  flushList();
-
-  const h1 = /^#\s+(.+)$/m.exec(body)?.[1]?.trim();
-  const fmTitle = kvPairs.find(([k]) => k === 'pretty_name' || k === 'title')?.[1];
-  const title = h1 || fmTitle || fallbackTitle;
-  const keepKeys = new Set([
-    'license',
-    'pipeline_tag',
-    'library_name',
-    'base_model',
-    'language',
-    'tags',
-    'datasets',
-    'sdk',
-    'task_categories',
-    'size_categories',
-  ]);
-  const selected = kvPairs.filter(([k]) => keepKeys.has(k)).slice(0, 10);
-  const tableLines =
-    selected.length > 0
-      ? formatGfmTable(
-          ['Property', 'Value'],
-          selected.map(([k, v]) => [`**${k}**`, v]),
-        )
-      : '';
-
-  const parts: string[] = [];
-  if (!body.startsWith('# ')) parts.push(`# ${title}`);
-  if (tableLines) parts.push(tableLines);
-  if (body) parts.push(body);
-
-  const desc = kvPairs.find(([k]) => k === 'description' || k === 'summary')?.[1];
+  const title = packed.slice(0, sep1) || fallbackTitle;
+  const description = packed.slice(sep1 + 1, sep2);
+  const markdown = packed.slice(sep2 + 1);
   return {
     title,
-    ...(desc ? { description: desc } : {}),
-    markdown: parts.join('\n\n').trim(),
+    ...(description ? { description } : {}),
+    markdown,
   };
 }

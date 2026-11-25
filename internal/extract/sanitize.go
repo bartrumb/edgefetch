@@ -3,12 +3,29 @@ package extract
 import (
 	"html"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
 const maxSanitizeMarkdownScanBytes = 8 << 20 // 8 MiB linear scan cap (matches TS MAX_MARKDOWN_SANITIZE_CHARS)
+
+var (
+	reMintlifyDocIndexSanGo        = regexp.MustCompile(`(?i)^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+`)
+	reMintlifyFooterSanGo          = regexp.MustCompile(`(?i)^This documentation is built and hosted on \[Mintlify\]\([^)\r\n]{1,300}\),\s*a developer documentation platform\.[ \t]*$`)
+	reMinifiedSchemaJsonFenceSanGo = regexp.MustCompile("(?i)^`{3,}json[ \\t]*\\r?\\n\\{\\s*\"@context\"\\s*:\\s*\"https?://schema\\.org\"[^\\r\\n]{80,}\\r?\\n`{3,}$")
+	reTwoslashWordSanGo            = regexp.MustCompile(`(?i)\btwoslash\b`)
+	reTwoslashCutMarkerSanGo       = regexp.MustCompile(`(?m)^[ \t]*//[ \t]*---cut(?:-(?:before|after))?---[ \t]*$`)
+	reTwoslashCutBeforeSanGo       = regexp.MustCompile(`(?m)^[ \t]*//[ \t]*---cut(?:-before)?---[ \t]*\r?\n`)
+	reTwoslashCutAfterSanGo        = regexp.MustCompile(`\r?\n[ \t]*//[ \t]*---cut-after---[ \t]*(?:\r?\n|$)`)
+	reTwoslashAnnotationSanGo      = regexp.MustCompile(`(?m)^[ \t]*//[ \t]*@(?:noErrors|errors:[ \t]*[\d \t]+|target:[ \t]*\S+|module:[ \t]*\S+|moduleResolution:[ \t]*\S+|lib:[ \t]*\S+|strict(?::[ \t]*\S+)?)[ \t]*\r?\n`)
+	reAdmonitionDirectiveSanGo     = regexp.MustCompile(`(?im)^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]{1,200}))?[ \t]*$`)
+	reAdmonitionCloseSanGo         = regexp.MustCompile(`(?im)^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:[ \t]+[^\r\n]{0,120})?|raw|v-pre))?[ \t]*$`)
+	reBracketHeadingLinkSanGo      = regexp.MustCompile(`(?i)\[\s*<h([1-6])\b[^>"\n]{0,200}>([^<\n]{1,400})</h[1-6]>\s*\]\(([^)\s\n]+)\)`)
+	reHelpfulPromptSanGo           = regexp.MustCompile(`(?i)(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes[ \t]*No|Yes[ \t]*/[ \t]*No))?[ \t]*(?:\n|$)`)
+	reOnThisPageTailSanGo          = regexp.MustCompile(`(?i)^\n##+[ \t]+On this page[ \t]*(?:\n+(?:[-*][ \t]+\[[^\[\]\n]{1,200}\]\(#[^)\n]{1,200}\)[ \t]*)+)?[ \t]*$`)
+)
 
 var uriNamedEntities = map[string]string{
 	"amp":                   "&",
@@ -153,6 +170,13 @@ func SanitizeScrapedMeta(s string) string {
 	if s == "" {
 		return ""
 	}
+	if len(s) > 4096 {
+		cut := 4096
+		for cut > 0 && (s[cut]&0xC0) == 0x80 {
+			cut--
+		}
+		s = s[:cut]
+	}
 	if !utf8.ValidString(s) {
 		s = strings.ToValidUTF8(s, "\uFFFD")
 	}
@@ -194,6 +218,123 @@ func SanitizeMarkdown(md, baseURL string) string {
 	return SanitizeMarkdownWithOptions(md, baseURL, false)
 }
 
+func canFastEscapeCodeSpanOnlyLtInProseGo(prose string) bool {
+	if strings.IndexByte(prose, '<') < 0 ||
+		strings.IndexByte(prose, '`') < 0 ||
+		strings.IndexByte(prose, '[') >= 0 ||
+		strings.IndexByte(prose, '&') >= 0 ||
+		strings.Contains(prose, ":::") ||
+		strings.Contains(prose, "{/*") ||
+		strings.Contains(prose, "://") ||
+		strings.Contains(prose, "www.") ||
+		strings.Contains(prose, "WWW.") ||
+		strings.IndexByte(prose, '@') >= 0 ||
+		strings.IndexByte(prose, '~') >= 0 ||
+		strings.IndexByte(prose, '?') >= 0 ||
+		strings.Contains(prose, "\n## ") ||
+		strings.Contains(prose, "```") ||
+		strings.Contains(prose, "\n\n\n") {
+		return false
+	}
+	n := len(prose)
+	var scannedByLen [32]int
+	pos := 0
+	for pos < n {
+		nlRel := strings.IndexByte(prose[pos:], '\n')
+		lineEnd := n
+		if nlRel >= 0 {
+			lineEnd = pos + nlRel
+		}
+		for k := range scannedByLen {
+			scannedByLen[k] = pos
+		}
+		i := pos
+		for i < lineEnd {
+			ch := prose[i]
+			if ch == '<' {
+				return false
+			}
+			if ch == '`' {
+				if i > pos {
+					prev := prose[i-1]
+					if prev == '\\' || prev == '_' || prev == '*' {
+						return false
+					}
+				}
+				tEnd := i + 1
+				for tEnd < lineEnd && prose[tEnd] == '`' {
+					tEnd++
+				}
+				tickLen := tEnd - i
+				if tickLen >= 32 {
+					return false
+				}
+				search := tEnd
+				if scannedByLen[tickLen] > search {
+					search = scannedByLen[tickLen]
+				}
+				closeStart := -1
+				for search < lineEnd {
+					rel := strings.IndexByte(prose[search:lineEnd], '`')
+					if rel < 0 {
+						scannedByLen[tickLen] = lineEnd
+						break
+					}
+					hit := search + rel
+					cEnd := hit + 1
+					for cEnd < lineEnd && prose[cEnd] == '`' {
+						cEnd++
+					}
+					if cEnd-hit == tickLen {
+						closeStart = hit
+						scannedByLen[tickLen] = cEnd
+						break
+					}
+					search = cEnd
+					scannedByLen[tickLen] = cEnd
+				}
+				if closeStart < 0 {
+					return false
+				}
+				i = closeStart + tickLen
+				continue
+			}
+			i++
+		}
+		if nlRel < 0 {
+			break
+		}
+		pos = lineEnd + 1
+	}
+	return true
+}
+
+func stripMintlifyDocHygieneBannersGo(s string) string {
+	headLim := minInt(len(s), 256)
+	if strings.Contains(s[:headLim], "Documentation Index") {
+		if m := reMintlifyDocIndexSanGo.FindStringIndex(s); len(m) == 2 && m[0] == 0 {
+			s = s[m[1]:]
+		}
+	}
+	const mintlifyNeedle = "this documentation is built and hosted on [mintlify]("
+	tailStart := len(s) - 600
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	tailLow := asciiLowerExtractString(s[tailStart:])
+	if rel := strings.LastIndex(tailLow, mintlifyNeedle); rel >= 0 {
+		absIdx := tailStart + rel
+		if reMintlifyFooterSanGo.MatchString(s[absIdx:]) {
+			cut := absIdx
+			for cut > 0 && (s[cut-1] == '\n' || s[cut-1] == '\r') {
+				cut--
+			}
+			s = s[:cut]
+		}
+	}
+	return s
+}
+
 // SanitizeMarkdownWithOptions sanitizes Markdown with optional PDF page marker preservation.
 func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) string {
 	if md == "" {
@@ -215,8 +356,15 @@ func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) s
 	if cleaned == "" {
 		return ""
 	}
+	cleaned = stripMintlifyDocHygieneBannersGo(cleaned)
+	if cleaned == "" {
+		return ""
+	}
 
 	_, parts := recognizeAndHardenMarkdownFencesGo(cleaned, true)
+	if len(parts) == 1 && !allowPdfPageMarkers && canFastEscapeCodeSpanOnlyLtInProseGo(parts[0]) {
+		return trimASCIIWhitespaceLinearGo(replaceAllLtFastGo(parts[0]))
+	}
 
 	sanitizedParts := make([]string, len(parts))
 	for idx, part := range parts {
@@ -1280,6 +1428,11 @@ func parseFenceHeaderPrefixGo(rawHeader string) (fencePrefix string, rawInfo str
 }
 
 func cleanCodeFenceSegmentGo(fenceBlock string) string {
+	if len(fenceBlock) < 32768 && strings.Contains(fenceBlock, "schema.org") {
+		if reMinifiedSchemaJsonFenceSanGo.MatchString(strings.TrimSpace(fenceBlock)) {
+			return ""
+		}
+	}
 	nlIdx := strings.IndexByte(fenceBlock, '\n')
 	if nlIdx < 0 {
 		h := strings.TrimSuffix(fenceBlock, "\r")
@@ -1290,7 +1443,9 @@ func cleanCodeFenceSegmentGo(fenceBlock string) string {
 	}
 	rawHeader := strings.TrimSuffix(fenceBlock[:nlIdx], "\r")
 	var cleanHeader string
+	rawInfo := ""
 	if pfx, info, ok := parseFenceHeaderPrefixGo(rawHeader); ok {
+		rawInfo = info
 		cleanHeader = pfx + cleanFenceInfoStringLinearGo(info)
 	} else {
 		lim := minInt(len(rawHeader), 256)
@@ -1309,6 +1464,16 @@ func cleanCodeFenceSegmentGo(fenceBlock string) string {
 		innerCode := ""
 		if innerEnd > nlIdx+1 {
 			innerCode = fenceBlock[nlIdx+1 : innerEnd]
+		}
+		infoHead := rawInfo[:minInt(len(rawInfo), 256)]
+		if reTwoslashWordSanGo.MatchString(infoHead) || reTwoslashCutMarkerSanGo.MatchString(innerCode) {
+			if loc := reTwoslashCutBeforeSanGo.FindStringIndex(innerCode); len(loc) == 2 {
+				innerCode = innerCode[loc[1]:]
+			}
+			if loc := reTwoslashCutAfterSanGo.FindStringIndex(innerCode); len(loc) == 2 {
+				innerCode = innerCode[:loc[0]]
+			}
+			innerCode = reTwoslashAnnotationSanGo.ReplaceAllString(innerCode, "")
 		}
 		return cleanHeader + "\n" + innerCode + "\n" + closingLine
 	}
@@ -2390,6 +2555,33 @@ func isDisallowedMarkdownLinkDestinationGo(rawHref string) bool {
 	if rawHref == "" {
 		return false
 	}
+	if len(rawHref) > 8192 {
+		return true
+	}
+	// Zero-allocation fast path for clean printable ASCII schemes (`javascript:`, `data:`, `vbscript:`, `https://`, `http://`).
+	if strings.IndexByte(rawHref, '&') < 0 && strings.IndexByte(rawHref, '\\') < 0 {
+		cleanASCII := true
+		for i := 0; i < len(rawHref) && i < 32; i++ {
+			if rawHref[i] <= 0x20 || rawHref[i] >= 0x7f || rawHref[i] == '(' || rawHref[i] == '<' {
+				cleanASCII = false
+				break
+			}
+		}
+		if cleanASCII {
+			if len(rawHref) >= 11 && strings.EqualFold(rawHref[:11], "javascript:") {
+				return true
+			}
+			if len(rawHref) >= 5 && strings.EqualFold(rawHref[:5], "data:") {
+				return true
+			}
+			if len(rawHref) >= 9 && strings.EqualFold(rawHref[:9], "vbscript:") {
+				return true
+			}
+			if len(rawHref) >= 5 && (strings.EqualFold(rawHref[:5], "file:") || strings.EqualFold(rawHref[:5], "blob:")) {
+				return true
+			}
+		}
+	}
 	unescaped := rawHref
 	if strings.IndexByte(unescaped, '\\') >= 0 {
 		var sb strings.Builder
@@ -2418,6 +2610,9 @@ func isDisallowedMarkdownLinkDestinationGo(rawHref string) bool {
 		cleanBuf.WriteRune(r)
 		if cleanBuf.Len() >= 256 && sawDelimOrColon {
 			break
+		}
+		if cleanBuf.Len() > 4096 {
+			return true
 		}
 	}
 	clean := cleanBuf.String()
@@ -2611,6 +2806,15 @@ func scanDestinationTokenEndAndCheckUnsafeGo(s string, destStart int, isInlinePa
 	depth := 0
 	for p < n {
 		c := s[p]
+		if c > 0x20 && c != '\\' && c != ']' && c != '[' && c != '(' && c != ')' {
+			rel := strings.IndexAny(s[p+1:], " \t\r\n\\][()")
+			if rel < 0 {
+				p = n
+				break
+			}
+			p += 1 + rel
+			continue
+		}
 		if c == '\\' && p+1 < n {
 			p += 2
 			continue
@@ -3441,6 +3645,18 @@ func sanitizeAndResolveMarkdownProseLinksLinearGo(prose, baseURL string) string 
 						lastCopyIdx = i
 						continue
 					}
+					if !tok.isImage && strings.HasPrefix(href, "#") {
+						trimmedSkip := strings.TrimSpace(tok.rawLabel)
+						if strings.EqualFold(trimmedSkip, "skip to content") || strings.EqualFold(trimmedSkip, "skip to main content") {
+							out.WriteString(line[lastCopyIdx:i])
+							for nextIdx < len(line) && (line[nextIdx] == ' ' || line[nextIdx] == '\t') {
+								nextIdx++
+							}
+							i = nextIdx
+							lastCopyIdx = i
+							continue
+						}
+					}
 					href = encodeUnsafeHrefCharsGo(resolveMarkdownRelativeHrefGo(href, baseURL))
 					if tok.isImage {
 						out.WriteString(line[lastCopyIdx:i])
@@ -4072,7 +4288,7 @@ func formatInlineCodeSpanGo(txt string) string {
 		}
 	}
 	fence := strings.Repeat("`", maxRun+1)
-	if clean[0] == '`' || clean[len(clean)-1] == '`' {
+	if maxRun > 0 {
 		return fence + " " + clean + " " + fence
 	}
 	return fence + clean + fence
@@ -4215,7 +4431,61 @@ func convertSimpleHTMLTablesInProseGo(s string) string {
 	return s
 }
 
+func convertAnchorInnerWithBadgeImagesSanGo(inner, baseURL string) string {
+	lowInner := asciiLowerExtractString(inner)
+	if !strings.Contains(lowInner, "<img") {
+		return stripTagsInlineLinear(inner)
+	}
+	noDbl, noSgl := false, false
+	var sb strings.Builder
+	last := 0
+	pos := 0
+	for pos < len(inner) {
+		tag, ok := scanNextHTMLTagQuoteAwareGo(inner, pos, &noDbl, &noSgl)
+		if !ok {
+			break
+		}
+		if tag.tagLower == "img" && !tag.isClosing {
+			sb.WriteString(inner[last:tag.start])
+			if !hasInlineEventHandlerAttrGo(tag.attrs) {
+				attrs := parseHTMLTagAttrsGo(tag.attrs)
+				srcCand := attrs["src"]
+				if srcCand == "" {
+					srcCand = attrs["data-src"]
+				}
+				resolvedSrc := resolveSafeMarkdownHrefOrRelativeFullDocGo(srcCand, baseURL, false)
+				alt := strings.NewReplacer("[", "", "]", "").Replace(stripTagsInlineLinear(attrs["alt"]))
+				if resolvedSrc != "" && !isTinyOrAvatarImageURLFullDocGo(resolvedSrc, alt) {
+					sb.WriteString(" ![" + alt + "](" + resolvedSrc + ") ")
+				}
+			}
+			last = tag.end
+		}
+		pos = tag.end
+	}
+	if last > 0 {
+		sb.WriteString(inner[last:])
+		return stripTagsInlineLinear(sb.String())
+	}
+	return stripTagsInlineLinear(inner)
+}
+
 func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]string) string {
+	if strings.IndexByte(s, '[') >= 0 && strings.Contains(asciiLowerExtractString(s), "</h") {
+		s = reBracketHeadingLinkSanGo.ReplaceAllStringFunc(s, func(m string) string {
+			sub := reBracketHeadingLinkSanGo.FindStringSubmatch(m)
+			if len(sub) < 4 {
+				return m
+			}
+			lvl := int(sub[1][0] - '0')
+			lbl := stripTagsInlineLinear(sub[2])
+			href := strings.TrimSpace(sub[3])
+			if lbl == "" || isDisallowedMarkdownLinkDestinationGo(href) {
+				return lbl
+			}
+			return "\n\n" + strings.Repeat("#", lvl) + " [" + lbl + "](" + href + ")\n\n"
+		})
+	}
 	s = convertSimpleHTMLTablesInProseGo(s)
 	// 1. Convert paired inline elements (`a`, `h1`..`h6`, `summary`, `code`, `kbd`, `strong`, `b`, `em`, `i`, `sup`)
 	pairedTargets := map[string]bool{
@@ -4252,12 +4522,27 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 						switch tag.tagLower {
 						case "a":
 							attrs := parseHTMLTagAttrsGo(tag.attrs)
-							href := resolveInlineHTMLHrefGo(attrs["href"], baseURL, true)
-							if txt != "" {
+							trimmedInner := strings.TrimSpace(inner)
+							if len(trimmedInner) >= 7 && trimmedInner[0] == '<' && (trimmedInner[1] == 'h' || trimmedInner[1] == 'H') && trimmedInner[2] >= '1' && trimmedInner[2] <= '6' {
+								hLvl := int(trimmedInner[2] - '0')
+								hClose := "</h" + string(trimmedInner[2]) + ">"
+								if strings.HasSuffix(asciiLowerExtractString(trimmedInner), hClose) && txt != "" {
+									href := resolveInlineHTMLHrefGo(attrs["href"], baseURL, true)
+									if href != "" {
+										replacement = "\n\n" + strings.Repeat("#", hLvl) + " [" + txt + "](" + href + ")\n\n"
+									} else {
+										replacement = "\n\n" + strings.Repeat("#", hLvl) + " " + txt + "\n\n"
+									}
+									break
+								}
+							}
+							href := resolveSafeMarkdownHrefOrRelativeFullDocGo(attrs["href"], baseURL, true)
+							lbl := convertAnchorInnerWithBadgeImagesSanGo(inner, baseURL)
+							if lbl != "" {
 								if href != "" {
-									replacement = "[" + txt + "](" + href + ")"
+									replacement = "[" + lbl + "](" + href + ")"
 								} else {
-									replacement = txt
+									replacement = lbl
 								}
 							}
 						case "h1", "h2", "h3", "h4", "h5", "h6":
@@ -4366,9 +4651,9 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 				if srcRaw == "" {
 					srcRaw = attrs["data-src"]
 				}
-				resolved := resolveInlineHTMLHrefGo(srcRaw, baseURL, false)
+				resolved := resolveSafeMarkdownHrefOrRelativeFullDocGo(srcRaw, baseURL, false)
 				alt := stripTagsInlineLinear(attrs["alt"])
-				if resolved == "" {
+				if resolved == "" || isTinyOrAvatarImageURLFullDocGo(resolved, alt) {
 					rep = ""
 				} else {
 					rep = "![" + alt + "](" + resolved + ")"
@@ -4384,6 +4669,25 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 				strings.IndexByte(tag.tagLower, ':') < 0 &&
 				!(tag.start >= 2 && s[tag.start-2] == ']' && s[tag.start-1] == '(') {
 				rep = ""
+				if !tag.isClosing && !tag.selfClosing && tag.attrs != "" && strings.Contains(asciiLowerExtractString(tag.attrs), "title") {
+					ls := strings.LastIndexByte(s[:tag.start], '\n') + 1
+					leRel := strings.IndexByte(s[tag.end:], '\n')
+					le := len(s)
+					if leRel >= 0 {
+						le = tag.end + leRel
+					}
+					if tag.start-ls <= 64 && le-tag.end <= 64 && isBlankASCIILineGo(s[ls:tag.start]) && isBlankASCIILineGo(s[tag.end:le]) {
+						attrs := parseHTMLTagAttrsGo(tag.attrs)
+						ht := attrs["title"]
+						if ht == "" {
+							ht = attrs["titletext"]
+						}
+						htClean := stripTagsInlineLinear(ht)
+						if htClean != "" {
+							rep = "\n\n**" + htClean + "**\n\n"
+						}
+					}
+				}
 				replaceIt = true
 			} else if wrapperStrip[tag.tagLower] {
 				rep = ""
@@ -4576,9 +4880,27 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, isLa
 		if strings.IndexByte(proseWork, '<') >= 0 && strings.IndexByte(proseWork, '>') >= 0 {
 			proseWork = stripHiddenAndChromeSubtreesGo(proseWork)
 		}
-		if strings.IndexByte(proseWork, '<') >= 0 && strings.IndexByte(proseWork, '>') >= 0 {
-			proseWork = convertInlineHTMLInProseGo(proseWork, baseURL, &inlineCodeStash)
-		}
+	}
+
+	if strings.Contains(proseWork, ":::") {
+		proseWork = reAdmonitionDirectiveSanGo.ReplaceAllStringFunc(proseWork, func(m string) string {
+			sub := reAdmonitionDirectiveSanGo.FindStringSubmatch(m)
+			if len(sub) < 2 {
+				return m
+			}
+			kindRaw := sub[1]
+			kindLabel := strings.ToUpper(kindRaw[:1]) + strings.ToLower(kindRaw[1:])
+			custom := strings.TrimSpace(sub[2])
+			if custom != "" && !strings.EqualFold(custom, kindRaw) {
+				return "\n\n**" + kindLabel + ": " + custom + "**\n\n"
+			}
+			return "\n\n**" + kindLabel + "**\n\n"
+		})
+		proseWork = reAdmonitionCloseSanGo.ReplaceAllString(proseWork, "")
+	}
+
+	if strings.IndexByte(proseWork, '<') >= 0 && strings.IndexByte(proseWork, '>') >= 0 {
+		proseWork = convertInlineHTMLInProseGo(proseWork, baseURL, &inlineCodeStash)
 	}
 
 	if strings.IndexByte(proseWork, '&') >= 0 &&
@@ -4589,11 +4911,26 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, isLa
 	if len(inlineCodeStash) > 0 {
 		proseWork = restoreMarkdownInlineCodeStashGo(proseWork, inlineCodeStash)
 	}
+	proseWork = stripInvisibleSmugglingCharsGo(proseWork)
+	if strings.IndexByte(proseWork, '?') >= 0 && strings.Contains(asciiLowerExtractString(proseWork), "helpful?") {
+		proseWork = reHelpfulPromptSanGo.ReplaceAllString(proseWork, "\n")
+	}
+	if isLastSegment {
+		tailStart := len(proseWork) - 2000
+		if tailStart < 0 {
+			tailStart = 0
+		}
+		if rel := strings.LastIndex(asciiLowerExtractString(proseWork[tailStart:]), "\n## on this page"); rel >= 0 {
+			absIdx := tailStart + rel
+			if reOnThisPageTailSanGo.MatchString(proseWork[absIdx:]) {
+				proseWork = proseWork[:absIdx]
+			}
+		}
+	}
 	var detached string
 	if proseWork == firstDetached && len(inlineCodeStash) == 0 {
 		detached = proseWork
 	} else {
-		proseWork = stripInvisibleSmugglingCharsGo(proseWork)
 		detached = escapeGfmTaskListCheckboxesLinearGo(detachBareUrlsFromCodeSpansLinearGo(proseWork))
 	}
 	resolved := sanitizeAndResolveMarkdownProseLinksLinearGo(detached, baseURL)

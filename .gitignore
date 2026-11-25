@@ -2,6 +2,7 @@
 /edgefetch
 /edgefetch.exe
 /edgefetch-wasm.wasm
+hub/src/edgefetch-core.wasm
 *.out
 coverage.html
 

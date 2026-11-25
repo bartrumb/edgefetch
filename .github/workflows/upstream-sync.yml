@@ -131,6 +131,12 @@ jobs:
           echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
           echo "should_deploy=true" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        if: steps.verify.outputs.should_deploy == 'true'
+        with:
+          go-version: '1.27.x'
+          cache: true
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.verify.outputs.should_deploy == 'true'
         with:

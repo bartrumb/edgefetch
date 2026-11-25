@@ -20,7 +20,6 @@ import {
   NodeSqliteD1Database,
   RawServerWebSocket,
 } from '../portable/node-adapters.ts';
-import { resolvePublicOrigin as resolveDenoPublicOrigin } from '../portable/deno-server.ts';
 import { resolvePublicOrigin, startPortableHub } from '../portable/portable-server.ts';
 import { S3ArtifactBucket } from '../portable/s3-bucket.ts';
 import {
@@ -3135,16 +3134,6 @@ test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forge
   // 5. `R5-M5` (Per-IP In-Flight Cap), Low `Host` OAuth Issuer Protection, Malformed `%` -> `400`, Admin `nosniff`, & `/v1/catalog` `maxBytes`
   assert.equal(
     resolvePublicOrigin({
-      canonicalOrigin: 'http://hub.local:8787',
-      trustProxy: true,
-      hasExplicitPublicOrigin: false,
-      hostHeader: 'evil.test',
-      forwardedProtoHeader: 'https',
-    }).origin,
-    'https://hub.local:8787',
-  );
-  assert.equal(
-    resolveDenoPublicOrigin({
       canonicalOrigin: 'http://hub.local:8787',
       trustProxy: true,
       hasExplicitPublicOrigin: false,

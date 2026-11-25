@@ -10,7 +10,6 @@ import { buildOpenApiSpec } from '../src/openapi';
 import { MCP_TOOL_SCHEMAS } from '../src/mcp';
 import { NodeFsR2Bucket, NodeSqliteD1Database, LocalAgentHubCoordinator } from '../portable/node-adapters';
 import { startPortableHub } from '../portable/portable-server';
-import { createDenoHubHandler } from '../portable/deno-server';
 import {
   EASYPRIVACY_SOURCE_URL,
   EASYPRIVACY_LICENCE_URL,
@@ -382,19 +381,6 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
     await Promise.all(waitUntilPromises);
     assert.equal(disabledFetchCalls, 0, 'Cloudflare scheduled() with EDGEFETCH_TRACKER_LIST=off must make 0 requests');
     cfCoordinator.close();
-
-    const denoInstance = createDenoHubHandler({
-      dataDir: join(tmp, 'deno-off'),
-      env: {
-        CALLER_TOKEN: OWNER_TOKEN,
-        AGENT_TOKEN,
-        EDGEFETCH_TRACKER_LIST: 'off',
-        EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
-      },
-      safeFetchImpl: disabledFetchStub,
-    });
-    await denoInstance.close();
-    assert.equal(disabledFetchCalls, 0, 'Deno Hub with EDGEFETCH_TRACKER_LIST=off must make 0 requests');
 
     // --- Portable Hub: verify ZERO fetch calls during startup even when enabled, then test live WS connect/reconnect + version update + /admin + scrape/interact ---
     let listFetchCalls = 0;

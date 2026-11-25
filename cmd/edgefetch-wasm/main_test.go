@@ -83,3 +83,49 @@ func TestRunWasmCLIExtractsMarkdownAndJSON(t *testing.T) {
 		t.Fatalf("expected read stdin error rc=1, got rc=%d stderr=%q", rcErr, errBuf.String())
 	}
 }
+
+func TestWasmReactorExportsRoundTrip(t *testing.T) {
+	_ = efInPtr(1024)
+
+	pat := `(?i)(?P<word>[a-z]+)-\d+`
+	copy(wasmInBuf, pat)
+	id := efRe2Compile(uint32(len(pat)))
+	if id <= 0 {
+		t.Fatalf("expected positive re2 handle, got %d", id)
+	}
+	subj := "🚀 HELLO-42!"
+	copy(wasmInBuf, subj)
+	if efRe2Test(id, uint32(len(subj))) != 1 {
+		t.Fatal("expected efRe2Test match")
+	}
+	execLen := efRe2Exec(id, uint32(len(subj)))
+	if execLen == 0 || efOutLen() != execLen {
+		t.Fatalf("expected non-empty efRe2Exec JSON, got %d", execLen)
+	}
+	_ = efOutPtr()
+
+	rpcReq := `{"op":"sanitize_meta","payload":{"text":"Hello <script>x</script>"}}`
+	copy(wasmInBuf, rpcReq)
+	callLen := efCall(uint32(len(rpcReq)))
+	if callLen == 0 || !strings.Contains(string(wasmOutBuf[:callLen]), "&lt;script>") {
+		t.Fatalf("unexpected efCall output: %q", string(wasmOutBuf[:callLen]))
+	}
+
+	rawMeta := `{"op":"has_unicode_tag","meta":null}`
+	rawBody := "clean text"
+	copy(wasmInBuf, rawMeta)
+	copy(wasmInBuf[len(rawMeta):], rawBody)
+	rawLen := efCallRaw(uint32(len(rawMeta)), uint32(len(rawMeta)+len(rawBody)))
+	if rawLen == 0 || !strings.Contains(string(wasmOutBuf[:rawLen]), `"hit":false`) {
+		t.Fatalf("unexpected efCallRaw output: %q", string(wasmOutBuf[:rawLen]))
+	}
+
+	strMeta := `{"op":"sanitize_markdown","meta":{"baseUrl":"https://example.com/"}}`
+	strBody := "Hi <script>alert(1)</script>"
+	copy(wasmInBuf, strMeta)
+	copy(wasmInBuf[len(strMeta):], strBody)
+	strLen := efCallRawStr(uint32(len(strMeta)), uint32(len(strMeta)+len(strBody)))
+	if strLen == 0 || strings.Contains(string(wasmOutBuf[:strLen]), "<script") || !strings.HasPrefix(string(wasmOutBuf[:strLen]), "Hi") {
+		t.Fatalf("unexpected efCallRawStr output: %q", string(wasmOutBuf[:strLen]))
+	}
+}

@@ -109,7 +109,7 @@ var (
 
 	reEmail = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
 	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
-	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?\(\d{3}\)[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
+	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\b\d{3})[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
 	reCard  = regexp.MustCompile(`\b(?:\d[ -]*?){13,19}\b`)
 
 	reSPAShell = regexp.MustCompile(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)

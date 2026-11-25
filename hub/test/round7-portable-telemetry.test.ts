@@ -16,11 +16,6 @@ import collectorWorker, {
   type D1DatabaseLike,
   type D1PreparedStatementLike,
 } from '../../telemetry/src/index.ts';
-import {
-  createDenoHubHandler,
-  createDenoSafeFetch,
-  resolveConfiguredPublicOrigin as resolveDenoConfiguredOrigin,
-} from '../portable/deno-server.ts';
 import { LocalAgentHubCoordinator } from '../portable/node-adapters.ts';
 import {
   FIRST_BYTE_PREHEADER_TIMEOUT_MS,
@@ -303,75 +298,12 @@ test('R7-AuthSlots: Bogus Authorization/X-Api-Key/Cookie headers cannot claim re
     await hub.close();
     await rm(dataDir, { recursive: true, force: true });
   }
-
-  // Verify identical parity on `createDenoHubHandler`
-  const denoHub = createDenoHubHandler({
-    ephemeralStores: true,
-    maxInflightPerIp: 8,
-    maxInflightTotal: 8,
-    envOverrides: { CALLER_TOKEN, MCP_TOKEN },
-  });
-  const streamCtrls: ReadableStreamDefaultController<Uint8Array>[] = [];
-  const pendingPromises: Promise<Response>[] = [];
-  try {
-    for (let i = 0; i < 6; i++) {
-      const slowBody = new ReadableStream<Uint8Array>({
-        start(c) {
-          streamCtrls.push(c);
-        },
-      });
-      pendingPromises.push(
-        denoHub.handler(
-          new Request('http://hub.local:8787/oauth/token', {
-            method: 'POST',
-            headers: {
-              authorization: 'Bearer bogus-deno-token',
-              'content-type': 'application/x-www-form-urlencoded',
-            },
-            body: slowBody,
-            duplex: 'half',
-          } as RequestInit),
-          { remoteAddr: { hostname: `198.51.100.${i + 1}` } },
-        ),
-      );
-    }
-    await sleep(50);
-
-    const denoBogus7 = await denoHub.handler(
-      new Request('http://hub.local:8787/openapi.json', {
-        headers: { authorization: 'Bearer bogus-7' },
-      }),
-      { remoteAddr: { hostname: '198.51.100.50' } },
-    );
-    assert.equal(denoBogus7.status, 429);
-
-    const denoValid = await denoHub.handler(
-      new Request('http://hub.local:8787/v1/capabilities', {
-        headers: { authorization: `Bearer ${CALLER_TOKEN}` },
-      }),
-      { remoteAddr: { hostname: '198.51.100.51' } },
-    );
-    assert.equal(denoValid.status, 200);
-  } finally {
-    for (const c of streamCtrls) {
-      try {
-        c.close();
-      } catch {
-        // ignore
-      }
-    }
-    await Promise.allSettled(pendingPromises);
-    await denoHub.close();
-  }
 });
 
 test('R7-Origin: Fly.io, Render, and Railway 1-click deploy env vars resolve canonical HTTPS origin for /admin login CSRF & Secure cookies while blocking Host spoofing', async () => {
   assert.equal(resolveConfiguredPublicOrigin({ FLY_APP_NAME: 'myhub' }), 'https://myhub.fly.dev');
   assert.equal(resolveConfiguredPublicOrigin({ RENDER_EXTERNAL_URL: 'https://myhub.onrender.com/ignored' }), 'https://myhub.onrender.com');
   assert.equal(resolveConfiguredPublicOrigin({ RAILWAY_PUBLIC_DOMAIN: 'myhub.up.railway.app' }), 'https://myhub.up.railway.app');
-  assert.equal(resolveDenoConfiguredOrigin({ FLY_APP_NAME: 'myhub' }), 'https://myhub.fly.dev');
-  assert.equal(resolveDenoConfiguredOrigin({ RENDER_EXTERNAL_HOSTNAME: 'myhub.onrender.com' }), 'https://myhub.onrender.com');
-  assert.equal(resolveDenoConfiguredOrigin({ RAILWAY_PUBLIC_DOMAIN: 'myhub.up.railway.app' }), 'https://myhub.up.railway.app');
 
   const dataDir = await mkdtemp(join(tmpdir(), 'ef-r7-fly-'));
   const hub = await startPortableHub({
@@ -414,98 +346,6 @@ test('R7-Origin: Fly.io, Render, and Railway 1-click deploy env vars resolve can
   } finally {
     await hub.close();
     await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test('R7-DenoSSRF: createDenoSafeFetch enforces single DNS resolution (IP-pinned), fails closed without Deno.resolveDns, blocks trailing-dot FQDNs, and permanently strips credentials across cross-origin hops', async () => {
-  // 1. Real network transport (`fetchImpl` omitted) resolves DNS ONCE and dials the pinned IP directly
-  let dnsLookupCount = 0;
-  const rebindSafeFetch = createDenoSafeFetch('hub.example', {
-    allowExplicitLoopbackUrls: false,
-    resolveDns: async (_q, type) => {
-      if (type === 'AAAA') return [];
-      dnsLookupCount++;
-      // 1st lookup returns non-listening public test port / IP; if a 2nd lookup occurred, it would return 127.0.0.1!
-      return dnsLookupCount === 1 ? ['93.184.216.34'] : ['127.0.0.1'];
-    },
-  });
-  const abortCtrl = new AbortController();
-  abortCtrl.abort(new Error('stop_after_single_dns'));
-  // Test with live un-aborted connect that times out/aborts quickly after DNS resolution
-  dnsLookupCount = 0;
-  const quickAbort = new AbortController();
-  setTimeout(() => quickAbort.abort(), 60).unref?.();
-  await assert.rejects(() => rebindSafeFetch('https://rebind.example/admin', { signal: quickAbort.signal }));
-  assert.equal(dnsLookupCount, 1, 'createDenoSafeFetch must resolve hostname ONLY ONCE (no check-then-dial second lookup)');
-
-  // 2. Missing `Deno.resolveDns` (`resolveDns` omitted when `globalThis.Deno` is undefined) MUST fail closed on unresolvable internal hosts!
-  let dialedWithoutResolver = false;
-  const noResolverFetch = createDenoSafeFetch('hub.example', {
-    fetchImpl: async () => {
-      dialedWithoutResolver = true;
-      return new Response('should never dial', { status: 200 });
-    },
-  });
-  await assert.rejects(() => noResolverFetch('https://internal-only.corp.invalid/'));
-  assert.equal(dialedWithoutResolver, false, 'Must fail closed when Deno.resolveDns is absent');
-
-  // 3. Trailing-dot FQDN (`https://example.com./`) is rejected before dialing
-  let dialedTrailingDot = false;
-  const trailingDotFetch = createDenoSafeFetch('hub.example', {
-    resolveDns: async (_q, t) => (t === 'A' ? ['93.184.216.34'] : []),
-    fetchImpl: async () => {
-      dialedTrailingDot = true;
-      return new Response('ok', { status: 200 });
-    },
-  });
-  await assert.rejects(() => trailingDotFetch('https://example.com./'), /trailing-dot/);
-  assert.equal(dialedTrailingDot, false);
-
-  // 4. Cross-origin redirect `a.example -> b.example -> a.example/back` permanently strips all credential/secret/token headers!
-  const hopLog: Array<{ url: string; headers: Record<string, string>; pinnedIp?: string }> = [];
-  const redirectFetch = createDenoSafeFetch('hub.example', {
-    resolveDns: async (_q, t) => (t === 'A' ? ['93.184.216.34'] : []),
-    fetchImpl: async (u, init) => {
-      const urlStr = String(u);
-      hopLog.push({
-        url: urlStr,
-        headers: Object.fromEntries(new Headers(init?.headers).entries()),
-        pinnedIp: (init as { pinnedIp?: string } | undefined)?.pinnedIp,
-      });
-      if (urlStr === 'https://a.example/') {
-        return new Response(null, { status: 307, headers: { location: 'https://b.example/' } });
-      }
-      if (urlStr === 'https://b.example/') {
-        return new Response(null, { status: 307, headers: { location: 'https://a.example/back' } });
-      }
-      return new Response('done', { status: 200 });
-    },
-  });
-
-  const finalRes = await redirectFetch('https://a.example/', {
-    method: 'POST',
-    body: 'payload=1',
-    headers: {
-      authorization: 'Bearer TOP_SECRET',
-      cookie: 'sess=SECRET_COOKIE',
-      'x-api-key': 'SECRET_X_KEY',
-      'api-key': 'AZURE_SECRET',
-      'x-amz-security-token': 'AWS_STS_TOKEN',
-      'x-custom-secret': 'CUSTOM_SECRET',
-      'x-benign': 'keep-me',
-    },
-  });
-  assert.equal(finalRes.status, 200);
-  assert.equal(hopLog.length, 3);
-  assert.equal(hopLog[0]!.pinnedIp, '93.184.216.34');
-  assert.equal(hopLog[0]!.headers.authorization, 'Bearer TOP_SECRET');
-
-  // Hop 1 (`b.example`) AND Hop 2 (`a.example/back`) must have ZERO credential/token/secret headers!
-  for (const hop of [hopLog[1]!, hopLog[2]!]) {
-    for (const secretHdr of ['authorization', 'cookie', 'x-api-key', 'api-key', 'x-amz-security-token', 'x-custom-secret']) {
-      assert.equal(hop.headers[secretHdr], undefined, `${secretHdr} must remain stripped on ${hop.url}`);
-    }
-    assert.equal(hop.headers['x-benign'], 'keep-me');
   }
 });
 

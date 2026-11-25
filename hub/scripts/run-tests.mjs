@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:f
 import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildSync } from 'esbuild';
+import { build } from 'esbuild';
+import { ensureCoreWasmBuilt } from './build-wasm.mjs';
+import { createNodeWasmPlugin, createWorkerdWasmExternalPlugin } from './esbuild-wasm-plugin.mjs';
 import { collectAndPrintCoverage } from './v8-coverage.mjs';
 
 const args = process.argv.slice(2);
@@ -25,20 +27,11 @@ function resolveRealPath(p) {
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 execFileSync(process.execPath, [join(scriptsDir, 'compile-manifests.mjs')], { stdio: 'inherit' });
+const coreWasmPath = ensureCoreWasmBuilt();
+const nodeWasmPlugin = createNodeWasmPlugin({ wasmAbsPath: coreWasmPath });
+const workerdWasmPlugin = createWorkerdWasmExternalPlugin();
 
 const dir = resolveRealPath(mkdtempSync(join(tmpdir(), 'edgefetch-hub-test-')));
-const unitOutfile = join(dir, 'hub.test.mjs');
-const adaptersOutfile = join(dir, 'adapters.test.mjs');
-const agentAdvOutfile = join(dir, 'agent-advanced.test.mjs');
-const secAuditOutfile = join(dir, 'security-audit.test.mjs');
-const ghMultiOutfile = join(dir, 'github-auth-multiuser.test.mjs');
-const mcpFedOutfile = join(dir, 'mcp-federation.test.mjs');
-const updatesTelOutfile = join(dir, 'updates-telemetry.test.mjs');
-const r7MultiMcpOutfile = join(dir, 'round7-multiuser-mcp.test.mjs');
-const r7PortTelOutfile = join(dir, 'round7-portable-telemetry.test.mjs');
-const sdkTsTestFile = resolve('test/sdk-ts.test.ts');
-const hasSdkTsTest = existsSync(sdkTsTestFile);
-const sdkTsOutfile = join(dir, 'sdk-ts.test.mjs');
 const workerOutfile = join(dir, 'workerd-entry.mjs');
 const e2eTestFile = resolve('test/workerd.e2e.test.mjs');
 
@@ -48,7 +41,7 @@ const nodeBanner = {
 };
 
 function buildNodeTestBundle(entryPoint, outfile) {
-  buildSync({
+  return build({
     entryPoints: [entryPoint],
     bundle: true,
     ...(coverageEnabled ? { treeShaking: false } : {}),
@@ -57,109 +50,63 @@ function buildNodeTestBundle(entryPoint, outfile) {
     banner: nodeBanner,
     alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
     loader: textAssetLoaders,
+    plugins: [nodeWasmPlugin],
     sourcemap: coverageEnabled ? 'inline' : false,
     outfile,
   });
 }
 
+const suiteSpecs = [
+  ['test/hub.test.ts', 'hub.test.mjs'],
+  ['test/adapters.test.ts', 'adapters.test.mjs'],
+  ['test/agent-advanced.test.ts', 'agent-advanced.test.mjs'],
+  ['test/security-audit.test.ts', 'security-audit.test.mjs'],
+  ['test/github-auth-multiuser.test.ts', 'github-auth-multiuser.test.mjs'],
+  ['test/mcp-federation.test.ts', 'mcp-federation.test.mjs'],
+  ['test/updates-telemetry.test.ts', 'updates-telemetry.test.mjs'],
+  ['test/round7-multiuser-mcp.test.ts', 'round7-multiuser-mcp.test.mjs'],
+  ['test/round7-portable-telemetry.test.ts', 'round7-portable-telemetry.test.mjs'],
+  ...(existsSync(resolve('test/sdk-ts.test.ts')) ? [['test/sdk-ts.test.ts', 'sdk-ts.test.mjs']] : []),
+  ['test/round7-sanitizer-adapters.test.ts', 'round7-sanitizer-adapters.test.mjs'],
+  ['test/live-mcp-audit.test.ts', 'live-mcp-audit.test.mjs'],
+  ['test/round8-portable-telemetry-openapi.test.ts', 'round8-portable-telemetry-openapi.test.mjs'],
+  ['test/round8-sanitizer-paging-cpu.test.ts', 'round8-sanitizer-paging-cpu.test.mjs'],
+  ['test/round8-auth-mcp-isolation.test.ts', 'round8-auth-mcp-isolation.test.mjs'],
+  ['test/round8-manifests-commerce.test.ts', 'round8-manifests-commerce.test.mjs'],
+  ['test/round9-sanitizer-jobs.test.ts', 'round9-sanitizer-jobs.test.mjs'],
+  ['test/round9-auth-mcp-agent.test.ts', 'round9-auth-mcp-agent.test.mjs'],
+  ['test/round9-portable-otel.test.ts', 'round9-portable-otel.test.mjs'],
+  ['test/round9-bughunt.test.ts', 'round9-bughunt.test.mjs'],
+  ['test/round10-sanitizer-commerce.test.ts', 'round10-sanitizer-commerce.test.mjs'],
+  ['test/round10-auth-mcp-vault.test.ts', 'round10-auth-mcp-vault.test.mjs'],
+  ['test/round10-portable-eviction.test.ts', 'round10-portable-eviction.test.mjs'],
+  ['test/round10-live-traces.test.ts', 'round10-live-traces.test.mjs'],
+  ['test/universal-extraction-scale.test.ts', 'universal-extraction-scale.test.mjs'],
+  ['test/tracker-blocking.test.ts', 'tracker-blocking.test.mjs'],
+  ['test/round11-stream1-sanitizer.test.ts', 'round11-stream1-sanitizer.test.mjs'],
+  ['test/round11-stream4-mcp-vault.test.ts', 'round11-stream4-mcp-vault.test.mjs'],
+  ['test/round11-stream5-oauth-jobs-manifests.test.ts', 'round11-stream5-oauth-jobs-manifests.test.mjs'],
+  ['test/round11-stream3-portable.test.ts', 'round11-stream3-portable.test.mjs'],
+];
+
 try {
-  buildNodeTestBundle('test/hub.test.ts', unitOutfile);
-  buildNodeTestBundle('test/adapters.test.ts', adaptersOutfile);
-  buildNodeTestBundle('test/agent-advanced.test.ts', agentAdvOutfile);
-  buildNodeTestBundle('test/security-audit.test.ts', secAuditOutfile);
-  buildNodeTestBundle('test/github-auth-multiuser.test.ts', ghMultiOutfile);
-  buildNodeTestBundle('test/mcp-federation.test.ts', mcpFedOutfile);
-  buildNodeTestBundle('test/updates-telemetry.test.ts', updatesTelOutfile);
-  buildNodeTestBundle('test/round7-multiuser-mcp.test.ts', r7MultiMcpOutfile);
-  buildNodeTestBundle('test/round7-portable-telemetry.test.ts', r7PortTelOutfile);
+  const nodeTestFiles = suiteSpecs.map(([, outName]) => join(dir, outName));
 
-  const nodeTestFiles = [
-    unitOutfile,
-    adaptersOutfile,
-    agentAdvOutfile,
-    secAuditOutfile,
-    ghMultiOutfile,
-    mcpFedOutfile,
-    updatesTelOutfile,
-    r7MultiMcpOutfile,
-    r7PortTelOutfile,
-  ];
-  if (hasSdkTsTest) {
-    buildNodeTestBundle('test/sdk-ts.test.ts', sdkTsOutfile);
-    nodeTestFiles.push(sdkTsOutfile);
-  }
-  const round7SanitizerOutfile = join(dir, 'round7-sanitizer-adapters.test.mjs');
-  buildNodeTestBundle('test/round7-sanitizer-adapters.test.ts', round7SanitizerOutfile);
-  nodeTestFiles.push(round7SanitizerOutfile);
-  const liveMcpAuditOutfile = join(dir, 'live-mcp-audit.test.mjs');
-  buildNodeTestBundle('test/live-mcp-audit.test.ts', liveMcpAuditOutfile);
-  nodeTestFiles.push(liveMcpAuditOutfile);
-  const round8PortTelOpenapiOutfile = join(dir, 'round8-portable-telemetry-openapi.test.mjs');
-  buildNodeTestBundle('test/round8-portable-telemetry-openapi.test.ts', round8PortTelOpenapiOutfile);
-  nodeTestFiles.push(round8PortTelOpenapiOutfile);
-  const round8SanitizerOutfile = join(dir, 'round8-sanitizer-paging-cpu.test.mjs');
-  buildNodeTestBundle('test/round8-sanitizer-paging-cpu.test.ts', round8SanitizerOutfile);
-  nodeTestFiles.push(round8SanitizerOutfile);
-  const round8AuthMcpOutfile = join(dir, 'round8-auth-mcp-isolation.test.mjs');
-  buildNodeTestBundle('test/round8-auth-mcp-isolation.test.ts', round8AuthMcpOutfile);
-  nodeTestFiles.push(round8AuthMcpOutfile);
-  const round8ManifestsOutfile = join(dir, 'round8-manifests-commerce.test.mjs');
-  buildNodeTestBundle('test/round8-manifests-commerce.test.ts', round8ManifestsOutfile);
-  nodeTestFiles.push(round8ManifestsOutfile);
-  const round9SanitizerJobsOutfile = join(dir, 'round9-sanitizer-jobs.test.mjs');
-  buildNodeTestBundle('test/round9-sanitizer-jobs.test.ts', round9SanitizerJobsOutfile);
-  nodeTestFiles.push(round9SanitizerJobsOutfile);
-  const round9AuthMcpOutfile = join(dir, 'round9-auth-mcp-agent.test.mjs');
-  buildNodeTestBundle('test/round9-auth-mcp-agent.test.ts', round9AuthMcpOutfile);
-  nodeTestFiles.push(round9AuthMcpOutfile);
-  const round9PortableOtelOutfile = join(dir, 'round9-portable-otel.test.mjs');
-  buildNodeTestBundle('test/round9-portable-otel.test.ts', round9PortableOtelOutfile);
-  nodeTestFiles.push(round9PortableOtelOutfile);
-  const round9BughuntOutfile = join(dir, 'round9-bughunt.test.mjs');
-  buildNodeTestBundle('test/round9-bughunt.test.ts', round9BughuntOutfile);
-  nodeTestFiles.push(round9BughuntOutfile);
-  const round10SanitizerCommerceOutfile = join(dir, 'round10-sanitizer-commerce.test.mjs');
-  buildNodeTestBundle('test/round10-sanitizer-commerce.test.ts', round10SanitizerCommerceOutfile);
-  nodeTestFiles.push(round10SanitizerCommerceOutfile);
-  const round10AuthMcpVaultOutfile = join(dir, 'round10-auth-mcp-vault.test.mjs');
-  buildNodeTestBundle('test/round10-auth-mcp-vault.test.ts', round10AuthMcpVaultOutfile);
-  nodeTestFiles.push(round10AuthMcpVaultOutfile);
-  const round10PortableEvictionOutfile = join(dir, 'round10-portable-eviction.test.mjs');
-  buildNodeTestBundle('test/round10-portable-eviction.test.ts', round10PortableEvictionOutfile);
-  nodeTestFiles.push(round10PortableEvictionOutfile);
-  const round10LiveTracesOutfile = join(dir, 'round10-live-traces.test.mjs');
-  buildNodeTestBundle('test/round10-live-traces.test.ts', round10LiveTracesOutfile);
-  nodeTestFiles.push(round10LiveTracesOutfile);
-  const universalScaleOutfile = join(dir, 'universal-extraction-scale.test.mjs');
-  buildNodeTestBundle('test/universal-extraction-scale.test.ts', universalScaleOutfile);
-  nodeTestFiles.push(universalScaleOutfile);
-  const trackerBlockingOutfile = join(dir, 'tracker-blocking.test.mjs');
-  buildNodeTestBundle('test/tracker-blocking.test.ts', trackerBlockingOutfile);
-  nodeTestFiles.push(trackerBlockingOutfile);
-  const r11Stream1Outfile = join(dir, 'round11-stream1-sanitizer.test.mjs');
-  buildNodeTestBundle('test/round11-stream1-sanitizer.test.ts', r11Stream1Outfile);
-  nodeTestFiles.push(r11Stream1Outfile);
-  const r11Stream4Outfile = join(dir, 'round11-stream4-mcp-vault.test.mjs');
-  buildNodeTestBundle('test/round11-stream4-mcp-vault.test.ts', r11Stream4Outfile);
-  nodeTestFiles.push(r11Stream4Outfile);
-  const r11Stream5Outfile = join(dir, 'round11-stream5-oauth-jobs-manifests.test.mjs');
-  buildNodeTestBundle('test/round11-stream5-oauth-jobs-manifests.test.ts', r11Stream5Outfile);
-  nodeTestFiles.push(r11Stream5Outfile);
-  const r11Stream3Outfile = join(dir, 'round11-stream3-portable.test.mjs');
-  buildNodeTestBundle('test/round11-stream3-portable.test.ts', r11Stream3Outfile);
-  nodeTestFiles.push(r11Stream3Outfile);
-
-  buildSync({
-    entryPoints: ['test/workerd-harness-entry.ts'],
-    bundle: true,
-    platform: 'neutral',
-    mainFields: ['module', 'main'],
-    conditions: ['workerd', 'worker', 'browser'],
-    format: 'esm',
-    loader: textAssetLoaders,
-    external: ['cloudflare:workers', 'node:*'],
-    outfile: workerOutfile,
-  });
+  await Promise.all([
+    ...suiteSpecs.map(([entry, outName]) => buildNodeTestBundle(entry, join(dir, outName))),
+    build({
+      entryPoints: ['test/workerd-harness-entry.ts'],
+      bundle: true,
+      platform: 'neutral',
+      mainFields: ['module', 'main'],
+      conditions: ['workerd', 'worker', 'browser'],
+      format: 'esm',
+      loader: textAssetLoaders,
+      plugins: [workerdWasmPlugin],
+      external: ['cloudflare:workers', 'node:*'],
+      outfile: workerOutfile,
+    }),
+  ]);
 
   const covDir = join(dir, 'v8-coverage');
   if (coverageEnabled) {
@@ -169,6 +116,7 @@ try {
   const childEnv = {
     ...process.env,
     EDGEFETCH_WORKERD_BUNDLE: workerOutfile,
+    EDGEFETCH_WASM_PATH: coreWasmPath,
     EDGEFETCH_HUB_ROOT: resolve('.'),
   };
   if (coverageEnabled) {

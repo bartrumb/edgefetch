@@ -493,11 +493,29 @@ test('Step 1 & Step 6: Global 4 MiB WASM input budget & memory matrix across all
   assert.equal(preEscaped, '&amp;lt;img src=x onerror=alert(1)&amp;gt; a &amp; b');
   // Invisible smuggling characters below U+200B and variation selectors are stripped.
   assert.equal(escapeMarkdownFallbackLinear('a­b͏c؜d᠎e️f'), 'abcdef');
-  // Linear time on adversarial unclosed `](` runs (was ~4 s for 5M chars).
-  const parenStart = performance.now();
-  const parenOut = escapeMarkdownFallbackLinear('[](('.repeat(1_000_000));
-  const parenMs = performance.now() - parenStart;
-  assert.ok(parenMs < 1_000, `Fallback must stay linear on '[]((' runs, took ${parenMs.toFixed(0)}ms`);
+  // Linear time on adversarial unclosed `](` runs (previously ~4 s for 4M chars: each `[` rescanned 2,048 parens).
+  // Compared against a same-length `[]` run so the check holds on slow or coverage-instrumented CI runners;
+  // the old quadratic scan was ~50x slower than the baseline, the linear one is ~1.5x.
+  const bestOf = (fn: () => void): number => {
+    let best = Infinity;
+    for (let r = 0; r < 2; r++) {
+      const s = performance.now();
+      fn();
+      best = Math.min(best, performance.now() - s);
+    }
+    return best;
+  };
+  let parenOut = '';
+  const parenMs = bestOf(() => {
+    parenOut = escapeMarkdownFallbackLinear('[](('.repeat(1_000_000));
+  });
+  const baselineMs = bestOf(() => {
+    escapeMarkdownFallbackLinear('[]'.repeat(2_000_000));
+  });
+  assert.ok(
+    parenMs < 10 * Math.max(baselineMs, 5),
+    `Fallback must stay linear on '[]((' runs: ${parenMs.toFixed(0)}ms vs ${baselineMs.toFixed(0)}ms same-length baseline`,
+  );
   assert.equal(parenOut.includes('['), false);
   assert.ok(fallbackEscaped.includes('Readable Link'), 'Fallback must preserve link label text');
   assert.ok(fallbackEscaped.includes('Alt Label'), 'Fallback must preserve image alt text');

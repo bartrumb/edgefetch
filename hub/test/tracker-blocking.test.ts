@@ -1305,6 +1305,213 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(metaCalls, 1, 'Repeat catalog pull on warm origin must hit SHOPIFY_ORIGIN_CURRENCY_CACHE');
       assert.equal(robotsCalls, 1, 'Repeat catalog pull on warm origin must hit ORIGIN_UCP_CACHE');
 
+      // ── WASM Memory Eviction, Exact Raw-Pair Sizing, RE2 Stale-Handle Safety & Lite Greenhouse Boards (Tests 1–5) ──
+      const {
+        callCoreWasmRawMetaPair,
+        callCoreWasmRawPair,
+        compileWasmRe2,
+        getWasmReactorStats,
+        resetWasmReactor,
+      } = await import('../src/wasm-bridge');
+      const {
+        compileLinearRegex,
+        compileSafeUserRegex,
+        compileSafeUserRegexUnion,
+      } = await import('../src/safe-input');
+      const { tryParseJsonPayloadForScrape } = await import('../src/scrape');
+
+      // Test 1: Oversized (>8 MiB) WASM calls evict `cachedReactor` immediately after decoding output so grown
+      // `WebAssembly.Memory` pages are freed and the next call spawns a fresh baseline reactor instance.
+      resetWasmReactor();
+      compileWasmRe2('^warmup-gen$')?.test('warmup-gen');
+      const statsBeforeOversized = getWasmReactorStats();
+      assert.equal(statsBeforeOversized.active, true);
+      assert.ok(statsBeforeOversized.initialMemoryBytes > 0);
+
+      const hugeIngestJsonDoc = tryParseJsonPayloadForScrape(
+        antBigJson,
+        'application/json',
+        'https://boards-api.greenhouse.io/v1/boards/anthropic/jobs',
+      );
+      assert.ok(hugeIngestJsonDoc && hugeIngestJsonDoc.markdown.length > 1_000 && hugeIngestJsonDoc.markdown.length < 600_000);
+      assert.equal(hugeIngestJsonDoc.parsed, null, 'Oversized >2 MiB JSON must skip V8 object graph allocation');
+
+      const statsAfterOversized = getWasmReactorStats();
+      assert.equal(statsAfterOversized.active, false, 'Oversized >8 MiB WASM call must evict cachedReactor');
+      assert.equal(statsAfterOversized.memoryBytes, 0);
+
+      compileWasmRe2('^post-evict$')?.test('post-evict');
+      const statsFreshInstance = getWasmReactorStats();
+      assert.equal(statsFreshInstance.active, true);
+      assert.equal(statsFreshInstance.generation, statsBeforeOversized.generation + 1);
+      assert.equal(statsFreshInstance.memoryBytes, statsFreshInstance.initialMemoryBytes);
+
+      // Test 2: `callCoreWasmRawMetaPair` and `callCoreWasmRawPair` use exact UTF-8 byte lengths (`0` `rawB.length * 3`).
+      // A 17 MiB ASCII `rawB` is <= 48 MiB `maxWasmInputBytes`, whereas `17 MiB * 3 = 51 MiB` would fail `ef_in_ptr`!
+      const rawB17MiB = 'x'.repeat(17 * 1024 * 1024);
+      const metaPairOut = callCoreWasmRawMetaPair<{ thin: boolean }>(
+        'jobs_is_thin_scripted',
+        {},
+        '<html><body><p>ok</p></body></html>',
+        rawB17MiB,
+      );
+      assert.equal(typeof metaPairOut.thin, 'boolean');
+      assert.equal(getWasmReactorStats().active, false, '17 MiB callCoreWasmRawMetaPair must also evict cachedReactor');
+
+      const rawPairOut = callCoreWasmRawPair<{ detected: boolean }>(
+        'detect_prompt_injection',
+        'Normal clean markdown',
+        rawB17MiB,
+      );
+      assert.equal(rawPairOut.detected, false);
+      assert.equal(getWasmReactorStats().active, false, '17 MiB callCoreWasmRawPair must also evict cachedReactor');
+
+      // Test 3: RE2 matchers (`compileWasmRe2`, `compileLinearRegex`, `compileSafeUserRegex`, `compileSafeUserRegexUnion`)
+      // bind the reactor instance reference and never mis-evaluate against recycled handles (`1..k`) after reactor reset/eviction.
+      resetWasmReactor();
+      const directRe2 = compileWasmRe2('^https://allow\\.example\\.com/(?P<id>[0-9]+)$')!;
+      const linearRe = compileLinearRegex('^https://allow-linear\\.example\\.com/v1/[0-9]+$')!;
+      const userRe = compileSafeUserRegex('^/allowed-user/[a-z0-9-]+$')!;
+      const unionMatcher = compileSafeUserRegexUnion(['^/union-alpha/[0-9]+$', '^/union-beta/[0-9]+$'])!;
+
+      assert.equal(directRe2.test('https://allow.example.com/42'), true);
+      assert.equal(directRe2.exec('https://allow.example.com/42')?.groups?.id, '42');
+      assert.equal(linearRe.test('https://allow-linear.example.com/v1/7'), true);
+      assert.equal(linearRe.test('https://poison.example.org/hijack'), false);
+      assert.equal(userRe.test('/allowed-user/ok-1'), true);
+      assert.equal(userRe.test('/poison-user/hijack'), false);
+      assert.equal(unionMatcher('/union-alpha/10'), true);
+      assert.equal(unionMatcher('/poison-union/99'), false);
+
+      // Evict the reactor via a real >8 MiB call, then populate handles 1..8 on the new reactor with OPPOSITE poison patterns!
+      resolveAtsPreFetchSpec('https://boards.greenhouse.io/cloudflare')!.format(
+        cfBigJson,
+        'https://boards.greenhouse.io/cloudflare',
+      );
+      assert.equal(getWasmReactorStats().active, false);
+      for (let k = 0; k < 8; k++) {
+        const poison = compileWasmRe2('^(?:https://poison\\.example\\.org/hijack|/poison-user/hijack|/poison-union/99)$')!;
+        assert.equal(poison.test('https://poison.example.org/hijack'), true);
+      }
+
+      // Every pre-eviction cached matcher MUST recompile onto the new reactor and reject the poison subjects (both seen & unseen)!
+      assert.equal(directRe2.test('https://poison.example.org/hijack'), false);
+      assert.equal(directRe2.test('https://allow.example.com/42'), true);
+      assert.equal(directRe2.exec('https://allow.example.com/99')?.groups?.id, '99');
+      assert.equal(linearRe.test('https://poison.example.org/hijack'), false);
+      assert.equal(linearRe.test('https://allow-linear.example.com/v1/7'), true);
+      assert.equal(linearRe.test('https://allow-linear.example.com/v1/88'), true);
+      assert.equal(userRe.test('/poison-user/hijack'), false);
+      assert.equal(userRe.test('/allowed-user/ok-1'), true);
+      assert.equal(userRe.test('/allowed-user/ok-2'), true);
+      assert.equal(unionMatcher('/poison-union/99'), false);
+      assert.equal(unionMatcher('/union-beta/55'), true);
+
+      // Test 4: RE2 ring-buffer wraparound (>1,024 patterns on the SAME reactor) verifies per-slot `{ id, re }` identity.
+      const ringFirst = compileWasmRe2('^ring-origin-(?P<num>[0-9]+)$')!;
+      assert.equal(ringFirst.test('ring-origin-1'), true);
+      const genDuringRing = getWasmReactorStats().generation;
+      for (let rIdx = 0; rIdx < 1_050; rIdx++) {
+        const filler = compileWasmRe2(`^ring-overwrite-${rIdx}$`)!;
+        if (rIdx === 1_023 || rIdx === 1_049) {
+          assert.equal(filler.test(`ring-overwrite-${rIdx}`), true);
+        }
+      }
+      assert.equal(getWasmReactorStats().generation, genDuringRing, '1,050 small regexes must stay on the same reactor instance');
+      assert.equal(ringFirst.test('ring-overwrite-1023'), false, 'Evicted ring slot must not match overwriting pattern');
+      assert.equal(ringFirst.exec('ring-overwrite-1023'), null);
+      assert.equal(ringFirst.exec('ring-origin-777')?.groups?.num, '777', 'Evicted ring handle must recompile and preserve groups');
+
+      // Test 5: Lite Greenhouse board (`?content=false`) across `verify` mode AND `domains` slug-existence probes (`runSlugProbeWave`),
+      // with isolated `|lite` cache keys so subsequent `search` calls still fetch full `?content=true` board descriptions.
+      resetJobsCacheForTests();
+      const liteGhBoardSpec = resolveAtsPreFetchSpec('https://job-boards.greenhouse.io/anthropic', { liteBoard: true });
+      const liteGhJobSpec = resolveAtsPreFetchSpec('https://job-boards.greenhouse.io/anthropic/jobs/5462972008', { liteBoard: true });
+      const fullGhBoardSpec = resolveAtsPreFetchSpec('https://job-boards.greenhouse.io/anthropic');
+      assert.equal(liteGhBoardSpec?.fetchUrl, 'https://boards-api.greenhouse.io/v1/boards/anthropic/jobs');
+      assert.equal(liteGhJobSpec?.fetchUrl, 'https://boards-api.greenhouse.io/v1/boards/anthropic/jobs/5462972008');
+      assert.equal(fullGhBoardSpec?.fetchUrl, 'https://boards-api.greenhouse.io/v1/boards/anthropic/jobs?content=true');
+
+      const seenJobsScrapeCalls: Array<{ url: string; ephemeral?: unknown; atsLiteBoard?: unknown }> = [];
+      const mockJobsScrape = async (args: Record<string, unknown>) => {
+        const u = String(args.url ?? '');
+        seenJobsScrapeCalls.push({ url: u, ephemeral: args.ephemeral, atsLiteBoard: args.atsLiteBoard });
+        if (u === 'https://stealthco.com/careers') {
+          // Stays on `/careers` with 200 OK but zero ATS links -> triggers `runSlugProbeWave`!
+          return { status: 200, body: { ok: true, finalUrl: u, rawHtml: '<html><body><h1>Join StealthCo</h1></body></html>', links: [] } };
+        }
+        if (u === 'https://boards.greenhouse.io/stealthco' || u === 'https://job-boards.greenhouse.io/stealthco') {
+          const isLite = args.atsLiteBoard === true;
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              extractorId: 'greenhouse-board',
+              total: 1,
+              returned: 1,
+              truncated: false,
+              links: ['https://job-boards.greenhouse.io/stealthco/jobs/5001'],
+              jobs: [
+                {
+                  title: 'Systems Engineer',
+                  company: 'StealthCo',
+                  url: 'https://job-boards.greenhouse.io/stealthco/jobs/5001',
+                  applyUrl: 'https://job-boards.greenhouse.io/stealthco/jobs/5001',
+                  workplaceType: 'remote',
+                  locations: ['Remote - US'],
+                  pay: isLite ? null : { currency: 'USD', min: 180_000, max: 220_000, period: 'year', basis: 'base', raw: '$180k-$220k' },
+                  postedAt: '2026-11-24T00:00:00Z',
+                  source: 'greenhouse',
+                  ...(isLite ? {} : { snippet: 'Full ?content=true description body with compensation details.' }),
+                },
+              ],
+            },
+          };
+        }
+        return { status: 404, body: { ok: false } };
+      };
+
+      const verifyStealth = await executeJobsCall({
+        payload: {
+          verify: [
+            'https://job-boards.greenhouse.io/stealthco/jobs/5001',
+            'https://job-boards.greenhouse.io/stealthco/jobs/9999',
+          ],
+        },
+        env: { JOBS_SHARED_CACHE: true },
+        executeSearch: async () => ({ status: 200, body: { results: [] } }),
+        executeScrape: mockJobsScrape,
+      });
+      assert.equal(verifyStealth.status, 200);
+      assert.equal(seenJobsScrapeCalls.length, 1);
+      assert.equal(seenJobsScrapeCalls[0]?.ephemeral, true);
+      assert.equal(seenJobsScrapeCalls[0]?.atsLiteBoard, true);
+      const vStealthRes = verifyStealth.body.results as Array<{ status: string }>;
+      assert.equal(vStealthRes[0]?.status, 'live');
+      assert.equal(vStealthRes[1]?.status, 'closed');
+
+      // First verify on a cold cache that `runSlugProbeWave` itself sends `ephemeral: true` + `atsLiteBoard: true`,
+      // while `runCandidateWave` does NOT reuse the `|lite` entry and fetches the full `?content=true` board!
+      seenJobsScrapeCalls.length = 0;
+      resetJobsCacheForTests();
+      const slugProbeSearch = await executeJobsCall({
+        payload: {
+          domains: ['stealthco.com'],
+          query: 'Systems Engineer',
+          minBase: 170_000,
+          strictPay: true,
+        },
+        env: { JOBS_SHARED_CACHE: true },
+        executeSearch: async () => ({ status: 200, body: { results: [] } }),
+        executeScrape: mockJobsScrape,
+      });
+      assert.equal(slugProbeSearch.status, 200);
+      const ghSlugProbeCall = seenJobsScrapeCalls.find((c) => c.url === 'https://boards.greenhouse.io/stealthco' && c.atsLiteBoard === true);
+      const ghFullWaveCall = seenJobsScrapeCalls.find((c) => c.url === 'https://boards.greenhouse.io/stealthco' && c.atsLiteBoard !== true);
+      assert.ok(ghSlugProbeCall && ghSlugProbeCall.ephemeral === true, 'runSlugProbeWave must use ephemeral + atsLiteBoard: true');
+      assert.ok(ghFullWaveCall && ghFullWaveCall.ephemeral === true, 'runCandidateWave must not reuse |lite cache entry and must fetch full board');
+      assert.equal((slugProbeSearch.body.jobs as unknown[]).length, 1, 'Full board fetch in runCandidateWave must supply strictPay compensation');
+
       wsAgent.close();
     } finally {
       adminRefreshCoord.close();

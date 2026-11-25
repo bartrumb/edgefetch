@@ -25,8 +25,53 @@ interface CoreReactorExports extends WebAssembly.Exports {
 
 const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
+const EMPTY_BYTES = new Uint8Array(0);
+
+// WebAssembly linear memory pages (`64 KiB` each) can never shrink once grown. After any oversized I/O call (`> 8 MiB`)
+// or cumulative linear-memory growth (`> 24 MiB` above the freshly initialized reactor baseline), evict `cachedReactor`
+// immediately after decoding its output so V8 garbage-collects the grown `WebAssembly.Memory` instance.
+const WASM_EVICT_IO_BYTES = 8 * 1024 * 1024;
+const WASM_MAX_MEMORY_GROWTH_BYTES = 24 * 1024 * 1024;
+const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 524_288;
 
 let cachedReactor: CoreReactorExports | null = null;
+let cachedReactorInitMemBytes = 0;
+let reactorGeneration = 0;
+
+export interface WasmReactorStats {
+  active: boolean;
+  generation: number;
+  memoryBytes: number;
+  initialMemoryBytes: number;
+}
+
+export function getWasmReactorStats(): WasmReactorStats {
+  return {
+    active: cachedReactor !== null,
+    generation: reactorGeneration,
+    memoryBytes: cachedReactor ? cachedReactor.memory.buffer.byteLength : 0,
+    initialMemoryBytes: cachedReactorInitMemBytes,
+  };
+}
+
+export function resetWasmReactor(): void {
+  cachedReactor = null;
+  cachedReactorInitMemBytes = 0;
+}
+
+function maybeEvictOversizedReactor(reactor: CoreReactorExports, inBytes: number, outBytes: number): void {
+  if (cachedReactor !== reactor) return;
+  const memBytes = reactor.memory.buffer.byteLength;
+  const growthBytes = cachedReactorInitMemBytes > 0 ? memBytes - cachedReactorInitMemBytes : 0;
+  if (
+    inBytes > WASM_EVICT_IO_BYTES ||
+    outBytes > WASM_EVICT_IO_BYTES ||
+    growthBytes > WASM_MAX_MEMORY_GROWTH_BYTES
+  ) {
+    cachedReactor = null;
+    cachedReactorInitMemBytes = 0;
+  }
+}
 
 function createMinimalWasiImports(getMemory: () => WebAssembly.Memory): WebAssembly.Imports {
   const baseWasi: Record<string, (...args: never[]) => number> = {
@@ -140,6 +185,8 @@ function getReactor(): CoreReactorExports {
   const exports = instanceRef.exports as CoreReactorExports;
   exports._initialize();
   cachedReactor = exports;
+  cachedReactorInitMemBytes = exports.memory.buffer.byteLength;
+  reactorGeneration++;
   return exports;
 }
 
@@ -171,28 +218,34 @@ function writeInputBytes(reactor: CoreReactorExports, bytes: Uint8Array): number
 export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: unknown): T {
   let reactor = getReactor();
   const reqBytes = utf8Encoder.encode(JSON.stringify({ op, payload }));
-  let outLen: number;
+  let inLen = 0;
+  let outLen = 0;
+  let jsonText = '{}';
   try {
-    const inLen = writeInputBytes(reactor, reqBytes);
-    outLen = reactor.ef_call(inLen) >>> 0;
-  } catch (err) {
-    // Fault-isolated auto-recovery if the WASI reactor ever traps
-    cachedReactor = null;
-    reactor = getReactor();
-    const inLen = writeInputBytes(reactor, reqBytes);
-    outLen = reactor.ef_call(inLen) >>> 0;
-    void err;
+    try {
+      inLen = writeInputBytes(reactor, reqBytes);
+      outLen = reactor.ef_call(inLen) >>> 0;
+    } catch (err) {
+      // Fault-isolated auto-recovery if the WASI reactor ever traps
+      resetWasmReactor();
+      reactor = getReactor();
+      inLen = writeInputBytes(reactor, reqBytes);
+      outLen = reactor.ef_call(inLen) >>> 0;
+      void err;
+    }
+    const outPtr = reactor.ef_out_ptr() >>> 0;
+    if (outLen > 0) {
+      jsonText = utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
+    }
+  } finally {
+    maybeEvictOversizedReactor(reactor, inLen, outLen);
   }
-  const outPtr = reactor.ef_out_ptr() >>> 0;
-  const jsonText = outLen > 0 ? utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen)) : '{}';
   const parsed = JSON.parse(jsonText) as T & { error?: string };
   if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string' && !('ok' in parsed)) {
     throw new Error(parsed.error);
   }
   return parsed;
 }
-
-const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 3_145_728;
 
 function writeMetaAndRawStrings(
   reactor: CoreReactorExports,
@@ -256,19 +309,29 @@ function writeMetaAndRawStrings(
 export function callCoreWasmRaw<T = Record<string, unknown>>(op: string, meta: unknown, rawStr: string): T {
   let reactor = getReactor();
   const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta }));
-  let outLen: number;
+  let usedTotalLen = 0;
+  let outLen = 0;
+  let jsonText = '{}';
   try {
-    const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
-    outLen = reactor.ef_call_raw(metaLen, totalLen) >>> 0;
-  } catch (err) {
-    cachedReactor = null;
-    reactor = getReactor();
-    const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
-    outLen = reactor.ef_call_raw(metaLen, totalLen) >>> 0;
-    void err;
+    try {
+      const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
+      usedTotalLen = totalLen;
+      outLen = reactor.ef_call_raw(metaLen, totalLen) >>> 0;
+    } catch (err) {
+      resetWasmReactor();
+      reactor = getReactor();
+      const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
+      usedTotalLen = totalLen;
+      outLen = reactor.ef_call_raw(metaLen, totalLen) >>> 0;
+      void err;
+    }
+    const outPtr = reactor.ef_out_ptr() >>> 0;
+    if (outLen > 0) {
+      jsonText = utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
+    }
+  } finally {
+    maybeEvictOversizedReactor(reactor, usedTotalLen, outLen);
   }
-  const outPtr = reactor.ef_out_ptr() >>> 0;
-  const jsonText = outLen > 0 ? utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen)) : '{}';
   const parsed = JSON.parse(jsonText) as T & { error?: string };
   if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string' && !('ok' in parsed)) {
     throw new Error(parsed.error);
@@ -283,11 +346,11 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
   rawB: string,
 ): T {
   let reactor = getReactor();
-  const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : new Uint8Array(0);
+  const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : EMPTY_BYTES;
+  const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : EMPTY_BYTES;
   const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { ...metaObj, htmlByteLen: encA.byteLength } }));
+  const allocLen = metaBytes.byteLength + encA.byteLength + encB.byteLength;
   const run = (r: CoreReactorExports): number => {
-    const maxBBytes = rawB.length * 3;
-    const allocLen = metaBytes.byteLength + encA.byteLength + maxBBytes;
     const ptr = r.ef_in_ptr(allocLen) >>> 0;
     if (ptr === 0 && allocLen > 0) {
       throw new Error(`WASM input buffer allocation failed (${allocLen} bytes)`);
@@ -299,33 +362,40 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
       mem.set(encA, offset);
       offset += encA.byteLength;
     }
-    if (rawB.length > 0) {
-      const encB = utf8Encoder.encodeInto(rawB, mem.subarray(offset, offset + maxBBytes));
-      offset += encB.written;
+    if (encB.byteLength > 0) {
+      mem.set(encB, offset);
+      offset += encB.byteLength;
     }
     return r.ef_call_raw(metaBytes.byteLength, offset - ptr) >>> 0;
   };
-  let outLen: number;
+  let outLen = 0;
+  let jsonText = '{}';
   try {
-    outLen = run(reactor);
-  } catch (err) {
-    cachedReactor = null;
-    reactor = getReactor();
-    outLen = run(reactor);
-    void err;
+    try {
+      outLen = run(reactor);
+    } catch (err) {
+      resetWasmReactor();
+      reactor = getReactor();
+      outLen = run(reactor);
+      void err;
+    }
+    const outPtr = reactor.ef_out_ptr() >>> 0;
+    if (outLen > 0) {
+      jsonText = utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
+    }
+  } finally {
+    maybeEvictOversizedReactor(reactor, allocLen, outLen);
   }
-  const outPtr = reactor.ef_out_ptr() >>> 0;
-  const jsonText = outLen > 0 ? utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen)) : '{}';
   return JSON.parse(jsonText) as T;
 }
 
 export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, rawA: string, rawB: string): T {
   let reactor = getReactor();
-  const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : new Uint8Array(0);
+  const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : EMPTY_BYTES;
+  const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : EMPTY_BYTES;
   const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { mdByteLen: encA.byteLength } }));
+  const allocLen = metaBytes.byteLength + encA.byteLength + encB.byteLength;
   const run = (r: CoreReactorExports): number => {
-    const maxBBytes = rawB.length * 3;
-    const allocLen = metaBytes.byteLength + encA.byteLength + maxBBytes;
     const ptr = r.ef_in_ptr(allocLen) >>> 0;
     if (ptr === 0 && allocLen > 0) {
       throw new Error(`WASM input buffer allocation failed (${allocLen} bytes)`);
@@ -337,23 +407,30 @@ export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, raw
       mem.set(encA, offset);
       offset += encA.byteLength;
     }
-    if (rawB.length > 0) {
-      const encB = utf8Encoder.encodeInto(rawB, mem.subarray(offset, offset + maxBBytes));
-      offset += encB.written;
+    if (encB.byteLength > 0) {
+      mem.set(encB, offset);
+      offset += encB.byteLength;
     }
     return r.ef_call_raw(metaBytes.byteLength, offset - ptr) >>> 0;
   };
-  let outLen: number;
+  let outLen = 0;
+  let jsonText = '{}';
   try {
-    outLen = run(reactor);
-  } catch (err) {
-    cachedReactor = null;
-    reactor = getReactor();
-    outLen = run(reactor);
-    void err;
+    try {
+      outLen = run(reactor);
+    } catch (err) {
+      resetWasmReactor();
+      reactor = getReactor();
+      outLen = run(reactor);
+      void err;
+    }
+    const outPtr = reactor.ef_out_ptr() >>> 0;
+    if (outLen > 0) {
+      jsonText = utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
+    }
+  } finally {
+    maybeEvictOversizedReactor(reactor, allocLen, outLen);
   }
-  const outPtr = reactor.ef_out_ptr() >>> 0;
-  const jsonText = outLen > 0 ? utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen)) : '{}';
   return JSON.parse(jsonText) as T;
 }
 
@@ -364,21 +441,29 @@ export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, raw
 export function callCoreWasmRawString(op: string, meta: unknown, rawStr: string): string {
   let reactor = getReactor();
   const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta }));
-  let outLen: number;
+  let usedTotalLen = 0;
+  let outLen = 0;
   try {
-    const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
-    outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
-  } catch (err) {
-    cachedReactor = null;
-    reactor = getReactor();
-    const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
-    outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
-    void err;
+    try {
+      const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
+      usedTotalLen = totalLen;
+      outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
+    } catch (err) {
+      resetWasmReactor();
+      reactor = getReactor();
+      const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
+      usedTotalLen = totalLen;
+      outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
+      void err;
+    }
+    if (outLen === 0xffffffff) return rawStr;
+    if (outLen === 0) return '';
+    const outPtr = reactor.ef_out_ptr() >>> 0;
+    return utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
+  } finally {
+    const effectiveOutBytes = outLen === 0xffffffff ? 0 : outLen;
+    maybeEvictOversizedReactor(reactor, usedTotalLen, effectiveOutBytes);
   }
-  if (outLen === 0xffffffff) return rawStr;
-  if (outLen === 0) return '';
-  const outPtr = reactor.ef_out_ptr() >>> 0;
-  return utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
 }
 
 // ── Fast Integer-Handle RE2 Regex Engine (replaces `re2js`) ─────────────────────────────────────
@@ -389,44 +474,88 @@ export interface WasmRe2Compiled {
 }
 
 export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
-  const reactor = getReactor();
+  let initReactor = getReactor();
   const patBytes = utf8Encoder.encode(re2Pattern);
-  const patLen = writeInputBytes(reactor, patBytes);
-  let handle = reactor.ef_re2_compile(patLen);
+  let handle: number;
+  try {
+    const patLen = writeInputBytes(initReactor, patBytes);
+    handle = initReactor.ef_re2_compile(patLen);
+  } catch (err) {
+    resetWasmReactor();
+    initReactor = getReactor();
+    const patLen = writeInputBytes(initReactor, patBytes);
+    handle = initReactor.ef_re2_compile(patLen);
+    void err;
+  }
   if (handle <= 0) return null;
+
+  let boundReactor: CoreReactorExports | null = initReactor;
 
   const ensureHandle = (r: CoreReactorExports): number => {
     const len = writeInputBytes(r, patBytes);
     handle = r.ef_re2_compile(len);
+    boundReactor = handle > 0 ? r : null;
     return handle;
   };
 
   return {
     test(subject: string): boolean {
-      const r = getReactor();
+      let r = getReactor();
       const subjBytes = utf8Encoder.encode(subject);
-      const subjLen = writeInputBytes(r, subjBytes);
-      let res = r.ef_re2_test(handle, subjLen);
-      if (res === -1) {
+      let res: number;
+      try {
+        if (r !== boundReactor && ensureHandle(r) <= 0) return false;
+        const subjLen = writeInputBytes(r, subjBytes);
+        res = r.ef_re2_test(handle, subjLen);
+        if (res === -1) {
+          if (ensureHandle(r) <= 0) return false;
+          const retryLen = writeInputBytes(r, subjBytes);
+          res = r.ef_re2_test(handle, retryLen);
+        }
+      } catch (err) {
+        resetWasmReactor();
+        boundReactor = null;
+        r = getReactor();
         if (ensureHandle(r) <= 0) return false;
         const retryLen = writeInputBytes(r, subjBytes);
         res = r.ef_re2_test(handle, retryLen);
+        void err;
+      } finally {
+        maybeEvictOversizedReactor(r, subjBytes.byteLength, 0);
       }
       return res === 1;
     },
     exec(subject: string): RegExpExecArray | null {
-      const r = getReactor();
+      let r = getReactor();
       const subjBytes = utf8Encoder.encode(subject);
-      const subjLen = writeInputBytes(r, subjBytes);
-      let outLen = r.ef_re2_exec(handle, subjLen) >>> 0;
-      if (outLen === 0 && r.ef_re2_test(handle, 0) === -1) {
-        if (ensureHandle(r) <= 0) return null;
-        const retryLen = writeInputBytes(r, subjBytes);
-        outLen = r.ef_re2_exec(handle, retryLen) >>> 0;
+      let outLen = 0;
+      let hitText = '';
+      try {
+        try {
+          if (r !== boundReactor && ensureHandle(r) <= 0) return null;
+          const subjLen = writeInputBytes(r, subjBytes);
+          outLen = r.ef_re2_exec(handle, subjLen) >>> 0;
+          if (outLen === 0 && (r !== boundReactor || r.ef_re2_test(handle, 0) === -1)) {
+            if (ensureHandle(r) <= 0) return null;
+            const retryLen = writeInputBytes(r, subjBytes);
+            outLen = r.ef_re2_exec(handle, retryLen) >>> 0;
+          }
+        } catch (err) {
+          resetWasmReactor();
+          boundReactor = null;
+          r = getReactor();
+          if (ensureHandle(r) <= 0) return null;
+          const retryLen = writeInputBytes(r, subjBytes);
+          outLen = r.ef_re2_exec(handle, retryLen) >>> 0;
+          void err;
+        }
+        if (outLen === 0) return null;
+        const outPtr = r.ef_out_ptr() >>> 0;
+        hitText = utf8Decoder.decode(new Uint8Array(r.memory.buffer, outPtr, outLen));
+      } finally {
+        maybeEvictOversizedReactor(r, subjBytes.byteLength, outLen);
       }
-      if (outLen === 0) return null;
-      const outPtr = r.ef_out_ptr() >>> 0;
-      const hit = JSON.parse(utf8Decoder.decode(new Uint8Array(r.memory.buffer, outPtr, outLen))) as {
+      const hit = JSON.parse(hitText) as {
         matched: boolean;
         index: number;
         groups: Array<string | null>;

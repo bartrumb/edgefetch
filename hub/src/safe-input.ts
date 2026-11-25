@@ -3,7 +3,7 @@
  * and IPv6 `/64` rate-limit key canonicalization (`hub/src/safe-input.ts`).
  */
 
-import { compileWasmRe2, type WasmRe2Compiled } from './wasm-bridge';
+import { compileWasmRe2, getWasmReactorStats, type WasmRe2Compiled } from './wasm-bridge';
 
 export const MAX_HTML_SCAN_CHARS = 2 * 1024 * 1024; // 2 MiB ceiling on regex/DOM scan inputs (M4)
 
@@ -1609,6 +1609,7 @@ function buildRe2RegExp(
     const literalHint = extractMandatoryLiteralHint(effectivePattern, ignoreCase);
     let lastSubj = '\u0000__UNSET__';
     let lastRes = false;
+    let lastReactorGen = getWasmReactorStats().generation;
 
     const regExpLike = {
       source: rawSource,
@@ -1623,15 +1624,18 @@ function buildRe2RegExp(
       lastIndex: 0,
       test(subject: string): boolean {
         if (typeof subject !== 'string' || subject.length > maxSubjectLen) return false;
-        if (subject === lastSubj) return lastRes;
+        const curGen = getWasmReactorStats().generation;
+        if (subject === lastSubj && curGen === lastReactorGen) return lastRes;
         if (literalHint && subject.indexOf(literalHint) < 0) {
           lastSubj = subject;
           lastRes = false;
+          lastReactorGen = curGen;
           return false;
         }
         const ok = compiled.test(subject);
         lastSubj = subject;
         lastRes = ok;
+        lastReactorGen = getWasmReactorStats().generation;
         return ok;
       },
       exec(subject: string): RegExpExecArray | null {

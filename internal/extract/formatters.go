@@ -2864,6 +2864,11 @@ func marshalPrettyJSONNoEscapeFmtGo(val any) string {
 	return strings.TrimRight(buf.String(), "\r\n")
 }
 
+const (
+	maxJSONScrapeFullDecodeBytes = 2 << 20    // 2 MiB ceiling for full `map[string]any` DOM materialization
+	maxJSONScrapeFenceBytes      = 512 * 1024 // 512 KiB preview cap for oversized multi-MiB JSON artifacts
+)
+
 // TryParseJSONPayloadForScrape parses JSON scrape payloads, upgrading Jupyter `.ipynb` notebooks and OpenAPI/Swagger specs
 // to native GFM Markdown and formatting generic JSON objects/arrays in pretty-printed `json` fences with sanitized metadata.
 func TryParseJSONPayloadForScrape(raw, urlStr string) *FormattedPayloadDoc {
@@ -2872,6 +2877,47 @@ func TryParseJSONPayloadForScrape(raw, urlStr string) *FormattedPayloadDoc {
 		return nil
 	}
 	jsonBytes := []byte(trimmed)
+	if len(jsonBytes) > maxJSONScrapeFullDecodeBytes {
+		if !json.Valid(jsonBytes) {
+			return nil
+		}
+		head := truncateUTF8SafeFullDocGo(trimmed, 8192)
+		var title, description string
+		if strings.HasPrefix(trimmed, "{") {
+			nameStr := matchJSONStringFieldInSliceFmtGo(head, "name")
+			verStr := matchJSONStringFieldInSliceFmtGo(head, "version")
+			titleStr := matchJSONStringFieldInSliceFmtGo(head, "title")
+			switch {
+			case nameStr != "" && verStr != "":
+				title = nameStr + "@" + verStr
+			case titleStr != "":
+				title = titleStr
+			case nameStr != "":
+				title = nameStr
+			}
+			descCand := firstNonEmptyFullDocGo(
+				matchJSONStringFieldInSliceFmtGo(head, "description"),
+				matchJSONStringFieldInSliceFmtGo(head, "summary"),
+			)
+			if descCand != "" {
+				description = truncateUTF8SafeFullDocGo(descCand, 500)
+			}
+		}
+		cleanTitle := SanitizeScrapedMetadataField(title, 512)
+		cleanDesc := SanitizeScrapedMetadataField(description, 2000)
+		preview := strings.TrimRight(truncateUTF8SafeFullDocGo(trimmed, maxJSONScrapeFenceBytes), " \t\r\n") +
+			"\n// ... [JSON payload truncated at 512 KiB]"
+		fence := MakeSafeCodeFence(preview, "json", false)
+		md := fence
+		if cleanTitle != "" {
+			md = "# " + cleanTitle + "\n\n" + fence
+		}
+		return &FormattedPayloadDoc{
+			Title:       cleanTitle,
+			Description: cleanDesc,
+			Markdown:    md,
+		}
+	}
 	parsed, ok := decodeJSONWithNumbers(jsonBytes)
 	if !ok {
 		return nil

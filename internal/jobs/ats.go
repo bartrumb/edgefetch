@@ -169,9 +169,13 @@ func ResolveATSPreFetchSpec(urlStr string) *ATSPreFetchSpec {
 			if isGHEU {
 				id = "greenhouse-eu-board"
 			}
+			fetchURL := "https://" + ghAPIHost + "/v1/boards/" + EncodeURIComponent(co) + "/jobs?content=true"
+			if strings.EqualFold(q.Get("content"), "false") {
+				fetchURL = "https://" + ghAPIHost + "/v1/boards/" + EncodeURIComponent(co) + "/jobs"
+			}
 			return &ATSPreFetchSpec{
 				ID:        id,
-				FetchURL:  "https://" + ghAPIHost + "/v1/boards/" + EncodeURIComponent(co) + "/jobs?content=true",
+				FetchURL:  fetchURL,
 				Method:    "GET",
 				Kind:      "json",
 				Accept:    "application/json",
@@ -183,9 +187,13 @@ func ResolveATSPreFetchSpec(urlStr string) *ATSPreFetchSpec {
 		if len(parts) >= 3 && parts[1] == "jobs" {
 			jobID := parts[2]
 			if reGHSlugIdent.MatchString(co) && reDigitsOnly.MatchString(jobID) {
+				fetchURL := "https://" + ghAPIHost + "/v1/boards/" + EncodeURIComponent(co) + "/jobs/" + jobID + "?content=true"
+				if strings.EqualFold(q.Get("content"), "false") {
+					fetchURL = "https://" + ghAPIHost + "/v1/boards/" + EncodeURIComponent(co) + "/jobs/" + jobID
+				}
 				return &ATSPreFetchSpec{
 					ID:       "greenhouse-job",
-					FetchURL: "https://" + ghAPIHost + "/v1/boards/" + EncodeURIComponent(co) + "/jobs/" + jobID + "?content=true",
+					FetchURL: fetchURL,
 					Method:   "GET",
 					Kind:     "json",
 					Accept:   "application/json",

@@ -663,10 +663,11 @@ export function extractPdfTitle(md: string, urlStr?: string): string | undefined
 }
 
 export function formatVcardToMarkdown(raw: string): { title?: string; markdown: string } {
-  const doc = callCoreWasm<{ doc: { title?: string; markdown: string } | null }>('format_payload', {
-    kind: 'vcard',
-    raw: String(raw ?? ''),
-  }).doc;
+  const doc = callCoreWasmRaw<{ doc: { title?: string; markdown: string } | null }>(
+    'format_payload',
+    { kind: 'vcard' },
+    String(raw ?? ''),
+  ).doc;
   return {
     ...(doc?.title ? { title: doc.title } : {}),
     markdown: doc?.markdown ?? '# Contact Card (vCard)',
@@ -1338,6 +1339,7 @@ export interface ScrapeRequestPayload {
   spaFallback?: unknown;
   noCache?: unknown;
   ephemeral?: unknown;
+  atsLiteBoard?: unknown;
   visibility?: unknown;
   collectionId?: unknown;
   target?: unknown;
@@ -1800,9 +1802,10 @@ function encodeBytesToBase64(bytes: Uint8Array): string {
 
 export function formatIcalendarToMarkdown(raw: string): { title?: string; description?: string; markdown: string } | null {
   if (!raw || !/^BEGIN:VCALENDAR\b/im.test(raw.slice(0, 512))) return null;
-  const doc = callCoreWasm<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+  const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
     'format_payload',
-    { kind: 'icalendar', raw },
+    { kind: 'icalendar' },
+    raw,
   ).doc;
   if (!doc || !doc.markdown) return null;
   return {
@@ -1829,9 +1832,10 @@ export function formatGitPatchToMarkdown(
   if (!isPatchCt && !isPatchUrl && !isFormatPatch && !isUnifiedDiff) {
     return null;
   }
-  const doc = callCoreWasm<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+  const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
     'format_payload',
-    { kind: 'git_patch', raw: rawBody, url: urlStr ?? '' },
+    { kind: 'git_patch', url: urlStr ?? '' },
+    rawBody,
   ).doc;
   if (!doc || !doc.markdown) return null;
   return {
@@ -1847,14 +1851,14 @@ export function formatSourceCodeUrlToMarkdown(
   urlStr?: string,
 ): { title: string; description?: string; markdown: string } | null {
   if (!urlStr || !rawBody) return null;
-  const doc = callCoreWasm<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+  const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
     'format_payload',
     {
       kind: 'source_code',
-      raw: rawBody,
       url: urlStr,
       contentType: typeof contentType === 'string' ? contentType : '',
     },
+    rawBody,
   ).doc;
   if (!doc || !doc.markdown) return null;
   return {
@@ -1868,15 +1872,18 @@ export function formatFeedXmlToMarkdown(
   rawXml: string,
   baseUrl?: string,
 ): { title?: string; description?: string; markdown: string; links: string[] } | null {
-  if (!rawXml) return null;
-  const res = callCoreWasm<{
+  if (!rawXml || !/^\ufeff?\s*</.test(rawXml)) return null;
+  const res = callCoreWasmRaw<{
     doc: { title?: string; description?: string; markdown: string } | null;
     links?: string[];
-  }>('format_payload', {
-    kind: 'feed_xml',
-    raw: rawXml,
-    url: baseUrl ?? '',
-  });
+  }>(
+    'format_payload',
+    {
+      kind: 'feed_xml',
+      url: baseUrl ?? '',
+    },
+    rawXml,
+  );
   if (!res.doc || !res.doc.markdown) return null;
   return {
     ...(res.doc.title ? { title: res.doc.title } : {}),
@@ -2015,19 +2022,22 @@ export function formatDelimitedTableToMarkdown(
       // ignore
     }
   }
-  const doc = callCoreWasm<{
+  const doc = callCoreWasmRaw<{
     doc: {
       title?: string;
       description?: string;
       markdown: string;
       structured?: { rowCount?: number; columnCount?: number };
     } | null;
-  }>('format_payload', {
-    kind: 'delimited',
-    raw: rawBody,
-    sep,
-    titleHint: fileLabel,
-  }).doc;
+  }>(
+    'format_payload',
+    {
+      kind: 'delimited',
+      sep,
+      titleHint: fileLabel,
+    },
+    rawBody,
+  ).doc;
   if (!doc || !doc.markdown) return null;
   return {
     ...(doc.title ? { title: doc.title } : {}),
@@ -2089,13 +2099,13 @@ export function formatJupyterNotebookToMarkdown(
   fallbackTitle?: string,
 ): { title?: string; description?: string; markdown: string } | null {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const doc = callCoreWasm<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+  const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
     'format_payload',
     {
       kind: 'ipynb',
-      raw: JSON.stringify(parsed),
       url: fallbackTitle ?? '',
     },
+    JSON.stringify(parsed),
   ).doc;
   if (!doc || !doc.markdown) return null;
   const finalTitle = doc.title || fallbackTitle;
@@ -2111,12 +2121,12 @@ export function formatOpenApiSpecToMarkdown(
   parsed: unknown,
 ): { title?: string; description?: string; markdown: string } | null {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const doc = callCoreWasm<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+  const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
     'format_payload',
     {
       kind: 'openapi',
-      raw: JSON.stringify(parsed),
     },
+    JSON.stringify(parsed),
   ).doc;
   if (!doc || !doc.markdown) return null;
   return {
@@ -2125,6 +2135,8 @@ export function formatOpenApiSpecToMarkdown(
     markdown: doc.markdown,
   };
 }
+
+const MAX_JSON_SCRAPE_JS_PARSE_CHARS = 2 * 1024 * 1024;
 
 export function tryParseJsonPayloadForScrape(
   rawBody: string,
@@ -2143,19 +2155,21 @@ export function tryParseJsonPayloadForScrape(
   if ((!looksJsonCt && !looksJsonUrl) || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
     return null;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return null;
+  let parsed: unknown = null;
+  if (trimmed.length <= MAX_JSON_SCRAPE_JS_PARSE_CHARS) {
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
   }
-  const doc = callCoreWasm<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+  const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
     'format_payload',
     {
       kind: 'json_scrape',
-      raw: trimmed,
       url: finalUrl,
     },
+    trimmed,
   ).doc;
   if (!doc || !doc.markdown) return null;
   return {
@@ -3280,7 +3294,9 @@ export async function executeScrapeCall(params: {
     !stringFormats.has('branding') &&
     !attributesSpec &&
     !jsonSchemaSpec;
-  const atsSpec = canUseAtsAdapter ? resolveAtsPreFetchSpec(normalizedUrl) : null;
+  const atsSpec = canUseAtsAdapter
+    ? resolveAtsPreFetchSpec(normalizedUrl, { liteBoard: payload.atsLiteBoard === true })
+    : null;
   if (atsSpec) {
     try {
       const atsRes = await executeHubFetch(

@@ -229,4 +229,19 @@ func TestLargeGreenhouseAndAshbyStreamingBoundedHeap(t *testing.T) {
 	if ashbyRes == nil || len(ashbyRes.Jobs) != 1 || ashbyRes.Jobs[0].Company != "Linear" {
 		t.Fatalf("expected Ashby streaming to backfill trailing organizationName='Linear', got %+v", ashbyRes)
 	}
+
+	// Verify lite Greenhouse board (`?content=false` for `verify` mode & slug-existence probes) and single posting omit `?content=true` upstream.
+	liteSpec := ResolveATSPreFetchSpec("https://job-boards.greenhouse.io/anthropic?content=false")
+	if liteSpec == nil || liteSpec.FetchURL != "https://boards-api.greenhouse.io/v1/boards/anthropic/jobs" {
+		t.Fatalf("expected lite Greenhouse board FetchURL without ?content=true, got %+v", liteSpec)
+	}
+	liteJobSpec := ResolveATSPreFetchSpec("https://job-boards.greenhouse.io/anthropic/jobs/5462972008?content=false")
+	if liteJobSpec == nil || liteJobSpec.FetchURL != "https://boards-api.greenhouse.io/v1/boards/anthropic/jobs/5462972008" {
+		t.Fatalf("expected lite Greenhouse job FetchURL without ?content=true, got %+v", liteJobSpec)
+	}
+	liteGH := `{"jobs":[{"id":5462972008,"title":"Member of Technical Staff","absolute_url":"https://job-boards.greenhouse.io/anthropic/jobs/5462972008","location":{"name":"San Francisco, CA"},"company_name":"Anthropic","updated_at":"2026-11-24T12:00:00Z"}],"meta":{"total":1}}`
+	liteRes := FormatATSResponse("https://job-boards.greenhouse.io/anthropic?content=false", liteGH, "https://job-boards.greenhouse.io/anthropic", nil, refNow)
+	if liteRes == nil || len(liteRes.Jobs) != 1 || len(liteRes.Links) != 1 || liteRes.Jobs[0].URL != "https://job-boards.greenhouse.io/anthropic/jobs/5462972008" {
+		t.Fatalf("unexpected lite Greenhouse board result: %+v", liteRes)
+	}
 }

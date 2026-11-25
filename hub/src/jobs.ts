@@ -292,11 +292,23 @@ export function salvageAshbyBoardFromTruncatedJson(raw: string): {
   );
 }
 
-export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
+export function resolveAtsPreFetchSpec(urlStr: string, opts?: { liteBoard?: boolean }): AtsPreFetchSpec | null {
   if (!urlStr) return null;
+  let effectiveUrl = String(urlStr);
+  if (opts?.liteBoard) {
+    try {
+      const u = new URL(effectiveUrl);
+      if (u.hostname.toLowerCase().endsWith('.greenhouse.io') && !u.searchParams.has('content')) {
+        u.searchParams.set('content', 'false');
+        effectiveUrl = u.toString();
+      }
+    } catch {
+      // ignore
+    }
+  }
   const spec = callCoreWasm<{
     spec: Omit<AtsPreFetchSpec, 'format'> | null;
-  }>('jobs_resolve_ats_spec', { url: String(urlStr) }).spec;
+  }>('jobs_resolve_ats_spec', { url: effectiveUrl }).spec;
   if (!spec) return null;
   return {
     ...spec,
@@ -305,7 +317,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
       return (
         callCoreWasmRaw<{ result: AtsFormattedDoc | null }>(
           'jobs_format_ats',
-          { specUrl: urlStr, origUrl: String(originalUrl || urlStr), nowMs: Date.now() },
+          { specUrl: effectiveUrl, origUrl: String(originalUrl || urlStr), nowMs: Date.now() },
           rawBody,
         ).result ?? null
       );
@@ -785,7 +797,10 @@ function buildJobsScrapeCacheKey(args: Record<string, unknown>, callerCacheScope
       parts.length === 1 &&
       !u.searchParams.has('offset')
     ) {
-      canonicalUrl = `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}`;
+      const ghLite = u.searchParams.get('content')?.toLowerCase() === 'false';
+      canonicalUrl = ghLite
+        ? `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}?content=false`
+        : `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}`;
     } else if (host === 'jobs.lever.co' && parts.length === 1 && !u.searchParams.has('offset')) {
       canonicalUrl = `https://jobs.lever.co/${parts[0]!.toLowerCase()}`;
     } else if (host === 'ats.rippling.com' && parts.length >= 1) {
@@ -806,7 +821,8 @@ function buildJobsScrapeCacheKey(args: Record<string, unknown>, callerCacheScope
   const fmts = Array.isArray(args.formats) ? [...(args.formats as string[])].sort().join(',') : 'markdown';
   const siteKey = typeof args.site === 'string' ? args.site.trim().toLowerCase() : '';
   const targetKey = typeof args.target === 'string' ? args.target.trim().toLowerCase() : '';
-  return `${callerCacheScope}|${canonicalUrl}|${fmts}|${targetKey}|${siteKey}`;
+  const liteSuffix = args.atsLiteBoard === true ? '|lite' : '';
+  return `${callerCacheScope}|${canonicalUrl}|${fmts}|${targetKey}|${siteKey}${liteSuffix}`;
 }
 
 function readJobsScrapeCache(partition: JobsCachePartition, key: string, now = Date.now()): JobsScrapeResponse | null {
@@ -1016,6 +1032,8 @@ async function executeJobsVerifyMode(params: {
         executeScrape({
           url: grp.boardUrl,
           renderMode: 'auto',
+          ephemeral: true,
+          atsLiteBoard: true,
           formats: ['markdown', 'links'],
           ...(payload.target ? { target: payload.target } : {}),
           ...(payload.site ? { site: payload.site } : {}),
@@ -1030,6 +1048,8 @@ async function executeJobsVerifyMode(params: {
           const fbRes = await executeScrape({
             url: fb.boardUrl,
             renderMode: 'auto',
+            ephemeral: true,
+            atsLiteBoard: true,
             formats: ['markdown', 'links'],
             ...(payload.target ? { target: payload.target } : {}),
             ...(payload.site ? { site: payload.site } : {}),
@@ -1060,6 +1080,8 @@ async function executeJobsVerifyMode(params: {
             const recRes = await executeScrape({
               url: recoveredIdentity.boardUrl,
               renderMode: 'auto',
+              ephemeral: true,
+              atsLiteBoard: true,
               formats: ['markdown', 'links'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -1081,6 +1103,8 @@ async function executeJobsVerifyMode(params: {
       const direct = await executeScrape({
         url: item.url,
         renderMode: 'auto',
+        ephemeral: true,
+        atsLiteBoard: true,
         formats: ['markdown'],
         ...(payload.target ? { target: payload.target } : {}),
         ...(payload.site ? { site: payload.site } : {}),
@@ -1176,6 +1200,8 @@ async function executeJobsVerifyMode(params: {
       const wdCheck = await executeScrape({
         url: item.url,
         renderMode: 'auto',
+        ephemeral: true,
+        atsLiteBoard: true,
         formats: ['markdown'],
         ...(payload.target ? { target: payload.target } : {}),
         ...(payload.site ? { site: payload.site } : {}),
@@ -1327,6 +1353,13 @@ export async function executeJobsCall(params: {
     ): Promise<{ status: number; body: Record<string, unknown> }> => {
       const cacheKey = args.noCache === true ? null : buildJobsScrapeCacheKey(args, callerCacheScope);
       if (cacheKey) {
+        if (args.atsLiteBoard === true) {
+          const fullBoardKey = buildJobsScrapeCacheKey({ ...args, atsLiteBoard: false }, callerCacheScope);
+          if (fullBoardKey) {
+            const fullCached = readJobsScrapeCache(cachePartition, fullBoardKey);
+            if (fullCached) return fullCached;
+          }
+        }
         const cached = readJobsScrapeCache(cachePartition, cacheKey);
         if (cached) return cached;
         const existingFlight = cachePartition.inFlight.get(cacheKey);
@@ -1598,6 +1631,7 @@ export async function executeJobsCall(params: {
                 discoverLlmsTxt: false,
                 preferOriginMarkdown: false,
                 ephemeral: true,
+                atsLiteBoard: true,
                 formats: ['markdown', 'links'],
                 ...(payload.target ? { target: payload.target } : {}),
                 ...(payload.site ? { site: payload.site } : {}),
@@ -1946,6 +1980,7 @@ export async function executeJobsCall(params: {
       const biRes = await executeScrape({
         url: builtInUrl,
         renderMode: 'auto',
+        ephemeral: true,
         formats: ['markdown', 'links'],
       }).catch(() => null);
       const biMd = typeof biRes?.body?.markdown === 'string' ? biRes.body.markdown : '';
@@ -1968,6 +2003,7 @@ export async function executeJobsCall(params: {
           fo: await executeScrape({
             url: feed.url,
             renderMode: 'auto',
+            ephemeral: true,
             formats: ['markdown'],
             ...(payload.target ? { target: payload.target } : {}),
             ...(payload.site ? { site: payload.site } : {}),
@@ -2147,6 +2183,7 @@ export async function executeJobsCall(params: {
               renderMode: srBoard ? 'off' : 'auto',
               discoverLlmsTxt: false,
               preferOriginMarkdown: false,
+              ephemeral: true,
               formats: needLinks ? ['markdown', 'links'] : ['markdown'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -2225,6 +2262,7 @@ export async function executeJobsCall(params: {
                   renderMode: 'off',
                   discoverLlmsTxt: false,
                   preferOriginMarkdown: false,
+                  ephemeral: true,
                   formats: ['markdown'],
                   ...(payload.target ? { target: payload.target } : {}),
                   ...(payload.site ? { site: payload.site } : {}),
@@ -2486,6 +2524,7 @@ export async function executeJobsCall(params: {
               renderMode: 'off',
               discoverLlmsTxt: false,
               preferOriginMarkdown: false,
+              ephemeral: true,
               formats: ['markdown'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),

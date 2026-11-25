@@ -10,6 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { assertFastAsync, assertFastSync, PERF_SCALE } from './perf-budget.ts';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { gzipSync } from 'node:zlib';
@@ -1229,11 +1230,10 @@ test('R7-H7: Sanitizer & Markdown differential hardening (ordered-list 2., fence
     runK++;
   }
   ticksInc = ticksInc.slice(0, 2_000_000);
-  const t0 = performance.now();
-  const sanitizedTicks = sanitizeInlineHtmlInMarkdown(ticksInc, 'https://example.com/');
-  const dtTicks = performance.now() - t0;
+  const sanitizedTicks = assertFastSync('2 MiB increasing-backticks scan', 50, () =>
+    sanitizeInlineHtmlInMarkdown(ticksInc, 'https://example.com/'),
+  );
   assert.equal(sanitizedTicks.length, 2_000_000);
-  assert.ok(dtTicks < 50, `Expected 2 MiB increasing-backticks scan in < 50ms, took ${dtTicks.toFixed(1)}ms`);
 });
 
 test('R7-H9: Declarative adapter linear link sanitization, MediaWiki 2 MiB linear preset, RSS https:// rule, URL parity & PSL/allowlist guards', () => {
@@ -1244,31 +1244,30 @@ test('R7-H9: Declarative adapter linear link sanitization, MediaWiki 2 MiB linea
     title: '[x](javascript:a'.repeat(61_000),
     post_stream: { posts: [{ username: 'alice', created_at: '2026-01-01', cooked: '<p>Body</p>' }] },
   });
-  const t0 = performance.now();
-  const h9Doc = discourseTwin.formatTwin(h9Body, 'https://discuss.python.org/t/async-io/12345', (h) => ({ markdown: h }));
-  const dtH9 = performance.now() - t0;
+  const h9Doc = assertFastSync('H9 977KB Discourse title', 40, () =>
+    discourseTwin.formatTwin(h9Body, 'https://discuss.python.org/t/async-io/12345', (h) => ({ markdown: h })),
+  );
   assert.ok(h9Doc);
   assert.equal(/\]\(\s*javascript:/i.test(h9Doc.markdown), false);
-  assert.ok(dtH9 < 40, `Expected H9 977KB Discourse title in < 40ms, took ${dtH9.toFixed(1)}ms`);
 
   // 2. MediaWiki 2 MiB spaces & newlines preset runs in < 25ms + `formatYamlFrontmatterCard` 2 MiB linear
   const wikiSpaces = `# Rust [edit]\n\nText [citation needed]\n${' '.repeat(2_000_000)}\n## Navigation menu\nChrome`;
-  const tw0 = performance.now();
-  const wikiOut = applyPostFetchSiteExtractor(
-    '<!doctype html><html><head><meta name="generator" content="MediaWiki 1.43"></head><body></body></html>',
-    'https://en.wikipedia.org/wiki/Rust',
-    wikiSpaces,
-    (h) => ({ markdown: h }),
+  const wikiOut = assertFastSync('2 MiB MediaWiki cleanup', 40, () =>
+    applyPostFetchSiteExtractor(
+      '<!doctype html><html><head><meta name="generator" content="MediaWiki 1.43"></head><body></body></html>',
+      'https://en.wikipedia.org/wiki/Rust',
+      wikiSpaces,
+      (h) => ({ markdown: h }),
+    ),
   );
-  const dtWiki = performance.now() - tw0;
   assert.ok(wikiOut);
   assert.equal(wikiOut.markdown.includes('[edit]'), false);
   assert.equal(wikiOut.markdown.includes('Navigation menu'), false);
-  assert.ok(dtWiki < 40, `Expected 2 MiB MediaWiki cleanup in < 40ms, took ${dtWiki.toFixed(1)}ms`);
 
-  const tf0 = performance.now();
-  const cardOut = formatYamlFrontmatterCard(`---\ntitle: Model\nlicense: mit\n---\n${'x'.repeat(2_000_000)}`, 'Fallback');
-  assert.ok(performance.now() - tf0 < 40 && cardOut.title === 'Model');
+  const cardOut = assertFastSync('2 MiB YAML frontmatter card', 40, () =>
+    formatYamlFrontmatterCard(`---\ntitle: Model\nlicense: mit\n---\n${'x'.repeat(2_000_000)}`, 'Fallback'),
+  );
+  assert.equal(cardOut.title, 'Model');
 
   // 3. XML/RSS/Atom feeds enforce strict public `https://` URLs in both `scrape.ts` and `declarative.ts`
   const rssXml = `<?xml version="1.0"?><rss version="2.0"><channel><title>Feed</title>
@@ -2603,7 +2602,7 @@ test('Round 8 (H3, H8 & Pre-Ship #3): Linear O(N) CPU budgets + 3 Prompt-Injecti
   sanitizeInlineHtmlInMarkdown('[a](https://example.com) <b/>');
   detectPromptInjection({ rawHtml: '<div hidden>warmup</div>', markdown: 'warmup' });
 
-  const bestMs = (fn: () => void, runs = 3): number => {
+  const bestMs = (fn: () => void, runs = 5): number => {
     let best = Infinity;
     for (let i = 0; i < runs; i++) {
       const t0 = performance.now();
@@ -2614,7 +2613,8 @@ test('Round 8 (H3, H8 & Pre-Ship #3): Linear O(N) CPU budgets + 3 Prompt-Injecti
     return best;
   };
 
-  const covMult = process.env.NODE_V8_COVERAGE ? 15 : process.env.CI ? 5 : 1;
+  // Local runs share the suite's `--test-concurrency=2` CPU, so use the shared local `PERF_SCALE` rather than 1x.
+  const covMult = process.env.NODE_V8_COVERAGE ? 15 : process.env.CI ? 5 : PERF_SCALE;
 
   // 1. H3: 64K and 2 MiB spaces + 'x' linear ASCII trim (< 5 ms / < 15 ms, scaled under V8 --coverage)
   const spaces64k = `${' '.repeat(65_536)}x`;
@@ -4263,17 +4263,15 @@ test('Round 9 (H2 & Mediums): Destination <10ms up to 1MiB, Storage v32 clamping
     const destNoDelim = 'a'.repeat(size);
     const mdLink = `[download](${destNoDelim})`;
 
-    const t0 = performance.now();
-    const disallowed = isDisallowedMarkdownLinkDestination(destNoDelim);
-    const dtDest = performance.now() - t0;
+    const disallowed = assertFastSync(`isDisallowedMarkdownLinkDestination(${size}B)`, 10, () =>
+      isDisallowedMarkdownLinkDestination(destNoDelim),
+    );
     assert.equal(disallowed, true, `>${8192}B destination without delimiter must fail closed`);
-    assert.ok(dtDest < 10 * covMul, `isDisallowedMarkdownLinkDestination(${size}B) took ${dtDest.toFixed(2)}ms (expected < 10ms)`);
 
-    const t1 = performance.now();
-    const neutralized = neutralizeAllUnsafeMarkdownLinksLinear(`${mdLink} :`);
-    const dtNeut = performance.now() - t1;
+    const neutralized = assertFastSync(`neutralizeAllUnsafeMarkdownLinksLinear(${size}B)`, 10, () =>
+      neutralizeAllUnsafeMarkdownLinksLinear(`${mdLink} :`),
+    );
     assert.ok(neutralized.startsWith('[download](#)'), `Expected oversized destination neutralized`);
-    assert.ok(dtNeut < 10 * covMul, `neutralizeAllUnsafeMarkdownLinksLinear(${size}B) took ${dtNeut.toFixed(2)}ms (expected < 10ms)`);
   }
 
   // 2. Storage `SCRAPE_PIPELINE_VERSION === 34`, clamping `pipelineVersion < 34`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
@@ -4311,17 +4309,16 @@ test('Round 9 (H2 & Mediums): Destination <10ms up to 1MiB, Storage v32 clamping
     limit: 16_384,
   });
   for (const pageOffset of [0, 65_536, 250_000, 512_000, 800_000, 1_000_000]) {
-    const tPage0 = performance.now();
-    const pageOut = await readArtifactPage({
-      bucket: bucket as unknown as R2Bucket,
-      blobSha256: `md:${bigSha}`,
-      format: 'markdown',
-      offset: pageOffset,
-      limit: 16_384,
-    });
-    const dtPage = performance.now() - tPage0;
+    const pageOut = await assertFastAsync(`1 MiB readArtifactPage(offset=${pageOffset})`, 5, () =>
+      readArtifactPage({
+        bucket: bucket as unknown as R2Bucket,
+        blobSha256: `md:${bigSha}`,
+        format: 'markdown',
+        offset: pageOffset,
+        limit: 16_384,
+      }),
+    );
     assert.equal(pageOut.ok, true);
-    assert.ok(dtPage < 5 * covMul, `1 MiB readArtifactPage(offset=${pageOffset}) took ${dtPage.toFixed(2)}ms (expected < 5ms)`);
     if (pageOut.ok) {
       assertZeroLiveHtmlAcrossSixDialects(pageOut.page.content, `1MiB:offset=${pageOffset}`);
     }

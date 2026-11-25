@@ -406,7 +406,9 @@ func TestLiveChromiumHiddenDOMPruningAndDetailsPreservationIfInstalled(t *testin
 	}
 	defer func() { _ = r.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 90s, not 30s: this t.Parallel() test cold-starts a real Chromium under `go test -race` alongside the other
+	// browser tests, and on a 2-vCPU CI runner that alone has exceeded 30s ("context deadline exceeded").
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	out, err := r.Execute(ctx, Task{

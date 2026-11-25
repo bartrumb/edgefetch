@@ -117,6 +117,7 @@ import {
   matchesApprovedWildcard as compilerWildcardMatch,
   validateManifestSet,
 } from '../scripts/compile-manifests.mjs';
+import { assertFastSync } from './perf-budget.ts';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks.ts';
 
 // ============================================================================
@@ -4611,17 +4612,17 @@ test('Job-Hunt-Kit Parity Retest (Items Aâ€“E) & Clean-Room Security Audit (F1â€
     isWikimediaHost,
   } = await import('../src/wikipedia');
 
-  const wikiReDoSStart = performance.now();
-  const cleanedSpacesBracket = cleanMediaWikiMarkdownLinear(' '.repeat(150_000) + '[');
-  const cleanedSpacesClosedUnmatched = cleanMediaWikiMarkdownLinear('x' + ' '.repeat(150_000) + '[unmatched]');
-  const cleanedUnclosedEdit = cleanMediaWikiMarkdownLinear('[edit](' + '?action=edit'.repeat(10_000));
-  const cleanedRepeatedOpenLinks = cleanMediaWikiMarkdownLinear('[a]('.repeat(20_000) + '?action=edit)');
-  const wikiElapsedMs = performance.now() - wikiReDoSStart;
+  const [cleanedSpacesBracket, cleanedSpacesClosedUnmatched, cleanedUnclosedEdit, cleanedRepeatedOpenLinks] =
+    assertFastSync('cleanMediaWikiMarkdownLinear adversarial corpus', 50, () => [
+      cleanMediaWikiMarkdownLinear(' '.repeat(150_000) + '['),
+      cleanMediaWikiMarkdownLinear('x' + ' '.repeat(150_000) + '[unmatched]'),
+      cleanMediaWikiMarkdownLinear('[edit](' + '?action=edit'.repeat(10_000)),
+      cleanMediaWikiMarkdownLinear('[a]('.repeat(20_000) + '?action=edit)'),
+    ]);
   assert.equal(cleanedSpacesBracket, '[');
   assert.equal(cleanedSpacesClosedUnmatched.length, 150_012);
   assert.ok(cleanedUnclosedEdit.startsWith('[edit]('));
   assert.ok(cleanedRepeatedOpenLinks.length > 70_000);
-  assert.ok(wikiElapsedMs < 50, `cleanMediaWikiMarkdownLinear must be O(N) (<50ms), took ${wikiElapsedMs.toFixed(1)}ms`);
 
   assert.equal(parseWikipediaArticleUrl('https://en.wikipedia.org/wiki/..%2fw%2fapi.php'), null);
   assert.equal(parseWikipediaArticleUrl('https://en.wikipedia.org/wiki/Foo/..%2f..%2fw%2fapi.php'), null);

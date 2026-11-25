@@ -1619,9 +1619,11 @@ describe('Tier 1 — Area A: Portable Hub HTTP, MCP & Sub-Modules', () => {
         assert.equal(res.status, 200, `[F2/M1] ${c.path} returned ${res.status}: ${await res.text()}`);
         assertTraceHeaders(res, { expectedTraceId: traceId, tag: `[F2/M1 ${c.path}]` });
 
+        // Also wait for the `edgefetch.http` span asserted below; it can be exported in a later batch.
         await collector.waitForSpans((entries) =>
           entries.some((e) => e.span?.traceId === traceId && e.span?.name === c.spanName) &&
-          entries.some((e) => e.span?.traceId === traceId && e.span?.name === 'edgefetch.dispatch'),
+          entries.some((e) => e.span?.traceId === traceId && e.span?.name === 'edgefetch.dispatch') &&
+          entries.some((e) => e.span?.traceId === traceId && e.span?.name === 'edgefetch.http'),
         );
         const spans = collector.findByTraceId(traceId);
         const httpSpan = spans.find((e) => e.span.name === 'edgefetch.http');
@@ -2414,7 +2416,9 @@ describe('Tier 1 — Area C: OAuth 2.1, /admin, RFC 9421 BotAuth, Twins, Content
       });
       assert.equal(afterRev.status, 401);
 
-      await collector.waitForSpans((e) => e.some((x) => x.span.name.startsWith('edgefetch.oauth.')), 3500);
+      // Wait for the same count the assertion checks: audit spans are exported asynchronously (ctx.waitUntil batches),
+      // so waiting for only the first span races the later flushes (CI run 45715569476 saw 2 of 3).
+      await collector.waitForSpans((e) => e.filter((x) => x.span.name.startsWith('edgefetch.oauth.')).length >= 3, 6000);
       const oauthSpans = collector.entries.filter((e) => e.span.name.startsWith('edgefetch.oauth.'));
       assert.ok(oauthSpans.length >= 3, `[F4/M1] expected >=3 edgefetch.oauth.* audit spans, got ${oauthSpans.length}`);
       assertNoLeakedSecrets(collector.entries, [
@@ -2477,7 +2481,9 @@ describe('Tier 1 — Area C: OAuth 2.1, /admin, RFC 9421 BotAuth, Twins, Content
       });
       assert.equal(outRes.status, 302);
 
-      await collector.waitForSpans((e) => e.some((x) => x.span.name.startsWith('edgefetch.admin.')), 3500);
+      // Wait for the same count the assertion checks: audit spans are exported asynchronously (ctx.waitUntil batches),
+      // so waiting for only the first span races the later flushes.
+      await collector.waitForSpans((e) => e.filter((x) => x.span.name.startsWith('edgefetch.admin.')).length >= 3, 6000);
       const adminSpans = collector.entries.filter((e) => e.span.name.startsWith('edgefetch.admin.'));
       assert.ok(adminSpans.length >= 3, `[F4/M1] expected >=3 edgefetch.admin.* audit spans, got ${adminSpans.length}`);
       assertNoLeakedSecrets(collector.entries, [hub.callerToken, sess.cookieVal, sess.csrf], '[F4/M1 admin]');

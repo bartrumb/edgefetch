@@ -1,28 +1,19 @@
 /**
- * Polite Full-Store Catalog Engine (`hub/src/catalog.ts`):
+ * Polite Full-Store Catalog Coordinator (`hub/src/catalog.ts`).
  *
- *  - Sequential, single-host-at-a-time pagination through `CatalogSpec` adapters (`shopify`, `woocommerce`).
- *  - Every page executes through `executeHubFetch` (enforcing `robots.txt`, `Content-Signal`, Web Bot Auth, and SSRF guards).
- *  - 3-Strikes `429` cooldown (`status: 'cooling_down'`, `resumeAt`, honoring `Retry-After` / default `60s` on Shopify).
- *  - Immediate ethical halt on WAF/challenges or non-JSON bodies (`status: 'challenged'`, never bypassing).
- *  - All-or-nothing completion (`status: 'complete'` iff every page succeeded and natural end-of-catalog was reached).
- *  - Shrink Guard (`warning: 'shrink'`, `previousProducts`) when `< 50%` of prior `complete` snapshot for the same origin.
- *  - NDJSON artifact serialization in `ARTIFACTS` R2 + deterministic snapshot diff (`added`, `removed`, `changed`) ignoring `updatedAt`.
+ * Thin Cloudflare R2/D1/semaphore/cooldown/LRU async coordinator delegating all pure-CPU storefront URL
+ * validation, page evaluation (WAF/non-storefront/redirect/cooldown), record clamping, FNV-1a snapshot
+ * hashing, `>50%` shrink-guard diffing, UCP discovery, NDJSON parsing, lean projection, and multi-attribute
+ * record filtering to Go WASM (`internal/catalog/`).
  */
 
-import {
-  getCatalogAdapter,
-  type CatalogRecord,
-  type CatalogSpec,
-  type CatalogVariantRecord,
-} from './extractors/registry';
+import { getCatalogAdapter, type CatalogRecord, type CatalogSpec, type CatalogVariantRecord } from './extractors/registry';
 import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
 import { getActiveCallerAuthContext } from './oauth';
-import { isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
 import { ensureD1ColumnIfMissing } from './search-index';
 import { sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
-import { classifyWafAndChallenge } from './waf';
+import { callCoreWasm, callCoreWasmRaw } from './wasm-bridge';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
 
@@ -86,41 +77,6 @@ export interface CatalogRecordsResult {
   records: Array<CatalogRecord | Record<string, unknown>>;
 }
 
-/** Projects a `CatalogRecord` down to compact product-level summary fields (`fields: "lean"`), omitting `tags`, `options`, `images`, `descriptionText`, and `variants[]`. */
-export function projectLeanCatalogRecord(rec: CatalogRecord): Record<string, unknown> {
-  const numericPrices: number[] = [];
-  let currency: string | null = null;
-  let available = false;
-  let fallbackVariantImg: string | null = null;
-  for (const v of rec.variants) {
-    if (typeof v.price === 'number' && Number.isFinite(v.price)) numericPrices.push(v.price);
-    if (!currency && typeof v.currency === 'string' && v.currency) currency = v.currency;
-    if (v.available === true) available = true;
-    if (!fallbackVariantImg && typeof v.image === 'string' && v.image) fallbackVariantImg = v.image;
-  }
-  const priceMin = numericPrices.length > 0 ? Math.min(...numericPrices) : null;
-  const priceMax = numericPrices.length > 0 ? Math.max(...numericPrices) : null;
-  const primaryImage = (Array.isArray(rec.images) && rec.images[0] ? rec.images[0] : null) ?? fallbackVariantImg;
-  return {
-    platform: rec.platform,
-    origin: rec.origin,
-    productId: rec.productId,
-    handle: rec.handle,
-    url: rec.url,
-    title: rec.title,
-    vendor: rec.vendor,
-    productType: rec.productType,
-    available,
-    priceMin,
-    priceMax,
-    currency,
-    image: primaryImage,
-    variantCount: rec.variants.length,
-    publishedAt: rec.publishedAt,
-    updatedAt: rec.updatedAt,
-  };
-}
-
 export interface CatalogCallPayload {
   url?: unknown;
   platform?: unknown;
@@ -133,10 +89,15 @@ export interface CatalogCallPayload {
   catalogId?: unknown;
   catalogJobId?: unknown;
   offset?: unknown;
+  cursor?: unknown;
   limit?: unknown;
   vendor?: unknown;
   productType?: unknown;
+  tag?: unknown;
   availableOnly?: unknown;
+  inStockOnly?: unknown;
+  minPrice?: unknown;
+  maxPrice?: unknown;
   query?: unknown;
   target?: unknown;
   site?: unknown;
@@ -171,27 +132,22 @@ interface D1PreparedStatementLike {
   first<T = Record<string, unknown>>(): Promise<T | null>;
   all<T = Record<string, unknown>>(): Promise<{ results?: T[] }>;
 }
-
 interface D1DatabaseLike {
   prepare(query: string): D1PreparedStatementLike;
 }
-
 interface R2ObjectBodyLike {
   body?: ReadableStream<Uint8Array>;
   arrayBuffer?(): Promise<ArrayBuffer>;
   text(): Promise<string>;
 }
-
 interface R2BucketLike {
   put(key: string, value: string | Uint8Array | ArrayBuffer, options?: Record<string, unknown>): Promise<unknown>;
   get(key: string): Promise<R2ObjectBodyLike | null>;
 }
-
 interface SnapshotHashBundle {
   products: Record<string, string>;
   variants: Record<string, string>;
 }
-
 interface StoredCatalogRun {
   userId: string;
   summary: CatalogStatusSummary;
@@ -209,16 +165,14 @@ export const MAX_CACHED_CATALOG_RUNS = 16;
 export const MAX_CACHED_CATALOG_RUNS_PER_USER = 4;
 export const MAX_CONCURRENT_CATALOG_PER_PRINCIPAL = 2;
 export const MAX_CONCURRENT_CATALOG_GLOBAL = 8;
-export const MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL = 6; // Reserves 2 global slots for `owner` so members cannot starve owner!
+export const MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL = 6;
 export const MAX_CONCURRENT_R2_RELOADS = 2;
 export const MAX_CATALOG_TOTAL_SLEEP_MS = 120_000;
 export const MAX_CATALOG_WALL_MS = 120_000;
+
 const MAX_R2_DECOMPRESSED_BYTES = 32 * 1024 * 1024;
 const MAX_R2_CACHEABLE_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_VARIANTS_PER_CATALOG_RUN = 50_000;
-const MAX_RECORD_SERIALIZED_BYTES = 64 * 1024;
-const MAX_IMAGES_PER_CATALOG_RECORD = 250;
-const MAX_VARIANTS_PER_CATALOG_RECORD = 250;
 const MAX_COMPACT_HISTORY_RUNS = 256;
 const MAX_COMPACT_HISTORY_RUNS_PER_USER = 32;
 const VALID_CATALOG_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
@@ -226,112 +180,54 @@ const VALID_CATALOG_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const MEMORY_CATALOG_RUNS = new Map<string, StoredCatalogRun>();
 const R2_RELOAD_LRU_CACHE = new Map<string, { records: CatalogRecord[]; bytes: number }>();
 const INFLIGHT_R2_RELOADS = new Map<string, Promise<unknown>>();
+const SHOPIFY_ORIGIN_CURRENCY_CACHE = new Map<string, { currency: string | null; expiresAt: number }>();
+const SHOPIFY_ORIGIN_CURRENCY_TTL_MS = 30 * 60_000;
+
 let activeR2Reloads = 0;
 let peakR2ReloadsSeen = 0;
 const r2ReloadWaitQueue: Array<() => void> = [];
-
 const ACTIVE_CATALOG_BY_PRINCIPAL = new Map<string, number>();
 let activeCatalogGlobal = 0;
 let activeCatalogNonOwnerGlobal = 0;
 const D1_INIT_CACHE = new WeakSet<object>();
 
-function resolveCatalogTenantKey(params?: { userId?: string; principal?: string }): {
-  ownerKey: string;
-  concurrencyBucketKey: string;
-  isOwner: boolean;
-} {
-  const activeAuth = getActiveCallerAuthContext();
-  if (typeof params?.userId === 'string' && params.userId.trim()) {
-    const cleanUid = sanitizeStorageUserId(params.userId.trim());
-    const isOwner = activeAuth ? activeAuth.role === 'owner' : cleanUid === 'owner';
-    return { ownerKey: cleanUid, concurrencyBucketKey: cleanUid, isOwner };
-  }
-  if (activeAuth) {
-    const cleanUid = sanitizeStorageUserId(activeAuth.userId);
-    return {
-      ownerKey: cleanUid,
-      concurrencyBucketKey: cleanUid,
-      isOwner: activeAuth.role === 'owner',
-    };
-  }
-  const rawPrincipal = (params?.principal ?? '').trim();
-  if (rawPrincipal === 'anonymous') {
-    return { ownerKey: 'anonymous', concurrencyBucketKey: 'anonymous', isOwner: false };
-  }
-  if (!rawPrincipal || rawPrincipal === 'owner_token' || rawPrincipal === 'mcp_token' || rawPrincipal === 'owner') {
-    return { ownerKey: 'owner', concurrencyBucketKey: 'owner', isOwner: true };
-  }
-  // When invoked directly with `oauth:<client>` without an explicit `userId`, group multi-client member prefixes
-  // (`oauth:member-client-1..N` -> `oauth:member`) so multi-client rotation cannot multiply per-user concurrency!
-  let bucket = rawPrincipal;
-  if (rawPrincipal.startsWith('oauth:')) {
-    const clientPart = rawPrincipal.slice('oauth:'.length);
-    const dashPrefix = /^([a-z0-9_]+)-client-\d+$/i.exec(clientPart);
-    if (dashPrefix?.[1]) {
-      bucket = `oauth:${dashPrefix[1].toLowerCase()}`;
-    }
-  }
-  return { ownerKey: rawPrincipal.slice(0, 128), concurrencyBucketKey: bucket.slice(0, 128), isOwner: false };
-}
-
-function withR2ReloadSemaphore<T>(fn: () => Promise<T>): Promise<T> {
-  return new Promise<T>((resolveSlot, rejectSlot) => {
-    const runTask = () => {
-      activeR2Reloads++;
-      if (activeR2Reloads > peakR2ReloadsSeen) {
-        peakR2ReloadsSeen = activeR2Reloads;
-      }
-      Promise.resolve()
-        .then(fn)
-        .then(resolveSlot, rejectSlot)
-        .finally(() => {
-          activeR2Reloads = Math.max(0, activeR2Reloads - 1);
-          const next = r2ReloadWaitQueue.shift();
-          if (next) next();
-        });
-    };
-    if (activeR2Reloads < MAX_CONCURRENT_R2_RELOADS) {
-      runTask();
-    } else {
-      r2ReloadWaitQueue.push(runTask);
-    }
-  });
-}
-
-function coalesceSingleflightR2Reload<T>(key: string, loader: () => Promise<T>): Promise<T> {
-  const existing = INFLIGHT_R2_RELOADS.get(key) as Promise<T> | undefined;
-  if (existing) return existing;
-  const p = withR2ReloadSemaphore(loader).finally(() => {
-    if (INFLIGHT_R2_RELOADS.get(key) === p) {
-      INFLIGHT_R2_RELOADS.delete(key);
-    }
-  });
-  INFLIGHT_R2_RELOADS.set(key, p);
-  return p;
+export function projectLeanCatalogRecord(rec: CatalogRecord): Record<string, unknown> {
+  return callCoreWasm<{ lean: Record<string, unknown> }>('catalog_project_lean', { record: rec }).lean;
 }
 
 export function approxHashBundleBytes(hashes: SnapshotHashBundle | null): number {
-  if (!hashes) return 0;
-  let total = 64;
-  for (const [k, v] of Object.entries(hashes.products)) {
-    total += approxUtf8Bytes(k) + approxUtf8Bytes(v) + 48;
-  }
-  for (const [vk, vv] of Object.entries(hashes.variants)) {
-    total += approxUtf8Bytes(vk) + approxUtf8Bytes(vv) + 48;
-  }
-  return total;
+  return hashes ? callCoreWasm<{ bytes: number }>('catalog_approx_hash_bytes', { hashes }).bytes : 0;
 }
 
-export function getCatalogMemoryUsageForTests(): {
-  runsCount: number;
-  recordsBytes: number;
-  hashesBytes: number;
-  reloadCacheBytes: number;
-  totalBytes: number;
-  maxBytes: number;
-  activeR2Reloads: number;
-  peakR2ReloadsSeen: number;
-} {
+export function computeCatalogVariantHash(v: CatalogVariantRecord): string {
+  return callCoreWasm<{ hash: string }>('catalog_variant_hash', { variant: v }).hash;
+}
+
+export function computeCatalogProductHash(rec: CatalogRecord): string {
+  return callCoreWasm<{ hash: string }>('catalog_product_hash', { record: rec }).hash;
+}
+
+export function computeCatalogSnapshotDiff(prev: SnapshotHashBundle, curr: SnapshotHashBundle): CatalogSnapshotDiff {
+  return callCoreWasm<{ diff: CatalogSnapshotDiff }>('catalog_snapshot_diff', { prev, curr }).diff;
+}
+
+export function discoverUcpEndpointFromRobots(originStr: string, robotsText: string): CatalogUcpMetadata | null {
+  if (!robotsText) return null;
+  return callCoreWasmRaw<{ ucp: CatalogUcpMetadata | null }>('catalog_discover_ucp', { origin: String(originStr ?? '') }, String(robotsText)).ucp ?? null;
+}
+
+export function isSafeHttpsStoreUrl(urlStr: string, selfHost?: string): URL | null {
+  if (typeof urlStr !== 'string' || !urlStr.trim()) return null;
+  const res = callCoreWasm<{ ok: boolean; normalized?: string }>('catalog_validate_store_url', { url: urlStr, selfHost: selfHost ?? '' });
+  if (!res.ok || !res.normalized) return null;
+  try {
+    return new URL(res.normalized);
+  } catch {
+    return null;
+  }
+}
+
+export function getCatalogMemoryUsageForTests() {
   let recordsBytes = 0;
   let hashesBytes = 0;
   for (const v of MEMORY_CATALOG_RUNS.values()) {
@@ -339,9 +235,7 @@ export function getCatalogMemoryUsageForTests(): {
     if (v.hashes !== null) hashesBytes += v.hashesBytes;
   }
   let reloadCacheBytes = 0;
-  for (const c of R2_RELOAD_LRU_CACHE.values()) {
-    reloadCacheBytes += c.bytes;
-  }
+  for (const c of R2_RELOAD_LRU_CACHE.values()) reloadCacheBytes += c.bytes;
   return {
     runsCount: MEMORY_CATALOG_RUNS.size,
     recordsBytes,
@@ -359,72 +253,56 @@ export function resetCatalogStateForTests(): void {
   R2_RELOAD_LRU_CACHE.clear();
   INFLIGHT_R2_RELOADS.clear();
   ACTIVE_CATALOG_BY_PRINCIPAL.clear();
+  SHOPIFY_ORIGIN_CURRENCY_CACHE.clear();
   activeCatalogGlobal = 0;
   activeCatalogNonOwnerGlobal = 0;
   peakR2ReloadsSeen = 0;
 }
 
-function approxUtf8Bytes(s: string): number {
-  let bytes = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 0x80) bytes += 1;
-    else if (c < 0x800) bytes += 2;
-    else if (c >= 0xd800 && c <= 0xdbff) {
-      bytes += 4;
-      i++;
-    } else bytes += 3;
-  }
-  return bytes;
+function resolveCatalogTenantKey(params?: { userId?: string; principal?: string }) {
+  const activeAuth = getActiveCallerAuthContext();
+  const cleanUserId = typeof params?.userId === 'string' && params.userId.trim() ? sanitizeStorageUserId(params.userId.trim()) : '';
+  const activeUserId = activeAuth ? sanitizeStorageUserId(activeAuth.userId) : '';
+  return callCoreWasm<{ ownerKey: string; concurrencyBucketKey: string; isOwner: boolean }>('catalog_resolve_tenant', {
+    cleanUserId,
+    principal: String(params?.principal ?? ''),
+    activeUserId,
+    activeRole: activeAuth ? activeAuth.role : '',
+  });
 }
 
-function clampCatalogRecord(rec: CatalogRecord): { record: CatalogRecord; bytes: number } {
-  let desc = rec.descriptionText;
-  if (typeof desc === 'string' && desc.length > 60_000) {
-    desc = desc.slice(0, 60_000);
-  }
-  const images = Array.isArray(rec.images) ? rec.images.slice(0, MAX_IMAGES_PER_CATALOG_RECORD) : [];
-  const variants = Array.isArray(rec.variants) ? rec.variants.slice(0, MAX_VARIANTS_PER_CATALOG_RECORD) : [];
-  const tags = Array.isArray(rec.tags) ? rec.tags.slice(0, 128) : [];
-  const options = Array.isArray(rec.options) ? rec.options.slice(0, 32) : [];
+function withR2ReloadSemaphore<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolveSlot, rejectSlot) => {
+    const runTask = () => {
+      activeR2Reloads++;
+      if (activeR2Reloads > peakR2ReloadsSeen) peakR2ReloadsSeen = activeR2Reloads;
+      Promise.resolve()
+        .then(fn)
+        .then(resolveSlot, rejectSlot)
+        .finally(() => {
+          activeR2Reloads = Math.max(0, activeR2Reloads - 1);
+          r2ReloadWaitQueue.shift()?.();
+        });
+    };
+    if (activeR2Reloads < MAX_CONCURRENT_R2_RELOADS) runTask();
+    else r2ReloadWaitQueue.push(runTask);
+  });
+}
 
-  let clamped: CatalogRecord = {
-    ...rec,
-    ...(desc !== undefined ? { descriptionText: desc } : {}),
-    images,
-    variants,
-    tags,
-    options,
-  };
-  let serialized = JSON.stringify(clamped);
-  let bytes = approxUtf8Bytes(serialized);
-  if (bytes > MAX_RECORD_SERIALIZED_BYTES) {
-    if (typeof clamped.descriptionText === 'string' && clamped.descriptionText.length > 0) {
-      const keepDesc = Math.max(0, Math.min(4_096, clamped.descriptionText.length - (bytes - MAX_RECORD_SERIALIZED_BYTES)));
-      clamped = { ...clamped, descriptionText: clamped.descriptionText.slice(0, keepDesc) };
-      serialized = JSON.stringify(clamped);
-      bytes = approxUtf8Bytes(serialized);
-    }
-    if (bytes > MAX_RECORD_SERIALIZED_BYTES && clamped.variants.length > 32) {
-      clamped = {
-        ...clamped,
-        variants: clamped.variants.slice(0, 32),
-        ...(clamped.images ? { images: clamped.images.slice(0, 32) } : {}),
-      };
-      serialized = JSON.stringify(clamped);
-      bytes = approxUtf8Bytes(serialized);
-    }
-  }
-  return { record: clamped, bytes };
+function coalesceSingleflightR2Reload<T>(key: string, loader: () => Promise<T>): Promise<T> {
+  const existing = INFLIGHT_R2_RELOADS.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const p = withR2ReloadSemaphore(loader).finally(() => {
+    if (INFLIGHT_R2_RELOADS.get(key) === p) INFLIGHT_R2_RELOADS.delete(key);
+  });
+  INFLIGHT_R2_RELOADS.set(key, p);
+  return p;
 }
 
 function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
   const protectedEntry = protectedCatalogId ? MEMORY_CATALOG_RUNS.get(protectedCatalogId) : undefined;
   const activeUserId = protectedEntry?.userId;
 
-  // 0. Per-user fair-share isolation (`R8-Catalog`): BEFORE touching any other user's runs, enforce the calling user's
-  // own per-user compact history cap, per-user cached-body cap, and per-user memory byte cap so one tenant in memory-only
-  // mode can NEVER wipe another tenant's catalog runs, records, or diff baselines!
   if (activeUserId) {
     const perUserCachedCap = activeUserId === 'owner' ? MAX_CACHED_CATALOG_RUNS_PER_USER * 2 : MAX_CACHED_CATALOG_RUNS_PER_USER;
     const perUserByteCap = activeUserId === 'owner' ? MAX_GLOBAL_CATALOG_BYTES : MAX_PER_USER_CATALOG_BYTES;
@@ -438,9 +316,7 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
         userCachedBodyRuns++;
         userBytes += v.retainedBytes;
       }
-      if (v.hashes !== null) {
-        userBytes += v.hashesBytes;
-      }
+      if (v.hashes !== null) userBytes += v.hashesBytes;
     }
     if (userCachedBodyRuns > perUserCachedCap || userBytes > perUserByteCap) {
       for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
@@ -465,8 +341,7 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
       for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
         if (k === protectedCatalogId || v.userId !== activeUserId) continue;
         MEMORY_CATALOG_RUNS.delete(k);
-        userRunCount--;
-        if (userRunCount <= MAX_COMPACT_HISTORY_RUNS_PER_USER) break;
+        if (--userRunCount <= MAX_COMPACT_HISTORY_RUNS_PER_USER) break;
       }
     }
   }
@@ -487,11 +362,8 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
       bytesByUser.set(v.userId, (bytesByUser.get(v.userId) ?? 0) + v.hashesBytes);
     }
   }
-  for (const c of R2_RELOAD_LRU_CACHE.values()) {
-    globalBytes += c.bytes;
-  }
+  for (const c of R2_RELOAD_LRU_CACHE.values()) globalBytes += c.bytes;
 
-  // 1. Evict oldest R2 reload LRU entries first when over global 32 MiB budget
   if (globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
     for (const [rk, rv] of R2_RELOAD_LRU_CACHE.entries()) {
       globalBytes -= rv.bytes;
@@ -500,7 +372,6 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
     }
   }
 
-  // 2. Evict full in-memory record bodies (`v.records`) from heaviest tenant (`cachedRuns >= 2` / largest byte user) first
   while (cachedBodyRuns > MAX_CACHED_CATALOG_RUNS || globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
     let heaviestUser: string | null = null;
     let maxUserCached = 1;
@@ -512,16 +383,17 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
     }
     let victimRun: StoredCatalogRun | null = null;
     for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
-      if (k === protectedCatalogId || v.records === null) continue;
-      if (heaviestUser !== null && v.userId !== heaviestUser) continue;
-      victimRun = v;
-      break;
+      if (k !== protectedCatalogId && v.records !== null && (heaviestUser === null || v.userId === heaviestUser)) {
+        victimRun = v;
+        break;
+      }
     }
     if (!victimRun) {
       for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
-        if (k === protectedCatalogId || v.records === null) continue;
-        victimRun = v;
-        break;
+        if (k !== protectedCatalogId && v.records !== null) {
+          victimRun = v;
+          break;
+        }
       }
     }
     if (!victimRun) break;
@@ -533,7 +405,6 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
     victimRun.retainedBytes = 0;
   }
 
-  // 3. `M3`: Evict retained `variantHashes` / `SnapshotHashBundle` (`v.hashes`) from heaviest byte tenant first
   while (globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
     let heaviestByteUser: string | null = null;
     let maxBytes = 0;
@@ -545,16 +416,17 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
     }
     let victimHashRun: StoredCatalogRun | null = null;
     for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
-      if (k === protectedCatalogId || v.hashes === null) continue;
-      if (heaviestByteUser !== null && v.userId !== heaviestByteUser) continue;
-      victimHashRun = v;
-      break;
+      if (k !== protectedCatalogId && v.hashes !== null && (heaviestByteUser === null || v.userId === heaviestByteUser)) {
+        victimHashRun = v;
+        break;
+      }
     }
     if (!victimHashRun) {
       for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
-        if (k === protectedCatalogId || v.hashes === null) continue;
-        victimHashRun = v;
-        break;
+        if (k !== protectedCatalogId && v.hashes !== null) {
+          victimHashRun = v;
+          break;
+        }
       }
     }
     if (!victimHashRun) break;
@@ -564,7 +436,6 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
     victimHashRun.hashesBytes = 0;
   }
 
-  // 4. Hard guard if even `protectedCatalogId` alone exceeds `32 MiB` (`records` + `hashes` combined)
   if (globalBytes > MAX_GLOBAL_CATALOG_BYTES && protectedCatalogId) {
     const prot = MEMORY_CATALOG_RUNS.get(protectedCatalogId);
     if (prot) {
@@ -574,7 +445,6 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
         prot.retainedBytes = 0;
       }
       if (globalBytes > MAX_GLOBAL_CATALOG_BYTES && prot.hashes !== null) {
-        globalBytes -= prot.hashesBytes;
         prot.hashes = null;
         prot.hashesBytes = 0;
       }
@@ -583,9 +453,7 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
 
   while (MEMORY_CATALOG_RUNS.size > MAX_COMPACT_HISTORY_RUNS) {
     const totalByUser = new Map<string, number>();
-    for (const v of MEMORY_CATALOG_RUNS.values()) {
-      totalByUser.set(v.userId, (totalByUser.get(v.userId) ?? 0) + 1);
-    }
+    for (const v of MEMORY_CATALOG_RUNS.values()) totalByUser.set(v.userId, (totalByUser.get(v.userId) ?? 0) + 1);
     let heaviestUser: string | null = null;
     let heaviestCnt = 1;
     for (const [uid, cnt] of totalByUser) {
@@ -595,12 +463,10 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
       }
     }
     let victimKey: string | undefined;
-    if (heaviestUser !== null) {
-      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
-        if (k !== protectedCatalogId && v.userId === heaviestUser) {
-          victimKey = k;
-          break;
-        }
+    for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+      if (k !== protectedCatalogId && (heaviestUser === null || v.userId === heaviestUser)) {
+        victimKey = k;
+        break;
       }
     }
     if (victimKey === undefined) {
@@ -617,10 +483,8 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
 }
 
 function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
-  entry.hashesBytes = approxHashBundleBytes(entry.hashes);
-  if (MEMORY_CATALOG_RUNS.has(catalogId)) {
-    MEMORY_CATALOG_RUNS.delete(catalogId);
-  }
+  entry.hashesBytes = entry.hashes ? approxHashBundleBytes(entry.hashes) : 0;
+  if (MEMORY_CATALOG_RUNS.has(catalogId)) MEMORY_CATALOG_RUNS.delete(catalogId);
   MEMORY_CATALOG_RUNS.set(catalogId, entry);
   enforceGlobalCatalogMemoryBudget(catalogId);
 }
@@ -641,20 +505,11 @@ async function ensureCatalogRunsTable(db: D1DatabaseLike): Promise<void> {
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS catalog_runs (
-        catalog_id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL DEFAULT 'owner',
-        origin TEXT NOT NULL,
-        platform TEXT NOT NULL,
-        collection TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL,
-        products_count INTEGER NOT NULL DEFAULT 0,
-        variants_count INTEGER NOT NULL DEFAULT 0,
-        pages_read INTEGER NOT NULL DEFAULT 0,
-        artifact_id TEXT,
-        hashes_json TEXT,
-        summary_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        catalog_id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT 'owner', origin TEXT NOT NULL,
+        platform TEXT NOT NULL, collection TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+        products_count INTEGER NOT NULL DEFAULT 0, variants_count INTEGER NOT NULL DEFAULT 0,
+        pages_read INTEGER NOT NULL DEFAULT 0, artifact_id TEXT, hashes_json TEXT,
+        summary_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       )`,
     )
     .run();
@@ -664,16 +519,8 @@ async function ensureCatalogRunsTable(db: D1DatabaseLike): Promise<void> {
     column: 'user_id',
     alterSql: "ALTER TABLE catalog_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
   });
-  await db
-    .prepare(
-      `CREATE INDEX IF NOT EXISTS idx_catalog_runs_origin_status ON catalog_runs(origin, collection, status, created_at)`,
-    )
-    .run()
-    .catch(() => null);
-  await db
-    .prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_runs_user ON catalog_runs(user_id, created_at DESC)`)
-    .run()
-    .catch(() => null);
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_runs_origin_status ON catalog_runs(origin, collection, status, created_at)`).run().catch(() => null);
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_runs_user ON catalog_runs(user_id, created_at DESC)`).run().catch(() => null);
   D1_INIT_CACHE.add(key);
 }
 
@@ -681,22 +528,15 @@ function parseStoredCatalogSummary(rawJson: string): { summary: CatalogStatusSum
   try {
     const parsed = JSON.parse(rawJson) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    const ownerUserId =
-      typeof parsed._ownerUserId === 'string' && parsed._ownerUserId.trim() ? parsed._ownerUserId.trim() : 'owner';
+    const ownerUserId = typeof parsed._ownerUserId === 'string' && parsed._ownerUserId.trim() ? parsed._ownerUserId.trim() : 'owner';
     const { _ownerUserId: _omitOwner, ...cleanSummary } = parsed;
-    return {
-      summary: cleanSummary as unknown as CatalogStatusSummary,
-      ownerUserId,
-    };
+    return { summary: cleanSummary as unknown as CatalogStatusSummary, ownerUserId };
   } catch {
     return null;
   }
 }
 
-async function persistCatalogRun(
-  env: (OptionalStorageBindings & Record<string, unknown>) | undefined,
-  entry: StoredCatalogRun,
-): Promise<void> {
+async function persistCatalogRun(env: (OptionalStorageBindings & Record<string, unknown>) | undefined, entry: StoredCatalogRun): Promise<void> {
   rememberRunInMemory(entry.summary.catalogId, entry);
   const db = getMetaD1(env);
   if (!db) return;
@@ -747,21 +587,17 @@ async function findPreviousCompleteCatalogRun(
       await ensureCatalogRunsTable(db);
       const rowsRes = await db
         .prepare(
-          `SELECT catalog_id, user_id, products_count, hashes_json, summary_json
-           FROM catalog_runs
+          `SELECT catalog_id, user_id, products_count, hashes_json, summary_json FROM catalog_runs
            WHERE user_id = ? AND origin = ? AND collection = ? AND status = 'complete' AND catalog_id != ?
-           ORDER BY created_at DESC
-           LIMIT 10`,
+           ORDER BY created_at DESC LIMIT 10`,
         )
         .bind(userId, origin, collection, excludeCatalogId)
         .all<{ catalog_id: string; user_id?: string; products_count: number; hashes_json: string | null; summary_json: string }>();
-      const rows = rowsRes.results ?? [];
-      for (const row of rows) {
+      for (const row of rowsRes.results ?? []) {
         if (row.user_id && row.user_id !== userId) continue;
         const parsedEntry = parseStoredCatalogSummary(row.summary_json);
         if (parsedEntry && parsedEntry.ownerUserId !== userId) continue;
         if (!parsedEntry && userId !== 'owner') continue;
-        // Never use an already shrink-warned snapshot as the trusted baseline
         if (parsedEntry?.summary.warning === 'shrink') continue;
         let hashes: SnapshotHashBundle | null = null;
         if (row.hashes_json) {
@@ -777,9 +613,7 @@ async function findPreviousCompleteCatalogRun(
       // Fall through to in-memory lookup
     }
   }
-
-  const memEntries = [...MEMORY_CATALOG_RUNS.values()].reverse();
-  for (const item of memEntries) {
+  for (const item of [...MEMORY_CATALOG_RUNS.values()].reverse()) {
     if (
       item.userId === userId &&
       item.summary.catalogId !== excludeCatalogId &&
@@ -791,179 +625,12 @@ async function findPreviousCompleteCatalogRun(
       let hashes = item.hashes;
       if (!hashes && item.hashesArtifactId) {
         const r2 = getArtifactsR2(env);
-        if (r2) {
-          hashes = await reloadHashBundleFromR2(r2, item.hashesArtifactId);
-        }
+        if (r2) hashes = await reloadHashBundleFromR2(r2, item.hashesArtifactId);
       }
-      return {
-        productsCount: item.summary.products,
-        hashes,
-      };
+      return { productsCount: item.summary.products, hashes };
     }
   }
   return null;
-}
-
-function fnv1a64Hex(input: string): string {
-  let h1 = 0x811c9dc5;
-  let h2 = 0xc9dc5118;
-  for (let i = 0; i < input.length; i++) {
-    const c = input.charCodeAt(i);
-    h1 ^= c;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= c ^ (i & 0xff);
-    h2 = Math.imul(h2, 0x01000193);
-  }
-  return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
-}
-
-export function computeCatalogVariantHash(v: CatalogVariantRecord): string {
-  const canonical = JSON.stringify({
-    variantId: v.variantId,
-    sku: v.sku ?? null,
-    barcode: v.barcode ?? null,
-    title: v.title ?? null,
-    options: v.options,
-    price: v.price,
-    compareAt: v.compareAt,
-    currency: v.currency,
-    available: v.available,
-    inventoryPolicy: v.inventoryPolicy ?? null,
-    grams: v.grams,
-    image: v.image,
-  });
-  return fnv1a64Hex(canonical);
-}
-
-/**
- * Computes a deterministic content hash for a `CatalogRecord` **explicitly ignoring `updatedAt` and `publishedAt`**
- * so Shopify inventory timestamp bumps do not trigger false `changed` diffs.
- */
-export function computeCatalogProductHash(rec: CatalogRecord): string {
-  const sortedVariantHashes = rec.variants
-    .map((v) => `${v.variantId}:${computeCatalogVariantHash(v)}`)
-    .sort();
-  const canonical = JSON.stringify({
-    productId: rec.productId,
-    handle: rec.handle,
-    title: rec.title,
-    vendor: rec.vendor,
-    productType: rec.productType,
-    tags: [...rec.tags].sort(),
-    options: rec.options,
-    variants: sortedVariantHashes,
-  });
-  return fnv1a64Hex(canonical);
-}
-
-function buildSnapshotHashBundle(records: CatalogRecord[]): SnapshotHashBundle {
-  const products: Record<string, string> = Object.create(null) as Record<string, string>;
-  const variants: Record<string, string> = Object.create(null) as Record<string, string>;
-  for (const r of records) {
-    const pKey = r.productId || r.handle;
-    if (!pKey) continue;
-    products[pKey] = computeCatalogProductHash(r);
-    for (const v of r.variants) {
-      const vKey = `${pKey}::${v.variantId || v.sku || v.title || '0'}`;
-      variants[vKey] = computeCatalogVariantHash(v);
-    }
-  }
-  return { products, variants };
-}
-
-export function computeCatalogSnapshotDiff(
-  prev: SnapshotHashBundle,
-  curr: SnapshotHashBundle,
-): CatalogSnapshotDiff {
-  let added = 0;
-  let removed = 0;
-  let changed = 0;
-  for (const [k, h] of Object.entries(curr.products)) {
-    const prevH = Object.prototype.hasOwnProperty.call(prev.products, k) ? prev.products[k] : undefined;
-    if (prevH === undefined) added++;
-    else if (prevH !== h) changed++;
-  }
-  for (const k of Object.keys(prev.products)) {
-    if (!Object.prototype.hasOwnProperty.call(curr.products, k)) removed++;
-  }
-
-  let vAdded = 0;
-  let vRemoved = 0;
-  let vChanged = 0;
-  for (const [vk, vh] of Object.entries(curr.variants)) {
-    const prevVh = Object.prototype.hasOwnProperty.call(prev.variants, vk) ? prev.variants[vk] : undefined;
-    if (prevVh === undefined) vAdded++;
-    else if (prevVh !== vh) vChanged++;
-  }
-  for (const vk of Object.keys(prev.variants)) {
-    if (!Object.prototype.hasOwnProperty.call(curr.variants, vk)) vRemoved++;
-  }
-
-  return {
-    added,
-    removed,
-    changed,
-    variantDiff: {
-      added: vAdded,
-      removed: vRemoved,
-      changed: vChanged,
-    },
-  };
-}
-
-/**
- * Inspects `robots.txt` text (or response headers) for advertised Shopify/Universal Commerce Protocol (UCP) endpoints
- * (`/.well-known/ucp` or `/api/ucp/mcp`), strictly treating `robots.txt` prose as untrusted data.
- */
-export function discoverUcpEndpointFromRobots(originStr: string, robotsText: string): CatalogUcpMetadata | null {
-  if (!robotsText) return null;
-  const bounded = robotsText.slice(0, 32_768);
-  const m = /(?:\/api\/ucp\/mcp|\/\.well-known\/ucp)\b/i.exec(bounded);
-  if (!m?.[0]) return null;
-  try {
-    const endpoint = new URL(m[0], originStr).toString();
-    return { advertised: true, endpoint };
-  } catch {
-    return null;
-  }
-}
-
-export function isSafeHttpsStoreUrl(urlStr: string, selfHost?: string): URL | null {
-  try {
-    const trimmed = urlStr.trim();
-    if (!trimmed) return null;
-    const u = new URL(trimmed);
-    if (u.protocol !== 'https:' || u.username || u.password) return null;
-    if (u.port !== '' && u.port !== '443') return null;
-    const host = u.hostname.toLowerCase();
-    if (
-      !host ||
-      host.endsWith('.') ||
-      !host.includes('.') ||
-      host === 'localhost' ||
-      host.endsWith('.localhost') ||
-      host.endsWith('.local') ||
-      host.endsWith('.internal') ||
-      !isSafePublicHostname(host, selfHost)
-    ) {
-      return null;
-    }
-    return u;
-  } catch {
-    return null;
-  }
-}
-
-function stripLeadingWww(host: string): string {
-  return host.startsWith('www.') ? host.slice(4) : host;
-}
-
-function isAllowedStoreRedirectUrl(finalUrlStr: string, requestedOriginUrl: URL, selfHost?: string): boolean {
-  const parsedFinal = isSafeHttpsStoreUrl(finalUrlStr, selfHost);
-  if (!parsedFinal) return false;
-  const reqHost = requestedOriginUrl.hostname.toLowerCase();
-  const finHost = parsedFinal.hostname.toLowerCase();
-  return finHost === reqHost || stripLeadingWww(finHost) === stripLeadingWww(reqHost);
 }
 
 function decodeBase64Utf8(b64: string): string {
@@ -977,45 +644,32 @@ function decodeBase64Utf8(b64: string): string {
   }
 }
 
-function normalizeHeadersMap(raw: unknown): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!raw) return out;
-  if (typeof (raw as Headers).forEach === 'function') {
-    (raw as Headers).forEach((v, k) => {
-      out[k.toLowerCase()] = v;
-    });
-    return out;
-  }
-  if (typeof raw === 'object' && !Array.isArray(raw)) {
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (typeof v === 'string') out[k.toLowerCase()] = v;
-    }
-  }
-  return out;
-}
-
 function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | null {
   try {
     if (!raw || typeof raw !== 'object') return null;
     const obj = raw as Record<string, unknown>;
-
-    // Unwrap `{ status, body: { results: [item] } }` from `fetch_url` / `fetch_batch` style responses if needed
-    const nestedBody = obj.body && typeof obj.body === 'object' && !Array.isArray(obj.body)
-      ? (obj.body as Record<string, unknown>)
-      : null;
+    const nestedBody = obj.body && typeof obj.body === 'object' && !Array.isArray(obj.body) ? (obj.body as Record<string, unknown>) : null;
     const firstResult =
       nestedBody && Array.isArray(nestedBody.results) && nestedBody.results[0] && typeof nestedBody.results[0] === 'object'
         ? (nestedBody.results[0] as Record<string, unknown>)
         : Array.isArray(obj.results) && obj.results[0] && typeof obj.results[0] === 'object'
           ? (obj.results[0] as Record<string, unknown>)
           : null;
-
     const target = firstResult ?? (nestedBody && typeof nestedBody.status === 'number' ? nestedBody : obj);
     const status = typeof target.status === 'number' ? target.status : typeof obj.status === 'number' ? obj.status : 0;
     const outcome = typeof target.outcome === 'string' ? target.outcome : typeof obj.outcome === 'string' ? obj.outcome : undefined;
     const problem = typeof target.problem === 'string' ? target.problem : typeof obj.problem === 'string' ? obj.problem : undefined;
-    const headers = normalizeHeadersMap(target.headers ?? obj.headers);
-
+    const rawHeaders = target.headers ?? obj.headers;
+    const headers: Record<string, string> = {};
+    if (rawHeaders && typeof (rawHeaders as Headers).forEach === 'function') {
+      (rawHeaders as Headers).forEach((v, k) => {
+        headers[k.toLowerCase()] = v;
+      });
+    } else if (rawHeaders && typeof rawHeaders === 'object' && !Array.isArray(rawHeaders)) {
+      for (const [k, v] of Object.entries(rawHeaders as Record<string, unknown>)) {
+        if (typeof v === 'string') headers[k.toLowerCase()] = v;
+      }
+    }
     let bodyStr = '';
     if (typeof target.body === 'string') {
       bodyStr = target.bodyEncoding === 'base64' ? decodeBase64Utf8(target.body) : target.body;
@@ -1024,13 +678,8 @@ function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | nul
     } else if (target.body && typeof target.body === 'object') {
       bodyStr = JSON.stringify(target.body);
     }
-
-    const retryAfterMs =
-      typeof target.retryAfterMs === 'number' && Number.isFinite(target.retryAfterMs)
-        ? target.retryAfterMs
-        : undefined;
+    const retryAfterMs = typeof target.retryAfterMs === 'number' && Number.isFinite(target.retryAfterMs) ? target.retryAfterMs : undefined;
     const finalUrl = typeof target.finalUrl === 'string' ? target.finalUrl : undefined;
-
     return {
       status,
       ...(outcome ? { outcome } : {}),
@@ -1045,107 +694,11 @@ function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | nul
   }
 }
 
-function parseRetryAfterMs(resp: NormalizedHubPageResponse, defaultMs: number): number {
-  if (resp.retryAfterMs !== undefined && resp.retryAfterMs > 0) {
-    return Math.min(300_000, Math.max(1_000, Math.round(resp.retryAfterMs)));
-  }
-  const hdr = resp.headers['retry-after']?.trim();
-  if (hdr) {
-    if (/^\d+$/.test(hdr)) {
-      const secs = parseInt(hdr, 10);
-      if (Number.isFinite(secs) && secs > 0) {
-        return Math.min(300_000, Math.max(1_000, secs * 1_000));
-      }
-    }
-    const parsedDate = Date.parse(hdr);
-    if (Number.isFinite(parsedDate)) {
-      const delta = parsedDate - Date.now();
-      if (delta > 0) return Math.min(300_000, Math.max(1_000, delta));
-    }
-  }
-  return defaultMs;
-}
-
-function hasAntiBotResponseHeader(headers: Record<string, string>): boolean {
-  return Boolean(
-    headers['cf-mitigated'] ||
-      headers['x-datadome'] ||
-      headers['x-dd-b'] ||
-      headers['x-kpsdk-ct'] ||
-      headers['x-px-blocked'] ||
-      headers['x-amzn-waf-action'] ||
-      headers['x-vercel-mitigated'],
-  );
-}
-
-function isChallengeResponse(resp: NormalizedHubPageResponse): boolean {
-  const out = (resp.outcome ?? '').toLowerCase();
-  if (out === 'challenge') return true;
-  if (resp.headers['cf-mitigated']) return true;
-  const prob = resp.problem ?? '';
-  if (/challenge|cf-mitigated|turnstile|captcha|verify you are human/i.test(prob)) return true;
-  const bodyHead = resp.body.slice(0, 4096);
-  const trimmedHead = bodyHead.trimStart();
-  const isJsonPayload =
-    (resp.headers['content-type'] ?? '').toLowerCase().includes('json') ||
-    trimmedHead.startsWith('{') ||
-    trimmedHead.startsWith('[');
-  if (!isJsonPayload && hasAntiBotResponseHeader(resp.headers)) {
-    return true;
-  }
-  if (!isJsonPayload && classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: resp.body }) !== null) {
-    return true;
-  }
-  if (
-    (resp.status === 403 || resp.status === 503 || (resp.status === 200 && !isJsonPayload)) &&
-    /cf-mitigated|_cf_chl_opt|challenge-platform|turnstile|verify you are human/i.test(bodyHead)
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function isNonStorefrontHtmlFallback(resp: NormalizedHubPageResponse, platform: string): boolean {
-  if (isChallengeResponse(resp) || hasAntiBotResponseHeader(resp.headers)) return false;
-  const head = resp.body.slice(0, 65_536).trimStart();
-  if (!head || (!/^<!doctype\s+html\b/i.test(head) && !/^<html\b/i.test(head))) {
-    return false;
-  }
-  if (
-    /blocked|access\s+denied|forbidden|captcha|turnstile|cf-mitigated|just\s+a\s+moment|attention\s+required|_incapsula_resource|incapsula|awswafintegration|aws-waf-token|px-captcha|_pxappid|perimeterx|captcha-delivery\.com|datadome|kpsdk|\/ips\.js|sec-cpt|bazadebezolkohpepadr|verifying\s+your\s+browser|checking\s+your\s+browser|pardon\s+our\s+interruption|human\s+verification|bot\s+verification|security\s+check|enable\s+javascript|enable\s+js/i.test(
-      head,
-    )
-  ) {
-    return false;
-  }
-  if (platform === 'shopify' && /cdn\.shopify\.com|shopify\.theme|shopify-digital-wallet/i.test(head)) {
-    return false;
-  }
-  if (platform === 'woocommerce' && /woocommerce|wc-block|wp-content\/plugins\/woocommerce/i.test(head)) {
-    return false;
-  }
-  return true;
-}
-
-function isRobotsOrSignalBlocked(resp: NormalizedHubPageResponse): 'robots_disallowed' | 'robots_unreachable' | 'content_signal_disallowed' | null {
-  const out = (resp.outcome ?? '').toLowerCase();
-  const prob = resp.problem ?? '';
-  if (out === 'content_signal_disallowed' || /content-signal|ai-input\s*=\s*no/i.test(prob)) {
-    return 'content_signal_disallowed';
-  }
-  if (out === 'robots_unreachable' || (/robots\.txt/i.test(prob) && /timed?\s*out|unreachable/i.test(prob))) {
-    return 'robots_unreachable';
-  }
-  if (out === 'robots_disallowed' || /robots\.txt/i.test(prob)) {
-    return 'robots_disallowed';
-  }
-  return null;
-}
-
 function generateCatalogId(): string {
-  const rand = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID().replace(/-/g, '').slice(0, 16)
-    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  const rand =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+      : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   return `cat_${rand}`;
 }
 
@@ -1183,21 +736,17 @@ async function readR2ObjectTextBounded(obj: R2ObjectBodyLike, key: string): Prom
     const isGzip = (bytes.byteLength >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) || key.endsWith('.gz');
     if (isGzip && typeof DecompressionStream === 'function') {
       const ds = new DecompressionStream('gzip') as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
-      const gunzipped = (new Blob([bytes]).stream() as ReadableStream<Uint8Array>).pipeThrough(ds);
-      return readStreamUtf8Bounded(gunzipped, MAX_R2_DECOMPRESSED_BYTES);
+      return readStreamUtf8Bounded((new Blob([bytes]).stream() as ReadableStream<Uint8Array>).pipeThrough(ds), MAX_R2_DECOMPRESSED_BYTES);
     }
-    if (bytes.byteLength > MAX_R2_DECOMPRESSED_BYTES) {
-      throw new Error(`Catalog R2 artifact exceeds ${MAX_R2_DECOMPRESSED_BYTES} bytes limit`);
-    }
+    if (bytes.byteLength > MAX_R2_DECOMPRESSED_BYTES) throw new Error(`Catalog R2 artifact exceeds ${MAX_R2_DECOMPRESSED_BYTES} bytes limit`);
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
   }
   if (obj.body && key.endsWith('.gz') && typeof DecompressionStream === 'function') {
     const ds = new DecompressionStream('gzip') as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
-    const gunzipped = obj.body.pipeThrough(ds);
-    return readStreamUtf8Bounded(gunzipped, MAX_R2_DECOMPRESSED_BYTES);
+    return readStreamUtf8Bounded(obj.body.pipeThrough(ds), MAX_R2_DECOMPRESSED_BYTES);
   }
   const txt = await obj.text();
-  if (approxUtf8Bytes(txt) > MAX_R2_DECOMPRESSED_BYTES) {
+  if (new TextEncoder().encode(txt).byteLength > MAX_R2_DECOMPRESSED_BYTES) {
     throw new Error(`Catalog R2 artifact exceeds ${MAX_R2_DECOMPRESSED_BYTES} bytes limit`);
   }
   return txt;
@@ -1213,23 +762,15 @@ async function reloadCatalogRecordsFromR2(r2: R2BucketLike, artifactId: string):
   return coalesceSingleflightR2Reload(`records:${artifactId}`, async () => {
     const hitAfterWait = R2_RELOAD_LRU_CACHE.get(artifactId);
     if (hitAfterWait) return hitAfterWait.records;
-    const loaded: CatalogRecord[] = [];
+    let loaded: CatalogRecord[] = [];
     let approxBytes = 64;
     try {
       const obj = await r2.get(artifactId);
       if (obj) {
         const ndjson = await readR2ObjectTextBounded(obj, artifactId);
-        for (const line of ndjson.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try {
-            const parsed = JSON.parse(trimmed) as CatalogRecord;
-            loaded.push(parsed);
-            approxBytes += approxUtf8Bytes(trimmed) + (Array.isArray(parsed.variants) ? parsed.variants.length * 64 : 64);
-          } catch {
-            // skip malformed line
-          }
-        }
+        const parsed = callCoreWasmRaw<{ records: CatalogRecord[]; bytes: number }>('catalog_parse_ndjson', null, ndjson);
+        loaded = parsed.records ?? [];
+        approxBytes = parsed.bytes ?? 64;
       }
     } catch {
       // ignore R2 read/decompression errors -> return partial/empty cleanly
@@ -1248,11 +789,8 @@ async function reloadHashBundleFromR2(r2: R2BucketLike, hashesArtifactId: string
     try {
       const obj = await r2.get(hashesArtifactId);
       if (!obj) return null;
-      const txt = await readR2ObjectTextBounded(obj, hashesArtifactId);
-      const parsed = JSON.parse(txt) as SnapshotHashBundle;
-      if (parsed && typeof parsed === 'object' && parsed.products && parsed.variants) {
-        return parsed;
-      }
+      const parsed = JSON.parse(await readR2ObjectTextBounded(obj, hashesArtifactId)) as SnapshotHashBundle;
+      if (parsed && typeof parsed === 'object' && parsed.products && parsed.variants) return parsed;
     } catch {
       // ignore
     }
@@ -1260,10 +798,7 @@ async function reloadHashBundleFromR2(r2: R2BucketLike, hashesArtifactId: string
   });
 }
 
-function awaitWithDeadline<T>(
-  promise: Promise<T>,
-  deadlineAt: number,
-): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+function awaitWithDeadline<T>(promise: Promise<T>, deadlineAt: number): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
   const rem = deadlineAt - Date.now();
   if (rem <= 0) {
     promise.catch(() => undefined);
@@ -1272,31 +807,31 @@ function awaitWithDeadline<T>(
   return new Promise((resolveRace, rejectRace) => {
     let done = false;
     const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      resolveRace({ timedOut: true });
+      if (!done) {
+        done = true;
+        resolveRace({ timedOut: true });
+      }
     }, rem);
     (timer as unknown as { unref?: () => void }).unref?.();
     promise.then(
       (value) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        resolveRace({ timedOut: false, value });
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          resolveRace({ timedOut: false, value });
+        }
       },
       (err) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        rejectRace(err);
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          rejectRace(err);
+        }
       },
     );
   });
 }
 
-/**
- * Retrieves the live or completed status of a catalog job (`running`, `cooling_down`, `complete`, `partial`, `challenged`).
- */
 export async function getCatalogStatus(params: {
   catalogId: string;
   userId?: string;
@@ -1304,65 +839,41 @@ export async function getCatalogStatus(params: {
   env?: OptionalStorageBindings & Record<string, unknown>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const catalogId = params.catalogId.trim();
-  if (!catalogId) {
-    return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
-  }
-  if (!VALID_CATALOG_ID_RE.test(catalogId)) {
-    return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
-  }
+  if (!catalogId) return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
+  if (!VALID_CATALOG_ID_RE.test(catalogId)) return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
   const { ownerKey } = resolveCatalogTenantKey({ userId: params.userId, principal: params.principal });
+  const notFound = { status: 404, body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` } };
 
   const mem = MEMORY_CATALOG_RUNS.get(catalogId);
-  if (mem) {
-    if (mem.userId !== ownerKey) {
-      return {
-        status: 404,
-        body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
-      };
-    }
-    return { status: 200, body: { ...mem.summary } };
-  }
+  if (mem) return mem.userId !== ownerKey ? notFound : { status: 200, body: { ...mem.summary } };
 
   const db = getMetaD1(params.env);
   if (db) {
     try {
       await ensureCatalogRunsTable(db);
-      const row = await db
-        .prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`)
-        .bind(catalogId)
-        .first<{ user_id?: string; summary_json: string }>();
+      const row = await db.prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`).bind(catalogId).first<{ user_id?: string; summary_json: string }>();
       if (row?.summary_json && (!row.user_id || row.user_id === ownerKey)) {
         const parsed = parseStoredCatalogSummary(row.summary_json);
-        if (parsed && parsed.ownerUserId === ownerKey) {
-          return { status: 200, body: { ...parsed.summary } };
-        }
+        if (parsed && parsed.ownerUserId === ownerKey) return { status: 200, body: { ...parsed.summary } };
       }
     } catch {
       // ignore
     }
   }
-
-  return {
-    status: 404,
-    body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
-  };
+  return notFound;
 }
 
-/**
- * Pages and filters normalized `CatalogRecord` rows from an in-memory or R2 NDJSON catalog artifact
- * without pulling multi-megabyte raw JSON pages into agent context.
- */
-const SHOPIFY_ORIGIN_CURRENCY_CACHE = new Map<string, { currency: string | null; expiresAt: number }>();
-const SHOPIFY_ORIGIN_CURRENCY_TTL_MS = 30 * 60_000;
-
-async function resolveShopifyOriginCurrency(
-  origin: string,
-  executeHubFetch: CatalogHubFetchFn,
-  timeoutMs = 3_500,
-): Promise<string | null> {
+async function resolveShopifyOriginCurrency(origin: string, executeHubFetch: CatalogHubFetchFn, timeoutMs = 3_500): Promise<string | null> {
   const now = Date.now();
   const cached = SHOPIFY_ORIGIN_CURRENCY_CACHE.get(origin);
   if (cached && now < cached.expiresAt) return cached.currency;
+  const setCache = (currency: string | null, ttl: number) => {
+    if (SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
+      const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
+      if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
+    }
+    SHOPIFY_ORIGIN_CURRENCY_CACHE.set(origin, { currency, expiresAt: now + ttl });
+  };
   for (const probePath of ['/meta.json', '/cart.js']) {
     try {
       const rawResp = await executeHubFetch({
@@ -1374,21 +885,9 @@ async function resolveShopifyOriginCurrency(
       });
       const normCurr = normalizeHubPageResponse(rawResp);
       if (normCurr && normCurr.status === 200 && normCurr.body) {
-        const parsedCurr = JSON.parse(normCurr.body) as { currency?: unknown; active?: unknown };
-        const cand =
-          typeof parsedCurr?.currency === 'string'
-            ? parsedCurr.currency.trim().toUpperCase()
-            : parsedCurr?.currency &&
-                typeof parsedCurr.currency === 'object' &&
-                typeof (parsedCurr.currency as { active?: unknown }).active === 'string'
-              ? (parsedCurr.currency as { active: string }).active.trim().toUpperCase()
-              : '';
-        if (/^[A-Z]{3}$/.test(cand)) {
-          if (SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
-            const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
-            if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
-          }
-          SHOPIFY_ORIGIN_CURRENCY_CACHE.set(origin, { currency: cand, expiresAt: now + SHOPIFY_ORIGIN_CURRENCY_TTL_MS });
+        const cand = callCoreWasmRaw<{ currency: string | null }>('catalog_parse_currency_probe', null, normCurr.body).currency ?? null;
+        if (cand) {
+          setCache(cand, SHOPIFY_ORIGIN_CURRENCY_TTL_MS);
           return cand;
         }
       }
@@ -1396,12 +895,13 @@ async function resolveShopifyOriginCurrency(
       // ignore failed probe
     }
   }
-  if (SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
-    const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
-    if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
-  }
-  SHOPIFY_ORIGIN_CURRENCY_CACHE.set(origin, { currency: null, expiresAt: now + 5 * 60_000 });
+  setCache(null, 5 * 60_000);
   return null;
+}
+
+function toStringArrayFilter(v?: string | string[]): string[] {
+  if (Array.isArray(v)) return v.filter((s): s is string => typeof s === 'string');
+  return typeof v === 'string' && v.trim() ? [v] : [];
 }
 
 export async function getCatalogRecords(params: {
@@ -1409,35 +909,31 @@ export async function getCatalogRecords(params: {
   userId?: string;
   principal?: string;
   offset?: number;
+  cursor?: string;
   limit?: number;
   vendor?: string | string[];
   productType?: string | string[];
+  tag?: string | string[];
   availableOnly?: boolean;
+  inStockOnly?: boolean;
+  minPrice?: number;
+  maxPrice?: number;
   query?: string;
   fields?: 'full' | 'lean';
   env?: OptionalStorageBindings & Record<string, unknown>;
   executeHubFetch?: CatalogHubFetchFn;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const catalogId = params.catalogId.trim();
-  if (!catalogId) {
-    return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
-  }
-  if (!VALID_CATALOG_ID_RE.test(catalogId)) {
-    return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
-  }
+  if (!catalogId) return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
+  if (!VALID_CATALOG_ID_RE.test(catalogId)) return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
   const { ownerKey } = resolveCatalogTenantKey({ userId: params.userId, principal: params.principal });
+  const notFound = { status: 404, body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` } };
 
   let summary: CatalogStatusSummary | null = null;
   let records: CatalogRecord[] | null = null;
-
   const mem = MEMORY_CATALOG_RUNS.get(catalogId);
   if (mem) {
-    if (mem.userId !== ownerKey) {
-      return {
-        status: 404,
-        body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
-      };
-    }
+    if (mem.userId !== ownerKey) return notFound;
     summary = mem.summary;
     records = mem.records;
   }
@@ -1446,124 +942,76 @@ export async function getCatalogRecords(params: {
   if (!summary && db) {
     try {
       await ensureCatalogRunsTable(db);
-      const row = await db
-        .prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`)
-        .bind(catalogId)
-        .first<{ user_id?: string; summary_json: string }>();
+      const row = await db.prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`).bind(catalogId).first<{ user_id?: string; summary_json: string }>();
       if (row?.summary_json && (!row.user_id || row.user_id === ownerKey)) {
         const parsed = parseStoredCatalogSummary(row.summary_json);
-        if (parsed && parsed.ownerUserId === ownerKey) {
-          summary = parsed.summary;
-        }
+        if (parsed && parsed.ownerUserId === ownerKey) summary = parsed.summary;
       }
     } catch {
       // ignore
     }
   }
-
-  if (!summary) {
-    return {
-      status: 404,
-      body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
-    };
-  }
-
+  if (!summary) return notFound;
   if (!records) {
     const r2 = getArtifactsR2(params.env);
-    if (r2 && summary.artifactId) {
-      records = await reloadCatalogRecordsFromR2(r2, summary.artifactId);
-    } else {
-      records = [];
-    }
+    records = r2 && summary.artifactId ? await reloadCatalogRecordsFromR2(r2, summary.artifactId) : [];
   }
 
-  const offset = typeof params.offset === 'number' && Number.isFinite(params.offset) ? Math.max(0, Math.floor(params.offset)) : 0;
-  const limit =
-    typeof params.limit === 'number' && Number.isFinite(params.limit)
-      ? Math.min(250, Math.max(1, Math.floor(params.limit)))
-      : 50;
-
-  const vendorFilters = (
-    Array.isArray(params.vendor) ? params.vendor : typeof params.vendor === 'string' && params.vendor.trim() ? [params.vendor] : []
-  ).map((v) => v.trim().toLowerCase());
-
-  const typeFilters = (
-    Array.isArray(params.productType)
-      ? params.productType
-      : typeof params.productType === 'string' && params.productType.trim()
-        ? [params.productType]
-        : []
-  ).map((t) => t.trim().toLowerCase());
-
-  const queryLower = typeof params.query === 'string' ? params.query.trim().toLowerCase() : '';
-  const availableOnly = params.availableOnly === true;
-
-  const filtered = records.filter((r) => {
-    if (vendorFilters.length > 0) {
-      const rv = (r.vendor ?? '').toLowerCase();
-      if (!vendorFilters.some((vf) => rv === vf || rv.includes(vf))) return false;
-    }
-    if (typeFilters.length > 0) {
-      const rt = (r.productType ?? '').toLowerCase();
-      if (!typeFilters.some((tf) => rt === tf || rt.includes(tf))) return false;
-    }
-    if (availableOnly) {
-      if (!r.variants.some((v) => v.available === true)) return false;
-    }
-    if (queryLower) {
-      const hay = [
-        r.title,
-        r.handle,
-        r.vendor ?? '',
-        r.productType ?? '',
-        r.tags.join(' '),
-        ...r.variants.map((v) => `${v.sku ?? ''} ${v.title ?? ''}`),
-      ]
-        .join(' ')
-        .toLowerCase();
-      if (!hay.includes(queryLower)) return false;
-    }
-    return true;
-  });
-
-  let sliced = filtered.slice(offset, offset + limit);
-  if (
-    summary.platform === 'shopify' &&
-    summary.origin &&
-    params.executeHubFetch &&
-    sliced.some((rec) => rec.variants.some((v) => !v.currency))
-  ) {
-    const fallbackCurr = await resolveShopifyOriginCurrency(summary.origin, params.executeHubFetch);
-    if (fallbackCurr) {
-      sliced = sliced.map((rec) => ({
-        ...rec,
-        variants: rec.variants.map((v) => (v.currency ? v : { ...v, currency: fallbackCurr })),
-      }));
-    }
-  }
   const effectiveFields = params.fields ?? summary.fields ?? 'full';
-  const projectedRecords = effectiveFields === 'lean' ? sliced.map(projectLeanCatalogRecord) : sliced;
+  const baseFilter = {
+    platform: summary.platform,
+    offset: typeof params.offset === 'number' && Number.isFinite(params.offset) ? Math.max(0, Math.floor(params.offset)) : 0,
+    ...(typeof params.cursor === 'string' && params.cursor.trim() ? { cursor: params.cursor.trim() } : {}),
+    limit: typeof params.limit === 'number' && Number.isFinite(params.limit) ? Math.min(250, Math.max(1, Math.floor(params.limit))) : 50,
+    vendors: toStringArrayFilter(params.vendor),
+    productTypes: toStringArrayFilter(params.productType),
+    tags: toStringArrayFilter(params.tag),
+    availableOnly: params.availableOnly === true,
+    inStockOnly: params.inStockOnly === true,
+    ...(typeof params.minPrice === 'number' && Number.isFinite(params.minPrice) ? { minPrice: params.minPrice } : {}),
+    ...(typeof params.maxPrice === 'number' && Number.isFinite(params.maxPrice) ? { maxPrice: params.maxPrice } : {}),
+    query: typeof params.query === 'string' ? params.query : '',
+    fields: effectiveFields,
+  };
+
+  type FilterOut = {
+    totalProducts: number;
+    matchedProducts: number;
+    offset: number;
+    limit: number;
+    returned: number;
+    hasMore: boolean;
+    needsShopifyCurrency?: boolean;
+    fullRecords?: CatalogRecord[];
+    leanRecords?: Array<Record<string, unknown>>;
+  };
+  let filteredOut = callCoreWasm<FilterOut>('catalog_filter_records', { records, filter: baseFilter });
+  if (filteredOut.needsShopifyCurrency && summary.origin && params.executeHubFetch) {
+    const fallbackCurrency = await resolveShopifyOriginCurrency(summary.origin, params.executeHubFetch);
+    if (fallbackCurrency) {
+      filteredOut = callCoreWasm<FilterOut>('catalog_filter_records', { records, filter: { ...baseFilter, fallbackCurrency } });
+    } else if (effectiveFields === 'lean' && filteredOut.fullRecords) {
+      filteredOut.leanRecords = filteredOut.fullRecords.map(projectLeanCatalogRecord);
+    }
+  }
+
   const result: CatalogRecordsResult = {
     ok: true,
     catalogId,
     status: summary.status,
     platform: summary.platform,
     origin: summary.origin,
-    totalProducts: records.length,
-    matchedProducts: filtered.length,
-    offset,
-    limit,
-    returned: sliced.length,
-    hasMore: offset + sliced.length < filtered.length,
-    records: projectedRecords,
+    totalProducts: filteredOut.totalProducts,
+    matchedProducts: filteredOut.matchedProducts,
+    offset: filteredOut.offset,
+    limit: filteredOut.limit,
+    returned: filteredOut.returned,
+    hasMore: filteredOut.hasMore,
+    records: effectiveFields === 'lean' ? (filteredOut.leanRecords ?? []) : (filteredOut.fullRecords ?? []),
   };
-
   return { status: 200, body: result as unknown as Record<string, unknown> };
 }
 
-/**
- * Starts a polite full-store catalog pull OR polls/pages an existing `catalogId`.
- */
 export async function executeCatalogCall(params: {
   payload: CatalogCallPayload;
   env?: OptionalStorageBindings & Record<string, unknown>;
@@ -1591,10 +1039,15 @@ export async function executeCatalogCall(params: {
   if (existingId && !payload.url) {
     const wantsRecords =
       payload.offset !== undefined ||
+      payload.cursor !== undefined ||
       payload.limit !== undefined ||
       payload.vendor !== undefined ||
       payload.productType !== undefined ||
+      payload.tag !== undefined ||
       payload.availableOnly !== undefined ||
+      payload.inStockOnly !== undefined ||
+      payload.minPrice !== undefined ||
+      payload.maxPrice !== undefined ||
       payload.query !== undefined ||
       payload.fields === 'lean' ||
       payload.fields === 'full';
@@ -1604,105 +1057,77 @@ export async function executeCatalogCall(params: {
         userId: params.userId,
         principal: params.principal,
         offset: typeof payload.offset === 'number' ? payload.offset : undefined,
+        cursor: typeof payload.cursor === 'string' ? payload.cursor : undefined,
         limit: typeof payload.limit === 'number' ? payload.limit : undefined,
-        vendor:
-          typeof payload.vendor === 'string' || Array.isArray(payload.vendor)
-            ? (payload.vendor as string | string[])
-            : undefined,
-        productType:
-          typeof payload.productType === 'string' || Array.isArray(payload.productType)
-            ? (payload.productType as string | string[])
-            : undefined,
+        vendor: typeof payload.vendor === 'string' || Array.isArray(payload.vendor) ? (payload.vendor as string | string[]) : undefined,
+        productType: typeof payload.productType === 'string' || Array.isArray(payload.productType) ? (payload.productType as string | string[]) : undefined,
+        tag: typeof payload.tag === 'string' || Array.isArray(payload.tag) ? (payload.tag as string | string[]) : undefined,
         availableOnly: payload.availableOnly === true,
+        inStockOnly: payload.inStockOnly === true,
+        minPrice: typeof payload.minPrice === 'number' ? payload.minPrice : undefined,
+        maxPrice: typeof payload.maxPrice === 'number' ? payload.maxPrice : undefined,
         query: typeof payload.query === 'string' ? payload.query : undefined,
         fields: payload.fields === 'lean' ? 'lean' : payload.fields === 'full' ? 'full' : undefined,
         env,
         executeHubFetch,
       });
     }
-    return getCatalogStatus({
-      catalogId: existingId,
-      userId: params.userId,
-      principal: params.principal,
-      env,
-    });
+    return getCatalogStatus({ catalogId: existingId, userId: params.userId, principal: params.principal, env });
   }
 
-  const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
-  const parsedUrl = isSafeHttpsStoreUrl(rawUrl, params.selfHost);
-  if (!parsedUrl) {
-    return {
-      status: 400,
-      body: {
-        ok: false,
-        error: 'invalid_url',
-        message: 'Provide a valid public `https://` storefront URL in `url` (or `catalogId` to poll an existing run).',
-      },
-    };
-  }
-
-  const rawPlatform = typeof payload.platform === 'string' ? payload.platform.trim().toLowerCase() : 'auto';
-  if (rawPlatform !== 'auto' && rawPlatform !== 'shopify' && rawPlatform !== 'woocommerce') {
-    return {
-      status: 400,
-      body: {
-        ok: false,
-        error: 'invalid_platform',
-        message: 'Supported `platform` values are `"auto"`, `"shopify"`, or `"woocommerce"`.',
-      },
-    };
-  }
-
+  const shopAdapter = getCatalogAdapter('shopify');
+  const wcAdapter = getCatalogAdapter('woocommerce');
   const scopeObj = payload.scope && typeof payload.scope === 'object' ? (payload.scope as Record<string, unknown>) : undefined;
-  const pathColMatch = /^\/collections\/([A-Za-z0-9_-]+)/i.exec(parsedUrl.pathname);
-  const collection =
-    (typeof payload.collection === 'string' && payload.collection.trim()
-      ? payload.collection.trim()
-      : typeof scopeObj?.collection === 'string' && scopeObj.collection.trim()
-        ? scopeObj.collection.trim()
-        : pathColMatch?.[1] ?? '');
+  const reqPause = typeof payload.pauseMs === 'number' && Number.isFinite(payload.pauseMs) ? Math.floor(payload.pauseMs) : undefined;
+  const reqMaxPages = typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages) ? Math.floor(payload.maxPages) : undefined;
 
-  const fields: 'full' | 'lean' = payload.fields === 'lean' ? 'lean' : 'full';
-  const originUrl = new URL(parsedUrl.origin);
-  if (collection) {
-    originUrl.pathname = `/collections/${encodeURIComponent(collection)}`;
-  }
-
-  // Resolve initial `CatalogSpec`
-  const initialPlatform =
-    rawPlatform !== 'auto'
-      ? rawPlatform
-      : parsedUrl.pathname.toLowerCase().includes('/wp-json/wc/store/')
-        ? 'woocommerce'
-        : 'shopify';
-
-  const initialAdapter = getCatalogAdapter(initialPlatform);
-  if (!initialAdapter?.catalog) {
-    return {
-      status: 500,
-      body: { ok: false, error: 'missing_catalog_adapter', message: `Catalog adapter "${initialPlatform}" is not registered.` },
+  const initRes = callCoreWasm<{
+    ok: boolean;
+    error?: string;
+    message?: string;
+    plan?: {
+      origin: string;
+      originWithCollection: string;
+      collection?: string;
+      fields: 'full' | 'lean';
+      rawPlatform: string;
+      initialPlatform: string;
+      effectivePauseMs: number;
+      maxPages: number;
+      callerExplicitMaxPages: boolean;
+      firstPageUrl: string;
     };
+  }>('catalog_init_pull', {
+    url: typeof payload.url === 'string' ? payload.url : '',
+    platform: typeof payload.platform === 'string' ? payload.platform : 'auto',
+    collection: typeof payload.collection === 'string' ? payload.collection : '',
+    scopeCollection: typeof scopeObj?.collection === 'string' ? scopeObj.collection : '',
+    fields: payload.fields === 'lean' ? 'lean' : 'full',
+    ...(reqMaxPages !== undefined ? { maxPages: reqMaxPages } : {}),
+    ...(reqPause !== undefined ? { pauseMs: reqPause } : {}),
+    selfHost: params.selfHost ?? '',
+    shopifyPauseMs: shopAdapter?.catalog?.pauseMs ?? 2000,
+    shopifyPageCap: shopAdapter?.catalog?.pageCap ?? 200,
+    wooPauseMs: wcAdapter?.catalog?.pauseMs ?? 1000,
+    wooPageCap: wcAdapter?.catalog?.pageCap ?? 200,
+  });
+
+  if (!initRes.ok || !initRes.plan) {
+    return { status: 400, body: { ok: false, error: initRes.error || 'invalid_url', message: initRes.message || 'Invalid catalog request.' } };
+  }
+  const plan = initRes.plan;
+  const initialAdapter = getCatalogAdapter(plan.initialPlatform);
+  if (!initialAdapter?.catalog) {
+    return { status: 500, body: { ok: false, error: 'missing_catalog_adapter', message: `Catalog adapter "${plan.initialPlatform}" is not registered.` } };
   }
 
-  // `R5-M4` & Round 7: Per-user (`2`), non-owner aggregate (`6` of `8` — reserving `2` for `owner`), and global (`8`) concurrency guard!
-  const { ownerKey, concurrencyBucketKey, isOwner } = resolveCatalogTenantKey({
-    userId: params.userId,
-    principal: params.principal,
-  });
+  const { ownerKey, concurrencyBucketKey, isOwner } = resolveCatalogTenantKey({ userId: params.userId, principal: params.principal });
   const activeForPrincipal = ACTIVE_CATALOG_BY_PRINCIPAL.get(concurrencyBucketKey) ?? 0;
   const nonOwnerPoolFull = !isOwner && activeCatalogNonOwnerGlobal >= MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL;
-  if (
-    activeCatalogGlobal >= MAX_CONCURRENT_CATALOG_GLOBAL ||
-    nonOwnerPoolFull ||
-    activeForPrincipal >= MAX_CONCURRENT_CATALOG_PER_PRINCIPAL
-  ) {
+  if (activeCatalogGlobal >= MAX_CONCURRENT_CATALOG_GLOBAL || nonOwnerPoolFull || activeForPrincipal >= MAX_CONCURRENT_CATALOG_PER_PRINCIPAL) {
     return {
       status: 429,
-      body: {
-        ok: false,
-        error: 'catalog_busy',
-        message: 'Too many concurrent catalog pulls are active. Wait for an active run to finish or poll its catalogId.',
-      },
+      body: { ok: false, error: 'catalog_busy', message: 'Too many concurrent catalog pulls are active. Wait for an active run to finish or poll its catalogId.' },
     };
   }
   activeCatalogGlobal++;
@@ -1721,21 +1146,14 @@ export async function executeCatalogCall(params: {
 
   const wantAsync = payload.sync === false && typeof params.ctx?.waitUntil === 'function';
   let activeSpec: CatalogSpec = initialAdapter.catalog;
-  if (!wantAsync || rawPlatform !== 'auto' || initialPlatform === 'woocommerce') {
+  if (!wantAsync || plan.rawPlatform !== 'auto' || plan.initialPlatform === 'woocommerce') {
     activeTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
   }
   activeTracer?.setAttribute('edgefetch.catalog.sync', payload.sync !== false);
-  const reqPause = typeof payload.pauseMs === 'number' && Number.isFinite(payload.pauseMs) ? Math.floor(payload.pauseMs) : activeSpec.pauseMs;
-  const computeEffectivePauseMs = (spec: CatalogSpec): number =>
-    Math.min(30_000, Math.max(spec.platform === 'shopify' ? 2000 : spec.pauseMs, reqPause));
 
-  let effectivePauseMs = computeEffectivePauseMs(activeSpec);
-  const callerExplicitMaxPages =
-    typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages) && payload.maxPages >= 1;
-  const maxPages = callerExplicitMaxPages
-    ? Math.min(activeSpec.pageCap, Math.floor(payload.maxPages as number))
-    : activeSpec.pageCap;
-
+  let effectivePauseMs = plan.effectivePauseMs;
+  const maxPages = plan.maxPages;
+  const collection = plan.collection ?? '';
   const catalogId = generateCatalogId();
   const startedAtMs = Date.now();
   const effectiveMaxWallMs =
@@ -1752,9 +1170,9 @@ export async function executeCatalogCall(params: {
       catalogId,
       status: 'running',
       platform: activeSpec.platform,
-      origin: parsedUrl.origin,
+      origin: plan.origin,
       ...(collection ? { collection } : {}),
-      ...(fields === 'lean' ? { fields: 'lean' } : {}),
+      ...(plan.fields === 'lean' ? { fields: 'lean' } : {}),
       products: 0,
       variants: 0,
       pages: 0,
@@ -1769,528 +1187,411 @@ export async function executeCatalogCall(params: {
     records: [],
     retainedBytes: 0,
   };
-
   await persistCatalogRun(env, currentEntry);
 
   const runPull = async (pullTracer?: RequestTracer | TraceContext): Promise<CatalogStatusSummary> => {
     const resolvedPullTracer = getActiveRequestTracer(pullTracer);
     try {
-    const byProductId = new Map<string, CatalogRecord>();
-    const bytesByProductId = new Map<string, number>();
-    let accumulatedBytes = 0;
-    let totalVariantsCount = 0;
-    let totalSleptMs = 0;
-    let truncatedByBudget = false;
-    let pagesRead = 0;
-    let naturalCompletion = false;
-    let finalStatus: CatalogRunStatus = 'partial';
-    let stopReason: string | undefined;
-    let blockedInfo: BlockedSuggestion | undefined;
-    let currentUrl: string | null = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
-    let triedAutoFallbackToWc = rawPlatform !== 'auto' || activeSpec.platform === 'woocommerce';
-    let autoFallbackFromShopify = false;
-    let resolvedPlatformOut: string = activeSpec.platform;
+      const byProductId = new Map<string, CatalogRecord>();
+      const bytesByProductId = new Map<string, number>();
+      let accumulatedBytes = 0;
+      let totalVariantsCount = 0;
+      let totalSleptMs = 0;
+      let truncatedByBudget = false;
+      let pagesRead = 0;
+      let naturalCompletion = false;
+      let finalStatus: CatalogRunStatus = 'partial';
+      let stopReason: string | undefined;
+      let blockedInfo: BlockedSuggestion | undefined;
+      let currentUrl: string | null = plan.firstPageUrl;
+      let triedAutoFallbackToWc = plan.rawPlatform !== 'auto' || activeSpec.platform === 'woocommerce';
+      let autoFallbackFromShopify = false;
+      let resolvedPlatformOut: string = activeSpec.platform;
 
-    while (currentUrl && pagesRead < maxPages) {
-      if (Date.now() >= syncDeadlineAt) {
-        stopReason = 'time_budget_exceeded';
-        truncatedByBudget = true;
-        break;
-      }
-      if (pagesRead > 0) {
-        if (totalSleptMs + effectivePauseMs > MAX_CATALOG_TOTAL_SLEEP_MS) {
-          stopReason = 'sleep_budget_exceeded';
-          truncatedByBudget = true;
-          break;
-        }
-        if (Date.now() + effectivePauseMs >= syncDeadlineAt) {
+      while (currentUrl && pagesRead < maxPages) {
+        if (Date.now() >= syncDeadlineAt) {
           stopReason = 'time_budget_exceeded';
           truncatedByBudget = true;
           break;
         }
-        totalSleptMs += effectivePauseMs;
-        const sleepOut = await awaitWithDeadline(sleep(effectivePauseMs), syncDeadlineAt);
-        if (sleepOut.timedOut || Date.now() >= syncDeadlineAt) {
-          stopReason = 'time_budget_exceeded';
-          truncatedByBudget = true;
-          break;
-        }
-      }
-
-      let strikes = 0;
-      let pageResp: NormalizedHubPageResponse | null = null;
-
-      while (true) {
-        const remBeforeFetchMs = syncDeadlineAt - Date.now();
-        if (remBeforeFetchMs <= 0) {
-          stopReason = 'time_budget_exceeded';
-          truncatedByBudget = true;
-          pageResp = null;
-          break;
-        }
-        const callFetchPage = () =>
-          executeHubFetch({
-            url: currentUrl!,
-            kind: 'json',
-            accept: 'application/json',
-            maxBytes: 16_777_216,
-            timeoutMs: Math.min(30_000, remBeforeFetchMs),
-            ...(payload.target !== undefined ? { target: payload.target } : {}),
-            ...(payload.site !== undefined ? { site: payload.site } : {}),
-            ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
-          });
-        const fetchPromise = Promise.resolve()
-          .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callFetchPage) : callFetchPage()))
-          .catch((err: unknown) => ({
-            status: 0,
-            outcome: 'network_error',
-            problem: err instanceof Error ? err.message : String(err),
-            headers: {},
-            body: '',
-          }));
-        const fetchRace = await awaitWithDeadline(fetchPromise, syncDeadlineAt);
-        if (fetchRace.timedOut) {
-          stopReason = 'time_budget_exceeded';
-          truncatedByBudget = true;
-          pageResp = null;
-          break;
-        }
-        const rawFetchOut = fetchRace.value;
-
-        pageResp = normalizeHubPageResponse(rawFetchOut);
-        if (!pageResp) {
-          stopReason = strikes > 0 ? 'rate_limited' : 'empty_response';
-          break;
-        }
-
-        // Reject cross-origin redirects to an unrelated host on `/products.json` or `/wp-json/wc/store/v1/products`
-        // (allow only the same host or `www.`-equivalent of the requested store origin).
-        if (pageResp.finalUrl && !isAllowedStoreRedirectUrl(pageResp.finalUrl, originUrl, params.selfHost)) {
-          stopReason = 'cross_origin_redirect';
-          pageResp = null;
-          break;
-        }
-
-        // 1. Immediate ethical halt on `robots.txt` or `Content-Signal`
-        const blockKind = isRobotsOrSignalBlocked(pageResp);
-        if (blockKind) {
-          stopReason = blockKind;
-          blockedInfo =
-            buildBlockedInfo(currentUrl, pageResp.outcome ?? blockKind, pageResp.problem, pageResp.status) ?? undefined;
-          pageResp = null;
-          break;
-        }
-
-        // 2. Immediate halt on WAF / bot challenge (`cf-mitigated`, `outcome: "challenge"`, Turnstile)
-        if (isChallengeResponse(pageResp)) {
-          finalStatus = 'challenged';
-          stopReason = 'challenge';
-          blockedInfo =
-            buildBlockedInfo(currentUrl, 'challenge', pageResp.problem || 'anti-bot challenge', pageResp.status) ?? undefined;
-          pageResp = null;
-          break;
-        }
-
-        // 3. Polite 3-Strikes `429` Cooldown Handling
-        if (pageResp.status === 429 || pageResp.outcome === 'rate_limited') {
-          strikes++;
-          if (strikes > 3) {
-            stopReason = 'rate_limited';
-            pageResp = null;
-            break;
-          }
-          const defaultCooldownMs = activeSpec.platform === 'shopify' ? 60_000 : 30_000;
-          const waitMs = parseRetryAfterMs(pageResp, defaultCooldownMs);
-          if (totalSleptMs + waitMs > MAX_CATALOG_TOTAL_SLEEP_MS) {
+        if (pagesRead > 0) {
+          if (totalSleptMs + effectivePauseMs > MAX_CATALOG_TOTAL_SLEEP_MS) {
             stopReason = 'sleep_budget_exceeded';
             truncatedByBudget = true;
-            pageResp = null;
             break;
           }
-          if (Date.now() + waitMs >= syncDeadlineAt) {
-            // Preserve `sleep_budget_exceeded` when virtual `sleepFn` tests pass `Retry-After > 120s` while real wall clock hasn't advanced
-            stopReason = waitMs > MAX_CATALOG_TOTAL_SLEEP_MS ? 'sleep_budget_exceeded' : 'time_budget_exceeded';
-            truncatedByBudget = true;
-            pageResp = null;
-            break;
-          }
-          totalSleptMs += waitMs;
-          const resumeAt = new Date(Date.now() + waitMs).toISOString();
-          currentEntry.summary = {
-            ...currentEntry.summary,
-            status: 'cooling_down',
-            resumeAt,
-            pages: pagesRead,
-            pagesRead,
-            durationMs: Date.now() - startedAtMs,
-            updatedAt: new Date().toISOString(),
-          };
-          await persistCatalogRun(env, currentEntry);
-          const coolSleep = await awaitWithDeadline(sleep(waitMs), syncDeadlineAt);
-          if (coolSleep.timedOut || Date.now() >= syncDeadlineAt) {
+          if (Date.now() + effectivePauseMs >= syncDeadlineAt) {
             stopReason = 'time_budget_exceeded';
             truncatedByBudget = true;
-            pageResp = null;
             break;
           }
-          const { resumeAt: _cleared, ...restSummary } = currentEntry.summary;
-          currentEntry.summary = {
-            ...restSummary,
-            status: 'running',
-            updatedAt: new Date().toISOString(),
-          };
-          await persistCatalogRun(env, currentEntry);
-          continue;
+          totalSleptMs += effectivePauseMs;
+          const sleepOut = await awaitWithDeadline(sleep(effectivePauseMs), syncDeadlineAt);
+          if (sleepOut.timedOut || Date.now() >= syncDeadlineAt) {
+            stopReason = 'time_budget_exceeded';
+            truncatedByBudget = true;
+            break;
+          }
         }
 
-        break;
-      }
+        type CatalogPageEvalResult = {
+          action: 'parsed' | 'cooldown' | 'fallback_wc' | 'halt';
+          stopReason?: string;
+          blockKind?: string;
+          challenged?: boolean;
+          unsupportedStore?: boolean;
+          waitMs?: number;
+          newPauseMs?: number;
+          nextUrl?: string;
+          done?: boolean;
+          items?: Array<{ key: string; record: CatalogRecord; footprintBytes: number }>;
+        };
+        let strikes = 0;
+        let evalOut: CatalogPageEvalResult | null = null;
 
-      if (!pageResp) {
-        break;
-      }
+        while (true) {
+          const remBeforeFetchMs = syncDeadlineAt - Date.now();
+          if (remBeforeFetchMs <= 0) {
+            stopReason = 'time_budget_exceeded';
+            truncatedByBudget = true;
+            evalOut = null;
+            break;
+          }
+          const callFetchPage = () =>
+            executeHubFetch({
+              url: currentUrl!,
+              kind: 'json',
+              accept: 'application/json',
+              maxBytes: 16_777_216,
+              timeoutMs: Math.min(30_000, remBeforeFetchMs),
+              ...(payload.target !== undefined ? { target: payload.target } : {}),
+              ...(payload.site !== undefined ? { site: payload.site } : {}),
+              ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+            });
+          const fetchPromise = Promise.resolve()
+            .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callFetchPage) : callFetchPage()))
+            .catch((err: unknown) => ({
+              status: 0,
+              outcome: 'network_error',
+              problem: err instanceof Error ? err.message : String(err),
+              headers: {},
+              body: '',
+            }));
+          const fetchRace = await awaitWithDeadline(fetchPromise, syncDeadlineAt);
+          if (fetchRace.timedOut) {
+            stopReason = 'time_budget_exceeded';
+            truncatedByBudget = true;
+            evalOut = null;
+            break;
+          }
+          const pageResp = normalizeHubPageResponse(fetchRace.value);
+          if (!pageResp) {
+            stopReason = strikes > 0 ? 'rate_limited' : 'empty_response';
+            evalOut = null;
+            break;
+          }
 
-      // Platform `auto` fallback: if page 1 on `/products.json` returned 404/400/405, try WooCommerce Store API!
-      if (
-        pagesRead === 0 &&
-        !triedAutoFallbackToWc &&
-        (pageResp.status === 404 || pageResp.status === 400 || pageResp.status === 405)
-      ) {
-        triedAutoFallbackToWc = true;
-        autoFallbackFromShopify = true;
-        const wcAdapter = getCatalogAdapter('woocommerce');
-        if (wcAdapter?.catalog) {
+          evalOut = callCoreWasmRaw<CatalogPageEvalResult>(
+            'catalog_evaluate_page',
+            {
+              currentUrl,
+              originWithCollection: plan.originWithCollection,
+              collection,
+              selfHost: params.selfHost ?? '',
+              platform: activeSpec.platform,
+              fields: plan.fields,
+              pagesRead,
+              triedAutoFallbackToWc,
+              autoFallbackFromShopify,
+              ...(reqPause !== undefined ? { reqPauseMs: reqPause } : {}),
+              catalogCfg: { platform: activeSpec.platform, pauseMs: activeSpec.pauseMs, pageCap: activeSpec.pageCap },
+              wooCatalogCfg: { platform: 'woocommerce', pauseMs: wcAdapter?.catalog?.pauseMs ?? 1000, pageCap: wcAdapter?.catalog?.pageCap ?? 200 },
+              status: pageResp.status,
+              outcome: pageResp.outcome ?? '',
+              problem: pageResp.problem ?? '',
+              headers: pageResp.headers,
+              finalUrl: pageResp.finalUrl ?? '',
+              ...(pageResp.retryAfterMs !== undefined ? { retryAfterMs: pageResp.retryAfterMs } : {}),
+              nowMs: Date.now(),
+            },
+            pageResp.body,
+          );
+
+          if (evalOut.action === 'cooldown') {
+            if (++strikes > 3) {
+              stopReason = 'rate_limited';
+              evalOut = null;
+              break;
+            }
+            const waitMs = evalOut.waitMs ?? 30_000;
+            if (totalSleptMs + waitMs > MAX_CATALOG_TOTAL_SLEEP_MS) {
+              stopReason = 'sleep_budget_exceeded';
+              truncatedByBudget = true;
+              evalOut = null;
+              break;
+            }
+            if (Date.now() + waitMs >= syncDeadlineAt) {
+              stopReason = waitMs > MAX_CATALOG_TOTAL_SLEEP_MS ? 'sleep_budget_exceeded' : 'time_budget_exceeded';
+              truncatedByBudget = true;
+              evalOut = null;
+              break;
+            }
+            totalSleptMs += waitMs;
+            currentEntry.summary = {
+              ...currentEntry.summary,
+              status: 'cooling_down',
+              resumeAt: new Date(Date.now() + waitMs).toISOString(),
+              pages: pagesRead,
+              pagesRead,
+              durationMs: Date.now() - startedAtMs,
+              updatedAt: new Date().toISOString(),
+            };
+            await persistCatalogRun(env, currentEntry);
+            const coolSleep = await awaitWithDeadline(sleep(waitMs), syncDeadlineAt);
+            if (coolSleep.timedOut || Date.now() >= syncDeadlineAt) {
+              stopReason = 'time_budget_exceeded';
+              truncatedByBudget = true;
+              evalOut = null;
+              break;
+            }
+            const { resumeAt: _cleared, ...restSummary } = currentEntry.summary;
+            currentEntry.summary = { ...restSummary, status: 'running', updatedAt: new Date().toISOString() };
+            await persistCatalogRun(env, currentEntry);
+            continue;
+          }
+
+          if (evalOut.action === 'halt') {
+            stopReason = evalOut.stopReason;
+            if (evalOut.blockKind) {
+              blockedInfo = buildBlockedInfo(currentUrl, pageResp.outcome ?? evalOut.blockKind, pageResp.problem, pageResp.status) ?? undefined;
+            } else if (evalOut.challenged) {
+              finalStatus = 'challenged';
+              if (evalOut.stopReason === 'challenge') {
+                blockedInfo = buildBlockedInfo(currentUrl, 'challenge', pageResp.problem || 'anti-bot challenge', pageResp.status) ?? undefined;
+              }
+            }
+            if (evalOut.unsupportedStore) {
+              resolvedPlatformOut = 'unknown';
+              currentEntry.summary.platform = 'unknown';
+              resolvedPullTracer?.setAttribute('edgefetch.adapter_id', 'unknown');
+            }
+            evalOut = null;
+          }
+          break;
+        }
+
+        if (!evalOut) break;
+        if (evalOut.action === 'fallback_wc' && wcAdapter?.catalog && evalOut.nextUrl) {
+          triedAutoFallbackToWc = true;
+          autoFallbackFromShopify = true;
           activeSpec = wcAdapter.catalog;
           resolvedPlatformOut = activeSpec.platform;
           resolvedPullTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
-          effectivePauseMs = computeEffectivePauseMs(activeSpec);
+          effectivePauseMs = evalOut.newPauseMs ?? effectivePauseMs;
           currentEntry.summary.platform = activeSpec.platform;
           currentEntry.summary.pauseMs = effectivePauseMs;
-          currentUrl = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
+          currentUrl = evalOut.nextUrl;
           continue;
         }
-      }
 
-      if (pageResp.status !== 200) {
-        if (
-          pagesRead === 0 &&
-          autoFallbackFromShopify &&
-          (pageResp.status === 404 || pageResp.status === 400 || pageResp.status === 405)
-        ) {
-          resolvedPlatformOut = 'unknown';
-          currentEntry.summary.platform = 'unknown';
-          resolvedPullTracer?.setAttribute('edgefetch.adapter_id', 'unknown');
-          stopReason = 'unsupported_storefront';
-          break;
-        }
-        stopReason = `http_${pageResp.status || 'error'}`;
-        break;
-      }
-
-      // Parse page strictly; non-JSON body on a 200 catalog feed is a bot wall / interstitial -> `challenged`
-      // UNLESS `auto` mode probed a plain non-storefront HTML SPA/site with zero WAF/challenge or platform signals!
-      let parsedPage: { records: CatalogRecord[]; done: boolean };
-      try {
-        parsedPage = activeSpec.parsePage(pageResp.body, originUrl, {
-          fields,
-          headers: pageResp.headers,
-        });
-      } catch {
-        const trimmedBody = pageResp.body.trim();
-        const looksLikeJson = trimmedBody.startsWith('{') || trimmedBody.startsWith('[');
-        const nonStorefrontHtml = isNonStorefrontHtmlFallback(pageResp, activeSpec.platform);
-        if (pagesRead === 0 && !triedAutoFallbackToWc && (looksLikeJson || nonStorefrontHtml)) {
-          triedAutoFallbackToWc = true;
-          autoFallbackFromShopify = true;
-          const wcAdapter = getCatalogAdapter('woocommerce');
-          if (wcAdapter?.catalog) {
-            activeSpec = wcAdapter.catalog;
-            resolvedPlatformOut = activeSpec.platform;
-            resolvedPullTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
-            effectivePauseMs = computeEffectivePauseMs(activeSpec);
-            currentEntry.summary.platform = activeSpec.platform;
-            currentEntry.summary.pauseMs = effectivePauseMs;
-            currentUrl = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
-            continue;
+        pagesRead++;
+        let hitByteBudget = false;
+        for (const item of evalOut.items ?? []) {
+          const prevRec = byProductId.get(item.key);
+          const prevVariants = prevRec ? prevRec.variants.length : 0;
+          const prevBytes = bytesByProductId.get(item.key) ?? 0;
+          if (
+            accumulatedBytes - prevBytes + item.footprintBytes > MAX_CATALOG_IN_MEMORY_BYTES ||
+            totalVariantsCount - prevVariants + item.record.variants.length > MAX_VARIANTS_PER_CATALOG_RUN
+          ) {
+            hitByteBudget = true;
+            truncatedByBudget = true;
+            stopReason = 'byte_budget';
+            break;
           }
+          accumulatedBytes = accumulatedBytes - prevBytes + item.footprintBytes;
+          totalVariantsCount = totalVariantsCount - prevVariants + item.record.variants.length;
+          bytesByProductId.set(item.key, item.footprintBytes);
+          byProductId.set(item.key, item.record);
         }
-        if (pagesRead === 0 && autoFallbackFromShopify && nonStorefrontHtml) {
-          resolvedPlatformOut = 'unknown';
-          currentEntry.summary.platform = 'unknown';
-          resolvedPullTracer?.setAttribute('edgefetch.adapter_id', 'unknown');
-          finalStatus = 'partial';
-          stopReason = 'unsupported_storefront';
-          break;
-        }
-        finalStatus = 'challenged';
-        stopReason = 'non_json_body';
-        break;
-      }
 
-      pagesRead++;
-      let hitByteBudget = false;
-      for (const rec of parsedPage.records) {
-        const key = rec.productId || rec.handle || rec.url;
-        const { record: clampedRec, bytes: rawRecBytes } = clampCatalogRecord(rec);
-        // Account V8 object + variant-hash overhead (`96 B` per variant) so minimal-variant bombs stop well within `16 MiB`!
-        const recFootprintBytes = rawRecBytes + clampedRec.variants.length * 96;
-        const prevRec = byProductId.get(key);
-        const prevVariants = prevRec ? prevRec.variants.length : 0;
-        const prevBytes = bytesByProductId.get(key) ?? 0;
-        if (
-          accumulatedBytes - prevBytes + recFootprintBytes > MAX_CATALOG_IN_MEMORY_BYTES ||
-          totalVariantsCount - prevVariants + clampedRec.variants.length > MAX_VARIANTS_PER_CATALOG_RUN
-        ) {
-          hitByteBudget = true;
+        const currentRecords = [...byProductId.values()];
+        currentEntry.records = currentRecords;
+        currentEntry.retainedBytes = accumulatedBytes;
+        currentEntry.summary = {
+          ...currentEntry.summary,
+          products: currentRecords.length,
+          variants: totalVariantsCount,
+          pages: pagesRead,
+          pagesRead,
+          durationMs: Date.now() - startedAtMs,
+          updatedAt: new Date().toISOString(),
+        };
+        await persistCatalogRun(env, currentEntry);
+
+        if (hitByteBudget) break;
+        if (Date.now() >= syncDeadlineAt) {
+          stopReason = 'time_budget_exceeded';
           truncatedByBudget = true;
-          stopReason = 'byte_budget';
           break;
         }
-        accumulatedBytes = accumulatedBytes - prevBytes + recFootprintBytes;
-        totalVariantsCount = totalVariantsCount - prevVariants + clampedRec.variants.length;
-        bytesByProductId.set(key, recFootprintBytes);
-        byProductId.set(key, clampedRec);
+        if (evalOut.done || !evalOut.nextUrl) {
+          naturalCompletion = true;
+          break;
+        }
+        if (pagesRead >= maxPages) {
+          stopReason = 'max_pages_reached';
+          break;
+        }
+        currentUrl = evalOut.nextUrl;
       }
 
-      const currentRecords = [...byProductId.values()];
-      const currentVariantsCount = currentRecords.reduce((acc, r) => acc + r.variants.length, 0);
-      currentEntry.records = currentRecords;
-      currentEntry.retainedBytes = accumulatedBytes;
-      currentEntry.summary = {
-        ...currentEntry.summary,
-        products: currentRecords.length,
-        variants: currentVariantsCount,
-        pages: pagesRead,
-        pagesRead,
-        durationMs: Date.now() - startedAtMs,
-        updatedAt: new Date().toISOString(),
-      };
-      await persistCatalogRun(env, currentEntry);
-
-      if (hitByteBudget) {
-        break;
+      if (finalStatus !== 'challenged') {
+        if (naturalCompletion) finalStatus = 'complete';
+        else {
+          finalStatus = 'partial';
+          if (!stopReason) stopReason = 'incomplete_pagination';
+        }
       }
 
-      if (Date.now() >= syncDeadlineAt) {
-        stopReason = 'time_budget_exceeded';
-        truncatedByBudget = true;
-        break;
-      }
-
-      if (parsedPage.done) {
-        naturalCompletion = true;
-        break;
-      }
-
-      const nextUrl = activeSpec.nextPage({
-        url: currentUrl,
-        body: pageResp.body,
-        pageIndex: pagesRead - 1,
-        headers: pageResp.headers,
-      });
-
-      if (!nextUrl) {
-        naturalCompletion = true;
-        break;
-      }
-
-      if (pagesRead >= maxPages) {
-        stopReason = 'max_pages_reached';
-        break;
-      }
-
-      currentUrl = nextUrl;
-    }
-
-    if (finalStatus !== 'challenged') {
-      if (naturalCompletion) {
-        finalStatus = 'complete';
-      } else {
-        finalStatus = 'partial';
-        if (!stopReason) stopReason = 'incomplete_pagination';
-      }
-    }
-
-    const finalRecords = [...byProductId.values()];
-    const hasNullShopifyVariantCurrency =
-      activeSpec.platform === 'shopify' &&
-      finalRecords.some((rec) => rec.variants.some((v) => !v.currency));
-    const remForCartCurrencyMs = syncDeadlineAt - Date.now();
-    if (hasNullShopifyVariantCurrency && !truncatedByBudget && remForCartCurrencyMs >= 1_500) {
-      let detectedCurrency: string | null = null;
-      for (const probePath of ['/meta.json', '/cart.js']) {
-        const remProbeMs = syncDeadlineAt - Date.now();
-        if (remProbeMs < 1_000) break;
-        const callCurrProbe = () =>
-          executeHubFetch({
-            url: `${parsedUrl.origin}${probePath}`,
-            kind: 'json',
-            accept: 'application/json',
-            maxBytes: 65_536,
-            timeoutMs: Math.min(4_000, remProbeMs),
-            ...(payload.target !== undefined ? { target: payload.target } : {}),
-            ...(payload.site !== undefined ? { site: payload.site } : {}),
-            ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
-          });
-        const currRace = await awaitWithDeadline(
-          Promise.resolve()
-            .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callCurrProbe) : callCurrProbe()))
-            .catch(() => null),
-          syncDeadlineAt,
-        );
-        if (!currRace.timedOut) {
-          const normCurr = normalizeHubPageResponse(currRace.value);
-          if (normCurr && normCurr.status === 200 && normCurr.body) {
-            try {
-              const parsedCurr = JSON.parse(normCurr.body) as { currency?: unknown; active?: unknown };
-              const cand =
-                typeof parsedCurr?.currency === 'string'
-                  ? parsedCurr.currency.trim().toUpperCase()
-                  : parsedCurr?.currency &&
-                      typeof parsedCurr.currency === 'object' &&
-                      typeof (parsedCurr.currency as { active?: unknown }).active === 'string'
-                    ? ((parsedCurr.currency as { active: string }).active.trim().toUpperCase())
-                    : '';
-              if (/^[A-Z]{3}$/.test(cand)) {
+      const rawFinalRecords = [...byProductId.values()];
+      let detectedCurrency = '';
+      const hasNullShopifyVariantCurrency = activeSpec.platform === 'shopify' && rawFinalRecords.some((rec) => rec.variants.some((v) => !v.currency));
+      if (hasNullShopifyVariantCurrency && !truncatedByBudget && syncDeadlineAt - Date.now() >= 1_500) {
+        for (const probePath of ['/meta.json', '/cart.js']) {
+          const remProbeMs = syncDeadlineAt - Date.now();
+          if (remProbeMs < 1_000) break;
+          const callCurrProbe = () =>
+            executeHubFetch({
+              url: `${plan.origin}${probePath}`,
+              kind: 'json',
+              accept: 'application/json',
+              maxBytes: 65_536,
+              timeoutMs: Math.min(4_000, remProbeMs),
+              ...(payload.target !== undefined ? { target: payload.target } : {}),
+              ...(payload.site !== undefined ? { site: payload.site } : {}),
+              ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+            });
+          const currRace = await awaitWithDeadline(
+            Promise.resolve()
+              .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callCurrProbe) : callCurrProbe()))
+              .catch(() => null),
+            syncDeadlineAt,
+          );
+          if (!currRace.timedOut) {
+            const normCurr = normalizeHubPageResponse(currRace.value);
+            if (normCurr && normCurr.status === 200 && normCurr.body) {
+              const cand = callCoreWasmRaw<{ currency: string | null }>('catalog_parse_currency_probe', null, normCurr.body).currency ?? '';
+              if (cand) {
                 detectedCurrency = cand;
                 break;
               }
-            } catch {
-              // ignore non-JSON probe response
             }
           }
         }
       }
-      if (detectedCurrency) {
-        for (const rec of finalRecords) {
-          for (const v of rec.variants) {
-            if (!v.currency) v.currency = detectedCurrency;
+
+      let ucpMeta: CatalogUcpMetadata | undefined;
+      const remForUcpMs = syncDeadlineAt - Date.now();
+      if ((finalStatus === 'complete' || pagesRead > 0) && !truncatedByBudget && remForUcpMs >= 1_000) {
+        const callRobotsCheck = () =>
+          executeHubFetch({
+            url: `${plan.origin}/robots.txt`,
+            kind: 'text',
+            accept: 'text/plain',
+            timeoutMs: Math.min(5_000, remForUcpMs),
+            ...(payload.target !== undefined ? { target: payload.target } : {}),
+            ...(payload.site !== undefined ? { site: payload.site } : {}),
+            ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+          });
+        const ucpRace = await awaitWithDeadline(
+          Promise.resolve()
+            .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callRobotsCheck) : callRobotsCheck()))
+            .catch(() => null),
+          syncDeadlineAt,
+        );
+        if (!ucpRace.timedOut) {
+          const normRobots = normalizeHubPageResponse(ucpRace.value);
+          if (normRobots && normRobots.status === 200 && normRobots.body) {
+            ucpMeta = discoverUcpEndpointFromRobots(plan.origin, normRobots.body) ?? undefined;
           }
         }
       }
-    }
-    const totalVariants = finalRecords.reduce((acc, r) => acc + r.variants.length, 0);
-    const currHashes = buildSnapshotHashBundle(finalRecords);
 
-    // Optional lightweight `robots.txt` check for Shopify UCP / MCP endpoint advertisement
-    // (skipped if wall-clock deadline has expired or < 1s remains so total wall time NEVER exceeds `syncDeadlineAt`!).
-    let ucpMeta: CatalogUcpMetadata | undefined;
-    const remForUcpMs = syncDeadlineAt - Date.now();
-    if ((finalStatus === 'complete' || pagesRead > 0) && !truncatedByBudget && remForUcpMs >= 1_000) {
-      const callRobotsCheck = () =>
-        executeHubFetch({
-          url: `${parsedUrl.origin}/robots.txt`,
-          kind: 'text',
-          accept: 'text/plain',
-          timeoutMs: Math.min(5_000, remForUcpMs),
-          ...(payload.target !== undefined ? { target: payload.target } : {}),
-          ...(payload.site !== undefined ? { site: payload.site } : {}),
-          ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
-        });
-      const ucpRace = await awaitWithDeadline(
-        Promise.resolve()
-          .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callRobotsCheck) : callRobotsCheck()))
-          .catch(() => null),
-        syncDeadlineAt,
-      );
-      if (!ucpRace.timedOut) {
-        const normRobots = normalizeHubPageResponse(ucpRace.value);
-        if (normRobots && normRobots.status === 200 && normRobots.body) {
-          ucpMeta = discoverUcpEndpointFromRobots(parsedUrl.origin, normRobots.body) ?? undefined;
-        }
+      const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, plan.origin, collection, catalogId);
+      const r2 = getArtifactsR2(env);
+      const finalized = callCoreWasm<{
+        records: CatalogRecord[];
+        totalVariants: number;
+        hashes: SnapshotHashBundle;
+        hashesBytes: number;
+        diff: CatalogSnapshotDiff | null;
+        ndjson: string;
+        warning?: 'shrink';
+        previousProducts?: number;
+      }>('catalog_finalize_pull', {
+        records: rawFinalRecords,
+        detectedCurrency,
+        ...(prevRun ? { prevProducts: prevRun.productsCount, prevHashes: prevRun.hashes } : {}),
+        isComplete: finalStatus === 'complete',
+        buildNdjson: Boolean(r2 && rawFinalRecords.length > 0),
+      });
+
+      let artifactId: string | undefined;
+      let hashesArtifactId: string | undefined;
+      const r2Prefix = ownerKey !== 'owner' && ownerKey !== 'anonymous' ? `private/${sanitizeStorageUserId(ownerKey)}/catalog` : 'catalog';
+      if (r2 && finalized.records.length > 0) {
+        const key = `${r2Prefix}/${catalogId}.ndjson`;
+        await r2
+          .put(key, finalized.ndjson, { httpMetadata: { contentType: 'application/x-ndjson; charset=utf-8' } })
+          .then(() => {
+            artifactId = key;
+          })
+          .catch(() => undefined);
+        const hashesKey = `${r2Prefix}/${catalogId}.hashes.json`;
+        await r2
+          .put(hashesKey, JSON.stringify(finalized.hashes), { httpMetadata: { contentType: 'application/json; charset=utf-8' } })
+          .then(() => {
+            hashesArtifactId = hashesKey;
+          })
+          .catch(() => undefined);
       }
-    }
 
-    // Write NDJSON + SnapshotHashBundle artifacts to R2 when `ARTIFACTS` is bound (tenant-isolated under `private/<userId>/...` for non-owners!)
-    let artifactId: string | undefined;
-    let hashesArtifactId: string | undefined;
-    const r2 = getArtifactsR2(env);
-    const r2Prefix =
-      ownerKey !== 'owner' && ownerKey !== 'anonymous'
-        ? `private/${sanitizeStorageUserId(ownerKey)}/catalog`
-        : 'catalog';
-    if (r2 && finalRecords.length > 0) {
-      const key = `${r2Prefix}/${catalogId}.ndjson`;
-      const ndjson = `${finalRecords.map((r) => JSON.stringify(r)).join('\n')}\n`;
-      try {
-        await r2.put(key, ndjson, {
-          httpMetadata: { contentType: 'application/x-ndjson; charset=utf-8' },
-        });
-        artifactId = key;
-      } catch {
-        // Non-fatal if R2 put fails
-      }
-      const hashesKey = `${r2Prefix}/${catalogId}.hashes.json`;
-      try {
-        await r2.put(hashesKey, JSON.stringify(currHashes), {
-          httpMetadata: { contentType: 'application/json; charset=utf-8' },
-        });
-        hashesArtifactId = hashesKey;
-      } catch {
-        // Non-fatal if R2 put fails
-      }
-    }
+      const finishedNow = new Date().toISOString();
+      const { resumeAt: _dropResume, ...cleanBase } = currentEntry.summary;
+      const callerCappedSuccess = plan.callerExplicitMaxPages && stopReason === 'max_pages_reached' && finalized.records.length > 0;
+      const finalSummary: CatalogStatusSummary = {
+        ...cleanBase,
+        ok: finalStatus === 'complete' || callerCappedSuccess,
+        status: finalStatus,
+        platform: resolvedPlatformOut,
+        products: finalized.records.length,
+        variants: finalized.totalVariants,
+        pages: pagesRead,
+        pagesRead,
+        pauseMs: effectivePauseMs,
+        durationMs: Date.now() - startedAtMs,
+        ...(truncatedByBudget || stopReason === 'max_pages_reached' ? { truncated: true } : {}),
+        ...(stopReason ? { reason: stopReason } : {}),
+        ...(finalized.warning ? { warning: finalized.warning, previousProducts: finalized.previousProducts } : {}),
+        ...(artifactId ? { artifactId } : {}),
+        diff: finalized.diff ?? null,
+        ...(ucpMeta ? { ucp: ucpMeta } : {}),
+        ...(blockedInfo ? { blocked: blockedInfo } : {}),
+        updatedAt: finishedNow,
+      };
 
-    // Shrink Guard & Variant-Level Snapshot Diff against last trusted `complete` run for `(userId, origin, collection)`
-    let shrinkWarning: 'shrink' | undefined;
-    let previousProducts: number | undefined;
-    let diff: CatalogSnapshotDiff | null = null;
-
-    const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, parsedUrl.origin, collection, catalogId);
-    if (prevRun) {
-      if (prevRun.productsCount > 0 && finalRecords.length < prevRun.productsCount * 0.5) {
-        shrinkWarning = 'shrink';
-        previousProducts = prevRun.productsCount;
-      }
-      if (prevRun.hashes && finalStatus === 'complete') {
-        diff = computeCatalogSnapshotDiff(prevRun.hashes, currHashes);
-      }
-    }
-
-    const finishedNow = new Date().toISOString();
-    const { resumeAt: _dropResume, ...cleanBase } = currentEntry.summary;
-    const callerCappedSuccess =
-      callerExplicitMaxPages && stopReason === 'max_pages_reached' && finalRecords.length > 0;
-    const finalSummary: CatalogStatusSummary = {
-      ...cleanBase,
-      ok: finalStatus === 'complete' || callerCappedSuccess,
-      status: finalStatus,
-      platform: resolvedPlatformOut,
-      products: finalRecords.length,
-      variants: totalVariants,
-      pages: pagesRead,
-      pagesRead,
-      pauseMs: effectivePauseMs,
-      durationMs: Date.now() - startedAtMs,
-      ...(truncatedByBudget || stopReason === 'max_pages_reached' ? { truncated: true } : {}),
-      ...(stopReason ? { reason: stopReason } : {}),
-      ...(shrinkWarning ? { warning: shrinkWarning, previousProducts } : {}),
-      ...(artifactId ? { artifactId } : {}),
-      diff,
-      ...(ucpMeta ? { ucp: ucpMeta } : {}),
-      ...(blockedInfo ? { blocked: blockedInfo } : {}),
-      updatedAt: finishedNow,
-    };
-
-    currentEntry.summary = finalSummary;
-    currentEntry.hashes = currHashes;
-    currentEntry.hashesBytes = approxHashBundleBytes(currHashes);
-    if (hashesArtifactId) {
-      currentEntry.hashesArtifactId = hashesArtifactId;
-    }
-    // Flush full in-memory record bodies once persisted to `ARTIFACTS` R2 (`getCatalogRecords` reloads from R2 `artifactId`)
-    if (artifactId) {
-      currentEntry.records = null;
-      currentEntry.retainedBytes = 0;
-    } else {
-      currentEntry.records = finalRecords;
-      currentEntry.retainedBytes = accumulatedBytes;
-    }
-    await persistCatalogRun(env, currentEntry);
-    resolvedPullTracer?.setAttribute('edgefetch.catalog.status', finalStatus);
-    resolvedPullTracer?.setAttribute('edgefetch.catalog.pages_read', pagesRead);
-    resolvedPullTracer?.setAttribute('edgefetch.catalog.products', finalRecords.length);
-    return finalSummary;
+      currentEntry.summary = finalSummary;
+      currentEntry.hashes = finalized.hashes;
+      currentEntry.hashesBytes = finalized.hashesBytes;
+      if (hashesArtifactId) currentEntry.hashesArtifactId = hashesArtifactId;
+      currentEntry.records = artifactId ? null : finalized.records;
+      currentEntry.retainedBytes = artifactId ? 0 : accumulatedBytes;
+      await persistCatalogRun(env, currentEntry);
+      resolvedPullTracer?.setAttribute('edgefetch.catalog.status', finalStatus);
+      resolvedPullTracer?.setAttribute('edgefetch.catalog.pages_read', pagesRead);
+      resolvedPullTracer?.setAttribute('edgefetch.catalog.products', finalized.records.length);
+      return finalSummary;
     } finally {
       releaseConcurrencySlot();
     }
@@ -2302,49 +1603,27 @@ export async function executeCatalogCall(params: {
         activeTracer
           ? activeTracer.withSpan(
               'edgefetch.catalog.run',
-              {
-                kind: 1,
-                attributes: {
-                  'edgefetch.adapter_id': activeSpec.platform,
-                  'edgefetch.catalog.sync': false,
-                },
-              },
+              { kind: 1, attributes: { 'edgefetch.adapter_id': activeSpec.platform, 'edgefetch.catalog.sync': false } },
               (_runSpan, runTracer) => runPull(runTracer),
             )
           : runPull();
       return execPull().finally(async () => {
         if (activeTracer && env) {
           const otelEnv = env as OtelEnvConfig & { SAFE_FETCH?: typeof fetch; SAFE_PUBLIC_FETCH?: typeof fetch };
-          let resolvedDevTel: string | boolean | null | undefined;
-          if (typeof params.devTelemetrySetting === 'function') {
-            try {
-              resolvedDevTel = await params.devTelemetrySetting();
-            } catch {
-              resolvedDevTel = null;
-            }
-          } else {
-            resolvedDevTel = params.devTelemetrySetting;
-          }
+          const resolvedDevTel =
+            typeof params.devTelemetrySetting === 'function'
+              ? await Promise.resolve(params.devTelemetrySetting()).catch(() => null)
+              : params.devTelemetrySetting;
           await activeTracer
-            .flush({
-              env: otelEnv,
-              devTelemetrySetting: resolvedDevTel,
-              ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}),
-            })
+            .flush({ env: otelEnv, devTelemetrySetting: resolvedDevTel, ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}) })
             .catch(() => false);
         }
       });
     };
     params.ctx!.waitUntil!(runWithTrace());
-    return {
-      status: 202,
-      body: { ...currentEntry.summary },
-    };
+    return { status: 202, body: { ...currentEntry.summary } };
   }
 
   const completedSummary = await (activeTracer ? activeTracer.run(() => runPull(activeTracer)) : runPull());
-  return {
-    status: 200,
-    body: { ...completedSummary },
-  };
+  return { status: 200, body: { ...completedSummary } };
 }

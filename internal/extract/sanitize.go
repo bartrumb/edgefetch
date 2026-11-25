@@ -335,6 +335,57 @@ func stripMintlifyDocHygieneBannersGo(s string) string {
 	return s
 }
 
+const (
+	mdFlagDirtyChar  uint16 = 1 << iota // < 0x20 (except \t, \n) or >= 0x7F
+	mdFlagNewline                       // '\n'
+	mdFlagBacktick                      // '`'
+	mdFlagTilde                         // '~'
+	mdFlagLt                            // '<'
+	mdFlagAmp                           // '&'
+	mdFlagOpenBrack                     // '['
+	mdFlagCloseBrack                    // ']'
+	mdFlagColon                         // ':'
+	mdFlagSlash                         // '/'
+	mdFlagOpenBrace                     // '{'
+	mdFlagQuest                         // '?'
+)
+
+var mdCharFlagTable = func() [256]uint16 {
+	var t [256]uint16
+	for i := 0; i < 256; i++ {
+		if (i < 0x20 && i != '\t' && i != '\n') || i >= 0x7F {
+			t[i] |= mdFlagDirtyChar
+		}
+	}
+	t['\n'] |= mdFlagNewline
+	t['`'] |= mdFlagBacktick
+	t['~'] |= mdFlagTilde
+	t['<'] |= mdFlagLt
+	t['&'] |= mdFlagAmp
+	t['['] |= mdFlagOpenBrack
+	t[']'] |= mdFlagCloseBrack
+	t[':'] |= mdFlagColon
+	t['/'] |= mdFlagSlash
+	t['{'] |= mdFlagOpenBrace
+	t['?'] |= mdFlagQuest
+	return t
+}()
+
+func scanMdCharFlagsGo(s string) uint16 {
+	tbl := mdCharFlagTable
+	var flags uint16
+	i := 0
+	n := len(s)
+	for ; i+8 <= n; i += 8 {
+		flags |= tbl[s[i]] | tbl[s[i+1]] | tbl[s[i+2]] | tbl[s[i+3]] |
+			tbl[s[i+4]] | tbl[s[i+5]] | tbl[s[i+6]] | tbl[s[i+7]]
+	}
+	for ; i < n; i++ {
+		flags |= tbl[s[i]]
+	}
+	return flags
+}
+
 // SanitizeMarkdownWithOptions sanitizes Markdown with optional PDF page marker preservation.
 func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) string {
 	if md == "" {
@@ -350,8 +401,13 @@ func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) s
 		bounded = bounded[:cut]
 	}
 
-	cleaned := stripInvisibleSmugglingCharsGo(bounded)
-	cleaned = normalizeMarkdownLineEndings(cleaned)
+	flags := scanMdCharFlagsGo(bounded)
+	var cleaned string
+	if flags&mdFlagDirtyChar == 0 {
+		cleaned = bounded
+	} else {
+		cleaned = normalizeMarkdownLineEndings(stripInvisibleSmugglingCharsGo(bounded))
+	}
 	cleaned = trimLeadingBlankLinesAndTrailingASCIIGo(stripMarkdownFrontmatterBody(cleaned))
 	if cleaned == "" {
 		return ""
@@ -359,6 +415,12 @@ func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) s
 	cleaned = stripMintlifyDocHygieneBannersGo(cleaned)
 	if cleaned == "" {
 		return ""
+	}
+	const complexProseMask = mdFlagDirtyChar | mdFlagNewline | mdFlagBacktick | mdFlagTilde |
+		mdFlagLt | mdFlagAmp | mdFlagOpenBrace | mdFlagQuest | mdFlagColon | mdFlagSlash
+	const bracketPairMask = mdFlagOpenBrack | mdFlagCloseBrack
+	if flags&complexProseMask == 0 && (flags&bracketPairMask) != bracketPairMask {
+		return trimASCIIWhitespaceLinearGo(cleaned)
 	}
 
 	_, parts := recognizeAndHardenMarkdownFencesGo(cleaned, true)

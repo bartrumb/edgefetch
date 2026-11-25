@@ -254,20 +254,27 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
   rawB: string,
 ): T {
   let reactor = getReactor();
+  const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : new Uint8Array(0);
+  const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { ...metaObj, htmlByteLen: encA.byteLength } }));
   const run = (r: CoreReactorExports): number => {
-    const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : new Uint8Array(0);
-    const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : new Uint8Array(0);
-    const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { ...metaObj, htmlByteLen: encA.byteLength } }));
-    const totalLen = metaBytes.byteLength + encA.byteLength + encB.byteLength;
-    const ptr = r.ef_in_ptr(totalLen) >>> 0;
-    if (ptr === 0 && totalLen > 0) {
-      throw new Error(`WASM input buffer allocation failed (${totalLen} bytes)`);
+    const maxBBytes = rawB.length * 3;
+    const allocLen = metaBytes.byteLength + encA.byteLength + maxBBytes;
+    const ptr = r.ef_in_ptr(allocLen) >>> 0;
+    if (ptr === 0 && allocLen > 0) {
+      throw new Error(`WASM input buffer allocation failed (${allocLen} bytes)`);
     }
-    const mem = new Uint8Array(r.memory.buffer, ptr, totalLen);
-    mem.set(metaBytes, 0);
-    if (encA.byteLength > 0) mem.set(encA, metaBytes.byteLength);
-    if (encB.byteLength > 0) mem.set(encB, metaBytes.byteLength + encA.byteLength);
-    return r.ef_call_raw(metaBytes.byteLength, totalLen) >>> 0;
+    const mem = new Uint8Array(r.memory.buffer);
+    mem.set(metaBytes, ptr);
+    let offset = ptr + metaBytes.byteLength;
+    if (encA.byteLength > 0) {
+      mem.set(encA, offset);
+      offset += encA.byteLength;
+    }
+    if (rawB.length > 0) {
+      const encB = utf8Encoder.encodeInto(rawB, mem.subarray(offset, offset + maxBBytes));
+      offset += encB.written;
+    }
+    return r.ef_call_raw(metaBytes.byteLength, offset - ptr) >>> 0;
   };
   let outLen: number;
   try {
@@ -285,20 +292,27 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
 
 export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, rawA: string, rawB: string): T {
   let reactor = getReactor();
+  const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : new Uint8Array(0);
+  const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { mdByteLen: encA.byteLength } }));
   const run = (r: CoreReactorExports): number => {
-    const encA = rawA.length > 0 ? utf8Encoder.encode(rawA) : new Uint8Array(0);
-    const encB = rawB.length > 0 ? utf8Encoder.encode(rawB) : new Uint8Array(0);
-    const metaBytes = utf8Encoder.encode(JSON.stringify({ op, meta: { mdByteLen: encA.byteLength } }));
-    const totalLen = metaBytes.byteLength + encA.byteLength + encB.byteLength;
-    const ptr = r.ef_in_ptr(totalLen) >>> 0;
-    if (ptr === 0 && totalLen > 0) {
-      throw new Error(`WASM input buffer allocation failed (${totalLen} bytes)`);
+    const maxBBytes = rawB.length * 3;
+    const allocLen = metaBytes.byteLength + encA.byteLength + maxBBytes;
+    const ptr = r.ef_in_ptr(allocLen) >>> 0;
+    if (ptr === 0 && allocLen > 0) {
+      throw new Error(`WASM input buffer allocation failed (${allocLen} bytes)`);
     }
-    const mem = new Uint8Array(r.memory.buffer, ptr, totalLen);
-    mem.set(metaBytes, 0);
-    if (encA.byteLength > 0) mem.set(encA, metaBytes.byteLength);
-    if (encB.byteLength > 0) mem.set(encB, metaBytes.byteLength + encA.byteLength);
-    return r.ef_call_raw(metaBytes.byteLength, totalLen) >>> 0;
+    const mem = new Uint8Array(r.memory.buffer);
+    mem.set(metaBytes, ptr);
+    let offset = ptr + metaBytes.byteLength;
+    if (encA.byteLength > 0) {
+      mem.set(encA, offset);
+      offset += encA.byteLength;
+    }
+    if (rawB.length > 0) {
+      const encB = utf8Encoder.encodeInto(rawB, mem.subarray(offset, offset + maxBBytes));
+      offset += encB.written;
+    }
+    return r.ef_call_raw(metaBytes.byteLength, offset - ptr) >>> 0;
   };
   let outLen: number;
   try {
@@ -332,6 +346,7 @@ export function callCoreWasmRawString(op: string, meta: unknown, rawStr: string)
     outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
     void err;
   }
+  if (outLen === 0xffffffff) return rawStr;
   if (outLen === 0) return '';
   const outPtr = reactor.ef_out_ptr() >>> 0;
   return utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));

@@ -633,6 +633,11 @@ func RecognizeAndHardenMarkdownFences(rawMD string, opts RecognizeMarkdownFences
 	return hardened, segments
 }
 
+// UTF16Len returns the number of UTF-16 code units in s in O(N) time with an ASCII fast path.
+func UTF16Len(s string) int {
+	return utf16UnitsInChunkSliceGo(s)
+}
+
 // ComputeMarkdownSliceCheckpoints computes periodic canonical fence-recognizer checkpoints across rawFullMD.
 func utf16UnitsInChunkSliceGo(s string) int {
 	// Fast path for pure ASCII chunks
@@ -2093,16 +2098,36 @@ func stripHtmlTagsQuoteAwareLinearSliceGo(rawHTML string, replacement string, ma
 	if strings.IndexByte(src, '<') < 0 {
 		return src
 	}
+	if replacement != "" {
+		var sb strings.Builder
+		cursor := 0
+		scanHtmlTagsLinearSliceGo(src, maxChars, true, func(tag scannedHtmlTagSliceGo) bool {
+			if cursor == 0 && sb.Cap() == 0 {
+				sb.Grow(len(src))
+			}
+			if tag.index > cursor {
+				sb.WriteString(src[cursor:tag.index])
+			}
+			sb.WriteString(replacement)
+			cursor = tag.end
+			return true
+		})
+		if cursor == 0 {
+			return src
+		}
+		if cursor < len(src) {
+			sb.WriteString(src[cursor:])
+		}
+		return sb.String()
+	}
 	var out []string
 	cursor := 0
 	scanHtmlTagsLinearSliceGo(src, maxChars, true, func(tag scannedHtmlTagSliceGo) bool {
 		if tag.index > cursor {
 			out = append(out, src[cursor:tag.index])
 		}
-		if replacement == "" && tag.end < len(src) {
+		if tag.end < len(src) {
 			guardSplitTagReassemblySliceGo(&out, src[tag.end:minIntSliceGo(len(src), tag.end+24)], nil)
-		} else {
-			out = append(out, replacement)
 		}
 		cursor = tag.end
 		return true

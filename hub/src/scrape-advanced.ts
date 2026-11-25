@@ -7,7 +7,7 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
-import { callCoreWasm, callCoreWasmRawPair, callCoreWasmRawString } from './wasm-bridge';
+import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawPair, callCoreWasmRawString } from './wasm-bridge';
 
 export function isAsciiWhitespaceCode(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 13;
@@ -48,17 +48,17 @@ export function neutralizeAllUnsafeMarkdownLinksLinear(prose: string): string {
 
 export function escapeGfmTaskListCheckboxesLinear(prose: string): string {
   if (!prose || !prose.includes('[')) return prose;
-  return callCoreWasm<{ out: string }>('escape_task_checkboxes', { prose }).out;
+  return callCoreWasmRawString('escape_task_checkboxes', null, prose);
 }
 
 export function escapeAllResidualLtInProseLinear(prose: string, allowPdfPageMarkers = false): string {
   if (!prose || !prose.includes('<')) return prose;
-  return callCoreWasm<{ out: string }>('escape_residual_lt', { prose, allowPdfPageMarkers }).out;
+  return callCoreWasmRawString('escape_residual_lt', { allowPdfPageMarkers }, prose);
 }
 
 export function stripInvisibleSmugglingChars(s: string): string {
   if (!s) return '';
-  return callCoreWasm<{ out: string }>('strip_invisible', { text: s }).out;
+  return callCoreWasmRawString('strip_invisible', null, s);
 }
 
 export function cleanFenceInfoStringLinear(rawInfo: string): string {
@@ -113,15 +113,35 @@ export function recognizeAndHardenMarkdownFences(
   options?: RecognizeMarkdownFencesOptions,
 ): { hardened: string; segments: string[] } {
   if (!rawMd) return { hardened: '', segments: [''] };
-  const res = callCoreWasm<{ hardened: string; segments: string[] }>('recognize_fences', {
-    md: rawMd,
-    harden: Boolean(options?.harden),
-    preserveCrLf: Boolean(options?.preserveCrLf),
-    ...(options?.initialReopenedFence ? { initialReopenedFence: options.initialReopenedFence } : {}),
-    ...(options?.initialState ? { initialState: options.initialState } : {}),
-    skipLeadingSeparatorEmptyLine: Boolean(options?.skipLeadingSeparatorEmptyLine),
-  });
-  return { hardened: res.hardened ?? '', segments: res.segments ?? [''] };
+  const rawOut = callCoreWasmRawString(
+    'recognize_fences',
+    {
+      harden: Boolean(options?.harden),
+      preserveCrLf: Boolean(options?.preserveCrLf),
+      ...(options?.initialReopenedFence ? { initialReopenedFence: options.initialReopenedFence } : {}),
+      ...(options?.initialState ? { initialState: options.initialState } : {}),
+      skipLeadingSeparatorEmptyLine: Boolean(options?.skipLeadingSeparatorEmptyLine),
+    },
+    rawMd,
+  );
+  const nulIdx = rawOut.indexOf('\0');
+  if (nulIdx < 0) return { hardened: rawOut, segments: [rawOut] };
+  const header = rawOut.slice(0, nulIdx);
+  if (header === 'J') {
+    const parsed = JSON.parse(rawOut.slice(nulIdx + 1)) as { hardened?: string; segments?: string[] };
+    return { hardened: parsed.hardened ?? '', segments: parsed.segments ?? [''] };
+  }
+  const hardened = rawOut.slice(nulIdx + 1);
+  if (!header) return { hardened, segments: [hardened] };
+  const parts = header.split(',');
+  const segments = new Array<string>(parts.length);
+  let cur = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const len = Number(parts[i]);
+    segments[i] = hardened.slice(cur, cur + len);
+    cur += len;
+  }
+  return { hardened, segments };
 }
 
 export interface MarkdownSliceCheckpoint {
@@ -146,10 +166,11 @@ export interface MarkdownSliceCheckpoint {
 export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 16_384): MarkdownSliceCheckpoint[] {
   if (!rawFullMd) return [];
   return (
-    callCoreWasm<{ checkpoints: MarkdownSliceCheckpoint[] | null }>('slice_checkpoints', {
-      fullMd: rawFullMd,
-      stepChars,
-    }).checkpoints ?? []
+    callCoreWasmRaw<{ checkpoints: MarkdownSliceCheckpoint[] | null }>(
+      'slice_checkpoints',
+      { stepChars },
+      rawFullMd,
+    ).checkpoints ?? []
   );
 }
 
@@ -235,7 +256,7 @@ export function sanitizeFullMarkdownDocumentForArtifact(fullMd: string): string 
 
 export function stripMarkdownTableDividerLinesLinear(s: string): string {
   if (!s || !s.includes('-')) return s;
-  return callCoreWasm<{ out: string }>('strip_table_dividers', { text: s }).out;
+  return callCoreWasmRawString('strip_table_dividers', null, s);
 }
 
 export function detectPromptInjection(params: {
@@ -245,11 +266,12 @@ export function detectPromptInjection(params: {
   detected: boolean;
   triggers: string[];
 } {
-  const res = callCoreWasmRawPair<{ detected: boolean; triggers?: string[] }>(
-    'detect_prompt_injection',
-    String(params.markdown ?? ''),
-    String(params.rawHtml ?? ''),
-  );
+  const md = String(params.markdown ?? '');
+  const html = String(params.rawHtml ?? '');
+  const res =
+    html.length === 0
+      ? callCoreWasmRaw<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', null, md)
+      : callCoreWasmRawPair<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', md, html);
   return {
     detected: Boolean(res.detected),
     triggers: res.triggers ?? [],
@@ -272,9 +294,10 @@ export function extractHtmlAttributesBySelectors(
   if (cleanSelectors.length === 0) {
     return { items: [] };
   }
-  const res = callCoreWasm<{ items?: Array<{ selector: string; attribute: string; values?: string[] }> }>(
+  const res = callCoreWasmRaw<{ items?: Array<{ selector: string; attribute: string; values?: string[] }> }>(
     'extract_html_attributes',
-    { rawHtml, selectors: cleanSelectors },
+    { selectors: cleanSelectors },
+    rawHtml,
   );
   return {
     items: (res.items ?? []).map((it) => ({
@@ -298,12 +321,15 @@ export function extractStructuredProduct(params: {
   fallbackDescription?: string;
 }): Record<string, unknown> | null {
   if (!params.rawBody) return null;
-  const res = callCoreWasm<{ product: Record<string, unknown> | null }>('extract_structured_product', {
-    rawBody: params.rawBody,
-    finalUrl: params.finalUrl,
-    fallbackTitle: params.fallbackTitle ?? '',
-    fallbackDescription: params.fallbackDescription ?? '',
-  });
+  const res = callCoreWasmRaw<{ product: Record<string, unknown> | null }>(
+    'extract_structured_product',
+    {
+      finalUrl: params.finalUrl,
+      fallbackTitle: params.fallbackTitle ?? '',
+      fallbackDescription: params.fallbackDescription ?? '',
+    },
+    params.rawBody,
+  );
   return res.product ?? null;
 }
 

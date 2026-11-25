@@ -1133,8 +1133,18 @@ func isAutolinkLabelPIGo(lbl string) bool {
 func hasCaseInsensitiveBracketScrubbedPIGo(s string) bool {
 	const pat = "[scrubbed"
 	n := len(s)
-	for i := 0; i+len(pat) <= n; i++ {
-		if s[i] != '[' || (s[i+1]|0x20) != 's' {
+	pos := 0
+	for pos+len(pat) <= n {
+		rel := strings.IndexByte(s[pos:], '[')
+		if rel < 0 {
+			return false
+		}
+		i := pos + rel
+		if i+len(pat) > n {
+			return false
+		}
+		if (s[i+1] | 0x20) != 's' {
+			pos = i + 1
 			continue
 		}
 		match := true
@@ -1147,6 +1157,7 @@ func hasCaseInsensitiveBracketScrubbedPIGo(s string) bool {
 		if match {
 			return true
 		}
+		pos = i + 1
 	}
 	return false
 }
@@ -1538,7 +1549,11 @@ func toWordStreamLinearPIGo(raw string) string {
 	if alreadyClean {
 		return s
 	}
-	buf := make([]byte, 0, n)
+	initCap := n
+	if initCap > 65536 {
+		initCap = 65536
+	}
+	buf := make([]byte, 0, initCap)
 	inSpace := false
 	for i := 0; i < n; i++ {
 		c := s[i]
@@ -1625,7 +1640,7 @@ func normalizeProseBaseForInjectionScanPIGo(prose string, stripFillers bool) str
 	out = normalizeNonASCIIForInjectionScanPIGo(out, stripFillers)
 	out = stripFenceMarkerLinesLinearPIGo(out)
 	out = unwrapBackslashEscapesLinearPIGo(out)
-	if strings.IndexByte(out, '[') >= 0 || strings.IndexByte(out, ']') >= 0 {
+	if strings.IndexByte(out, '[') >= 0 && strings.IndexByte(out, ']') >= 0 {
 		out = unwrapMarkdownLinksForScanLinearPIGo(out, stripFillers)
 	}
 	return out
@@ -1659,9 +1674,7 @@ func normalizeProsePairForInjectionScanPIGo(prose string) (spaced, stripped, rec
 		reconstructed = finishFillerPassPIGo(rawReconstructed, false)
 	}
 	needsDistinctStripBase := hasHangulFillersPIGo(prose) ||
-		strings.Contains(prose, "[SCRUBBED") ||
-		strings.Contains(prose, "[scrubbed") ||
-		strings.Contains(asciiLowerSliceGo(prose), "[scrubbed")
+		(strings.IndexByte(prose, '[') >= 0 && strings.IndexByte(prose, ']') >= 0 && hasCaseInsensitiveBracketScrubbedPIGo(prose))
 	baseStripped := baseSpaced
 	if needsDistinctStripBase {
 		baseStripped = normalizeProseBaseForInjectionScanPIGo(prose, true)
@@ -1762,6 +1775,74 @@ func testInjectionPatternAgainstVariantsPIGo(
 		}
 	}
 	return false
+}
+
+func stripSimpleQuoteFreeTagsToSpacePIGo(src string) string {
+	n := len(src)
+	rel := strings.IndexByte(src, '<')
+	if rel < 0 {
+		return src
+	}
+	buf := make([]byte, 0, minIntSliceGo(n, 262144))
+	cursor := 0
+	pos := rel
+	for pos < n {
+		if pos+2 > n {
+			break
+		}
+		p := pos + 1
+		first := src[p]
+		validStart := false
+		if first == '/' {
+			p++
+			if p < n && isASCIIAlphaByteSliceGo(src[p]) {
+				validStart = true
+				p++
+			}
+		} else if isASCIIAlphaByteSliceGo(first) {
+			validStart = true
+			p++
+		}
+		if !validStart {
+			nx := strings.IndexByte(src[pos+1:], '<')
+			if nx < 0 {
+				break
+			}
+			pos = pos + 1 + nx
+			continue
+		}
+		for p < n && !isTagNameBoundaryByteSliceGo(src[p]) {
+			p++
+		}
+		if p >= n {
+			break
+		}
+		gtRel := strings.IndexByte(src[p:], '>')
+		if gtRel < 0 {
+			break
+		}
+		end := p + gtRel + 1
+		if pos > cursor {
+			buf = append(buf, src[cursor:pos]...)
+		}
+		buf = append(buf, ' ')
+		cursor = end
+		if cursor >= n {
+			break
+		}
+		nx := strings.IndexByte(src[cursor:], '<')
+		if nx < 0 {
+			break
+		}
+		pos = cursor + nx
+	}
+	if cursor == 0 {
+		return src
+	}
+	if cursor < n {
+		buf = append(buf, src[cursor:]...)
+	}
+	return string(buf)
 }
 
 func matchesHiddenSubtreeInjectionPIGo(rawFragment string) bool {
@@ -2179,28 +2260,46 @@ func DetectPromptInjection(markdown, rawHTML string) PromptInjectionResult {
 					}
 				}
 				if totalHiddenBytes > 0 {
-					var hsb strings.Builder
-					hsb.Grow(totalHiddenBytes)
+					var boundedJoinedHidden string
 					wroteFirst := false
-					for _, iv := range hiddenIntervals {
-						if hsb.Len() >= maxPromptInjectionScanBytesPIGo {
-							break
+					if len(hiddenIntervals) == 1 {
+						iv := hiddenIntervals[0]
+						if iv[1] > iv[0] {
+							boundedJoinedHidden = truncateValidUTF8SliceGo(rawForHidden[iv[0]:iv[1]], maxPromptInjectionScanBytesPIGo)
+							wroteFirst = boundedJoinedHidden != ""
 						}
-						rawSlice := rawForHidden[iv[0]:iv[1]]
-						if rawSlice == "" {
-							continue
+					} else {
+						var hsb strings.Builder
+						hsb.Grow(totalHiddenBytes)
+						for _, iv := range hiddenIntervals {
+							if hsb.Len() >= maxPromptInjectionScanBytesPIGo {
+								break
+							}
+							rawSlice := rawForHidden[iv[0]:iv[1]]
+							if rawSlice == "" {
+								continue
+							}
+							if wroteFirst {
+								hsb.WriteString("\n.\n")
+							}
+							hsb.WriteString(rawSlice)
+							wroteFirst = true
 						}
 						if wroteFirst {
-							hsb.WriteString("\n.\n")
+							boundedJoinedHidden = truncateValidUTF8SliceGo(hsb.String(), maxPromptInjectionScanBytesPIGo)
 						}
-						hsb.WriteString(rawSlice)
-						wroteFirst = true
 					}
 					if wroteFirst {
-						boundedJoinedHidden := truncateValidUTF8SliceGo(hsb.String(), maxPromptInjectionScanBytesPIGo)
 						strippedOnce := boundedJoinedHidden
 						if strings.IndexByte(boundedJoinedHidden, '<') >= 0 {
-							strippedOnce = stripHtmlTagsQuoteAwareLinearSliceGo(boundedJoinedHidden, " ", maxPromptInjectionScanBytesPIGo)
+							if strings.IndexByte(boundedJoinedHidden, '"') < 0 &&
+								strings.IndexByte(boundedJoinedHidden, '\'') < 0 &&
+								!strings.Contains(boundedJoinedHidden, "<!") &&
+								!strings.Contains(boundedJoinedHidden, "<?") {
+								strippedOnce = stripSimpleQuoteFreeTagsToSpacePIGo(boundedJoinedHidden)
+							} else {
+								strippedOnce = stripHtmlTagsQuoteAwareLinearSliceGo(boundedJoinedHidden, " ", maxPromptInjectionScanBytesPIGo)
+							}
 						}
 						if matchesHiddenSubtreeInjectionPIGo(strippedOnce) {
 							appendUniqueTriggerPIGo(&triggers, "hidden_css_instruction_injection")

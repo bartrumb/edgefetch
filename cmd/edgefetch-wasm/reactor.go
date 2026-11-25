@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,11 +18,12 @@ import (
 )
 
 const (
-	maxWasmInputBytes = 48 << 20 // 48 MiB ceiling per call (supports 8 MiB UTF-8 * 3 encodeInto headroom)
-	shrinkBufCapBytes = 1 << 20  // Shrink buffers back to 256 KiB after >1 MiB calls
-	baseBufCapBytes   = 256 << 10
-	re2RingCapacity   = 1024
-	domRingCapacity   = 32
+	maxWasmInputBytes   = 48 << 20 // 48 MiB ceiling per call (supports 8 MiB UTF-8 * 3 encodeInto headroom)
+	shrinkBufCapBytes   = 24 << 20 // Shrink buffers back to 256 KiB on small calls after >24 MiB spikes
+	baseBufCapBytes     = 256 << 10
+	re2RingCapacity     = 1024
+	domRingCapacity     = 32
+	wasmRawStrUnchanged = ^uint32(0)
 )
 
 type domDocSlot struct {
@@ -57,12 +59,12 @@ func efInPtr(size uint32) uint32 {
 	if size > maxWasmInputBytes {
 		return 0
 	}
-	if cap(wasmOutBuf) > shrinkBufCapBytes {
-		wasmOutBuf = make([]byte, 0, baseBufCapBytes)
-	}
 	need := int(size)
 	if need <= 0 {
 		need = 1
+	}
+	if cap(wasmOutBuf) > shrinkBufCapBytes && need <= baseBufCapBytes {
+		wasmOutBuf = make([]byte, 0, baseBufCapBytes)
 	}
 	if cap(wasmInBuf) < need {
 		wasmInBuf = make([]byte, need)
@@ -274,22 +276,29 @@ func efCallRawStr(metaLen uint32, totalLen uint32) (outLen uint32) {
 		wasmOutBuf = wasmOutBuf[:0]
 		return 0
 	}
-	outStr, err := dispatchWasmRawStrRPC(wasmInBuf[:metaLen], string(wasmInBuf[metaLen:totalLen]))
+	var inputStr string
+	if totalLen > metaLen {
+		inputStr = unsafe.String(&wasmInBuf[metaLen], int(totalLen-metaLen))
+	}
+	outStr, allowUnchanged, err := dispatchWasmRawStrRPC(wasmInBuf[:metaLen], inputStr)
 	if err != nil {
 		wasmOutBuf = wasmOutBuf[:0]
 		return 0
+	}
+	if allowUnchanged && outStr == inputStr {
+		return wasmRawStrUnchanged
 	}
 	wasmOutBuf = append(wasmOutBuf[:0], outStr...)
 	return uint32(len(wasmOutBuf))
 }
 
-func dispatchWasmRawStrRPC(metaBytes []byte, rawStr string) (string, error) {
+func dispatchWasmRawStrRPC(metaBytes []byte, rawStr string) (string, bool, error) {
 	var env struct {
 		Op   string          `json:"op"`
 		Meta json.RawMessage `json:"meta"`
 	}
 	if err := json.Unmarshal(metaBytes, &env); err != nil {
-		return "", err
+		return "", false, err
 	}
 	switch env.Op {
 	case "sanitize_markdown":
@@ -299,14 +308,14 @@ func dispatchWasmRawStrRPC(metaBytes []byte, rawStr string) (string, error) {
 		}
 		if len(env.Meta) > 0 {
 			if err := json.Unmarshal(env.Meta, &m); err != nil {
-				return "", err
+				return "", false, err
 			}
 		}
-		return extract.SanitizeMarkdownWithOptions(rawStr, m.BaseURL, m.AllowPdfPageMarkers), nil
+		return extract.SanitizeMarkdownWithOptions(rawStr, m.BaseURL, m.AllowPdfPageMarkers), true, nil
 	case "full_artifact_markdown":
-		return extract.SanitizeFullMarkdownDocumentForArtifact(rawStr), nil
+		return extract.SanitizeFullMarkdownDocumentForArtifact(rawStr), true, nil
 	case "neutralize_unsafe_links":
-		return extract.NeutralizeAllUnsafeMarkdownLinks(rawStr), nil
+		return extract.NeutralizeAllUnsafeMarkdownLinks(rawStr), true, nil
 	case "format_yaml_card":
 		var m struct {
 			FallbackTitle string `json:"fallbackTitle"`
@@ -316,11 +325,78 @@ func dispatchWasmRawStrRPC(metaBytes []byte, rawStr string) (string, error) {
 		}
 		card := extract.FormatYAMLFrontmatterCard(rawStr, m.FallbackTitle)
 		if card == nil {
-			return "", nil
+			return "", false, nil
 		}
-		return card.Title + "\x00" + card.Description + "\x00" + card.Markdown, nil
+		return card.Title + "\x00" + card.Description + "\x00" + card.Markdown, false, nil
+	case "recognize_fences":
+		var p struct {
+			Harden                        bool                                  `json:"harden"`
+			PreserveCrLf                  bool                                  `json:"preserveCrLf"`
+			InitialReopenedFence          *extract.ReopenedMarkdownFence        `json:"initialReopenedFence"`
+			InitialState                  *extract.MarkdownFenceRecognizerState `json:"initialState"`
+			SkipLeadingSeparatorEmptyLine bool                                  `json:"skipLeadingSeparatorEmptyLine"`
+		}
+		if len(env.Meta) > 0 {
+			if err := json.Unmarshal(env.Meta, &p); err != nil {
+				return "", false, err
+			}
+		}
+		hardened, segs := extract.RecognizeAndHardenMarkdownFences(rawStr, extract.RecognizeMarkdownFencesOptions{
+			Harden:                        p.Harden,
+			PreserveCrLf:                  p.PreserveCrLf,
+			InitialReopenedFence:          p.InitialReopenedFence,
+			InitialState:                  p.InitialState,
+			SkipLeadingSeparatorEmptyLine: p.SkipLeadingSeparatorEmptyLine,
+		})
+		if len(segs) == 1 && segs[0] == hardened {
+			return "\x00" + hardened, false, nil
+		}
+		pos := 0
+		contiguous := len(segs) > 0
+		for _, s := range segs {
+			if pos+len(s) > len(hardened) || hardened[pos:pos+len(s)] != s {
+				contiguous = false
+				break
+			}
+			pos += len(s)
+		}
+		if contiguous && pos != len(hardened) {
+			contiguous = false
+		}
+		if contiguous {
+			var sb strings.Builder
+			sb.Grow(len(segs)*10 + 1 + len(hardened))
+			for i, s := range segs {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(strconv.Itoa(extract.UTF16Len(s)))
+			}
+			sb.WriteByte(0)
+			sb.WriteString(hardened)
+			return sb.String(), false, nil
+		}
+		jb, err := json.Marshal(map[string]any{"hardened": hardened, "segments": segs})
+		if err != nil {
+			return "", false, err
+		}
+		return "J\x00" + string(jb), false, nil
+	case "escape_task_checkboxes":
+		return extract.EscapeGfmTaskListCheckboxes(rawStr), true, nil
+	case "escape_residual_lt":
+		var p struct {
+			AllowPdfPageMarkers bool `json:"allowPdfPageMarkers"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &p)
+		}
+		return extract.EscapeAllResidualLtInProse(rawStr, p.AllowPdfPageMarkers), true, nil
+	case "strip_invisible":
+		return extract.StripInvisibleSmugglingChars(rawStr), true, nil
+	case "strip_table_dividers":
+		return extract.StripMarkdownTableDividerLinesLinear(rawStr), true, nil
 	default:
-		return "", fmt.Errorf("unknown raw_str op %q", env.Op)
+		return "", false, fmt.Errorf("unknown raw_str op %q", env.Op)
 	}
 }
 
@@ -333,6 +409,41 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 		return nil, err
 	}
 	switch env.Op {
+	case "slice_checkpoints":
+		var p struct {
+			StepChars int `json:"stepChars"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &p)
+		}
+		return map[string]any{
+			"checkpoints": extract.ComputeMarkdownSliceCheckpoints(rawStr, p.StepChars),
+		}, nil
+
+	case "extract_html_attributes":
+		var p struct {
+			Selectors []extract.AttrSelectorSpec `json:"selectors"`
+		}
+		if len(env.Meta) > 0 {
+			if err := json.Unmarshal(env.Meta, &p); err != nil {
+				return nil, err
+			}
+		}
+		return map[string]any{"items": extract.ExtractHTMLAttributesBySelectors(rawStr, p.Selectors)}, nil
+
+	case "extract_structured_product":
+		var p struct {
+			FinalURL            string `json:"finalUrl"`
+			FallbackTitle       string `json:"fallbackTitle"`
+			FallbackDescription string `json:"fallbackDescription"`
+		}
+		if len(env.Meta) > 0 {
+			_ = json.Unmarshal(env.Meta, &p)
+		}
+		return map[string]any{
+			"product": extract.ExtractStructuredProduct(rawStr, p.FinalURL, p.FallbackTitle, p.FallbackDescription),
+		}, nil
+
 	case "extract_html_full":
 		var opts extract.FullExtractOptions
 		if len(env.Meta) > 0 {
@@ -434,12 +545,13 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 		return map[string]any{"ok": ok, "doc": doc}, nil
 
 	case "detect_prompt_injection":
+		if len(env.Meta) == 0 || string(env.Meta) == "null" {
+			return extract.DetectPromptInjection(rawStr, ""), nil
+		}
 		var p struct {
 			MDByteLen int `json:"mdByteLen"`
 		}
-		if len(env.Meta) > 0 {
-			_ = json.Unmarshal(env.Meta, &p)
-		}
+		_ = json.Unmarshal(env.Meta, &p)
 		split := p.MDByteLen
 		if split < 0 {
 			split = 0

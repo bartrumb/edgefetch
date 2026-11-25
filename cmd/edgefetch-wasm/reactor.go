@@ -553,6 +553,23 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 		doc, ok := extract.FormatJSONWithExtractSpec(rawStr, p.Extract, p.Params, p.OrigURL)
 		return map[string]any{"ok": ok, "doc": doc}, nil
 
+	case "validate_easyprivacy":
+		var p struct {
+			ByteLength           int      `json:"byteLength"`
+			PreviousHostCount    int      `json:"previousHostCount"`
+			ExtraNeverBlockHosts []string `json:"extraNeverBlockHosts"`
+		}
+		if len(env.Meta) > 0 {
+			if err := json.Unmarshal(env.Meta, &p); err != nil {
+				return nil, err
+			}
+		}
+		byteLen := p.ByteLength
+		if byteLen <= 0 {
+			byteLen = len(rawStr)
+		}
+		return extract.ParseAndValidateEasyPrivacyGo(rawStr, byteLen, p.PreviousHostCount, p.ExtraNeverBlockHosts), nil
+
 	case "detect_prompt_injection":
 		if len(env.Meta) == 0 || string(env.Meta) == "null" {
 			return extract.DetectPromptInjection(rawStr, ""), nil
@@ -610,6 +627,7 @@ func defaultHTMLToMD(frag, base string) (string, []string) {
 		BaseURL:         base,
 		OnlyMainContent: false,
 		IncludeImages:   true,
+		IsFragment:      true,
 	})
 	return doc.Markdown, doc.Links
 }

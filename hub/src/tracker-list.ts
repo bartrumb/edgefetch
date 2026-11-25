@@ -13,7 +13,7 @@
  *  - Hardcoded never-block allow-list for bot-challenge/WAF hosts, feature-flag/A-B SDKs, `selfHost`, and `EDGEFETCH_PUBLIC_ORIGIN`.
  */
 
-import { isPublicOrPrivateSuffix } from './psl';
+import { callCoreWasmRaw } from './wasm-bridge';
 
 export const EASYPRIVACY_SOURCE_URL = 'https://easylist.to/easylist/easyprivacy.txt';
 export const EASYPRIVACY_LICENCE_URL = 'https://easylist.to/pages/licence.html';
@@ -202,8 +202,6 @@ export function hostMatchesSuffixSet(host: string, set: ReadonlySet<string>): bo
   }
 }
 
-const PLAIN_HOST_RULE_RE = /^\|\|[a-z0-9.-]+\^$/;
-
 export type ParsedTrackerListResult =
   | {
       ok: true;
@@ -232,114 +230,35 @@ export function parseAndValidateEasyPrivacyList(
     return { ok: false, reason: `list exceeds maximum size (${byteLength} > ${MAX_TRACKER_LIST_BYTES} bytes)` };
   }
 
-  const headSample = rawText.slice(0, 512).trimStart().toLowerCase();
-  if (headSample.startsWith('<!doctype') || headSample.startsWith('<html') || headSample.startsWith('<head')) {
-    return { ok: false, reason: 'HTML document received instead of EasyPrivacy text list' };
+  // Single Go WASM pass (`internal/extract/tracker_validate.go`): parses all ~58k EasyPrivacy lines + ~44k PSL checks
+  // in 1 boundary crossing (~8ms CPU) instead of 44,000 per-host JS<->WASM crossings.
+  const out = callCoreWasmRaw<{
+    ok: boolean;
+    reason?: string;
+    version?: string;
+    headerLastModified?: string | null;
+    rawParsedHostCount?: number;
+    joinedHosts?: string;
+  }>(
+    'validate_easyprivacy',
+    {
+      byteLength,
+      ...(typeof options?.previousHostCount === 'number' ? { previousHostCount: options.previousHostCount } : {}),
+      ...(options?.extraNeverBlockHosts && options.extraNeverBlockHosts.length > 0
+        ? { extraNeverBlockHosts: options.extraNeverBlockHosts }
+        : {}),
+    },
+    rawText,
+  );
+  if (!out.ok || !out.version) {
+    return { ok: false, reason: out.reason ?? 'invalid EasyPrivacy list' };
   }
-
-  const extraAllowSet = new Set<string>();
-  for (const h of options?.extraNeverBlockHosts ?? []) {
-    const clean = normalizeDomainHostCandidate(h);
-    if (clean) extraAllowSet.add(clean);
-  }
-
-  let sawEasyPrivacyTitle = false;
-  let version = '';
-  let headerLastModified: string | null = null;
-  let nonEmptyHeaderLinesSeen = 0;
-
-  const skippedAllowSet = new Set<string>();
-  const survivingSet = new Set<string>();
-
-  let lineStart = 0;
-  const totalLen = rawText.length;
-  while (lineStart <= totalLen) {
-    let lineEnd = rawText.indexOf('\n', lineStart);
-    if (lineEnd < 0) lineEnd = totalLen;
-    let endTrim = lineEnd;
-    if (endTrim > lineStart && rawText.charCodeAt(endTrim - 1) === 0x0d) {
-      endTrim--;
-    }
-    const line = rawText.slice(lineStart, endTrim).trim();
-    lineStart = lineEnd + 1;
-
-    if (!line) continue;
-
-    if (nonEmptyHeaderLinesSeen < 30 && (line.startsWith('!') || line.startsWith('['))) {
-      nonEmptyHeaderLinesSeen++;
-      if (/^!\s*Title\s*:\s*EasyPrivacy(?:\b|$)/i.test(line)) {
-        // Require exact EasyPrivacy title prefix (reject "! Title: WrongList")
-        const titleVal = line.slice(line.indexOf(':') + 1).trim();
-        if (titleVal === 'EasyPrivacy' || titleVal.startsWith('EasyPrivacy ')) {
-          sawEasyPrivacyTitle = true;
-        }
-      } else if (!version && /^!\s*Version\s*:/i.test(line)) {
-        const verVal = line.slice(line.indexOf(':') + 1).trim();
-        if (verVal && verVal.length <= 64 && /^[A-Za-z0-9._-]+$/.test(verVal)) {
-          version = verVal;
-        }
-      } else if (!headerLastModified && /^!\s*Last\s+modified\s*:/i.test(line)) {
-        const lmVal = line.slice(line.indexOf(':') + 1).trim();
-        if (lmVal && lmVal.length <= 128) {
-          headerLastModified = lmVal;
-        }
-      }
-      continue;
-    }
-
-    // Fast skip comments, exceptions (`@@`), cosmetic rules (`#`), options (`$`), wildcards (`*`), and paths (`/`)
-    if (line.charCodeAt(0) !== 0x7c || line.charCodeAt(1) !== 0x7c || line.charCodeAt(line.length - 1) !== 0x5e) {
-      continue;
-    }
-    const lowerLine = line.toLowerCase();
-    if (!PLAIN_HOST_RULE_RE.test(lowerLine)) {
-      continue;
-    }
-    const rawHost = lowerLine.slice(2, -1);
-    const host = normalizeDomainHostCandidate(rawHost);
-    if (!host) continue;
-    if (isPublicOrPrivateSuffix(host)) continue;
-
-    if (hostMatchesSuffixSet(host, NEVER_BLOCK_HOST_SUFFIXES) || hostMatchesSuffixSet(host, extraAllowSet)) {
-      skippedAllowSet.add(host);
-      continue;
-    }
-    survivingSet.add(host);
-  }
-
-  if (!sawEasyPrivacyTitle) {
-    return { ok: false, reason: 'missing required "! Title: EasyPrivacy" header' };
-  }
-  if (!version) {
-    return { ok: false, reason: 'missing required "! Version:" header' };
-  }
-
-  const survivingCount = survivingSet.size;
-  const rawParsedHostCount = survivingCount + skippedAllowSet.size;
-  if (rawParsedHostCount < MIN_TRACKER_HOST_COUNT || survivingCount < MIN_TRACKER_HOST_COUNT) {
-    return { ok: false, reason: `parsed host count (${survivingCount}) below minimum (${MIN_TRACKER_HOST_COUNT})` };
-  }
-  if (rawParsedHostCount > MAX_TRACKER_HOST_COUNT || survivingCount > MAX_TRACKER_HOST_COUNT) {
-    return { ok: false, reason: `parsed host count (${survivingCount}) exceeds maximum (${MAX_TRACKER_HOST_COUNT})` };
-  }
-
-  const prevCount = options?.previousHostCount;
-  if (typeof prevCount === 'number' && prevCount > 0) {
-    const deltaRatio = Math.abs(survivingCount - prevCount) / prevCount;
-    if (deltaRatio > MAX_TRACKER_HOST_DELTA_RATIO) {
-      return {
-        ok: false,
-        reason: `parsed host count (${survivingCount}) differs from previous good list (${prevCount}) by ${(deltaRatio * 100).toFixed(1)}% (> 20%)`,
-      };
-    }
-  }
-
-  const hosts = [...survivingSet].sort();
+  const hosts = out.joinedHosts ? out.joinedHosts.split('\n') : [];
   return {
     ok: true,
-    version,
-    headerLastModified,
-    rawParsedHostCount,
+    version: out.version,
+    headerLastModified: out.headerLastModified ?? null,
+    rawParsedHostCount: out.rawParsedHostCount ?? hosts.length,
     hosts,
   };
 }

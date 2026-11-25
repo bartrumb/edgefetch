@@ -5078,6 +5078,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				BaseURL:         fragBase,
 				OnlyMainContent: false,
 				IncludeImages:   includeImages,
+				IsFragment:      true,
 			})
 			return sub.Markdown, sub.Links
 		}); siteOk && siteRes != nil {

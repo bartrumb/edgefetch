@@ -41,6 +41,15 @@ var (
 
 	domTable  [domRingCapacity]domDocSlot
 	domNextID int32 = 1
+
+	phase2JobsRPC       func(op string, payload json.RawMessage) (any, bool, error)
+	phase2JobsRawRPC    func(op string, meta json.RawMessage, rawStr string) (any, bool, error)
+	phase2CatalogRPC    func(op string, payload json.RawMessage) (any, bool, error)
+	phase2CatalogRawRPC func(op string, meta json.RawMessage, rawStr string) (any, bool, error)
+	phase2AgentRPC      func(op string, payload json.RawMessage) (any, bool, error)
+	phase2AgentRawRPC   func(op string, meta json.RawMessage, rawStr string) (any, bool, error)
+	phase2McpRPC        func(op string, payload json.RawMessage) (any, bool, error)
+	phase2McpRawRPC     func(op string, meta json.RawMessage, rawStr string) (any, bool, error)
 )
 
 func lookupDomNode(docID int32, nodeID int) *extract.HTMLNode {
@@ -580,6 +589,18 @@ func dispatchWasmRawRPC(metaBytes []byte, rawStr string) (any, error) {
 		return map[string]any{"hit": extract.HasRawOrEncodedUnicodeTag(rawStr)}, nil
 
 	default:
+		for _, fn := range []func(string, json.RawMessage, string) (any, bool, error){
+			phase2JobsRawRPC,
+			phase2CatalogRawRPC,
+			phase2AgentRawRPC,
+			phase2McpRawRPC,
+		} {
+			if fn != nil {
+				if out, handled, err := fn(env.Op, env.Meta, rawStr); handled {
+					return out, err
+				}
+			}
+		}
 		return nil, fmt.Errorf("unknown raw op %q", env.Op)
 	}
 }
@@ -1919,6 +1940,18 @@ func dispatchWasmRPC(rawReq []byte) (any, error) {
 		return map[string]any{"segments": extract.SplitMarkdownByCodeFences(p.MD)}, nil
 
 	default:
+		for _, fn := range []func(string, json.RawMessage) (any, bool, error){
+			phase2JobsRPC,
+			phase2CatalogRPC,
+			phase2AgentRPC,
+			phase2McpRPC,
+		} {
+			if fn != nil {
+				if out, handled, err := fn(env.Op, env.Payload); handled {
+					return out, err
+				}
+			}
+		}
 		return nil, fmt.Errorf("unknown wasm op %q", env.Op)
 	}
 }

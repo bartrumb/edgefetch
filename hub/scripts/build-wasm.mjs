@@ -49,9 +49,7 @@ export function ensureCoreWasmBuilt() {
     if (wasmStat.size > 100_000) {
       const latestInputMs = Math.max(
         newestMtimeMs(join(repoRoot, 'cmd', 'edgefetch-wasm')),
-        newestMtimeMs(join(repoRoot, 'internal', 'extract')),
-        newestMtimeMs(join(repoRoot, 'internal', 'classify')),
-        newestMtimeMs(join(repoRoot, 'internal', 'politeness')),
+        newestMtimeMs(join(repoRoot, 'internal')),
         existsSync(join(repoRoot, 'go.mod')) ? statSync(join(repoRoot, 'go.mod')).mtimeMs : 0,
       );
       if (wasmStat.mtimeMs >= latestInputMs) {

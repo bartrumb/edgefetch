@@ -9,6 +9,11 @@ const workerBundlePath = process.env.EDGEFETCH_WORKERD_BUNDLE;
 if (!workerBundlePath) {
   throw new Error('EDGEFETCH_WORKERD_BUNDLE environment variable is required');
 }
+const wasmBundlePath = process.env.EDGEFETCH_WASM_PATH || new URL('../src/edgefetch-core.wasm', import.meta.url);
+const WORKERD_MODULES = [
+  { type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') },
+  { type: 'CompiledWasm', path: 'edgefetch-core.wasm', contents: readFileSync(wasmBundlePath) },
+];
 
 const CALLER = randomBytes(24).toString('hex');
 const S1 = randomBytes(24).toString('hex');
@@ -26,7 +31,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
       workers: [
         {
           name: 'hub',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           bindings: {
@@ -342,7 +347,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       workers: [
         {
           name: 'hub-storage',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           r2Buckets: ['ARTIFACTS'],
@@ -1210,7 +1215,7 @@ test('F15.1 workerd E2E: /v1/scrape (SSR HTML, declarative YAML twin, 304 Not Mo
       workers: [
         {
           name: 'hub-f15-1',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           r2Buckets: ['ARTIFACTS'],
@@ -1618,7 +1623,7 @@ test('F15.2 workerd E2E: GET /v1/extractors, POST /v1/jobs, POST /v1/catalog, & 
       workers: [
         {
           name: 'hub-f15-2',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           r2Buckets: ['ARTIFACTS'],
@@ -1882,7 +1887,7 @@ test('F15.3 workerd E2E: /v1/agent autonomous LLM loop, SSE streaming, GET /trac
       workers: [
         {
           name: 'hub-f15-3',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           r2Buckets: ['ARTIFACTS'],
@@ -2105,7 +2110,7 @@ test('F15.4 workerd E2E: /v1/ingest-tab CORS & Auth + OAuth 2.1 PKCE S256 Full L
       workers: [
         {
           name: 'hub-f15-4',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           r2Buckets: ['ARTIFACTS'],
@@ -2339,7 +2344,7 @@ test('F15.5 workerd E2E: End-to-End OTLP Span Capture, W3C traceparent propagati
       workers: [
         {
           name: 'hub-f15-5',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: WORKERD_MODULES,
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           r2Buckets: ['ARTIFACTS'],

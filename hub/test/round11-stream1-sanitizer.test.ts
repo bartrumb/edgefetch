@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 
@@ -228,6 +228,7 @@ test('R11-S3 & M3: 100% byte-for-byte Go SanitizeMarkdown === TS sanitizeInlineH
       const norm = p.replace(/\\/g, '/');
       return `/mnt/${norm[0]!.toLowerCase()}${norm.slice(2)}`;
     };
+    const repoRootWsl = toWsl(resolve(process.cwd(), '..'));
     try {
       execFileSync(
         'wsl',
@@ -235,7 +236,7 @@ test('R11-S3 & M3: 100% byte-for-byte Go SanitizeMarkdown === TS sanitizeInlineH
           '-e',
           'bash',
           '-lc',
-          `export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"; cd "/mnt/c/Code/edgefetch" && EDGEFETCH_R8_SAN_IN="${toWsl(inWin)}" EDGEFETCH_R8_SAN_OUT="${toWsl(outWin)}" go test ./internal/extract -run '^TestRound8GoTSParityBatchRunner$' -count=1`,
+          `export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"; cd "${repoRootWsl}" && EDGEFETCH_R8_SAN_IN="${toWsl(inWin)}" EDGEFETCH_R8_SAN_OUT="${toWsl(outWin)}" go test ./internal/extract -run '^TestRound8GoTSParityBatchRunner$' -count=1`,
         ],
         { encoding: 'utf8', timeout: 45_000 },
       );

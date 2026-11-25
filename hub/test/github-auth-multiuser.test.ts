@@ -1039,7 +1039,14 @@ test('Pillar 1D: OTLP span hygiene & real Cloudflare workerd (Miniflare) E2E for
       workers: [
         {
           name: 'hub-multiuser-e2e',
-          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          modules: [
+            { type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') },
+            {
+              type: 'CompiledWasm',
+              path: 'edgefetch-core.wasm',
+              contents: readFileSync(join(resolve(process.env.EDGEFETCH_HUB_ROOT ?? '.'), 'src', 'edgefetch-core.wasm')),
+            },
+          ],
           compatibilityDate: '2026-10-01',
           durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
           bindings: {

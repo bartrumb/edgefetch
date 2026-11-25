@@ -120,8 +120,9 @@ func makeChromeHelperWrapper(t *testing.T, mode string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scriptPath := filepath.Join(t.TempDir(), "fake-chrome.sh")
-	body := fmt.Sprintf("#!/bin/sh\nexport EDGEFETCH_CHROME_HELPER=%s\nexec %q -test.run='^TestBrowserHelperProcess$' -- \"$@\"\n", mode, exe)
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "fake-chrome.sh")
+	body := fmt.Sprintf("#!/bin/sh\nexport EDGEFETCH_CHROME_HELPER=%s\nexport GOCOVERDIR=%q\nexec %q -test.run='^TestBrowserHelperProcess$' -- \"$@\"\n", mode, dir, exe)
 	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1474,7 +1475,7 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 		if strings.HasSuffix(path, "attr/current") {
 			return []byte("edgefetch"), nil
 		}
-		return nil, os.ErrNotExist
+		return origReadProc(path)
 	}
 	rPreDeny := NewRenderer(fallbackBin, nil, "UA", 1, log)
 	rPreDeny.requireSandbox = true

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"net/http"
 	"net/netip"
 	"sort"
 	"strconv"
@@ -180,7 +179,7 @@ func (h *HostState) RecordOutcome(now time.Time, minPause, retryAfter time.Durat
 	if next.After(h.nextAllowed) {
 		h.nextAllowed = next
 	}
-	if status == http.StatusTooManyRequests {
+	if status == 429 {
 		if next.After(h.rateLimitedUntil) {
 			h.rateLimitedUntil = next
 		}
@@ -296,8 +295,8 @@ func ParseRetryAfter(val string, now time.Time) time.Duration {
 	} else if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(val, "-") {
 		return MaxRetryAfter
 	}
-	// Go's `http.ParseTime` checks RFC 1123 (`Mon, 02 Jan 2006 15:04:05 GMT`), RFC 850, and ANSI C formats.
-	if t, err := http.ParseTime(val); err == nil {
+	// Parse RFC 9110 §5.6.7 HTTP-date formats (`Mon, 02 Jan 2006 15:04:05 GMT`, RFC 850, and ANSI C) without importing net/http.
+	if t, ok := parseHTTPDateUTC(val); ok {
 		d := t.Sub(now)
 		if d <= 0 {
 			return 0
@@ -308,6 +307,17 @@ func ParseRetryAfter(val string, now time.Time) time.Duration {
 		return d
 	}
 	return 0
+}
+
+func parseHTTPDateUTC(val string) (time.Time, bool) {
+	for _, layout := range []string{"Mon, 02 Jan 2006 15:04:05 GMT", time.RFC850, time.ANSIC} {
+		if t, err := time.ParseInLocation(layout, val, time.UTC); err == nil {
+			if layout == time.ANSIC || strings.HasSuffix(val, " GMT") {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
 }
 
 // RobotsRule represents one `Allow` or `Disallow` path directive inside `/robots.txt`.

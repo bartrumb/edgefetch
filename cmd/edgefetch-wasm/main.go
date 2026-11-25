@@ -22,9 +22,12 @@ func runWasmCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		IncludeLinks:    true,
 	}
 	wantJSON := false
+	wantRPC := false
 
 	for _, a := range args {
 		switch {
+		case a == "--rpc":
+			wantRPC = true
 		case a == "--json":
 			wantJSON = true
 		case a == "--full":
@@ -49,10 +52,28 @@ func runWasmCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(stdin, 16<<20))
+	raw, err := io.ReadAll(io.LimitReader(stdin, 24<<20))
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "read stdin: %v\n", err)
 		return 1
+	}
+
+	if wantRPC {
+		resp, rpcErr := dispatchWasmRPC(raw)
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if rpcErr != nil {
+			_ = enc.Encode(map[string]any{"error": rpcErr.Error()})
+			_, _ = stdout.Write(buf.Bytes())
+			return 1
+		}
+		if err := enc.Encode(resp); err != nil {
+			_, _ = fmt.Fprintf(stderr, "encode json: %v\n", err)
+			return 1
+		}
+		_, _ = stdout.Write(buf.Bytes())
+		return 0
 	}
 
 	res := extract.ExtractHTML(string(raw), opts)

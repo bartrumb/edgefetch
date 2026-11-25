@@ -10,7 +10,7 @@
  *
  * Strictly zero external dependencies: uses Node 22+ built-ins + in-repo
  * `hub/dist/portable-server.mjs`, `sdk/ts/edgefetch-client.ts`,
- * `sdk/py/edgefetch_client.py`, `hub/portable/deno-server.ts`,
+ * `sdk/py/edgefetch_client.py`,
  * `scripts/all-in-one-entrypoint.sh`, and compiled Go `cmd/edgefetch`.
  */
 
@@ -1383,76 +1383,6 @@ async function runEntrypointHarness({
   };
 }
 
-function buildDenoBundle(outDir) {
-  const esbuildPath = path.join(REPO_ROOT, 'hub', 'node_modules', 'esbuild', 'lib', 'main.js');
-  const outPath = path.join(outDir, 'deno-bundle.mjs');
-  const req = pathToFileURL(esbuildPath).href;
-  return import(req).then((esbuild) => {
-    esbuild.buildSync({
-      entryPoints: [path.join(REPO_ROOT, 'hub', 'portable', 'deno-server.ts')],
-      bundle: true,
-      platform: 'node',
-      target: 'node22',
-      format: 'esm',
-      banner: {
-        js: "import { createRequire as __efCR } from 'node:module'; const require = __efCR(import.meta.url);",
-      },
-      alias: {
-        'cloudflare:workers': path.join(REPO_ROOT, 'hub', 'portable', 'cloudflare-shim.ts'),
-      },
-      loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text' },
-      external: ['node:*'],
-      outfile: outPath,
-    });
-    return outPath;
-  });
-}
-
-async function invokeDenoHandler(bundlePath, envMap) {
-  let capturedHandler = null;
-  const prevDeno = globalThis.Deno;
-  globalThis.Deno = {
-    env: {
-      get: (k) => envMap[k],
-      toObject: () => ({ ...envMap }),
-    },
-    serve: (_opts, h) => {
-      capturedHandler = h;
-      return { finished: Promise.resolve(), shutdown: async () => {} };
-    },
-    upgradeWebSocket: () => {
-      throw new Error('upgradeWebSocket stub');
-    },
-  };
-  try {
-    const mod = await import(`${pathToFileURL(bundlePath).href}?v=${randomBytes(6).toString('hex')}`);
-    if (typeof mod.createDenoHubHandler === 'function') {
-      const created = mod.createDenoHubHandler({
-        dataDir: envMap.EDGEFETCH_DATA_DIR,
-        envOverrides: envMap,
-      });
-      const h = typeof created === 'function' ? created : (created?.handler ?? created?.fetch);
-      return { mod, handler: h, close: created?.close };
-    }
-    if (typeof mod.createDenoHandler === 'function') {
-      const created = mod.createDenoHandler({
-        dataDir: envMap.EDGEFETCH_DATA_DIR,
-        envOverrides: envMap,
-      });
-      const h = typeof created === 'function' ? created : (created?.handler ?? created?.fetch);
-      return { mod, handler: h, close: created?.close };
-    }
-    if (!capturedHandler && typeof mod.startDenoHub === 'function') {
-      mod.startDenoHub();
-    }
-    assert.ok(typeof capturedHandler === 'function', '[F5/M1] deno-server.ts did not provide a testable handler');
-    return { mod, handler: capturedHandler };
-  } finally {
-    if (prevDeno === undefined) delete globalThis.Deno;
-    else globalThis.Deno = prevDeno;
-  }
-}
-
 // ---------------------------------------------------------------------------
 // 6. OAuth 2.1 PKCE & Admin Session Helpers
 // ---------------------------------------------------------------------------
@@ -1554,7 +1484,6 @@ async function adminLogin(baseUrl, callerToken) {
 
 let suiteTmpDir;
 let goBin;
-let denoBundlePath;
 let pyBin;
 let tsSdk;
 let hubBotAuth;
@@ -1562,7 +1491,6 @@ let hubBotAuth;
 before(async () => {
   suiteTmpDir = mkdtempSync(path.join(os.tmpdir(), 'ef-e2e-matrix-'));
   goBin = buildEdgefetchBinary(suiteTmpDir);
-  denoBundlePath = await buildDenoBundle(suiteTmpDir);
   pyBin = findPythonBinary();
   tsSdk = await loadTsSdk();
   hubBotAuth = await loadHubBotAuth();
@@ -1586,7 +1514,7 @@ after(async () => {
 // TIER 1 — Feature Coverage (30 Tests: T1-A1 .. T1-E5)
 // ===========================================================================
 
-describe('Tier 1 — Area A: Portable Hub HTTP, MCP, Sub-Modules & Deno', () => {
+describe('Tier 1 — Area A: Portable Hub HTTP, MCP & Sub-Modules', () => {
   test('T1-A1: Root Trace & Response Headers across /v1/* [F1/M1]', async () => {
     const collector = await startMockOtlpCollector();
     const hub = await startTestHub({
@@ -2127,62 +2055,6 @@ describe('Tier 1 — Area A: Portable Hub HTTP, MCP, Sub-Modules & Deno', () => 
     } finally {
       await agent.close();
       await hub.close();
-      await collector.close();
-    }
-  });
-
-  test('T1-A7: Deno Deploy Hub Handler (deno-server.ts) OTLP & SAFE_FETCH Smoke [F5/M1]', async () => {
-    const collector = await startMockOtlpCollector();
-    const denoDataDir = mkdtempSync(path.join(suiteTmpDir, 'deno-t1a7-'));
-    const tokens = makeTokens();
-
-    try {
-      // Check if `deno` binary exists on PATH; if present, run `deno test` on hub/test/deno-server.test.ts too
-      let hasDeno = false;
-      try {
-        execFileSync('deno', ['--version'], { stdio: 'pipe', timeout: 4000 });
-        hasDeno = true;
-      } catch {
-        hasDeno = false;
-      }
-      if (hasDeno && existsSync(path.join(REPO_ROOT, 'hub', 'test', 'deno-server.test.ts'))) {
-        execFileSync('deno', ['test', '--allow-net', '--allow-env', '--allow-read', '--allow-write', 'hub/test/deno-server.test.ts'], {
-          cwd: REPO_ROOT,
-          stdio: 'pipe',
-          timeout: 30_000,
-        });
-      }
-
-      const { handler, close: closeDeno } = await invokeDenoHandler(denoBundlePath, {
-        PORT: '0',
-        EDGEFETCH_DATA_DIR: denoDataDir,
-        CALLER_TOKEN: tokens.callerToken,
-        OTEL_EXPORTER_OTLP_ENDPOINT: collector.endpoint,
-        OTEL_EXPORTER_OTLP_HEADERS: 'x-deno-hdr=deno123',
-        OTEL_SERVICE_NAME: 'edgefetch-deno-test',
-      });
-      try {
-        const { traceId, traceparent } = makeTraceIds('01');
-        const res = await handler(
-          new Request('http://127.0.0.1/v1/capabilities', {
-            method: 'GET',
-            headers: { authorization: `Bearer ${tokens.callerToken}`, traceparent },
-          }),
-          { remoteAddr: { hostname: '127.0.0.1' } },
-        );
-        assert.equal(res.status, 200);
-        assertTraceHeaders(res, { expectedTraceId: traceId, tag: '[F5/M1]' });
-
-        await collector.waitForSpans((e) => e.some((x) => x.span.traceId === traceId));
-        const spans = collector.findByTraceId(traceId);
-        assert.ok(spans.length >= 1, '[F5/M1] Deno handler did not flush OTLP spans via SAFE_FETCH');
-        assert.equal(spans[0].serviceName, 'edgefetch-deno-test', '[F5/M1] OTEL_SERVICE_NAME mismatch in Deno OTLP export');
-        const req = collector.requests.find((r) => JSON.stringify(r.payload).includes(traceId));
-        assert.equal(req?.headers['x-deno-hdr'], 'deno123', '[F5/M1] OTEL_EXPORTER_OTLP_HEADERS not forwarded in Deno');
-      } finally {
-        await closeDeno?.();
-      }
-    } finally {
       await collector.close();
     }
   });
@@ -4865,44 +4737,6 @@ print(c.last_trace_id)
       }
     } finally {
       await origin.close();
-      await collector.close();
-    }
-  });
-
-  test('T3-12: deno-server.ts x /admin & OAuth x OTLP [F4/F5/M1]', async () => {
-    const collector = await startMockOtlpCollector();
-    const denoDir = mkdtempSync(path.join(suiteTmpDir, 'deno-t3-12-'));
-    const tokens = makeTokens();
-    try {
-      const { handler, close: closeDeno } = await invokeDenoHandler(denoBundlePath, {
-        PORT: '0',
-        EDGEFETCH_DATA_DIR: denoDir,
-        CALLER_TOKEN: tokens.callerToken,
-        OTEL_EXPORTER_OTLP_ENDPOINT: collector.endpoint,
-        OTEL_SERVICE_NAME: 'edgefetch-deno-admin',
-      });
-      try {
-        const tp = makeTraceIds('01');
-        const loginRes = await handler(
-          new Request('http://127.0.0.1/admin/login', {
-            method: 'POST',
-            headers: { 'content-type': 'application/x-www-form-urlencoded', traceparent: tp.traceparent },
-            body: new URLSearchParams({ token: tokens.callerToken }).toString(),
-          }),
-          { remoteAddr: { hostname: '127.0.0.1' } },
-        );
-        assert.equal(loginRes.status, 302);
-        assertTraceHeaders(loginRes, { expectedTraceId: tp.traceId, tag: '[F5/M1 Deno admin]' });
-
-        await collector.waitForSpans((e) => e.some((x) => x.span.traceId === tp.traceId && x.serviceName === 'edgefetch-deno-admin'));
-        assert.ok(
-          collector.findByTraceId(tp.traceId).some((e) => e.serviceName === 'edgefetch-deno-admin'),
-          '[F5/M1] deno-server.ts did not flush OTLP spans via SAFE_FETCH',
-        );
-      } finally {
-        await closeDeno?.();
-      }
-    } finally {
       await collector.close();
     }
   });

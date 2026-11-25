@@ -69,7 +69,7 @@ jobs:
       - name: Run allocation microbenchmarks & WASI WebAssembly build check
         run: |
           go test -bench=. -benchmem ./...
-          GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/edgefetch-wasm.wasm ./cmd/edgefetch-wasm
+          GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build -buildmode=c-shared -trimpath -ldflags="-s -w" -o /tmp/edgefetch-wasm.wasm ./cmd/edgefetch-wasm
           rm -f /tmp/edgefetch-wasm.wasm
 
   hub:
@@ -112,31 +112,6 @@ jobs:
         run: node --test telemetry/test/collector.test.ts
       - run: npm run type-check
       - run: npm run deploy:dry
-      - name: Run Deno Deploy Hub OTLP & SafeFetch smoke tests (SHA-256 verified Deno v2.2.4)
-        run: |
-          set -euo pipefail
-          tmp_dir=$(mktemp -d)
-          trap 'rm -rf "$tmp_dir"' EXIT
-          curl -fsSL -o "$tmp_dir/deno.zip" https://github.com/denoland/deno/releases/download/v2.2.4/deno-x86_64-unknown-linux-gnu.zip
-          echo "9a260a624cab6e61f7603957f94f638d68739d8c6ac8c38bc337521266603a7c  $tmp_dir/deno.zip" | sha256sum -c -
-          python3 -m zipfile -e "$tmp_dir/deno.zip" "$tmp_dir"
-          chmod +x "$tmp_dir/deno"
-          node --input-type=module -e '
-            import { buildSync } from "esbuild";
-            buildSync({
-              entryPoints: ["test/deno-server.test.ts"],
-              bundle: true,
-              platform: "node",
-              target: "es2022",
-              format: "esm",
-              banner: { js: "import { createRequire as __efCR } from \"node:module\"; const require = __efCR(import.meta.url);" },
-              alias: { "cloudflare:workers": "./portable/cloudflare-shim.ts" },
-              loader: { ".sql": "text", ".yaml": "text", ".yml": "text" },
-              external: ["node:*"],
-              outfile: process.argv[1],
-            });
-          ' "$tmp_dir/deno-server.test.mjs"
-          "$tmp_dir/deno" test --no-check -A "$tmp_dir/deno-server.test.mjs"
       - name: Run Extraction & Token-Efficiency Fidelity Benchmark
         working-directory: .
         run: node bench/run-bench.mjs

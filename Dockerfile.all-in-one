@@ -11,7 +11,10 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -trimpath \
       -ldflags="-s -w -X github.com/bartrumb/edgefetch/v2/internal/agent.Version=${BUILD_VERSION}" \
-      -o /out/edgefetch ./cmd/edgefetch
+      -o /out/edgefetch ./cmd/edgefetch \
+    && CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -trimpath \
+      -ldflags="-s -w" \
+      -o /out/edgefetch-core.wasm ./cmd/edgefetch-wasm
 
 FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS hub-build
 WORKDIR /app/hub
@@ -20,10 +23,11 @@ RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY sdk ../sdk
 COPY internal ../internal
 COPY hub/src ./src
+COPY --from=go-build /out/edgefetch-core.wasm ./src/edgefetch-core.wasm
 COPY hub/migrations ./migrations
 COPY hub/portable ./portable
 COPY hub/scripts ./scripts
-RUN npm run build:portable
+RUN EDGEFETCH_SKIP_WASM_BUILD=1 npm run build:portable
 
 FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5
 LABEL org.opencontainers.image.title="EdgeFetch All-in-One" \
@@ -50,6 +54,7 @@ RUN apk add --no-cache \
 
 COPY --from=go-build /out/edgefetch /usr/local/bin/edgefetch
 COPY --from=hub-build /app/hub/dist/portable-server.mjs /app/hub/dist/portable-server.mjs
+COPY --from=hub-build /app/hub/dist/edgefetch-core.wasm /app/hub/dist/edgefetch-core.wasm
 COPY hub/LICENSE /app/hub/LICENSE
 COPY hub/migrations /app/hub/migrations
 COPY scripts/all-in-one-entrypoint.sh /usr/local/bin/all-in-one-entrypoint.sh

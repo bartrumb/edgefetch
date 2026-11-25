@@ -3,7 +3,7 @@
  * and IPv6 `/64` rate-limit key canonicalization (`hub/src/safe-input.ts`).
  */
 
-import { RE2JS } from 're2js';
+import { compileWasmRe2, type WasmRe2Compiled } from './wasm-bridge';
 
 export const MAX_HTML_SCAN_CHARS = 2 * 1024 * 1024; // 2 MiB ceiling on regex/DOM scan inputs (M4)
 
@@ -1168,7 +1168,7 @@ const JS_SPACE_RE2_RANGES =
 const JS_NOT_SPACE_RE2_RANGES =
   '\\x00-\\x08\\x0e-\\x1f\\x21-\\x{009f}\\x{00a1}-\\x{167f}\\x{1681}-\\x{1fff}\\x{200b}-\\x{2027}\\x{202a}-\\x{202e}\\x{2030}-\\x{205e}\\x{2060}-\\x{2fff}\\x{3001}-\\x{fefe}\\x{ff00}-\\x{10ffff}';
 
-const re2InstanceLru = new Map<string, ReturnType<typeof RE2JS.compile> | null>();
+const re2InstanceLru = new Map<string, WasmRe2Compiled | null>();
 const linearRegexLru = new Map<string, RegExp | null>();
 const safeUserRegexLru = new Map<string, RegExp | null>();
 const safeUnionMatcherLru = new Map<string, ((subject: string) => boolean) | null>();
@@ -1190,10 +1190,150 @@ function lruSet<V>(map: Map<string, V>, key: string, value: V, maxEntries = MAX_
   map.set(key, value);
 }
 
+function isHexChar(ch: string): boolean {
+  return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f');
+}
+
+function translateJsEscapesBase(data: string): string {
+  if (data.length === 0) return '(?:)';
+  let result = '';
+  let inCharClass = false;
+  let i = 0;
+  const size = data.length;
+  while (i < size) {
+    const ch = data[i]!;
+    if (ch === '\\') {
+      if (i + 1 >= size) return `${result}\\`;
+      const esc = data[i + 1]!;
+      if (esc === '\\') {
+        result += '\\\\';
+        i += 2;
+        continue;
+      }
+      if (esc === 'c') {
+        if (i + 2 < size) {
+          const code = data.charCodeAt(i + 2);
+          if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+            const val = code % 32;
+            result += `\\x${val.toString(16).padStart(2, '0').toUpperCase()}`;
+            i += 3;
+            continue;
+          }
+        }
+        result += 'c';
+        i += 2;
+        continue;
+      }
+      if (esc === 'u') {
+        if (i + 2 < size && data[i + 2] === '{') {
+          let j = i + 3;
+          let hasHex = false;
+          let closed = false;
+          while (j < size) {
+            const hc = data[j]!;
+            if (hc === '}') {
+              closed = true;
+              break;
+            }
+            if (!isHexChar(hc)) break;
+            hasHex = true;
+            j++;
+          }
+          if (closed && hasHex) {
+            result += '\\x';
+            i += 2;
+            continue;
+          }
+        } else if (
+          i + 5 < size &&
+          isHexChar(data[i + 2]!) &&
+          isHexChar(data[i + 3]!) &&
+          isHexChar(data[i + 4]!) &&
+          isHexChar(data[i + 5]!)
+        ) {
+          result += `\\x{${data.slice(i + 2, i + 6)}}`;
+          i += 6;
+          continue;
+        }
+        result += 'u';
+        i += 2;
+        continue;
+      }
+      if (esc === 'x') {
+        let validHex = false;
+        if (i + 2 < size && data[i + 2] === '{') {
+          let j = i + 3;
+          let hasHex = false;
+          while (j < size && isHexChar(data[j]!)) {
+            hasHex = true;
+            j++;
+          }
+          if (hasHex && j < size && data[j] === '}') validHex = true;
+        } else if (i + 3 < size && isHexChar(data[i + 2]!) && isHexChar(data[i + 3]!)) {
+          validHex = true;
+        }
+        result += validHex ? '\\x' : 'x';
+        i += 2;
+        continue;
+      }
+      if ('nrtfvadDsSwWbBpPAzQE01234567'.includes(esc)) {
+        result += `\\${esc}`;
+        i += 2;
+        continue;
+      }
+      const cp = data.codePointAt(i + 1)!;
+      const symSize = cp > 0xffff ? 2 : 1;
+      if ((cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)) {
+        result += data.slice(i + 1, i + 1 + symSize);
+      } else {
+        result += `\\${data.slice(i + 1, i + 1 + symSize)}`;
+      }
+      i += 1 + symSize;
+      continue;
+    }
+    if (ch === '[') {
+      if (!inCharClass && data[i + 1] === ']') {
+        result += '[^\\x00-\\x{10FFFF}]';
+        i += 2;
+        continue;
+      }
+      if (!inCharClass && data[i + 1] === '^' && data[i + 2] === ']') {
+        result += '[\\x00-\\x{10FFFF}]';
+        i += 3;
+        continue;
+      }
+      inCharClass = true;
+    } else if (ch === ']') {
+      inCharClass = false;
+    } else if (!inCharClass && ch === '(' && data[i + 1] === '?' && data[i + 2] === '<') {
+      if (i + 3 < size && !'=!)>'.includes(data[i + 3]!)) {
+        result += '(?P<';
+        i += 3;
+        continue;
+      }
+    }
+    const cp = data.codePointAt(i)!;
+    const symSize = cp > 0xffff ? 2 : 1;
+    result += data.slice(i, i + symSize);
+    i += symSize;
+  }
+  return result;
+}
+
 function translateJsPatternForRe2(effectivePattern: string, seenFlags: ReadonlySet<string>): string | null {
   const dotAll = seenFlags.has('s');
   const unicodeMode = seenFlags.has('u');
-  const base = RE2JS.translateRegExp(effectivePattern).replace(/\\0(?![0-7])/g, '\\x00');
+  // Reject JS lookaheads upfront before delegating to Go RE2 (`(?=...)`, `(?!...)`)
+  for (let k = 0; k + 2 < effectivePattern.length; k++) {
+    if (effectivePattern[k] === '\\') {
+      k++;
+      continue;
+    }
+    if (effectivePattern[k] === '(' && effectivePattern[k + 1] === '?' && (effectivePattern[k + 2] === '=' || effectivePattern[k + 2] === '!')) {
+      return null;
+    }
+  }
+  const base = translateJsEscapesBase(effectivePattern).replace(/\\0(?![0-7])/g, '\\x00');
   let out = '';
   let inClass = false;
   let classStart = -1;
@@ -1221,7 +1361,21 @@ function translateJsPatternForRe2(effectivePattern: string, seenFlags: ReadonlyS
         i += 2;
         continue;
       }
-      if ((next === 'x' || next === 'p' || next === 'P') && base[i + 2] === '{') {
+      if ((next === 'p' || next === 'P') && base[i + 2] === '{') {
+        if (!unicodeMode) {
+          // Without `/u`, `\p{L}` in JS is literal `p{L}` (`{L}` is literal `{L}`)
+          out += next;
+          i += 2;
+          continue;
+        }
+        const closeBrace = base.indexOf('}', i + 3);
+        if (closeBrace > i + 2) {
+          out += base.slice(i, closeBrace + 1);
+          i += closeBrace - i + 1;
+          continue;
+        }
+      }
+      if (next === 'x' && base[i + 2] === '{') {
         const closeBrace = base.indexOf('}', i + 3);
         if (closeBrace > i + 2) {
           out += base.slice(i, closeBrace + 1);
@@ -1427,17 +1581,17 @@ function buildRe2RegExp(
   maxSubjectLen: number,
 ): RegExp | null {
   if (seenFlags.has('y')) return null;
-  let re2Flags = 0;
   const ignoreCase = seenFlags.has('i');
-  if (ignoreCase) re2Flags |= RE2JS.CASE_INSENSITIVE;
-  if (seenFlags.has('m')) re2Flags |= RE2JS.MULTILINE;
-  if (seenFlags.has('s')) re2Flags |= RE2JS.DOTALL;
+  let re2Prefix = '';
+  if (ignoreCase) re2Prefix += 'i';
+  if (seenFlags.has('m')) re2Prefix += 'm';
+  if (seenFlags.has('s')) re2Prefix += 's';
 
   const canonicalFlags = ['d', 'g', 'i', 'm', 's', 'u', 'y'].filter((f) => seenFlags.has(f)).join('');
   const re2CacheKey = `${effectivePattern}\u0000${canonicalFlags}\u0000${maxSubjectLen}`;
 
   try {
-    let compiled: ReturnType<typeof RE2JS.compile> | null;
+    let compiled: WasmRe2Compiled | null;
     const cachedRe2 = lruGet(re2InstanceLru, re2CacheKey);
     if (cachedRe2.hit) {
       compiled = cachedRe2.value;
@@ -1447,7 +1601,8 @@ function buildRe2RegExp(
         lruSet(re2InstanceLru, re2CacheKey, null);
         return null;
       }
-      compiled = RE2JS.compile(translated, re2Flags);
+      const fullRe2 = re2Prefix ? `(?${re2Prefix})${translated}` : translated;
+      compiled = compileWasmRe2(fullRe2);
       lruSet(re2InstanceLru, re2CacheKey, compiled);
     }
     if (!compiled) return null;
@@ -1575,7 +1730,8 @@ export function compileSafeUserRegexUnion(
   }
 
   try {
-    const unionRe2 = RE2JS.compile(`(?:${branches.join('|')})`, 0);
+    const unionRe2 = compileWasmRe2(`(?:${branches.join('|')})`);
+    if (!unionRe2) throw new Error('union compile failed');
     const matcherFn = (subject: string): boolean => {
       if (typeof subject !== 'string' || subject.length > maxSubjectLen) return false;
       return unionRe2.test(subject);

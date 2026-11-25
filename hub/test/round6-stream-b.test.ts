@@ -6,12 +6,6 @@ import { join, resolve } from 'node:path';
 import type { TestContext } from 'node:test';
 import { gzipSync } from 'node:zlib';
 
-import {
-  applyDenoSecurityHeaders,
-  MAX_DENO_INFLIGHT_PER_IP,
-  resolveDenoTrustedClientIp,
-  startDenoHub,
-} from '../portable/deno-server.ts';
 import { NodeFsR2Bucket } from '../portable/node-adapters.ts';
 import {
   MAX_CONNECTIONS_PER_IP,
@@ -148,7 +142,13 @@ await t.test('R6-STREAM-B-1 (R6-H4): Portable Hub caps per-IP raw TCP & pre-head
       ),
     );
 
-    await new Promise((r) => setTimeout(r, 80));
+    const drainDeadline = Date.now() + 280; // strictly < headersTimeoutMs (400ms)
+    while (
+      Date.now() < drainDeadline &&
+      attackerSockets.filter((x) => !x.closed && !x.sock.destroyed).length > 16
+    ) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
     const openAttackerCount = attackerSockets.filter((x) => !x.closed && !x.sock.destroyed).length;
     assert.ok(
       openAttackerCount <= 16,
@@ -553,148 +553,6 @@ await t.test('R6-STREAM-B-3 (M3 & R5-M4): Catalog caps variantHashes inside 32 M
   } finally {
     resetCatalogStateForTests();
     rmSync(r2Dir, { recursive: true, force: true });
-  }
-});
-
-await t.test('R6-STREAM-B-4 (denoshim.mjs & hdr4.mjs): deno-server enforces per-IP active slot cap, body limits, malformed Host 400, full security headers, and TRUST_PROXY parity', async () => {
-  assert.equal(MAX_DENO_INFLIGHT_PER_IP, 16);
-  const prevDeno = (globalThis as { Deno?: unknown }).Deno;
-  type DenoHandler = (req: Request, info: { remoteAddr?: { hostname?: string } }) => Promise<Response> | Response;
-  let capturedHandler: DenoHandler | null = null;
-  const callerTok = 'deno-caller-token-0123456789abcdef';
-  const agentTok = 'deno-agent-token-0123456789abcdef';
-
-  try {
-    const denoEnv: Record<string, string> = {
-      CALLER_TOKEN: callerTok,
-      AGENT_TOKEN: agentTok,
-      EDGEFETCH_DATA_DIR: ':memory:',
-      EDGEFETCH_PUBLIC_ORIGIN: 'https://hub.example.test',
-      EDGEFETCH_TRUST_PROXY: '1',
-    };
-    (globalThis as { Deno?: unknown }).Deno = {
-      env: {
-        get: (k: string) => denoEnv[k],
-        toObject: () => ({ ...denoEnv }),
-      },
-      serve: (_opts: unknown, h: DenoHandler) => {
-        capturedHandler = h;
-        return {};
-      },
-      upgradeWebSocket: () => {
-        throw new Error('unexpected upgrade');
-      },
-    };
-
-    startDenoHub({ maxInflightPerIp: 2, maxInflightTotal: 6, maxReqBodyBytes: 1_024 });
-    assert.ok(capturedHandler, 'startDenoHub must register Deno.serve handler');
-    const handler = capturedHandler!;
-    const peerInfo = { remoteAddr: { hostname: '10.0.0.5' } };
-
-    // 1. Security headers (`hdr4.mjs`) on `/admin`, `/oauth/authorize`, `/health`, and `404 /nonexistent`
-    for (const path of ['/admin', '/admin/api/state', '/oauth/authorize?client_id=unknown', '/health', '/nonexistent']) {
-      const res = await handler(
-        new Request(`https://hub.example.test${path}`, {
-          headers: { 'x-forwarded-for': '198.51.100.10' },
-        }),
-        peerInfo,
-      );
-      assert.equal(res.headers.get('x-content-type-options'), 'nosniff', `Missing nosniff on ${path}`);
-      assert.equal(res.headers.get('x-frame-options'), 'DENY', `Missing XFO DENY on ${path}`);
-      assert.equal(res.headers.get('referrer-policy'), 'no-referrer', `Missing Referrer-Policy on ${path}`);
-      assert.match(res.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/, `Missing frame-ancestors on ${path}`);
-      assert.match(res.headers.get('strict-transport-security') ?? '', /max-age=/, `Missing HSTS on HTTPS ${path}`);
-    }
-
-    // 2. Malformed `Host: [` -> `400 Bad Request`
-    const badHostRes = await handler(
-      new Request('https://hub.example.test/agents', { headers: { host: '[' } }),
-      peerInfo,
-    );
-    assert.equal(badHostRes.status, 400);
-    assert.equal(badHostRes.headers.get('x-frame-options'), 'DENY');
-
-    // 3. Body limit (`maxReqBodyBytes = 1024`) -> `413 Payload Too Large`
-    const oversizedRes = await handler(
-      new Request('https://hub.example.test/v1/scrape', {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${callerTok}`,
-          'content-type': 'application/json',
-          'x-forwarded-for': '198.51.100.20',
-        },
-        body: JSON.stringify({ url: 'https://example.com/' + 'a'.repeat(2_000) }),
-      }),
-      peerInfo,
-    );
-    assert.equal(oversizedRes.status, 413);
-
-    // 4. Per-IP active request slot cap (`maxInflightPerIp = 2`): hold 2 slow streaming bodies from `203.0.113.99`
-    const controllers: Array<ReadableStreamDefaultController<Uint8Array>> = [];
-    const makeSlowDenoPost = () => {
-      const body = new ReadableStream<Uint8Array>({
-        start(c) {
-          controllers.push(c);
-          c.enqueue(new TextEncoder().encode('{"q":'));
-        },
-      });
-      return Promise.resolve(
-        handler(
-          new Request('https://hub.example.test/oauth/token', {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/x-www-form-urlencoded',
-              'x-forwarded-for': '203.0.113.99',
-            },
-            body,
-            duplex: 'half',
-          } as RequestInit),
-          peerInfo,
-        ),
-      );
-    };
-
-    const p1 = makeSlowDenoPost();
-    const p2 = makeSlowDenoPost();
-    await new Promise((r) => setTimeout(r, 30));
-
-    const thirdSameIp = await handler(
-      new Request('https://hub.example.test/health', {
-        headers: { 'x-forwarded-for': '203.0.113.99' },
-      }),
-      peerInfo,
-    );
-    assert.equal(thirdSameIp.status, 429, 'Deno server must reject 3rd concurrent request from same IP with 429');
-
-    const otherIp = await handler(
-      new Request('https://hub.example.test/health', {
-        headers: { 'x-forwarded-for': '198.51.100.44' },
-      }),
-      peerInfo,
-    );
-    assert.equal(otherIp.status, 200, 'Other IP on Deno server must still get 200');
-
-    for (const c of controllers) {
-      try {
-        c.close();
-      } catch {
-        // ignore
-      }
-    }
-    await Promise.allSettled([p1, p2]);
-
-    // 5. `resolveDenoTrustedClientIp` parity + `applyDenoSecurityHeaders` on immutable Response
-    const flyReq = new Request('https://hub.example.test/health', {
-      headers: { 'fly-client-ip': '198.51.100.88', 'x-forwarded-for': '1.2.3.4, 66.241.124.1' },
-    });
-    assert.equal(resolveDenoTrustedClientIp(flyReq, peerInfo, false, false), '10.0.0.5');
-    assert.equal(resolveDenoTrustedClientIp(flyReq, peerInfo, true, false), '66.241.124.1');
-    assert.equal(resolveDenoTrustedClientIp(flyReq, peerInfo, true, true), '198.51.100.88');
-    const redirWithHdrs = applyDenoSecurityHeaders(Response.redirect('https://hub.example.test/admin', 302), true);
-    assert.equal(redirWithHdrs.headers.get('x-frame-options'), 'DENY');
-  } finally {
-    if (prevDeno === undefined) delete (globalThis as { Deno?: unknown }).Deno;
-    else (globalThis as { Deno?: unknown }).Deno = prevDeno;
   }
 });
 

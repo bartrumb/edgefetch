@@ -24,7 +24,7 @@ import { detectPromptInjection } from './scrape-advanced';
  * Bidi overrides/isolates, zero-width / soft-hyphen characters, ANSI CSI sequences, and raw ASCII C0/DEL control bytes.
  */
 export function stripMcpSmugglingChars(s: string): string {
-  if (!s) return s;
+  if (!s || !/[^\x20-\x7e\r\n\t]/.test(s)) return s;
   return s
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(

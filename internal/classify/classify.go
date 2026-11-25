@@ -4,9 +4,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 )
+
+func headerGet(header map[string][]string, key string) string {
+	if len(header) == 0 {
+		return ""
+	}
+	if vals, ok := header[key]; ok && len(vals) > 0 {
+		return vals[0]
+	}
+	for k, vals := range header {
+		if len(vals) > 0 && strings.EqualFold(k, key) {
+			return vals[0]
+		}
+	}
+	return ""
+}
+
+func headerValues(header map[string][]string, key string) []string {
+	if len(header) == 0 {
+		return nil
+	}
+	var out []string
+	for k, vals := range header {
+		if strings.EqualFold(k, key) {
+			out = append(out, vals...)
+		}
+	}
+	return out
+}
 
 // Kind identifies what resource shape the caller expects from a URL.
 type Kind string
@@ -45,11 +72,11 @@ const (
 //
 // Note that Go `switch` cases do NOT fall through unless `fallthrough` is written explicitly, and multiple values
 // can share one `case 403, 429, 503:` branch cleanly.
-func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, string) {
+func Classify(kind Kind, status int, header map[string][]string, body []byte) (Outcome, string) {
 	if waf := ClassifyWAF(status, header, body); waf != nil {
 		return OutcomeChallenge, waf.Summary
 	}
-	if status == http.StatusPaymentRequired {
+	if status == 402 {
 		return OutcomePaymentRequired, "http 402 payment required"
 	}
 	ok := status >= 200 && status <= 299
@@ -80,7 +107,7 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 		case 410:
 			return OutcomeGone, ""
 		}
-		ctLower := strings.ToLower(header.Get("content-type"))
+		ctLower := strings.ToLower(headerGet(header, "content-type"))
 		isPageDoc := strings.Contains(ctLower, "text/html") ||
 			strings.Contains(ctLower, "text/markdown") ||
 			strings.Contains(ctLower, "text/x-markdown")
@@ -124,7 +151,7 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 		if !ok {
 			return OutcomeError, fmt.Sprintf("HTTP %d", status)
 		}
-		ct := strings.ToLower(header.Get("content-type"))
+		ct := strings.ToLower(headerGet(header, "content-type"))
 		prefix := body
 		if len(prefix) > 1024 {
 			prefix = prefix[:1024]
@@ -171,8 +198,8 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 	return OutcomeOK, ""
 }
 
-func invalidJSONMessage(header http.Header) string {
-	ct := header.Get("content-type")
+func invalidJSONMessage(header map[string][]string) string {
+	ct := headerGet(header, "content-type")
 	if ct == "" {
 		ct = "null"
 	}
@@ -205,14 +232,14 @@ func IsAutoPageContentType(contentType string) bool {
 // ClassifyAuto evaluates `Classify` and promotes structured/text 2xx responses (`application/json`, `application/*+json`,
 // `application/rss+xml`, `application/atom+xml`, `application/xml`, `text/xml`, `text/plain`, `text/markdown`) to
 // `OutcomeOK` when `kindAuto` is true (or `kind == ""`).
-func ClassifyAuto(kind Kind, kindAuto bool, status int, header http.Header, body []byte) (Outcome, string) {
+func ClassifyAuto(kind Kind, kindAuto bool, status int, header map[string][]string, body []byte) (Outcome, string) {
 	if kind == "" {
 		kind = KindPage
 		kindAuto = true
 	}
 	out, prob := Classify(kind, status, header, body)
 	if kindAuto && kind == KindPage && out == OutcomeSkip && status >= 200 && status <= 299 {
-		if IsAutoPageContentType(header.Get("content-type")) {
+		if IsAutoPageContentType(headerGet(header, "content-type")) {
 			return OutcomeOK, ""
 		}
 	}

@@ -9,7 +9,8 @@
     "adapter:check": "node scripts/compile-manifests.mjs --check",
     "psl:update": "node scripts/update-psl.mjs",
     "psl:check": "node scripts/update-psl.mjs --check",
-    "type-check": "node scripts/compile-manifests.mjs && tsc --noEmit -p tsconfig.json",
+    "wasm:build": "node scripts/build-wasm.mjs",
+    "type-check": "node scripts/compile-manifests.mjs && node scripts/build-wasm.mjs && tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
     "test:coverage": "node scripts/run-tests.mjs --coverage --include-sdk",
     "openapi:generate": "node scripts/generate-openapi.mjs",
@@ -18,8 +19,8 @@
     "adapter:test": "node scripts/test-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",
     "start:portable": "node scripts/build-portable.mjs && node dist/portable-server.mjs",
-    "deploy:dry": "node scripts/compile-manifests.mjs && wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",
-    "deploy": "node scripts/compile-manifests.mjs && wrangler deploy -c wrangler.toml -e production"
+    "deploy:dry": "node scripts/compile-manifests.mjs && node scripts/build-wasm.mjs && wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",
+    "deploy": "node scripts/compile-manifests.mjs && node scripts/build-wasm.mjs && wrangler deploy -c wrangler.toml -e production"
   },
   "cloudflare": {
     "bindings": {
@@ -35,16 +36,15 @@
     "@cloudflare/workers-types": "^5.20260804.1",
     "@types/ws": "8.18.2",
     "esbuild": "^0.28.2",
+    "htmlparser2": "12.0.0",
     "miniflare": "5.20261117.0-beta",
     "typescript": "^5.8.3",
-    "wrangler": "^4.164.0"
+    "wrangler": "^4.164.0",
+    "yaml": "2.9.1"
   },
   "dependencies": {
-    "htmlparser2": "12.0.0",
     "jose": "6.2.18",
     "oauth4webapi": "3.8.9",
-    "re2js": "2.10.0",
-    "ws": "8.23.0",
-    "yaml": "2.9.1"
+    "ws": "8.23.0"
   }
 }

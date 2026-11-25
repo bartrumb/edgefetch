@@ -296,6 +296,13 @@ function buildEdgefetchBinary(outDir) {
 async function bundleTypeScriptDeps(outDir) {
   const esbuildPath = path.join(REPO_ROOT, 'hub', 'node_modules', 'esbuild', 'lib', 'main.js');
   const esbuild = await import(pathToFileURL(esbuildPath).href);
+  const { ensureCoreWasmBuilt } = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'hub', 'scripts', 'build-wasm.mjs')).href
+  );
+  const { createNodeWasmPlugin } = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'hub', 'scripts', 'esbuild-wasm-plugin.mjs')).href
+  );
+  const coreWasmPath = ensureCoreWasmBuilt();
   const entryTs = path.join(outDir, 'fullstack-deps-entry.ts');
   const outMjs = path.join(outDir, 'fullstack-deps.mjs');
 
@@ -321,7 +328,7 @@ async function bundleTypeScriptDeps(outDir) {
     'utf8',
   );
 
-  esbuild.buildSync({
+  await esbuild.build({
     entryPoints: [entryTs],
     bundle: true,
     platform: 'node',
@@ -335,6 +342,7 @@ async function bundleTypeScriptDeps(outDir) {
       'cloudflare:workers': path.join(REPO_ROOT, 'hub', 'portable', 'cloudflare-shim.ts'),
     },
     loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text' },
+    plugins: [createNodeWasmPlugin({ wasmAbsPath: coreWasmPath })],
     external: ['node:*'],
     outfile: outMjs,
   });

@@ -16,12 +16,16 @@ import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+import { ensureCoreWasmBuilt } from '../hub/scripts/build-wasm.mjs';
+import { createNodeWasmPlugin } from '../hub/scripts/esbuild-wasm-plugin.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
 const hubDir = resolve(repoRoot, 'hub');
 const reqFromHub = createRequire(resolve(hubDir, 'package.json'));
 const { build } = reqFromHub('esbuild');
+const coreWasmPath = ensureCoreWasmBuilt();
+const nodeWasmPlugin = createNodeWasmPlugin({ wasmAbsPath: coreWasmPath });
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'edgefetch-bench-'));
 const outfile = join(tmpDir, 'scrape-bundle.mjs');
@@ -39,6 +43,7 @@ await build({
     '.yaml': 'text',
     '.yml': 'text',
   },
+  plugins: [nodeWasmPlugin],
   outfile,
   alias: {
     'cloudflare:workers': resolve(hubDir, 'test/cloudflare-workers-stub.ts'),
@@ -68,6 +73,7 @@ const { formatYamlFrontmatterCard } = await (async () => {
       '.yaml': 'text',
       '.yml': 'text',
     },
+    plugins: [nodeWasmPlugin],
     outfile: regOut,
   });
   return import(pathToFileURL(regOut).href);

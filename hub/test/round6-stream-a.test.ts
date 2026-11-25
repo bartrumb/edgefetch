@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 
-import { parseHtmlDoc } from '../src/extractors/html-doc.ts';
+import { parseHtmlDoc } from '../src/extractors/utils.ts';
 import {
   buildBlockedInfo,
   executeJobsCall,

@@ -109,7 +109,7 @@ var (
 
 	reEmail = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
 	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
-	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?\(\d{3}\)[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
+	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\b\d{3})[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
 	reCard  = regexp.MustCompile(`\b(?:\d[ -]*?){13,19}\b`)
 
 	reSPAShell = regexp.MustCompile(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)
@@ -783,12 +783,20 @@ func scanHeadMetadata(rawHTML string, base *url.URL) BrandingProfile {
 }
 
 func extractStyleSignals(rawHTML string) (colors, fonts []string) {
+	lowHTML := asciiLowerExtractString(rawHTML)
+	hasStyle := strings.Contains(lowHTML, "</style")
+	hasGoogleFont := strings.Contains(lowHTML, "fonts.googleapis.com")
+	if !hasStyle && !hasGoogleFont {
+		return nil, nil
+	}
 	seenColor := make(map[string]bool)
 	var styleBuf strings.Builder
-	for _, m := range reStyleContent.FindAllStringSubmatch(rawHTML, 25) {
-		if len(m) >= 2 {
-			styleBuf.WriteString(m[1])
-			styleBuf.WriteByte('\n')
+	if hasStyle {
+		for _, m := range reStyleContent.FindAllStringSubmatch(rawHTML, 25) {
+			if len(m) >= 2 {
+				styleBuf.WriteString(m[1])
+				styleBuf.WriteByte('\n')
+			}
 		}
 	}
 	styleText := styleBuf.String()
@@ -822,10 +830,12 @@ func extractStyleSignals(rawHTML string) (colors, fonts []string) {
 			fonts = append(fonts, f)
 		}
 	}
-	for _, gm := range reGoogleFont.FindAllStringSubmatch(rawHTML, 10) {
-		if len(gm) >= 2 {
-			name := strings.Split(gm[1], ":")[0]
-			addFont(strings.ReplaceAll(name, "+", " "))
+	if hasGoogleFont {
+		for _, gm := range reGoogleFont.FindAllStringSubmatch(rawHTML, 10) {
+			if len(gm) >= 2 {
+				name := strings.Split(gm[1], ":")[0]
+				addFont(strings.ReplaceAll(name, "+", " "))
+			}
 		}
 	}
 	for _, fm := range reFontFamily.FindAllStringSubmatch(styleText, 25) {

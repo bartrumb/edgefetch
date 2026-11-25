@@ -411,10 +411,13 @@ export function sanitizeConnectorText(
     const bounded = truncated ? redacted.slice(0, maxChars) : redacted;
     const piRes = sanitizeRemoteMcpText(bounded, maxChars);
     const safeMd = sanitizeMcpMarkdownOutput(piRes.text, baseUrl, maxChars);
-    const postVerify = detectPromptInjection({
-      markdown: safeMd,
-      ...(safeMd.includes('<') ? { rawHtml: safeMd } : {}),
-    });
+    const postVerify =
+      safeMd === piRes.text && !piRes.detected
+        ? { detected: false, triggers: [] as string[] }
+        : detectPromptInjection({
+            markdown: safeMd,
+            ...(safeMd.includes('<') ? { rawHtml: safeMd } : {}),
+          });
     const completedCleanly = !postVerify.detected && !MCP_DIRECTIVE_INJECTION_RE.test(safeMd);
     return {
       text: safeMd,

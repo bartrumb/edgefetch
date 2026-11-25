@@ -1136,6 +1136,24 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(secondJson.rateLimited, true);
       assert.equal(adminRefreshCalls, 1);
 
+      // Production-scale 45,000-host EasyPrivacy list parses in a single Go WASM call well within Worker CPU limits (< 500ms)
+      const fullScaleBody = buildEasyPrivacyFixture({ version: '2026112599', hostCount: 45_000 });
+      const fullScaleBucket = new NodeFsR2Bucket(join(tmp, 'worker-45k-r2'));
+      const t45k = performance.now();
+      const fullScaleOut = await refreshHubTrackerList({
+        bucket: fullScaleBucket,
+        fetchFn: (async () =>
+          new Response(fullScaleBody, {
+            status: 200,
+            headers: { 'content-type': 'text/plain; charset=utf-8' },
+          })) as typeof fetch,
+      });
+      const elapsed45k = performance.now() - t45k;
+      assert.equal(fullScaleOut.ok, true);
+      assert.equal(fullScaleOut.updated, true);
+      assert.equal(fullScaleOut.current?.meta.hostCount, 45_001);
+      assert.ok(elapsed45k < 1_000, `Expected 45k EasyPrivacy list refresh in < 1000ms, took ${elapsed45k.toFixed(1)}ms`);
+
       wsAgent.close();
     } finally {
       adminRefreshCoord.close();

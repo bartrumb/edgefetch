@@ -105,24 +105,24 @@ type ArtifactRef struct {
 
 // Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID                string                         `json:"id"`
-	URL               string                         `json:"url"`
-	Kind              classify.Kind                  `json:"kind"`
-	Outcome           classify.Outcome               `json:"outcome"`
-	BlockedReason     string                         `json:"blockedReason,omitempty"`
-	Problem           string                         `json:"problem,omitempty"`
-	Status            int                            `json:"status"`
-	ContentType       string                         `json:"contentType,omitempty"`
-	ContentSource     string                         `json:"contentSource,omitempty"`
-	ResponseHeaders   map[string]string              `json:"headers,omitempty"`
-	PaymentHeaders    map[string]string              `json:"paymentHeaders,omitempty"`
-	CfMitigated       string                         `json:"cfMitigated,omitempty"`
-	WAF               *classify.WAFMatch             `json:"waf,omitempty"`
-	ETag              string                         `json:"etag,omitempty"`
-	LastModified      string                         `json:"lastModified,omitempty"`
-	RetryAfter        string                         `json:"retryAfter,omitempty"`
-	RetryAfterMs      int64                          `json:"retryAfterMs,omitempty"`
-	Bytes             int                            `json:"bytes"`
+	ID                 string                         `json:"id"`
+	URL                string                         `json:"url"`
+	Kind               classify.Kind                  `json:"kind"`
+	Outcome            classify.Outcome               `json:"outcome"`
+	BlockedReason      string                         `json:"blockedReason,omitempty"`
+	Problem            string                         `json:"problem,omitempty"`
+	Status             int                            `json:"status"`
+	ContentType        string                         `json:"contentType,omitempty"`
+	ContentSource      string                         `json:"contentSource,omitempty"`
+	ResponseHeaders    map[string]string              `json:"headers,omitempty"`
+	PaymentHeaders     map[string]string              `json:"paymentHeaders,omitempty"`
+	CfMitigated        string                         `json:"cfMitigated,omitempty"`
+	WAF                *classify.WAFMatch             `json:"waf,omitempty"`
+	ETag               string                         `json:"etag,omitempty"`
+	LastModified       string                         `json:"lastModified,omitempty"`
+	RetryAfter         string                         `json:"retryAfter,omitempty"`
+	RetryAfterMs       int64                          `json:"retryAfterMs,omitempty"`
+	Bytes              int                            `json:"bytes"`
 	Truncated          bool                           `json:"truncated,omitempty"`
 	BodyOmitted        bool                           `json:"bodyOmitted,omitempty"`
 	ExtractedOnNode    bool                           `json:"extractedOnNode,omitempty"`
@@ -130,35 +130,35 @@ type Result struct {
 	ExtractorID        string                         `json:"extractorId,omitempty"`
 	Records            []map[string]any               `json:"records,omitempty"`
 	Attempts           int                            `json:"attempts"`
-	DurationMs        int64                          `json:"durationMs"`
-	Timing            Timing                         `json:"timing"`
-	Body              string                         `json:"body,omitempty"`
-	BodyEncoding      string                         `json:"bodyEncoding,omitempty"`
-	Artifact          *ArtifactRef                   `json:"artifact,omitempty"`
-	ArtifactError     string                         `json:"artifactError,omitempty"`
-	FinalURL          string                         `json:"finalUrl,omitempty"`
-	Title             string                         `json:"title,omitempty"`
-	Description       string                         `json:"description,omitempty"`
-	Favicon           string                         `json:"favicon,omitempty"`
-	Markdown          string                         `json:"markdown,omitempty"`
-	Text              string                         `json:"text,omitempty"`
-	Links             []string                       `json:"links,omitempty"`
-	Images            []extract.ImageInfo            `json:"images,omitempty"`
-	Branding          *extract.BrandingProfile       `json:"branding,omitempty"`
-	Llms              *extract.LlmsDiscovery         `json:"llms,omitempty"`
-	Rendered          bool                           `json:"rendered,omitempty"`
-	BlockedTrackers   *int                           `json:"blockedTrackers,omitempty"`
-	SessionID         string                         `json:"sessionId,omitempty"`
-	ScreenshotBase64  string                         `json:"screenshotBase64,omitempty"`
-	ActionScreenshots []string                       `json:"actionScreenshots,omitempty"`
-	ActionScrapes     []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
-	JavascriptReturns []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
-	ActionResults     []browser.ActionResult         `json:"actionResults,omitempty"`
-	CapturedJSON      []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
-	PDFBase64         string                         `json:"pdfBase64,omitempty"`
-	PDFEngine         string                         `json:"pdfEngine,omitempty"`
-	SHA256            string                         `json:"sha256,omitempty"`
-	BodyBase64        string                         `json:"bodyBase64,omitempty"`
+	DurationMs         int64                          `json:"durationMs"`
+	Timing             Timing                         `json:"timing"`
+	Body               string                         `json:"body,omitempty"`
+	BodyEncoding       string                         `json:"bodyEncoding,omitempty"`
+	Artifact           *ArtifactRef                   `json:"artifact,omitempty"`
+	ArtifactError      string                         `json:"artifactError,omitempty"`
+	FinalURL           string                         `json:"finalUrl,omitempty"`
+	Title              string                         `json:"title,omitempty"`
+	Description        string                         `json:"description,omitempty"`
+	Favicon            string                         `json:"favicon,omitempty"`
+	Markdown           string                         `json:"markdown,omitempty"`
+	Text               string                         `json:"text,omitempty"`
+	Links              []string                       `json:"links,omitempty"`
+	Images             []extract.ImageInfo            `json:"images,omitempty"`
+	Branding           *extract.BrandingProfile       `json:"branding,omitempty"`
+	Llms               *extract.LlmsDiscovery         `json:"llms,omitempty"`
+	Rendered           bool                           `json:"rendered,omitempty"`
+	BlockedTrackers    *int                           `json:"blockedTrackers,omitempty"`
+	SessionID          string                         `json:"sessionId,omitempty"`
+	ScreenshotBase64   string                         `json:"screenshotBase64,omitempty"`
+	ActionScreenshots  []string                       `json:"actionScreenshots,omitempty"`
+	ActionScrapes      []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
+	JavascriptReturns  []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
+	ActionResults      []browser.ActionResult         `json:"actionResults,omitempty"`
+	CapturedJSON       []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
+	PDFBase64          string                         `json:"pdfBase64,omitempty"`
+	PDFEngine          string                         `json:"pdfEngine,omitempty"`
+	SHA256             string                         `json:"sha256,omitempty"`
+	BodyBase64         string                         `json:"bodyBase64,omitempty"`
 
 	traceSpanID   string
 	traceStart    time.Time
@@ -183,18 +183,18 @@ func Bool(v bool) *bool { return &v }
 
 // Options bounds a crawl batch. Zero values take safe defaults in Normalize() (including RespectRobots = true).
 type Options struct {
-	PauseMs       int   `json:"pauseMs"`
-	PauseJitterMs int   `json:"pauseJitterMs,omitempty"`
-	GapMs         int   `json:"gapMs"`
-	Concurrency   int   `json:"concurrency"`
+	PauseMs            int   `json:"pauseMs"`
+	PauseJitterMs      int   `json:"pauseJitterMs,omitempty"`
+	GapMs              int   `json:"gapMs"`
+	Concurrency        int   `json:"concurrency"`
 	TimeoutMs          int   `json:"timeoutMs"`
 	MaxBytes           int   `json:"maxBytes"`
 	MaxTotalBytes      int   `json:"maxTotalBytes,omitempty"`
 	MaxInlineBodyBytes int   `json:"maxInlineBodyBytes,omitempty"`
 	Retries            int   `json:"retries"`
-	IncludeBody   bool  `json:"includeBody"`
-	DiscoverLlms  *bool `json:"discoverLlms,omitempty"`
-	RespectRobots *bool `json:"respectRobots,omitempty"`
+	IncludeBody        bool  `json:"includeBody"`
+	DiscoverLlms       *bool `json:"discoverLlms,omitempty"`
+	RespectRobots      *bool `json:"respectRobots,omitempty"`
 	// Robots is accepted as a wire alias for RespectRobots. When both are omitted, Normalize() defaults to true.
 	Robots *bool `json:"robots,omitempty"`
 }

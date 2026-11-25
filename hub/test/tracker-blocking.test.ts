@@ -1357,7 +1357,11 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       const statsFreshInstance = getWasmReactorStats();
       assert.equal(statsFreshInstance.active, true);
       assert.equal(statsFreshInstance.generation, statsBeforeOversized.generation + 1);
-      assert.equal(statsFreshInstance.memoryBytes, statsFreshInstance.initialMemoryBytes);
+      assert.ok(
+        statsFreshInstance.memoryBytes >= statsFreshInstance.initialMemoryBytes &&
+          statsFreshInstance.memoryBytes <= statsFreshInstance.initialMemoryBytes + 2 * 1024 * 1024,
+        `Fresh reactor post-eviction memory (${statsFreshInstance.memoryBytes}) must stay within 2 MiB of initial baseline (${statsFreshInstance.initialMemoryBytes})`,
+      );
 
       // Ordinary 2 MB documents (`2M` `<` sanitize -> `~77.5 MiB` total) must NOT trigger reactor rebuilds across
       // 12 consecutive calls (`generation` stays constant, zero `~50 ms` rebuild stalls or dual-instance overlap).

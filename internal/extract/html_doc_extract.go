@@ -1,9 +1,9 @@
 package extract
 
 import (
-	"regexp"
 	"encoding/json"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"

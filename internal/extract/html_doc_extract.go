@@ -4007,12 +4007,8 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	var hnExtracted *hnExtractedResultFullDocGo
 
 	if hasDefaultHTMLScoping && hasClosedTag {
-		if strings.Contains(boundedRawHTML, "ytInitial") || strings.Contains(baseURL, "youtube") || strings.Contains(baseURL, "youtu.be") {
-			ytMeta = ExtractYouTubeWatchMetadataFromHTML(boundedRawHTML, baseURL)
-		}
-		if strings.Contains(boundedRawHTML, "_preloads") {
-			substackPreload = extractSubstackPreloadDataFullDocGo(boundedRawHTML)
-		}
+		ytMeta = ExtractYouTubeWatchMetadataFromHTML(boundedRawHTML, baseURL)
+		substackPreload = extractSubstackPreloadDataFullDocGo(boundedRawHTML)
 		if substackPreload != nil {
 			if substackPreload.title != "" {
 				title = substackPreload.title
@@ -4027,9 +4023,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				publishedTime = substackPreload.publishedTime
 			}
 		}
-		if strings.Contains(boundedRawHTML, "hnmain") || strings.Contains(boundedRawHTML, "athing") {
-			hnExtracted = extractHackerNewsMarkdownFullDocGo(boundedRawHTML, baseURL)
-		}
+		hnExtracted = extractHackerNewsMarkdownFullDocGo(boundedRawHTML, baseURL)
 		if hnExtracted != nil {
 			if hnExtracted.title != "" {
 				title = hnExtracted.title

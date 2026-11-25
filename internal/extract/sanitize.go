@@ -4867,7 +4867,9 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, isLa
 	}
 
 	var inlineCodeStash []string
-	if strings.IndexByte(proseWork, '<') >= 0 || strings.Contains(proseWork, ":::") || strings.IndexByte(proseWork, '&') >= 0 {
+	if (strings.IndexByte(proseWork, '<') >= 0 && (strings.IndexByte(proseWork, '>') >= 0 || strings.Contains(proseWork, "<!--"))) ||
+		strings.Contains(proseWork, ":::") ||
+		strings.IndexByte(proseWork, '&') >= 0 {
 		proseWork = stashMarkdownInlineCodeSpansLinearGo(proseWork, &inlineCodeStash)
 	}
 

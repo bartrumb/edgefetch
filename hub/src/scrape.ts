@@ -4949,6 +4949,54 @@ export async function executeScrapeCall(params: {
               item = busyItem;
               finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
               try {
+                // The busy shortcut must apply the same guards as the main pipeline before returning node
+                // content: WAF/challenge interstitials, the prompt-injection gate, and content-state classification.
+                const busyStatus = typeof busyItem.status === 'number' ? busyItem.status : 200;
+                const busyRawTitle = typeof busyItem.title === 'string' ? busyItem.title : '';
+                const busyWaf =
+                  (busyItem.waf && typeof busyItem.waf === 'object' ? (busyItem.waf as WafClassification) : null) ??
+                  classifyWafAndChallenge({ status: busyStatus, rawBody: busyItem.markdown });
+                if (busyWaf) {
+                  return {
+                    status: 403,
+                    via: busyOffloadRes.via,
+                    body: {
+                      ok: false,
+                      url: normalizedUrl,
+                      finalUrl,
+                      outcome: 'challenge',
+                      status: busyStatus,
+                      problem: busyWaf.summary,
+                      waf: busyWaf,
+                    },
+                  };
+                }
+                if (checkPromptInjection) {
+                  const piBusy = detectPromptInjection({ markdown: `${busyRawTitle}\n${busyItem.markdown}` });
+                  if (piBusy.detected) {
+                    return {
+                      status: 403,
+                      via: busyOffloadRes.via,
+                      body: {
+                        ok: false,
+                        url: normalizedUrl,
+                        finalUrl,
+                        error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                        message: `Prompt injection guard blocked page content (${piBusy.triggers.join(', ')})`,
+                        triggers: piBusy.triggers,
+                      },
+                    };
+                  }
+                }
+                const busyContentState = classifyContentState({
+                  status: busyStatus,
+                  url: normalizedUrl,
+                  finalUrl,
+                  title: busyRawTitle,
+                  markdown: busyItem.markdown,
+                  rendered: false,
+                  nowMs: Date.now(),
+                });
                 const safeNodeMd = finalizeScrapedMarkdown(
                   redactPii ? redactPiiText(busyItem.markdown) : busyItem.markdown,
                   { isPdf: false, includeImages, maxChars, baseUrl: finalUrl },
@@ -4973,7 +5021,8 @@ export async function executeScrapeCall(params: {
                     status: busyItem.status ?? 200,
                     via: busyOffloadRes.via,
                     extractedOnNode: true,
-                    contentState: 'active',
+                    contentState: busyContentState.state,
+                    ...(busyContentState.reason ? { contentStateReason: busyContentState.reason } : {}),
                     rendered: false,
                     ...(nodeArt?.contentSha256 ? { contentSha256: nodeArt.contentSha256 } : {}),
                     ...(nodeArt?.blobSha256 ? { artifactId: nodeArt.blobSha256 } : {}),

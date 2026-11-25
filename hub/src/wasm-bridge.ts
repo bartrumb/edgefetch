@@ -119,6 +119,8 @@ export function acquireIsolateByteBudget(
         const idx = isolateWaitQueue.indexOf(waiter);
         if (idx >= 0) isolateWaitQueue.splice(idx, 1);
         resolve(null);
+        // A timed-out head waiter may have been the only thing blocking smaller waiters that already fit.
+        if (idx === 0) drainIsolateWaitQueue();
       }, waitTimeoutMs),
       resolve,
     };

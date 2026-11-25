@@ -87,9 +87,15 @@ export function cutMarkdownToSanitizerBudget(
   return { text: raw.slice(0, cutPos), cut: true };
 }
 
+/** Invisible / format characters (below U+200B) that the fallback strips: soft hyphen, CGJ, ALM, Mongolian VS. */
+function isFallbackStrippedLowInvisible(c: number): boolean {
+  return c === 0x00ad || c === 0x034f || c === 0x061c || (c >= 0x180b && c <= 0x180f);
+}
+
 /**
  * Pure-TS linear O(N) emergency fallback when WASM sanitization fails for any reason.
- * Replaces every `<` with `&lt;`, strips control/invisible smuggling characters, unwraps simple
+ * Escapes every `&`, `<` and `>` as HTML entities (so a later entity decode cannot revive a tag),
+ * strips control/invisible smuggling characters, unwraps simple
  * `[label](dest)` / `![alt](dest)` link/image syntax to plain visible text, and escapes any remaining
  * `[` / `]` so zero HTML tags, autolinks, links, or images can ever reach a caller unsanitized.
  */
@@ -110,6 +116,10 @@ export function escapeMarkdownFallbackLinear(
   }
 
   const chunks: string[] = [];
+  // End of the furthest failed `](...)` paren scan. A later `[` whose paren region starts before this point is
+  // escaped instead of rescanned, which keeps the whole pass linear (e.g. `'[](('.repeat(1e6)`). Escaping is
+  // always the safe outcome; it only forgoes link unwrapping in that rare overlap.
+  let parenScanFailedUntil = -1;
   let i = 0;
   while (i < limit) {
     const c = raw.charCodeAt(i);
@@ -118,11 +128,13 @@ export function escapeMarkdownFallbackLinear(
       i++;
       continue;
     }
-    // Strip zero-width & Bidi override smuggling characters
+    // Strip zero-width, Bidi override, variation-selector & other invisible smuggling characters
     if (
+      isFallbackStrippedLowInvisible(c) ||
       (c >= 0x200b && c <= 0x200f) ||
       (c >= 0x202a && c <= 0x202e) ||
       (c >= 0x2060 && c <= 0x2069) ||
+      (c >= 0xfe00 && c <= 0xfe0f) ||
       c === 0xfeff
     ) {
       i++;
@@ -141,6 +153,16 @@ export function escapeMarkdownFallbackLinear(
       i++;
       continue;
     }
+    if (c === 0x3e /* > */) {
+      chunks.push('&gt;');
+      i++;
+      continue;
+    }
+    if (c === 0x26 /* & */) {
+      chunks.push('&amp;');
+      i++;
+      continue;
+    }
     // Unwrap `![alt](dest)` or `[label](dest)` within a bounded 512-char window; otherwise escape `[` / `]`.
     if ((c === 0x21 /* ! */ && i + 1 < limit && raw.charCodeAt(i + 1) === 0x5b) || c === 0x5b /* [ */) {
       const bracketOpen = c === 0x21 ? i + 1 : i;
@@ -154,7 +176,12 @@ export function escapeMarkdownFallbackLinear(
           break;
         }
       }
-      if (closeBracket > bracketOpen && closeBracket + 1 < limit && raw.charCodeAt(closeBracket + 1) === 0x28 /* ( */) {
+      if (
+        closeBracket > bracketOpen &&
+        closeBracket + 1 < limit &&
+        raw.charCodeAt(closeBracket + 1) === 0x28 /* ( */ &&
+        closeBracket + 2 >= parenScanFailedUntil
+      ) {
         const parenCap = Math.min(limit, closeBracket + 2 + 2_048);
         let depth = 1;
         let p = closeBracket + 2;
@@ -173,6 +200,7 @@ export function escapeMarkdownFallbackLinear(
           i = p;
           continue;
         }
+        parenScanFailedUntil = p;
       }
       if (c === 0x21) {
         chunks.push('!&#91;');
@@ -197,7 +225,10 @@ export function escapeMarkdownFallbackLinear(
         nc < 0x20 ||
         nc === 0x7f ||
         nc === 0x3c ||
+        nc === 0x3e ||
+        nc === 0x26 ||
         nc === 0x21 ||
+        isFallbackStrippedLowInvisible(nc) ||
         nc === 0x5b ||
         nc === 0x5d ||
         nc >= 0x200b
@@ -470,6 +501,28 @@ export function stripMarkdownTableDividerLinesLinear(s: string): string {
   return callCoreWasmRawString('strip_table_dividers', null, s);
 }
 
+/** UTF-8 byte length of `s`, counting stops early once it exceeds `cap` (returns a value > cap). */
+const ALL_ASCII_RE = /^[\x00-\x7f]*$/;
+function utf8ByteLenUpTo(s: string, cap: number): number {
+  if (s.length > cap) return s.length; // every UTF-16 code unit is >= 1 UTF-8 byte
+  if (ALL_ASCII_RE.test(s)) return s.length; // native scan; avoids a JS loop on the common ASCII case
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else bytes += 3;
+    } else bytes += 3;
+    if (bytes > cap) return bytes;
+  }
+  return bytes;
+}
+
 export function detectPromptInjection(params: {
   markdown: string;
   rawHtml?: string;
@@ -480,12 +533,19 @@ export function detectPromptInjection(params: {
   const md = String(params.markdown ?? '');
   const html = String(params.rawHtml ?? '');
   const PI_MAX_SCAN_CHARS = 8 * 1024 * 1024;
-  const PI_WINDOW_CHARS = 2 * 1024 * 1024;
+  // The WASM budget is in UTF-8 bytes. One UTF-16 code unit is at most 3 UTF-8 bytes, so a window of
+  // `PI_WASM_BYTES / 3` chars always fits, even for all-CJK pages (a 2M-char CJK window would be ~6 MB).
+  const PI_WASM_BYTES = MAX_WASM_INPUT_BYTES - 65_536;
+  const PI_WINDOW_CHARS = Math.floor(PI_WASM_BYTES / 3);
   const PI_OVERLAP_CHARS = 16_384;
   const boundedMd = md.length > PI_MAX_SCAN_CHARS ? md.slice(0, PI_MAX_SCAN_CHARS) : md;
   const boundedHtml = html.length > PI_MAX_SCAN_CHARS ? html.slice(0, PI_MAX_SCAN_CHARS) : html;
 
-  if (boundedMd.length <= PI_WINDOW_CHARS && boundedHtml.length <= 1024 * 1024) {
+  if (
+    boundedMd.length <= 2 * 1024 * 1024 &&
+    boundedHtml.length <= 1024 * 1024 &&
+    utf8ByteLenUpTo(boundedMd, PI_WASM_BYTES) + utf8ByteLenUpTo(boundedHtml, PI_WASM_BYTES) <= PI_WASM_BYTES
+  ) {
     const res =
       boundedHtml.length === 0
         ? callCoreWasmRaw<{ detected: boolean; triggers?: string[] }>('detect_prompt_injection', null, boundedMd)

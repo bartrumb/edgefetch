@@ -79,14 +79,12 @@ const suiteSpecs = [
   ['test/round9-bughunt.test.ts', 'round9-bughunt.test.mjs'],
   ['test/round10-sanitizer-commerce.test.ts', 'round10-sanitizer-commerce.test.mjs'],
   ['test/round10-auth-mcp-vault.test.ts', 'round10-auth-mcp-vault.test.mjs'],
-  ['test/round10-portable-eviction.test.ts', 'round10-portable-eviction.test.mjs'],
   ['test/round10-live-traces.test.ts', 'round10-live-traces.test.mjs'],
   ['test/universal-extraction-scale.test.ts', 'universal-extraction-scale.test.mjs'],
   ['test/tracker-blocking.test.ts', 'tracker-blocking.test.mjs'],
   ['test/round11-stream1-sanitizer.test.ts', 'round11-stream1-sanitizer.test.mjs'],
   ['test/round11-stream4-mcp-vault.test.ts', 'round11-stream4-mcp-vault.test.mjs'],
   ['test/round11-stream5-oauth-jobs-manifests.test.ts', 'round11-stream5-oauth-jobs-manifests.test.mjs'],
-  ['test/round11-stream3-portable.test.ts', 'round11-stream3-portable.test.mjs'],
 ];
 
 try {

@@ -24,16 +24,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
 	"github.com/bartrumb/edgefetch/v2/internal/agent"
 	"github.com/bartrumb/edgefetch/v2/internal/botauth"
-	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/hub/hubauth"
+	"github.com/bartrumb/edgefetch/v2/internal/hub/hubstore"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
@@ -50,19 +50,26 @@ const (
 )
 
 var (
-	reSiteID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
-	reJobID  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	reSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	reSiteID        = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+	reJobID         = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	reSHA256        = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	reHubSitemapLoc = regexp.MustCompile(`(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>`)
+	reHubMdURL      = regexp.MustCompile(`\]\((https?://[^)\s]+)\)`)
 )
+
+// scrapePayload aliases ScrapeRequest for backward test compatibility.
+type scrapePayload = ScrapeRequest
 
 // Config configures a self-hosted Go Hub controller instance.
 type Config struct {
 	CallerToken         string
+	McpToken            string
 	AgentToken          string
 	AgentTokens         map[string]string
 	PeerURLs            []string
 	PeerToken           string
 	PeerHTTPClient      *http.Client
+	OperatorClient      *http.Client
 	FallbackCrawler     *crawl.Crawler
 	BotSigner           *botauth.Signer
 	BotPublicJWKs       []botauth.PublicJWK
@@ -75,6 +82,17 @@ type Config struct {
 	DispatchTimeout     time.Duration
 	MaxArtifactMemory   int
 	OtelExporter        *otel.Exporter
+	DataDir             string
+	SessionSecret       string
+	VaultMasterKey      string
+	PublicOrigin        string
+	TrustProxy          bool
+	TrustFly            bool
+	DisableUpdateCheck  bool
+	RobotsBypassHosts   []string
+	RedirectAllowlist   []string
+	GitHub              hubauth.GitHubConfig
+	Getenv              func(string) string
 }
 
 type agentSession struct {
@@ -148,13 +166,21 @@ type AgentInfo struct {
 	JobsErr      int64    `json:"jobsErr"`
 }
 
-// Server coordinates connected Go edge workers and serves `/fetch`, `/v1/scrape`, and `/mcp`.
+// Server coordinates connected Go edge workers and serves `/fetch`, `/v1/*`, `/v2/*`, `/oauth/*`, `/admin`, and `/mcp`.
 type Server struct {
-	cfg     Config
-	log     *slog.Logger
-	allow   func(*url.URL) error
-	callSem chan struct{}
-	closed  atomic.Bool
+	cfg              Config
+	log              *slog.Logger
+	allow            func(*url.URL) error
+	callSem          chan struct{}
+	closed           atomic.Bool
+	configuredOrigin string
+
+	store      *hubstore.Store
+	colIndex   *hubstore.CollectionIndex
+	trackerMgr *hubstore.TrackerManager
+	bgCancel   context.CancelFunc
+	authMgr    *hubauth.Manager
+	routes     *RouteHandler
 
 	mu         sync.Mutex
 	agents     map[string]*agentSession
@@ -213,7 +239,7 @@ func NewServer(cfg Config) *Server {
 	if conc <= 0 {
 		conc = maxConcurrentCalls
 	}
-	return &Server{
+	srv := &Server{
 		cfg:        cfg,
 		log:        log,
 		allow:      allow,
@@ -225,11 +251,19 @@ func NewServer(cfg Config) *Server {
 		blobs:      make(map[string]storedBlob),
 		maxBlobCap: maxCap,
 	}
+	srv.initSubsystems()
+	return srv
 }
 
 // Close disconnects any active agent WebSockets cleanly during server shutdown.
 func (s *Server) Close() error {
 	s.closed.Store(true)
+	if s.bgCancel != nil {
+		s.bgCancel()
+	}
+	if s.trackerMgr != nil {
+		s.trackerMgr.Stop()
+	}
 	s.mu.Lock()
 	sessions := make([]*agentSession, 0, len(s.agents))
 	for _, sess := range s.agents {
@@ -356,6 +390,12 @@ func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+func (w *statusResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func requestFullURL(r *http.Request) string {
 	if r == nil || r.URL == nil {
 		return ""
@@ -374,7 +414,7 @@ func requestFullURL(r *http.Request) string {
 	return scheme + "://" + host + r.URL.RequestURI()
 }
 
-// ServeHTTP routes control-plane (`/agent/*`) and caller-plane (`/health`, `/agents`, `/fetch`, `/v1/*`, `/mcp`) requests.
+// ServeHTTP routes control-plane (`/agent/*`), OAuth/Admin, and caller-plane (`/health`, `/agents`, `/fetch`, `/v1/*`, `/v2/*`, `/mcp`) requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rootTC := otel.ExtractOrNew(r.Header)
 	w.Header().Set("X-Trace-Id", rootTC.TraceID)
@@ -398,12 +438,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	w = sw
 
+	fallbackOrigin := "http://127.0.0.1"
+	if r.TLS != nil {
+		fallbackOrigin = "https://127.0.0.1"
+	}
+	if r.Host != "" {
+		fallbackOrigin = strings.Split(fallbackOrigin, "://")[0] + "://" + r.Host
+	}
+	origin, validHost := hubauth.ResolveRequestPublicOrigin(r, s.configuredOrigin, fallbackOrigin, s.cfg.TrustProxy)
+	hubauth.ApplySecurityHeaders(w, strings.HasPrefix(origin, "https://"))
+	if !validHost && strings.TrimSpace(s.cfg.CallerToken) != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_host"})
+		return
+	}
+
 	switch {
-	case (r.URL.Path == "/health" || r.URL.Path == "/healthz") && r.Method == http.MethodGet:
+	case (r.URL.Path == "/health" || r.URL.Path == "/healthz") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		s.mu.Lock()
 		n := len(s.agents)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "hub", "version": agent.Version, "connectedAgents": n})
+		return
+
+	case r.URL.Path == "/readyz" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		s.mu.Lock()
+		n := len(s.agents)
+		s.mu.Unlock()
+		ready := n > 0 || s.cfg.FallbackCrawler != nil
+		st := http.StatusOK
+		if !ready {
+			st = http.StatusServiceUnavailable
+		}
+		writeJSON(w, st, map[string]any{"ok": ready, "ready": ready, "mode": "hub", "version": agent.Version, "connectedAgents": n})
 		return
 
 	case r.URL.Path == "/openapi.json":
@@ -422,92 +488,122 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/agent/reply" && r.Method == http.MethodPost:
 		s.handleAgentReply(w, r)
 		return
-	}
 
-	if !s.isCallerAuthorized(r) {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "message": "valid Bearer or x-api-key token required"})
+	case r.URL.Path == "/v1/ingest-tab" && r.Method == http.MethodOptions:
+		s.routes.HandleIngestTab(w, r)
 		return
 	}
-	if strings.TrimSpace(s.cfg.CallerToken) == "" {
+
+	if s.authMgr != nil {
+		if s.authMgr.HandleOAuthOrWellKnown(w, r, origin) {
+			return
+		}
+		if s.authMgr.HandleAdmin(w, r, origin) {
+			return
+		}
+	}
+
+	// Tavily drop-in compatibility passes `api_key` inside the JSON request body when no Authorization header is set.
+	if strings.HasPrefix(r.URL.Path, "/compat/tavily/") && r.Method == http.MethodPost && extractCallerToken(r) == "" {
+		rawBody, tooLarge, rErr := ReadBoundedBody(w, r, maxScrapeBodyBytes)
+		if tooLarge {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"ok": false, "error": "payload_too_large"})
+			return
+		}
+		if rErr == nil {
+			r.Body = io.NopCloser(bytes.NewReader(rawBody))
+			if apiKey := ExtractTavilyBodyAPIKey(rawBody); apiKey != "" {
+				r.Header.Set("X-Api-Key", apiKey)
+			}
+		}
+	}
+
+	tokenlessMode := strings.TrimSpace(s.cfg.CallerToken) == "" && strings.TrimSpace(s.cfg.McpToken) == ""
+	if tokenlessMode {
 		if code, msg := s.validateTokenlessLoopbackRequest(r); code != 0 {
 			writeJSON(w, code, map[string]string{"error": "loopback_origin_rejected", "message": msg})
 			return
 		}
 	}
 
+	ownerOnly := r.URL.Path == "/fetch" || r.URL.Path == "/agents"
+	allowMcpTok := !ownerOnly
+	reqScope := ""
+	if r.URL.Path == "/v1/capabilities" || r.URL.Path == "/v1/extractors" {
+		reqScope = "crawl:read"
+	}
+	if s.authMgr != nil {
+		dec := s.authMgr.AuthorizeCaller(r, reqScope, allowMcpTok, ownerOnly)
+		if !dec.Allowed {
+			if dec.WWWAuthenticate != "" {
+				w.Header().Set("WWW-Authenticate", dec.WWWAuthenticate)
+			} else if dec.Status == http.StatusUnauthorized {
+				w.Header().Set("WWW-Authenticate", "Bearer")
+			}
+			if dec.Status == http.StatusUnauthorized {
+				// H9: suppress OTLP export on unauthenticated 401 traffic while preserving response trace headers.
+				httpSpan.Suppress()
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "message": "valid Bearer or x-api-key token required"})
+				return
+			}
+			writeJSON(w, dec.Status, map[string]string{"error": "forbidden", "message": "insufficient permissions or scope"})
+			return
+		}
+		r = r.WithContext(WithPrincipal(r.Context(), AuthPrincipal{
+			Authenticated: dec.Principal.Authenticated,
+			Kind:          dec.Principal.Kind,
+			UserID:        dec.Principal.UserID,
+			GitHubLogin:   dec.Principal.GitHubLogin,
+			Role:          dec.Principal.Role,
+			Scopes:        dec.Principal.Scopes,
+			GrantID:       dec.Principal.GrantID,
+			ClientID:      dec.Principal.ClientID,
+			IsOwner:       dec.Principal.IsOwner,
+		}))
+	} else if !s.isCallerAuthorized(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		httpSpan.Suppress()
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "message": "valid Bearer or x-api-key token required"})
+		return
+	}
+
 	switch {
-	case r.URL.Path == "/" && r.Method == http.MethodGet && strings.TrimSpace(s.cfg.CallerToken) == "":
+	case r.URL.Path == "/" && r.Method == http.MethodGet && tokenlessMode:
 		s.serveDesktopLaunchpad(w, r)
 
 	case r.URL.Path == "/agents" && r.Method == http.MethodGet:
-		writeJSON(w, http.StatusOK, s.ListAgents())
+		_, sp, _ := otel.StartChildSpan(r.Context(), s.cfg.OtelExporter, "edgefetch.agents", 1, nil)
+		out := s.ListAgents()
+		sp.End(true, "")
+		writeJSON(w, http.StatusOK, out)
 
 	case r.URL.Path == "/v1/capabilities" && r.Method == http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"runtime": "go-hub",
-			"version": agent.Version,
-			"capabilities": map[string]bool{
-				"fetch":           true,
-				"scrape":          true,
-				"extractors":      true,
-				"mcp":             true,
-				"artifacts":       true,
-				"localFallback":   s.cfg.FallbackCrawler != nil,
-				"trackerBlocking": false,
-			},
-			"trackerBlocking": map[string]any{
-				"available": false,
-				"reason":    "unavailable_in_go_hub_mode",
-			},
-		})
+		_, sp, _ := otel.StartChildSpan(r.Context(), s.cfg.OtelExporter, "edgefetch.capabilities", 1, nil)
+		out := s.capabilitiesPayload()
+		sp.End(true, "")
+		writeJSON(w, http.StatusOK, out)
 
 	case r.URL.Path == "/v1/extractors" && r.Method == http.MethodGet:
+		_, sp, _ := otel.StartChildSpan(r.Context(), s.cfg.OtelExporter, "edgefetch.extractors", 1, nil)
 		s.handleCallerExtractors(w, r)
+		sp.End(true, "")
 
 	case r.URL.Path == "/fetch" && r.Method == http.MethodPost:
 		s.withCallerConcurrencyGate(w, r, s.handleCallerFetch)
 
-	case r.URL.Path == "/v1/scrape" && r.Method == http.MethodPost:
-		s.withCallerConcurrencyGate(w, r, s.handleCallerScrape)
-
-	case (r.URL.Path == "/v2/scrape" || r.URL.Path == "/compat/firecrawl/v2/scrape") && r.Method == http.MethodPost:
-		s.withCallerConcurrencyGate(w, r, s.handleFirecrawlV2Scrape)
-
-	case (r.URL.Path == "/v1/map" || r.URL.Path == "/v2/map" || r.URL.Path == "/compat/firecrawl/v2/map") && r.Method == http.MethodPost:
-		s.withCallerConcurrencyGate(w, r, func(rw http.ResponseWriter, req *http.Request) {
-			s.handleCallerMap(rw, req, strings.HasPrefix(req.URL.Path, "/v2/") || strings.HasPrefix(req.URL.Path, "/compat/"))
-		})
-
-	case r.URL.Path == "/mcp":
-		s.withCallerConcurrencyGate(w, r, s.handleMCP)
-
-	case r.URL.Path == "/v1/mcp/registry" && r.Method == http.MethodGet:
-		q := strings.TrimSpace(r.URL.Query().Get("q"))
-		if q == "" {
-			q = strings.TrimSpace(r.URL.Query().Get("query"))
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"runtime":    "go-hub",
-			"query":      q,
-			"remoteOnly": r.URL.Query().Get("remoteOnly") == "true",
-			"count":      0,
-			"servers":    []any{},
-			"note":       "Use Cloudflare Worker Hub or Node Portable Hub for live dual-source MCP Registry + AES-256-GCM Vault connectors.",
-		})
-
-	case r.URL.Path == "/v1/mcp/query" && r.Method == http.MethodPost:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"action":     "list_connected",
-			"visibility": "private",
-			"count":      0,
-			"servers":    []any{},
-		})
+	case s.routes != nil && r.URL.Path == "/mcp":
+		s.withCallerConcurrencyGate(w, r, s.routes.HandleMCP)
 
 	default:
+		if s.routes != nil {
+			handled := false
+			s.withCallerConcurrencyGate(w, r, func(rw http.ResponseWriter, req *http.Request) {
+				handled = s.routes.TryServeRoute(rw, req)
+			})
+			if handled {
+				return
+			}
+		}
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 	}
 }
@@ -581,11 +677,26 @@ func (s *Server) isCallerAuthorized(r *http.Request) bool {
 }
 
 func (s *Server) authorizeAgent(r *http.Request) (string, bool) {
+	siteID, _, ok := s.authorizeAgentWithSubprotocol(r)
+	return siteID, ok
+}
+
+func (s *Server) authorizeAgentWithSubprotocol(r *http.Request) (siteID string, wantsSubproto bool, ok bool) {
 	tok := extractBearer(r)
 	if tok == "" {
-		return "", false
+		tok = strings.TrimSpace(r.Header.Get("X-Agent-Token"))
+	}
+	subTok, subProto := extractAgentSubprotocolToken(r)
+	if tok == "" {
+		tok = subTok
+	}
+	if tok == "" {
+		return "", subProto, false
 	}
 	hdrSite := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Agent-Site")))
+	if hdrSite == "" && r.URL != nil {
+		hdrSite = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("site")))
+	}
 	mappedSites := make(map[string]bool, len(s.cfg.AgentTokens))
 
 	if len(s.cfg.AgentTokens) > 0 {
@@ -597,17 +708,17 @@ func (s *Server) authorizeAgent(r *http.Request) (string, bool) {
 			}
 		}
 		if matchedSite != "" && (hdrSite == "" || hdrSite == matchedSite) {
-			return matchedSite, true
+			return matchedSite, subProto, true
 		}
 	}
 
 	shared := strings.TrimSpace(s.cfg.AgentToken)
 	if len(shared) >= agent.MinTokenLength && constantTimeEquals(tok, shared) {
 		if reSiteID.MatchString(hdrSite) && !mappedSites[hdrSite] {
-			return hdrSite, true
+			return hdrSite, subProto, true
 		}
 	}
-	return "", false
+	return "", subProto, false
 }
 
 func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
@@ -615,22 +726,26 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
 		return
 	}
-	siteID, ok := s.authorizeAgent(r)
+	siteID, wantsSubproto, ok := s.authorizeAgentWithSubprotocol(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
 
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+	acceptOpts := &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionDisabled,
-	})
+	}
+	if wantsSubproto {
+		acceptOpts.Subprotocols = []string{"edgefetch-agent"}
+	}
+	conn, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		return
 	}
 	conn.SetReadLimit(maxAgentFrameBytes)
 
 	caps := splitCSV(r.Header.Get("X-Agent-Capabilities"))
-	pubIP := clientIPOf(r)
+	pubIP := hubauth.ResolveClientIP(r, s.cfg.TrustProxy, s.cfg.TrustFly)
 	sess := &agentSession{
 		siteID:       siteID,
 		arch:         firstNonEmpty(r.Header.Get("X-Agent-Arch"), "unknown"),
@@ -657,6 +772,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	helloBytes, _ := json.Marshal(map[string]string{"type": "hello", "siteId": siteID})
 	_ = conn.Write(r.Context(), websocket.MessageText, helloBytes)
+	s.sendTrackerListToSession(r.Context(), sess)
 	s.log.Info("hub_agent_connected", slog.String("site", siteID), slog.String("arch", sess.arch), slog.String("version", sess.version))
 
 	defer func() {
@@ -747,6 +863,9 @@ func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) 
 		gzBytes:       gzBytes,
 		storedAt:      time.Now(),
 	})
+	if s.store != nil {
+		_ = s.store.PutGzipBlob("raw", blobSHA, contentSHA, gzBytes)
+	}
 	releaseUpload(blobSHA)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "blobSha256": blobSHA})
 }
@@ -781,17 +900,21 @@ func (s *Server) hydrateArtifacts(reply *crawl.FetchReply) {
 		s.mu.Lock()
 		bl, ok := s.blobs[res.Artifact.BlobSHA256]
 		s.mu.Unlock()
-		if !ok {
-			continue
+		if ok {
+			zr, err := gzip.NewReader(bytes.NewReader(bl.gzBytes))
+			if err == nil {
+				raw, rErr := io.ReadAll(io.LimitReader(zr, crawl.MaxMaxBytes+1))
+				_ = zr.Close()
+				if rErr == nil && len(raw) <= crawl.MaxMaxBytes {
+					res.Body = string(raw)
+					continue
+				}
+			}
 		}
-		zr, err := gzip.NewReader(bytes.NewReader(bl.gzBytes))
-		if err != nil {
-			continue
-		}
-		raw, rErr := io.ReadAll(io.LimitReader(zr, crawl.MaxMaxBytes+1))
-		_ = zr.Close()
-		if rErr == nil && len(raw) <= crawl.MaxMaxBytes {
-			res.Body = string(raw)
+		if s.store != nil {
+			if raw, okDisk, dErr := s.store.GetDecodedBlob("raw", res.Artifact.BlobSHA256, crawl.MaxMaxBytes); dErr == nil && okDisk {
+				res.Body = string(raw)
+			}
 		}
 	}
 }
@@ -808,8 +931,6 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_job_headers"})
 		return
 	}
-	// Atomically claim the single reply slot BEFORE reading r.Body so concurrent duplicate POSTs
-	// for the same pending job never buffer multiple 20-32 MiB payloads in memory!
 	dispatchedReqs, allowedBlobs, claimed := s.claimPendingJobReply(jobID, jobNonce, siteID)
 	if !claimed {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_or_already_claimed_job"})
@@ -853,7 +974,6 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mismatched_result_count"})
 		return
 	}
-	// Enforce H6 reply integrity: bind ID and URL to the dispatched requests and strip any unauthorized artifact hash!
 	for i := range reply.Results {
 		reply.Results[i].ID = dispatchedReqs[i].ID
 		reply.Results[i].URL = dispatchedReqs[i].URL
@@ -979,7 +1099,6 @@ func (s *Server) completePending(jobID, jobNonce, siteID string, out jobOutcome)
 // ListAgents returns fleet status across all currently connected WebSocket workers.
 func (s *Server) ListAgents() map[string]any {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	list := make([]AgentInfo, 0, len(s.agents))
 	ips := make(map[string]bool)
 	for _, sess := range s.agents {
@@ -1003,12 +1122,23 @@ func (s *Server) ListAgents() map[string]any {
 		sess.mu.Unlock()
 		list = append(list, info)
 	}
+	s.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return list[i].SiteID < list[j].SiteID })
+
+	trackerAvail := false
+	var trackerVer any
+	if s.trackerMgr != nil {
+		ver, hosts := s.trackerMgr.CurrentList()
+		if ver != "" && len(hosts) > 0 {
+			trackerAvail = true
+			trackerVer = ver
+		}
+	}
 	return map[string]any{
 		"connected":                len(list),
 		"distinctPublicIps":        len(ips),
-		"trackerBlockingAvailable": false,
-		"trackerListVersion":       nil,
+		"trackerBlockingAvailable": trackerAvail,
+		"trackerListVersion":       trackerVer,
 		"agents":                   list,
 	}
 }
@@ -1103,7 +1233,6 @@ func (s *Server) DispatchOrFallback(
 			if call.Options.IncludeBody {
 				s.hydrateArtifacts(&rep)
 			}
-			// If agent hit HTTP 429/403 stop and another peer exists, fail over automatically!
 			if replyHitStopOrChallenge(rep) && preferredSite == "" {
 				if next := s.pickAgent(primaryHost, "", needsBrowser, triedSites); next != nil {
 					next.mu.Lock()
@@ -1125,8 +1254,6 @@ func (s *Server) DispatchOrFallback(
 		}
 	}
 
-	// Tailscale / WireGuard Peer-to-Peer Egress Handoff (`EDGEFETCH_PEERS`):
-	// When local agents hit 429/challenge (or before local fallback if local fallback hits 429), forward 1 hop to healthy peers.
 	if lastAgentReply != nil && !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
 		if peerRep, peerVia, ok := s.tryPeerHandoff(dispCtx, call, primaryHost, traceMap); ok {
 			return peerRep, peerVia, http.StatusOK, nil
@@ -1166,7 +1293,7 @@ func (s *Server) tryPeerHandoff(ctx context.Context, call crawl.FetchCall, prima
 		client = &http.Client{
 			Timeout: 35 * time.Second,
 			Transport: &http.Transport{
-				Proxy:                 nil, // Never inherit ambient HTTP_PROXY / HTTPS_PROXY for peer token handoffs
+				Proxy:                 nil,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 				ForceAttemptHTTP2:     true,
@@ -1193,7 +1320,6 @@ func (s *Server) tryPeerHandoff(ctx context.Context, call crawl.FetchCall, prima
 		if pErr != nil {
 			continue
 		}
-		// Never transmit PeerToken/CallerToken over cleartext http:// to non-loopback peers!
 		if pu.Scheme != "https" && !(pu.Scheme == "http" && isLoopbackHostnameOnly(pu.Hostname())) {
 			continue
 		}
@@ -1389,6 +1515,13 @@ func (s *Server) dispatchToSession(ctx context.Context, sess *agentSession, call
 	}
 }
 
+func allowAgentDispatchURL(u *url.URL) error {
+	if u == nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
+		return errors.New("only http/https URLs without credentials permitted")
+	}
+	return nil
+}
+
 func (s *Server) handleCallerFetch(w http.ResponseWriter, r *http.Request) {
 	target := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("target")))
 	if target != "" && target != "auto" && target != "agent" && target != "container" {
@@ -1407,7 +1540,11 @@ func (s *Server) handleCallerFetch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_json", "message": err.Error()})
 		return
 	}
-	if code, msg, ok := crawl.ValidateCall(call, s.allow); !ok {
+	callAllow := s.allow
+	if target == "agent" {
+		callAllow = allowAgentDispatchURL
+	}
+	if code, msg, ok := crawl.ValidateCall(call, callAllow); !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": code, "message": msg})
 		return
 	}
@@ -1419,263 +1556,6 @@ func (s *Server) handleCallerFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Crawler-Via", via)
 	writeJSON(w, http.StatusOK, reply)
-}
-
-type scrapePayload struct {
-	URL             string                   `json:"url"`
-	Formats         []any                    `json:"formats,omitempty"`
-	OnlyMainContent *bool                    `json:"onlyMainContent,omitempty"`
-	RenderMode      string                   `json:"renderMode,omitempty"`
-	WaitFor         int                      `json:"waitFor,omitempty"`
-	WaitForMs       int                      `json:"waitForMs,omitempty"`
-	Mobile          bool                     `json:"mobile,omitempty"`
-	Actions         []browser.InteractAction `json:"actions,omitempty"`
-	Query           string                   `json:"query,omitempty"`
-	MaxChars        int                      `json:"maxChars,omitempty"`
-	Target          string                   `json:"target,omitempty"`
-	Site            string                   `json:"site,omitempty"`
-}
-
-func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.Header) (map[string]any, string, int) {
-	if _, ok := otel.TraceContextFromContext(ctx); !ok {
-		ctx = otel.WithTraceContext(ctx, otel.ExtractOrNew(hdr))
-	}
-	u := strings.TrimSpace(p.URL)
-	if u == "" {
-		return map[string]any{"ok": false, "error": "missing_url"}, "hub", http.StatusBadRequest
-	}
-	parsedURL, uErr := url.Parse(u)
-	if uErr != nil || s.allow(parsedURL) != nil {
-		return map[string]any{"ok": false, "error": "bad_url", "message": "only public https:// URLs are permitted"}, "hub", http.StatusBadRequest
-	}
-	var formats []string
-	wantScreenshot := false
-	for _, rawFmt := range p.Formats {
-		switch v := rawFmt.(type) {
-		case string:
-			if v == "screenshot" {
-				wantScreenshot = true
-			}
-			formats = append(formats, v)
-		case map[string]any:
-			if tStr, ok := v["type"].(string); ok && tStr != "" {
-				if tStr == "screenshot" {
-					wantScreenshot = true
-				}
-				formats = append(formats, tStr)
-			}
-		}
-	}
-	if len(formats) == 0 {
-		formats = []string{"markdown", "links"}
-	}
-	kind := classify.KindScrape
-	var interactSpec *crawl.InteractSpec
-	if len(p.Actions) > 0 {
-		kind = classify.KindRender
-		interactSpec = &crawl.InteractSpec{Actions: p.Actions}
-	} else if p.RenderMode == "always" || wantScreenshot || p.Mobile {
-		kind = classify.KindRender
-	}
-
-	// Pre-fetch 1-hop declarative JSON/text twin upgrade when standard non-interactive scrape is requested.
-	// Falls back seamlessly to standard HTML scraping if the twin endpoint errors, blocks, or mismatches schema.
-	if kind == classify.KindScrape {
-		if twin, ok := extract.ResolveDeclarativeTwin(u); ok {
-			if twinURL, tErr := url.Parse(twin.FetchURL); tErr == nil && s.allow(twinURL) == nil {
-				twinCall := crawl.FetchCall{
-					MaxSeconds: 30,
-					Options: crawl.Options{
-						Concurrency:   1,
-						IncludeBody:   true,
-						MaxBytes:      8 << 20,
-						RespectRobots: crawl.Bool(true),
-					},
-					Requests: []crawl.Request{
-						{
-							ID:     "twin-1",
-							URL:    twin.FetchURL,
-							Kind:   twin.Kind,
-							Accept: twin.Accept,
-						},
-					},
-				}
-				twinCtx, twinSpan, _ := otel.StartChildSpan(ctx, s.cfg.OtelExporter, "edgefetch.hub.twin", 1, map[string]any{
-					"edgefetch.adapter_id": firstNonEmpty(twin.AdapterID, twin.ID),
-					"url.full":             otel.SanitizeURL(twin.FetchURL),
-				})
-				twinVia := ""
-				twinErrMsg := ""
-				if twinRep, viaStr, _, dErr := s.DispatchOrFallback(twinCtx, twinCall, p.Target, p.Site, hdr); dErr == nil && len(twinRep.Results) > 0 {
-					twinVia = viaStr
-					tRes := twinRep.Results[0]
-					finalURL := tRes.FinalURL
-					if finalURL == "" {
-						finalURL = twin.FetchURL
-					}
-					finalAllowed := false
-					if twin.ValidateRedirectTarget(finalURL) {
-						if finalParsed, pfErr := url.Parse(finalURL); pfErr == nil && (s.allow == nil || s.allow(finalParsed) == nil) {
-							finalAllowed = true
-						}
-					}
-					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK && finalAllowed {
-						bodyBytes, decErr := tRes.DecodeBody()
-						bodyStr := tRes.Body
-						if decErr == nil && len(bodyBytes) > 0 {
-							bodyStr = string(bodyBytes)
-						}
-						if doc, fmtOK := twin.Format(bodyStr); fmtOK && doc != nil && strings.TrimSpace(doc.Markdown) != "" {
-							md := extract.SanitizeScrapedMarkdown(doc.Markdown)
-							cleanTitle := extract.SanitizeScrapedMeta(doc.Title)
-							cleanDesc := extract.SanitizeScrapedMeta(doc.Description)
-							cleanAuthor := extract.SanitizeScrapedMeta(doc.Author)
-							cleanPub := extract.SanitizeScrapedMeta(doc.PublishedTime)
-							if p.Query != "" {
-								md = extract.RerankPassages(md, p.Query, p.MaxChars)
-							} else if p.MaxChars > 0 && len(md) > p.MaxChars {
-								cut := p.MaxChars
-								for cut > 0 && !utf8.RuneStart(md[cut]) {
-									cut--
-								}
-								md = md[:cut]
-							}
-							meta := map[string]any{
-								"title":     cleanTitle,
-								"sourceURL": u,
-							}
-							if cleanDesc != "" {
-								meta["description"] = cleanDesc
-							}
-							if cleanAuthor != "" {
-								meta["author"] = cleanAuthor
-							}
-							if cleanPub != "" {
-								meta["publishedTime"] = cleanPub
-							}
-							out := map[string]any{
-								"ok":            true,
-								"url":           u,
-								"finalUrl":      finalURL,
-								"via":           twinVia,
-								"status":        tRes.Status,
-								"outcome":       tRes.Outcome,
-								"extractorId":   twin.ID,
-								"contentSource": "twin:" + twin.ID,
-								"title":         cleanTitle,
-								"description":   cleanDesc,
-								"markdown":      md,
-								"text":          md,
-								"links":         doc.Links,
-								"metadata":      meta,
-								"rendered":      false,
-								"timing":        tRes.Timing,
-							}
-							if cleanAuthor != "" {
-								out["author"] = cleanAuthor
-							}
-							if cleanPub != "" {
-								out["publishedTime"] = cleanPub
-							}
-							twinSpan.SetAttribute("edgefetch.twin.hit", true)
-							twinSpan.SetAttribute("crawler.via", twinVia)
-							twinSpan.End(true, "")
-							return out, twinVia, http.StatusOK
-						}
-					}
-				} else if dErr != nil {
-					twinErrMsg = dErr.Error()
-				}
-				twinSpan.SetAttribute("edgefetch.twin.hit", false)
-				if twinVia != "" {
-					twinSpan.SetAttribute("crawler.via", twinVia)
-				}
-				twinSpan.End(false, twinErrMsg)
-			}
-		}
-	}
-	waitMs := p.WaitForMs
-	if waitMs <= 0 && p.WaitFor > 0 {
-		waitMs = p.WaitFor
-	}
-	onlyMain := true
-	if p.OnlyMainContent != nil {
-		onlyMain = *p.OnlyMainContent
-	}
-	call := crawl.FetchCall{
-		MaxSeconds: 45,
-		Options: crawl.Options{
-			Concurrency:   1,
-			RespectRobots: crawl.Bool(true),
-			DiscoverLlms:  crawl.Bool(true),
-		},
-		Requests: []crawl.Request{
-			{
-				ID:              "scrape-1",
-				URL:             u,
-				Kind:            kind,
-				Formats:         formats,
-				OnlyMainContent: crawl.Bool(onlyMain),
-				DiscoverLlms:    crawl.Bool(true),
-				Query:           p.Query,
-				RenderMode:      p.RenderMode,
-				WaitForMs:       waitMs,
-				Mobile:          p.Mobile,
-				Interact:        interactSpec,
-			},
-		},
-	}
-
-	reply, via, status, err := s.DispatchOrFallback(ctx, call, p.Target, p.Site, hdr)
-	if err != nil {
-		return map[string]any{"ok": false, "error": "hub_unavailable", "message": err.Error()}, via, status
-	}
-	if len(reply.Results) == 0 {
-		return map[string]any{"ok": false, "error": "empty_reply"}, via, http.StatusBadGateway
-	}
-	res := reply.Results[0]
-	md := extract.SanitizeScrapedMarkdown(res.Markdown)
-	cleanTitle := extract.SanitizeScrapedMeta(res.Title)
-	cleanDesc := extract.SanitizeScrapedMeta(res.Description)
-	if p.MaxChars > 0 && len(md) > p.MaxChars {
-		cut := p.MaxChars
-		for cut > 0 && !utf8.RuneStart(md[cut]) {
-			cut--
-		}
-		md = md[:cut]
-	}
-	out := map[string]any{
-		"ok":          res.Outcome == classify.OutcomeOK,
-		"url":         res.URL,
-		"finalUrl":    res.FinalURL,
-		"via":         via,
-		"status":      res.Status,
-		"outcome":     res.Outcome,
-		"problem":     res.Problem,
-		"title":       cleanTitle,
-		"description": cleanDesc,
-		"markdown":    md,
-		"text":        extract.SanitizeScrapedMarkdown(res.Text),
-		"links":       res.Links,
-		"images":      res.Images,
-		"llms":        res.Llms,
-		"rendered":    res.Rendered,
-		"timing":      res.Timing,
-	}
-	if res.ContentSource != "" {
-		out["contentSource"] = res.ContentSource
-	}
-	if len(res.ActionResults) > 0 {
-		out["actionResults"] = res.ActionResults
-	}
-	if res.BlockedReason != "" {
-		out["blockedReason"] = res.BlockedReason
-		out["blocked"] = map[string]any{
-			"reason":    res.BlockedReason,
-			"retryable": false,
-		}
-	}
-	return out, via, http.StatusOK
 }
 
 func (s *Server) handleCallerExtractors(w http.ResponseWriter, r *http.Request) {
@@ -1696,352 +1576,6 @@ func (s *Server) handleCallerExtractors(w http.ResponseWriter, r *http.Request) 
 		"categories": categories,
 		"extractors": extractors,
 	})
-}
-
-func (s *Server) handleCallerScrape(w http.ResponseWriter, r *http.Request) {
-	var p scrapePayload
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, crawl.MaxCallBodyBytes))
-	if err := dec.Decode(&p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_json", "message": err.Error()})
-		return
-	}
-	body, via, status := s.executeScrape(r.Context(), p, r.Header)
-	w.Header().Set("X-Crawler-Via", via)
-	writeJSON(w, status, body)
-}
-
-func (s *Server) handleFirecrawlV2Scrape(w http.ResponseWriter, r *http.Request) {
-	var p scrapePayload
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, crawl.MaxCallBodyBytes))
-	if err := dec.Decode(&p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "bad_json", "message": err.Error()})
-		return
-	}
-	body, via, status := s.executeScrape(r.Context(), p, r.Header)
-	w.Header().Set("X-Crawler-Via", via)
-	okVal, _ := body["ok"].(bool)
-	if status != http.StatusOK || !okVal {
-		writeJSON(w, status, map[string]any{"success": false, "error": firstNonEmpty(fmt.Sprint(body["problem"]), fmt.Sprint(body["error"]))})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": body})
-}
-
-var (
-	reHubSitemapLoc = regexp.MustCompile(`(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>`)
-	reHubMdURL      = regexp.MustCompile(`\]\((https?://[^)\s]+)\)`)
-)
-
-func (s *Server) handleCallerMap(w http.ResponseWriter, r *http.Request, v2Envelope bool) {
-	var mp struct {
-		URL    string `json:"url"`
-		Search string `json:"search"`
-		Limit  int    `json:"limit"`
-		Target string `json:"target"`
-		Site   string `json:"site"`
-	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, crawl.MaxCallBodyBytes))
-	if err := dec.Decode(&mp); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "success": false, "error": "bad_json"})
-		return
-	}
-	parsedURL, uErr := url.Parse(strings.TrimSpace(mp.URL))
-	if uErr != nil || s.allow(parsedURL) != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "success": false, "error": "invalid_url"})
-		return
-	}
-	if mp.Limit <= 0 || mp.Limit > 500 {
-		mp.Limit = 100
-	}
-	origin := parsedURL.Scheme + "://" + parsedURL.Host
-	call := crawl.FetchCall{
-		MaxSeconds: 30,
-		Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
-		Requests: []crawl.Request{
-			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText, Accept: "text/plain"},
-			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText, Accept: "application/xml"},
-			{ID: "home", URL: parsedURL.String(), Kind: classify.KindScrape, Formats: []string{"links"}},
-		},
-	}
-	rep, via, status, err := s.DispatchOrFallback(r.Context(), call, mp.Target, mp.Site, r.Header)
-	if err != nil {
-		writeJSON(w, status, map[string]any{"ok": false, "success": false, "error": err.Error()})
-		return
-	}
-	seen := map[string]struct{}{}
-	var links []string
-	filterLower := strings.ToLower(strings.TrimSpace(mp.Search))
-	addCand := func(cand string) {
-		cand = strings.TrimSpace(cand)
-		if (!strings.HasPrefix(cand, "https://") && !strings.HasPrefix(cand, "http://")) || len(links) >= mp.Limit {
-			return
-		}
-		if cu, cErr := url.Parse(cand); cErr != nil || s.allow(cu) != nil {
-			return
-		}
-		if filterLower != "" && !strings.Contains(strings.ToLower(cand), filterLower) {
-			return
-		}
-		if _, exists := seen[cand]; !exists {
-			seen[cand] = struct{}{}
-			links = append(links, cand)
-		}
-	}
-	for _, item := range rep.Results {
-		for _, l := range item.Links {
-			addCand(l)
-		}
-		for _, m := range reHubSitemapLoc.FindAllStringSubmatch(item.Body, 500) {
-			if len(m) > 1 {
-				addCand(m[1])
-			}
-		}
-		for _, m := range reHubMdURL.FindAllStringSubmatch(item.Body, 500) {
-			if len(m) > 1 {
-				addCand(m[1])
-			}
-		}
-	}
-	w.Header().Set("X-Crawler-Via", via)
-	if v2Envelope {
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "links": links})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": origin, "total": len(links), "links": links})
-}
-
-func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodDelete || r.Method == http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method_not_allowed"})
-		return
-	}
-
-	var rpc struct {
-		JSONRPC string          `json:"jsonrpc"`
-		ID      any             `json:"id"`
-		Method  string          `json:"method"`
-		Params  json.RawMessage `json:"params"`
-	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10))
-	if err := dec.Decode(&rpc); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      nil,
-			"error":   map[string]any{"code": -32700, "message": "Parse error"},
-		})
-		return
-	}
-
-	switch rpc.Method {
-	case "notifications/initialized", "notifications/cancelled":
-		w.WriteHeader(http.StatusAccepted)
-		return
-
-	case "ping":
-		writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": rpc.ID, "result": map[string]any{}})
-		return
-
-	case "initialize":
-		writeJSON(w, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      rpc.ID,
-			"result": map[string]any{
-				"protocolVersion": "2025-03-26",
-				"capabilities":    map[string]any{"tools": map[string]any{}},
-				"serverInfo":      map[string]any{"name": "edgefetch-go-hub", "version": agent.Version},
-			},
-		})
-		return
-
-	case "tools/list":
-		writeJSON(w, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      rpc.ID,
-			"result": map[string]any{
-				"tools": []map[string]any{
-					{
-						"name":        "list_agents",
-						"description": "List connected EdgeFetch Go worker nodes and capabilities.",
-						"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-					},
-					{
-						"name":        "find_extractors",
-						"description": "Search built-in declarative keyless site/API adapters by optional provider query or category.",
-						"inputSchema": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"query": map[string]any{"type": "string"},
-								"category": map[string]any{
-									"type": "string",
-									"enum": []string{"developer", "genai", "jobs", "finance", "public-records", "research-health", "commerce-social"},
-								},
-								"limit": map[string]any{"type": "integer"},
-							},
-						},
-					},
-					{
-						"name":        "scrape",
-						"description": "Scrape a public HTTPS URL to clean Markdown via connected Go nodes or local Hub fallback.",
-						"inputSchema": map[string]any{
-							"type":     "object",
-							"required": []string{"url"},
-							"properties": map[string]any{
-								"url":        map[string]any{"type": "string"},
-								"query":      map[string]any{"type": "string"},
-								"maxChars":   map[string]any{"type": "integer"},
-								"renderMode": map[string]any{"type": "string", "enum": []string{"off", "auto", "always"}},
-								"target":     map[string]any{"type": "string", "enum": []string{"auto", "agent", "container"}},
-								"site":       map[string]any{"type": "string"},
-							},
-						},
-					},
-					{
-						"name":        "fetch_url",
-						"description": "Fetch one HTTPS URL with raw status, httptrace timing, and classification outcome.",
-						"inputSchema": map[string]any{
-							"type":     "object",
-							"required": []string{"url"},
-							"properties": map[string]any{
-								"url":    map[string]any{"type": "string"},
-								"kind":   map[string]any{"type": "string"},
-								"target": map[string]any{"type": "string"},
-							},
-						},
-					},
-				},
-			},
-		})
-		return
-
-	case "tools/call":
-		var callParams struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(rpc.Params, &callParams); err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"jsonrpc": "2.0",
-				"id":      rpc.ID,
-				"error":   map[string]any{"code": -32602, "message": "Invalid params"},
-			})
-			return
-		}
-		toolCtx, toolSpan, _ := otel.StartChildSpan(r.Context(), s.cfg.OtelExporter, "edgefetch.mcp.tool", 1, map[string]any{
-			"mcp.tool.name": callParams.Name,
-		})
-		switch callParams.Name {
-		case "list_agents":
-			txt, _ := json.MarshalIndent(s.ListAgents(), "", "  ")
-			toolSpan.End(true, "")
-			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
-			return
-		case "find_extractors":
-			var fp struct {
-				Query    string `json:"query"`
-				Category string `json:"category"`
-				Limit    int    `json:"limit"`
-			}
-			_ = json.Unmarshal(callParams.Arguments, &fp)
-			matches := extract.FindDeclarativeAdapters(fp.Query, fp.Category, fp.Limit)
-			txt, _ := json.MarshalIndent(map[string]any{
-				"ok":         true,
-				"count":      len(matches),
-				"runtime":    "go-declarative",
-				"extractors": matches,
-			}, "", "  ")
-			toolSpan.End(true, "")
-			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
-			return
-		case "scrape":
-			var sp scrapePayload
-			_ = json.Unmarshal(callParams.Arguments, &sp)
-			if sp.URL != "" {
-				toolSpan.SetAttribute("url.full", otel.SanitizeURL(sp.URL))
-			}
-			out, _, status := s.executeScrape(toolCtx, sp, r.Header)
-			txt, _ := json.MarshalIndent(out, "", "  ")
-			isErr := status >= 400 || out["ok"] == false
-			errMsg := ""
-			if isErr {
-				if pStr, ok := out["problem"].(string); ok && pStr != "" {
-					errMsg = pStr
-				} else if eStr, ok := out["error"].(string); ok && eStr != "" {
-					errMsg = eStr
-				} else {
-					errMsg = "scrape failed"
-				}
-			}
-			toolSpan.End(!isErr, errMsg)
-			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), isErr))
-			return
-		case "fetch_url":
-			var fp struct {
-				URL    string `json:"url"`
-				Kind   string `json:"kind"`
-				Target string `json:"target"`
-			}
-			_ = json.Unmarshal(callParams.Arguments, &fp)
-			if fp.URL != "" {
-				toolSpan.SetAttribute("url.full", otel.SanitizeURL(fp.URL))
-			}
-			k := classify.Kind(fp.Kind)
-			if k == "" {
-				k = classify.KindScrape
-			}
-			fc := crawl.FetchCall{
-				MaxSeconds: 45,
-				Options:    crawl.Options{IncludeBody: true, RespectRobots: crawl.Bool(true)},
-				Requests:   []crawl.Request{{ID: "mcp-1", URL: strings.TrimSpace(fp.URL), Kind: k}},
-			}
-			if code, msg, ok := crawl.ValidateCall(fc, s.allow); !ok {
-				toolSpan.End(false, code+": "+msg)
-				writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, code+": "+msg, true))
-				return
-			}
-			rep, via, _, err := s.DispatchOrFallback(toolCtx, fc, fp.Target, "", r.Header)
-			if err != nil {
-				toolSpan.End(false, err.Error())
-				writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, err.Error(), true))
-				return
-			}
-			toolSpan.End(true, "")
-			txt, _ := json.MarshalIndent(map[string]any{"via": via, "reply": rep}, "", "  ")
-			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
-			return
-		default:
-			toolSpan.End(false, "unknown tool: "+callParams.Name)
-			writeJSON(w, http.StatusOK, map[string]any{
-				"jsonrpc": "2.0",
-				"id":      rpc.ID,
-				"error":   map[string]any{"code": -32601, "message": "Unknown tool: " + callParams.Name},
-			})
-			return
-		}
-
-	default:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      rpc.ID,
-			"error":   map[string]any{"code": -32601, "message": "Method not found"},
-		})
-	}
-}
-
-func mcpTextResult(id any, text string, isError bool) map[string]any {
-	return map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"result": map[string]any{
-			"isError": isError,
-			"content": []map[string]any{
-				{"type": "text", "text": text},
-			},
-		},
-	}
 }
 
 func extractBearer(r *http.Request) string {

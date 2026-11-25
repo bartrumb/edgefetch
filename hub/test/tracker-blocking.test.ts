@@ -3,13 +3,12 @@ import test from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import WebSocket from 'ws';
 
+import meta0001 from '../migrations/meta/0001_tracking.sql';
 import worker from '../src/index';
 import { buildOpenApiSpec } from '../src/openapi';
 import { MCP_TOOL_SCHEMAS } from '../src/mcp';
-import { NodeFsR2Bucket, NodeSqliteD1Database, LocalAgentHubCoordinator } from '../portable/node-adapters';
-import { startPortableHub } from '../portable/portable-server';
+import { NodeFsR2Bucket, NodeSqliteD1Database, LocalAgentHubCoordinator } from './stubs/cf-storage-mocks';
 import {
   EASYPRIVACY_SOURCE_URL,
   EASYPRIVACY_LICENCE_URL,
@@ -382,134 +381,138 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
     assert.equal(disabledFetchCalls, 0, 'Cloudflare scheduled() with EDGEFETCH_TRACKER_LIST=off must make 0 requests');
     cfCoordinator.close();
 
-    // --- Portable Hub: verify ZERO fetch calls during startup even when enabled, then test live WS connect/reconnect + version update + /admin + scrape/interact ---
+    // --- Worker Hub: verify ZERO fetch calls before scheduled(), then test live agent connect/reconnect + version update + /admin + scrape/interact ---
     let listFetchCalls = 0;
     let currentFixtureVersion = '2026112401';
-    const portableDataDir = join(tmp, 'portable-live');
-    const hub = await startPortableHub({
-      port: 0,
-      host: '127.0.0.1',
-      dataDir: portableDataDir,
-      env: {
-        CALLER_TOKEN: OWNER_TOKEN,
-        AGENT_TOKEN,
-        EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
-      },
-      trackerFetchImpl: async () => {
-        listFetchCalls++;
-        return new Response(
-          buildEasyPrivacyFixture({ version: currentFixtureVersion, hostCount: 6_100 }),
-          {
-            status: 200,
-            headers: {
-              'content-type': 'text/plain; charset=utf-8',
-              etag: `"etag-${currentFixtureVersion}"`,
+    const liveBucket = new NodeFsR2Bucket(join(tmp, 'worker-live-r2'));
+    const liveMetaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+    const liveCoordinator = new LocalAgentHubCoordinator(join(tmp, 'worker-live.sqlite'));
+    const baseUrl = 'https://hub.example.com';
+    const liveEnv = {
+      AGENT_HUB: liveCoordinator.asNamespace() as unknown as DurableObjectNamespace,
+      ARTIFACTS: liveBucket as unknown as R2Bucket,
+      META: liveMetaDb as unknown as D1Database,
+      CALLER_TOKEN: OWNER_TOKEN,
+      AGENT_TOKEN,
+      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
+      SAFE_PUBLIC_FETCH: (async (input: RequestInfo | URL) => {
+        const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (u === EASYPRIVACY_SOURCE_URL) {
+          listFetchCalls++;
+          return new Response(
+            buildEasyPrivacyFixture({ version: currentFixtureVersion, hostCount: 6_100 }),
+            {
+              status: 200,
+              headers: {
+                'content-type': 'text/plain; charset=utf-8',
+                etag: `"etag-${currentFixtureVersion}"`,
+              },
             },
-          },
-        );
-      },
-    });
+          );
+        }
+        return new Response('User-agent: *\nAllow: /\n', { status: 200 });
+      }) as typeof fetch,
+    };
+    const dispatchWorker = (path: string, init?: RequestInit) =>
+      worker.fetch(new Request(`${baseUrl}${path}`, init), liveEnv as never);
 
     try {
-      assert.equal(listFetchCalls, 0, 'Portable Hub must NEVER fetch EasyPrivacy during startup');
-      const baseUrl = `http://127.0.0.1:${hub.port}`;
+      assert.equal(listFetchCalls, 0, 'Worker Hub must NEVER fetch EasyPrivacy before scheduled()');
 
-      // Trigger first scheduled refresh on the Portable Hub (simulating the delayed timer tick)
-      await hub.refreshTrackerListNow?.();
+      // Trigger first scheduled refresh on the Worker Hub
+      await worker.scheduled!(
+        { cron: '0 4 * * *', scheduledTime: Date.now(), noRetry() {} } as ScheduledController,
+        liveEnv as never,
+      );
       assert.equal(listFetchCalls, 1);
 
-      // Connect a simulated agent over `/agent/ws` -> must immediately receive `tracker_list` v1 (`2026112401`)!
-      const connectMockAgent = async () => {
+      // Connect a simulated agent -> must immediately receive `tracker_list` v1 (`2026112401`)!
+      const connectMockAgent = () => {
         const receivedTrackerVersions: string[] = [];
         const observedCrawlRequests: Array<Record<string, unknown>> = [];
-        const ws = new WebSocket(`ws://127.0.0.1:${hub.port}/agent/ws`, 'edgefetch-agent', {
-          headers: {
-            authorization: `Bearer ${AGENT_TOKEN}`,
-            'x-agent-site': 'node-test-1',
-            'x-agent-version': '2.7.8',
-            'x-agent-capabilities': 'http2,browser-v1,interact-v1',
+        const handle = liveCoordinator.connectMockAgent({
+          siteId: 'node-test-1',
+          arch: 'amd64',
+          version: '2.7.8',
+          capabilities: 'http2,browser-v1,interact-v1',
+          publicIp: '198.51.100.10',
+          onServerMessage: (raw) => {
+            const msg = JSON.parse(String(raw)) as Record<string, unknown>;
+            if (msg.type === 'tracker_list' && typeof msg.version === 'string') {
+              receivedTrackerVersions.push(msg.version);
+              queueMicrotask(() => {
+                handle.sendFromAgent(JSON.stringify({ type: 'tracker_list_ack', version: msg.version }));
+              });
+            } else if (
+              msg.type === 'dispatch' &&
+              typeof msg.jobId === 'string' &&
+              typeof msg.jobNonce === 'string' &&
+              msg.call &&
+              typeof msg.call === 'object'
+            ) {
+              const call = msg.call as { requests: Array<Record<string, unknown>> };
+              const firstReq = call.requests[0] ?? {};
+              observedCrawlRequests.push(firstReq);
+              const blockEnabled = firstReq.blockTrackers !== false;
+              const reply = {
+                results: [
+                  {
+                    id: firstReq.id,
+                    url: firstReq.url,
+                    finalUrl: firstReq.url || 'https://example.com/app',
+                    kind: firstReq.kind,
+                    outcome: 'ok',
+                    status: 200,
+                    rendered: true,
+                    blockedTrackers: blockEnabled ? 3 : 0,
+                    contentType: 'text/html; charset=utf-8',
+                    body: '<!doctype html><html><head><title>SPA App</title></head><body><main><h1>Clean Content</h1></main></body></html>',
+                    bodyEncoding: 'utf-8',
+                  },
+                ],
+              };
+              queueMicrotask(() => {
+                void dispatchWorker('/agent/reply', {
+                  method: 'POST',
+                  headers: {
+                    authorization: `Bearer ${AGENT_TOKEN}`,
+                    'x-agent-site': 'node-test-1',
+                    'x-job-id': String(msg.jobId),
+                    'x-job-nonce': String(msg.jobNonce),
+                    'content-type': 'application/json',
+                  },
+                  body: JSON.stringify(reply),
+                });
+              });
+            }
           },
         });
-
-        ws.on('message', (raw) => {
-          const msg = JSON.parse(String(raw)) as Record<string, unknown>;
-          if (msg.type === 'tracker_list' && typeof msg.version === 'string') {
-            receivedTrackerVersions.push(msg.version);
-            ws.send(JSON.stringify({ type: 'tracker_list_ack', version: msg.version }));
-          } else if (
-            msg.type === 'dispatch' &&
-            typeof msg.jobId === 'string' &&
-            typeof msg.jobNonce === 'string' &&
-            msg.call &&
-            typeof msg.call === 'object'
-          ) {
-            const call = msg.call as { requests: Array<Record<string, unknown>> };
-            const firstReq = call.requests[0] ?? {};
-            observedCrawlRequests.push(firstReq);
-            const blockEnabled = firstReq.blockTrackers !== false;
-            const reply = {
-              results: [
-                {
-                  id: firstReq.id,
-                  url: firstReq.url,
-                  finalUrl: firstReq.url || 'https://example.com/app',
-                  kind: firstReq.kind,
-                  outcome: 'ok',
-                  status: 200,
-                  rendered: true,
-                  blockedTrackers: blockEnabled ? 3 : 0,
-                  contentType: 'text/html; charset=utf-8',
-                  body: '<!doctype html><html><head><title>SPA App</title></head><body><main><h1>Clean Content</h1></main></body></html>',
-                  bodyEncoding: 'utf-8',
-                },
-              ],
-            };
-            void fetch(`${baseUrl}/agent/reply`, {
-              method: 'POST',
-              headers: {
-                authorization: `Bearer ${AGENT_TOKEN}`,
-                'x-agent-site': 'node-test-1',
-                'x-job-id': msg.jobId,
-                'x-job-nonce': msg.jobNonce,
-                'content-type': 'application/json',
-              },
-              body: JSON.stringify(reply),
-            });
-          }
-        });
-
-        await new Promise<void>((resolveOpen, rejectOpen) => {
-          ws.once('open', () => {
-            ws.send(
-              JSON.stringify({
-                type: 'agent_hello',
-                version: '2.7.8',
-                arch: 'amd64',
-                goVersion: 'go1.27',
-                capabilities: ['http2', 'browser-v1', 'interact-v1'],
-              }),
-            );
-            resolveOpen();
-          });
-          ws.once('error', rejectOpen);
-        });
+        handle.sendFromAgent(
+          JSON.stringify({
+            type: 'agent_hello',
+            version: '2.7.8',
+            arch: 'amd64',
+            goVersion: 'go1.27',
+            capabilities: ['http2', 'browser-v1', 'interact-v1'],
+          }),
+        );
 
         const waitForVersion = async (want: string) => {
           for (let i = 0; i < 60; i++) {
             if (receivedTrackerVersions.includes(want)) return;
-            await new Promise((r) => setTimeout(r, 25));
+            await new Promise((r) => setTimeout(r, 10));
           }
           assert.fail(`Timed out waiting for agent to receive tracker_list ${want}; got ${JSON.stringify(receivedTrackerVersions)}`);
         };
 
-        return { ws, receivedTrackerVersions, observedCrawlRequests, waitForVersion };
+        return { handle, receivedTrackerVersions, observedCrawlRequests, waitForVersion };
       };
 
-      const agent1 = await connectMockAgent();
+      const agent1 = connectMockAgent();
       await agent1.waitForVersion('2026112401');
 
       // Verify `GET /agents` and MCP `list_agents` expose `trackerListVersion: "2026112401"`
-      const agentsRes = await fetch(`${baseUrl}/agents`, {
+      const agentsRes = await dispatchWorker('/agents', {
         headers: { authorization: `Bearer ${OWNER_TOKEN}` },
       });
       assert.equal(agentsRes.status, 200);
@@ -520,7 +523,7 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
       assert.equal(agentsJson.trackerListVersion, '2026112401');
       assert.equal(agentsJson.agents[0]?.trackerListVersion, '2026112401');
 
-      const mcpListRes = await fetch(`${baseUrl}/mcp`, {
+      const mcpListRes = await dispatchWorker('/mcp', {
         method: 'POST',
         headers: {
           authorization: `Bearer ${OWNER_TOKEN}`,
@@ -543,7 +546,7 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
       assert.equal(mcpFleet.trackerListVersion, '2026112401');
 
       // Acceptance 5: Default `scrape` (rendered) blocks trackers (`blockedTrackers: 3` in metadata), while `blockTrackers: false` disables blocking for THAT request only (`blockedTrackers: 0`)!
-      const scrapeDefaultRes = await fetch(`${baseUrl}/v1/scrape`, {
+      const scrapeDefaultRes = await dispatchWorker('/v1/scrape', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ url: 'https://spa1.example.com/app', renderMode: 'always', noCache: true }),
@@ -552,7 +555,7 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
       const scrapeDefaultBody = (await scrapeDefaultRes.json()) as { metadata?: { blockedTrackers?: number } };
       assert.equal(scrapeDefaultBody.metadata?.blockedTrackers, 3);
 
-      const scrapeOptOutRes = await fetch(`${baseUrl}/v1/scrape`, {
+      const scrapeOptOutRes = await dispatchWorker('/v1/scrape', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -568,7 +571,7 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
       assert.equal(agent1.observedCrawlRequests[1]?.blockTrackers, false);
 
       // Same per-request check on `/v1/interact`
-      const interactOptOutRes = await fetch(`${baseUrl}/v1/interact`, {
+      const interactOptOutRes = await dispatchWorker('/v1/interact', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ url: 'https://spa3.example.com/app', blockTrackers: false }),
@@ -577,7 +580,7 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
       const interactOptOutBody = (await interactOptOutRes.json()) as { metadata?: { blockedTrackers?: number } };
       assert.equal(interactOptOutBody.metadata?.blockedTrackers, 0);
 
-      const interactDefaultRes = await fetch(`${baseUrl}/v1/interact`, {
+      const interactDefaultRes = await dispatchWorker('/v1/interact', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ url: 'https://spa4.example.com/app' }),
@@ -588,36 +591,43 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
 
       // Update list version on Hub -> connected agent receives new version `2026112501` live, AND reconnecting agent receives `2026112501`!
       currentFixtureVersion = '2026112501';
-      await hub.refreshTrackerListNow?.({ forceAfter6hOverrideForTest: true });
+      const updatedOutcome = await refreshHubTrackerList({
+        bucket: liveBucket,
+        fetchFn: liveEnv.SAFE_PUBLIC_FETCH,
+        now: Date.now() + 7 * 60 * 60_000,
+      });
+      assert.equal(updatedOutcome.updated, true);
+      liveCoordinator.syncTrackerList(
+        updatedOutcome.current!.meta.version,
+        buildTrackerListWsFrames(updatedOutcome.current!),
+      );
       await agent1.waitForVersion('2026112501');
 
-      agent1.ws.close();
-      await new Promise((r) => setTimeout(r, 50));
+      agent1.handle.close();
 
-      const agentReconnected = await connectMockAgent();
+      const agentReconnected = connectMockAgent();
       await agentReconnected.waitForVersion('2026112501');
 
       // `/admin` owner session sees `trackerList` metadata (`version`, `fetchedAt`, `hostCount`, `sourceUrl`, `licenseUrl`) AND dashboard HTML links EasyPrivacy licence!
-      const loginRes = await fetch(`${baseUrl}/admin/login`, {
+      const loginRes = await dispatchWorker('/admin/login', {
         method: 'POST',
         headers: {
           'content-type': 'application/x-www-form-urlencoded',
           origin: baseUrl,
         },
         body: new URLSearchParams({ token: OWNER_TOKEN }).toString(),
-        redirect: 'manual',
       });
       assert.equal(loginRes.status, 302);
       const cookie = loginRes.headers.get('set-cookie')?.split(';')[0] ?? '';
       assert.ok(cookie.length > 10);
 
-      const adminHtmlRes = await fetch(`${baseUrl}/admin`, { headers: { cookie } });
+      const adminHtmlRes = await dispatchWorker('/admin', { headers: { cookie } });
       assert.equal(adminHtmlRes.status, 200);
       const adminHtml = await adminHtmlRes.text();
       assert.ok(adminHtml.includes(EASYPRIVACY_LICENCE_URL), 'Admin UI must link EasyPrivacy licence');
       assert.ok(adminHtml.includes(EASYPRIVACY_SOURCE_URL), 'Admin UI must show EasyPrivacy source URL');
 
-      const stateRes = await fetch(`${baseUrl}/admin/api/state`, { headers: { cookie } });
+      const stateRes = await dispatchWorker('/admin/api/state', { headers: { cookie } });
       assert.equal(stateRes.status, 200);
       const stateJson = (await stateRes.json()) as {
         trackerList?: {
@@ -635,9 +645,10 @@ test('Acceptance 5, 6 & 7: EDGEFETCH_TRACKER_LIST=off makes zero requests; start
       assert.equal(stateJson.trackerList.sourceUrl, EASYPRIVACY_SOURCE_URL);
       assert.equal(stateJson.trackerList.licenseUrl, EASYPRIVACY_LICENCE_URL);
 
-      agentReconnected.ws.close();
+      agentReconnected.handle.close();
     } finally {
-      await hub.close();
+      liveCoordinator.close();
+      liveMetaDb.close();
     }
   } finally {
     rmSync(tmp, { recursive: true, force: true });
@@ -874,73 +885,73 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
     assert.equal(socketStaleSends, 1, 'Unsynced socket must receive broadcast');
 
     // 5. Scrape & Extract cache isolation when `blockTrackers: false` + OTel & crawl activity traces
-    const cacheDir = join(tmp, 'portable-cache');
-    const hub = await startPortableHub({
-      port: 0,
-      host: '127.0.0.1',
-      dataDir: cacheDir,
-      env: {
-        CALLER_TOKEN: OWNER_TOKEN,
-        AGENT_TOKEN,
-        EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
-      },
-      trackerFetchImpl: async () => new Response(validFixture, { status: 200, headers: { 'content-type': 'text/plain' } }),
-    });
+    const cacheBucket = new NodeFsR2Bucket(join(tmp, 'worker-cache-r2'));
+    const cacheMetaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001 }]);
+    const cacheCoordinator = new LocalAgentHubCoordinator(join(tmp, 'worker-cache.sqlite'));
+    const cacheBaseUrl = 'https://hub.example.com';
+    const cacheEnv = {
+      AGENT_HUB: cacheCoordinator.asNamespace() as unknown as DurableObjectNamespace,
+      ARTIFACTS: cacheBucket as unknown as R2Bucket,
+      META: cacheMetaDb as unknown as D1Database,
+      CALLER_TOKEN: OWNER_TOKEN,
+      AGENT_TOKEN,
+      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
+      SAFE_PUBLIC_FETCH: (async () => new Response('User-agent: *\nAllow: /\n', { status: 200 })) as typeof fetch,
+    };
+    const dispatchCacheWorker = (path: string, init?: RequestInit) =>
+      worker.fetch(new Request(`${cacheBaseUrl}${path}`, init), cacheEnv as never);
+
     try {
-      const baseUrl = `http://127.0.0.1:${hub.port}`;
       const observedReqs: Array<Record<string, unknown>> = [];
-      const ws = new WebSocket(`ws://127.0.0.1:${hub.port}/agent/ws`, 'edgefetch-agent', {
-        headers: {
-          authorization: `Bearer ${AGENT_TOKEN}`,
-          'x-agent-site': 'node-cache-1',
-          'x-agent-version': '2.7.8',
-          'x-agent-capabilities': 'http2,browser-v1,interact-v1,artifacts-v1',
+      const cacheAgent = cacheCoordinator.connectMockAgent({
+        siteId: 'node-cache-1',
+        arch: 'amd64',
+        version: '2.7.8',
+        capabilities: 'http2,browser-v1,interact-v1,artifacts-v1',
+        publicIp: '198.51.100.11',
+        onServerMessage: (raw) => {
+          const msg = JSON.parse(String(raw)) as Record<string, unknown>;
+          if (msg.type === 'dispatch' && typeof msg.jobId === 'string' && typeof msg.jobNonce === 'string') {
+            const call = msg.call as { requests: Array<Record<string, unknown>> };
+            const results = call.requests.map((r) => {
+              observedReqs.push(r);
+              const blockOn = r.blockTrackers !== false;
+              const htmlBody = blockOn
+                ? '<!doctype html><html><head><title>Blocked Variant</title></head><body><main><p>Contact alice@example.com — Blocked Variant Marker</p></main></body></html>'
+                : '<!doctype html><html><head><title>Unblocked Variant</title></head><body><main><p>Contact alice@example.com — Unblocked Tracker Variant Marker</p></main></body></html>';
+              return {
+                id: r.id,
+                url: r.url,
+                finalUrl: r.url,
+                kind: r.kind,
+                outcome: 'ok',
+                status: 200,
+                rendered: true,
+                blockedTrackers: blockOn ? 4 : 0,
+                contentType: 'text/html; charset=utf-8',
+                body: htmlBody,
+                bodyEncoding: 'utf-8',
+              };
+            });
+            queueMicrotask(() => {
+              void dispatchCacheWorker('/agent/reply', {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${AGENT_TOKEN}`,
+                  'x-agent-site': 'node-cache-1',
+                  'x-job-id': String(msg.jobId),
+                  'x-job-nonce': String(msg.jobNonce),
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify({ results }),
+              });
+            });
+          }
         },
-      });
-      ws.on('message', (raw) => {
-        const msg = JSON.parse(String(raw)) as Record<string, unknown>;
-        if (msg.type === 'dispatch' && typeof msg.jobId === 'string' && typeof msg.jobNonce === 'string') {
-          const call = msg.call as { requests: Array<Record<string, unknown>> };
-          const results = call.requests.map((r) => {
-            observedReqs.push(r);
-            const blockOn = r.blockTrackers !== false;
-            const htmlBody = blockOn
-              ? '<!doctype html><html><head><title>Blocked Variant</title></head><body><main><p>Contact alice@example.com — Blocked Variant Marker</p></main></body></html>'
-              : '<!doctype html><html><head><title>Unblocked Variant</title></head><body><main><p>Contact alice@example.com — Unblocked Tracker Variant Marker</p></main></body></html>';
-            return {
-              id: r.id,
-              url: r.url,
-              finalUrl: r.url,
-              kind: r.kind,
-              outcome: 'ok',
-              status: 200,
-              rendered: true,
-              blockedTrackers: blockOn ? 4 : 0,
-              contentType: 'text/html; charset=utf-8',
-              body: htmlBody,
-              bodyEncoding: 'utf-8',
-            };
-          });
-          void fetch(`${baseUrl}/agent/reply`, {
-            method: 'POST',
-            headers: {
-              authorization: `Bearer ${AGENT_TOKEN}`,
-              'x-agent-site': 'node-cache-1',
-              'x-job-id': msg.jobId,
-              'x-job-nonce': msg.jobNonce,
-              'content-type': 'application/json',
-            },
-            body: JSON.stringify({ results }),
-          });
-        }
-      });
-      await new Promise<void>((resolve, reject) => {
-        ws.once('open', () => resolve());
-        ws.once('error', reject);
       });
 
       // Step A: Scrape with `blockTrackers: false` FIRST (without `noCache`) -> must NOT poison canonical default `META` D1 cache!
-      const optOutFirstRes = await fetch(`${baseUrl}/v1/scrape`, {
+      const optOutFirstRes = await dispatchCacheWorker('/v1/scrape', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ url: 'https://cache-iso.example.com/page', blockTrackers: false, maxAgeMs: 60_000 }),
@@ -951,7 +962,7 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.match(optOutFirstJson.markdown ?? '', /Unblocked Tracker Variant Marker/);
 
       // Step B: Default scrape (`blockTrackers` omitted = true) with `maxAgeMs: 60_000` -> MUST miss canonical cache and fetch live Blocked Variant!
-      const defaultSecondRes = await fetch(`${baseUrl}/v1/scrape`, {
+      const defaultSecondRes = await dispatchCacheWorker('/v1/scrape', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ url: 'https://cache-iso.example.com/page', maxAgeMs: 60_000 }),
@@ -962,14 +973,14 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.match(defaultSecondJson.markdown ?? '', /Blocked Variant Marker/);
 
       // Step C: `blockTrackers: false` + `redactPii: true` + `maxAgeMs: 60_000` on a URL with canonical cache -> MUST NOT return Blocked Variant!
-      const canonicalSeedRes = await fetch(`${baseUrl}/v1/scrape`, {
+      const canonicalSeedRes = await dispatchCacheWorker('/v1/scrape', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ url: 'https://redact-iso.example.com/page', maxAgeMs: 60_000 }),
       });
       assert.equal(canonicalSeedRes.status, 200);
 
-      const redactOptOutRes = await fetch(`${baseUrl}/v1/scrape`, {
+      const redactOptOutRes = await dispatchCacheWorker('/v1/scrape', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -987,7 +998,7 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
 
       // Step D: `POST /v1/extract` forwards `blockTrackers: false`
       const reqCountBeforeExtract = observedReqs.length;
-      const extractRes = await fetch(`${baseUrl}/v1/extract`, {
+      const extractRes = await dispatchCacheWorker('/v1/extract', {
         method: 'POST',
         headers: { authorization: `Bearer ${OWNER_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -999,9 +1010,10 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(extractRes.status, 200);
       assert.equal(observedReqs[reqCountBeforeExtract]?.blockTrackers, false);
 
-      ws.close();
+      cacheAgent.close();
     } finally {
-      await hub.close();
+      cacheCoordinator.close();
+      cacheMetaDb.close();
     }
 
     // 6. OTel child spans & Activity Log crawl events include `blockedTrackers`

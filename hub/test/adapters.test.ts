@@ -125,7 +125,7 @@ import {
   salvageAshbyBoardFromTruncatedJson,
 } from '../src/jobs.ts';
 import { getActiveRequestTracer, RequestTracer } from '../src/otel.ts';
-import { NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
+import { NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks.ts';
 import {
   cleanPdfMarkdown,
   decodeHtmlEntities,

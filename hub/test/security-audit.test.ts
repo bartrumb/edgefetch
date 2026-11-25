@@ -14,20 +14,12 @@ import { gzipSync } from 'node:zlib';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import { runRound6StreamASubtests } from './round6-stream-a.test.ts';
 import { runRound6StreamBSubtests } from './round6-stream-b.test.ts';
+import hubWorker from '../src/index.ts';
 import {
   LocalAgentHubCoordinator,
   NodeFsR2Bucket,
   NodeSqliteD1Database,
-  RawServerWebSocket,
-} from '../portable/node-adapters.ts';
-import { resolvePublicOrigin, startPortableHub } from '../portable/portable-server.ts';
-import { S3ArtifactBucket } from '../portable/s3-bucket.ts';
-import {
-  createPublicOnlyLookup,
-  createSafeOutboundFetch,
-  isPublicIpAddress,
-  MAX_SAFE_FETCH_TIMEOUT_MS,
-} from '../portable/safe-fetch.ts';
+} from './stubs/cf-storage-mocks.ts';
 import {
   AdapterNetworkForbiddenError,
   runAdapterSyncInBulkhead,
@@ -285,40 +277,26 @@ test('SEC-AUDIT-1 (C1 & H5): Operator LLM env keys are origin-locked and LLM HTT
   assert.match(redirTurn.error ?? '', /redirect|302/i);
 });
 
-test('SEC-AUDIT-2 (H3 & H4): Portable Hub survives malformed Host: [ upgrade, blocks CF-Connecting-IP spoofing & Host: localhost escalation, and revokes logged-out admin cookies', async () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'ef-sec-h3h4-'));
+test('SEC-AUDIT-2 (H4): Worker Hub blocks X-Forwarded-Host: localhost LLM escalation, revokes logged-out admin cookies, and enforces IP login lockout', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'ef-sec-h4-'));
   const ownerTok = 'audit-owner-token-0123456789abcdef';
   const agentTok = 'audit-agent-token-0123456789abcdef';
-  // Bind on 0.0.0.0 without EDGEFETCH_TRUST_PROXY so canonical origin is non-loopback (`hub.local`).
-  const hub = await startPortableHub({
-    port: 0,
-    host: '0.0.0.0',
-    dataDir,
-    envOverrides: {
-      CALLER_TOKEN: ownerTok,
-      AGENT_TOKEN: agentTok,
-      EDGEFETCH_TRUST_PROXY: '',
-      EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE: '',
-    },
-  });
+  const coord = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
+  const baseUrl = 'https://hub.example.com';
+  const env = {
+    AGENT_HUB: coord.asNamespace() as never,
+    CALLER_TOKEN: ownerTok,
+    AGENT_TOKEN: agentTok,
+  };
+  const dispatch = (path: string, init?: RequestInit) =>
+    hubWorker.fetch(new Request(`${baseUrl}${path}`, init), env);
 
   try {
-    // 1. H3 PoC: Malformed `Host: [` on `/agent/ws` upgrade returns 400 Bad Request and does NOT crash Node process!
-    const rawUpgradeResp = await sendRawTcpRequest(
-      hub.port,
-      'GET /agent/ws HTTP/1.1\r\nHost: [\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
-    );
-    assert.match(rawUpgradeResp, /^HTTP\/1\.1 400 Bad Request/);
-
-    // Regular HTTP with malformed `Host: [` also returns 400 cleanly.
-    const rawHttpResp = await sendRawTcpRequest(hub.port, 'GET /health HTTP/1.1\r\nHost: [\r\nConnection: close\r\n\r\n');
-    assert.match(rawHttpResp, /^HTTP\/1\.1 400 Bad Request/);
-
-    const healthAfter = await fetch(`http://127.0.0.1:${hub.port}/health`);
+    const healthAfter = await dispatch('/health');
     assert.equal(healthAfter.status, 200);
 
-    // 2. H4 PoC A: `Host: localhost` + `X-Forwarded-Host: localhost` MUST NOT unlock loopback `llm.baseUrl` when untrusted!
-    const spoofedLocalLlm = await fetch(`http://127.0.0.1:${hub.port}/v1/agent`, {
+    // 1. H4 PoC A: `X-Forwarded-Host: localhost` MUST NOT unlock loopback `llm.baseUrl` on remote hub!
+    const spoofedLocalLlm = await dispatch('/v1/agent', {
       method: 'POST',
       headers: {
         authorization: `Bearer ${ownerTok}`,
@@ -332,60 +310,59 @@ test('SEC-AUDIT-2 (H3 & H4): Portable Hub survives malformed Host: [ upgrade, bl
     });
     assert.equal(spoofedLocalLlm.status, 400);
 
-    // 3. H4 PoC B: Admin login + server-side `/admin/logout` cookie revocation BEFORE testing IP lockout.
-    const loginOk = await fetch(`http://127.0.0.1:${hub.port}/admin/login`, {
+    // 2. H4 PoC B: Admin login + server-side `/admin/logout` cookie revocation BEFORE testing IP lockout.
+    const loginOk = await dispatch('/admin/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      headers: { origin: baseUrl, 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ token: ownerTok }).toString(),
-      redirect: 'manual',
     });
     assert.equal(loginOk.status, 302);
     const setCookie = loginOk.headers.get('set-cookie') ?? '';
     const cookiePair = setCookie.split(';')[0] ?? '';
-    assert.match(cookiePair, /^ef_admin_session=/);
-    const csrfToken = decodeURIComponent(cookiePair.slice('ef_admin_session='.length)).split('.')[2] ?? '';
+    const cookieName = cookiePair.split('=')[0] ?? '';
+    assert.match(cookieName, /^(?:__Host-)?ef_admin_session$/);
+    const csrfToken = decodeURIComponent(cookiePair.slice(cookieName.length + 1)).split('.')[2] ?? '';
     assert.ok(csrfToken.length >= 16);
 
-    const stateBeforeLogout = await fetch(`http://127.0.0.1:${hub.port}/admin/api/state`, {
+    const stateBeforeLogout = await dispatch('/admin/api/state', {
       headers: { cookie: cookiePair },
     });
     assert.equal(stateBeforeLogout.status, 200);
 
-    const logoutRes = await fetch(`http://127.0.0.1:${hub.port}/admin/logout`, {
+    const logoutRes = await dispatch('/admin/logout', {
       method: 'POST',
       headers: {
+        origin: baseUrl,
         cookie: cookiePair,
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ csrf: csrfToken }).toString(),
-      redirect: 'manual',
     });
     assert.equal(logoutRes.status, 302);
 
-    // Replaying the old `ef_admin` cookie after `/admin/logout` MUST fail with 401!
-    const replayAfterLogout = await fetch(`http://127.0.0.1:${hub.port}/admin/api/state`, {
+    // Replaying the old admin cookie after `/admin/logout` MUST fail with 401!
+    const replayAfterLogout = await dispatch('/admin/api/state', {
       headers: { cookie: cookiePair },
     });
     assert.equal(replayAfterLogout.status, 401);
 
-    // 4. H4 PoC C: Spoofed `CF-Connecting-IP` headers on every attempt do NOT bypass the 5-failure socket-IP lockout!
+    // 3. H4 PoC C: Repeated failed logins from same client IP hit 429 lockout!
     let lastStatus = 0;
     for (let i = 1; i <= 6; i++) {
-      const badLogin = await fetch(`http://127.0.0.1:${hub.port}/admin/login`, {
+      const badLogin = await dispatch('/admin/login', {
         method: 'POST',
         headers: {
+          origin: baseUrl,
           'content-type': 'application/x-www-form-urlencoded',
-          'cf-connecting-ip': `198.51.100.${i}`,
-          'x-forwarded-for': `203.0.113.${i}`,
+          'cf-connecting-ip': '198.51.100.42',
         },
         body: new URLSearchParams({ token: `wrong-token-${i}` }).toString(),
-        redirect: 'manual',
       });
       lastStatus = badLogin.status;
     }
     assert.equal(lastStatus, 429);
   } finally {
-    await hub.close();
+    coord.close();
     try {
       rmSync(dataDir, { recursive: true, force: true });
     } catch {
@@ -394,57 +371,7 @@ test('SEC-AUDIT-2 (H3 & H4): Portable Hub survives malformed Host: [ upgrade, bl
   }
 });
 
-test('SEC-AUDIT-3 (H5): Dial-time net.BlockList safe-fetch rejects loopback, RFC1918, CGNAT, link-local, IPv6 transition & dual-A DNS rebinding', async () => {
-  for (const blocked of [
-    '0.0.0.0',
-    '127.0.0.1',
-    '10.0.0.5',
-    '172.16.10.2',
-    '172.30.32.2',
-    '192.168.1.1',
-    '100.64.0.1',
-    '169.254.169.254',
-    '::1',
-    'fe80::1',
-    'fc00::1',
-    '::ffff:127.0.0.1',
-    '64:ff9b::7f00:1',
-    '2001:db8::1',
-  ]) {
-    assert.equal(isPublicIpAddress(blocked), false, `expected ${blocked} to be rejected as non-public`);
-  }
-  assert.equal(isPublicIpAddress('93.184.216.34'), true);
-  assert.equal(isPublicIpAddress('2606:4700:4700::1111'), true);
-
-  // Dual-A record DNS rebinding (one public IP + one RFC1918 IP) MUST fail closed before any socket connects!
-  const safeRebindFetch = createSafeOutboundFetch({
-    allowExplicitLoopbackUrls: false,
-    resolver: async () => [
-      { address: '93.184.216.34', family: 4 },
-      { address: '192.168.1.50', family: 4 },
-    ],
-  });
-  await assert.rejects(
-    async () => {
-      await safeRebindFetch('https://rebind.attacker.example/secret');
-    },
-    /SSRF blocked/,
-  );
-
-  // Cloud metadata DNS rebinding (`169.254.169.254`) MUST fail closed!
-  const safeMetadataFetch = createSafeOutboundFetch({
-    allowExplicitLoopbackUrls: false,
-    resolver: async () => [{ address: '169.254.169.254', family: 4 }],
-  });
-  await assert.rejects(
-    async () => {
-      await safeMetadataFetch('https://metadata-rebind.attacker.example/latest/meta-data/');
-    },
-    /SSRF blocked/,
-  );
-});
-
-test('SEC-AUDIT-4 (H6, H7 & M7): AgentHubEngine enforces dispatched id/url + authorized blobs + clamped retryAfter; verifyStoredArtifact preserves honest blobs; S3ArtifactBucket verifies sha256', async () => {
+test('SEC-AUDIT-4 (H6 & M7): AgentHubEngine enforces dispatched id/url + authorized blobs + clamped retryAfter; verifyStoredArtifact preserves honest blobs', async () => {
   // 1. H6 + M7 in AgentHubEngine
   const cooldownMap = new Map<string, number>();
   let capturedSentFrame = '';
@@ -573,26 +500,6 @@ test('SEC-AUDIT-4 (H6, H7 & M7): AgentHubEngine enforces dispatched id/url + aut
       // Windows SQLite WAL handle release lag
     }
   }
-
-  // 3. H7: `S3ArtifactBucket.put` enforces `options.sha256` BEFORE issuing S3 network PUT!
-  let s3PutCalled = false;
-  const s3 = new S3ArtifactBucket({
-    endpoint: 'https://s3.example.com',
-    bucket: 'artifacts',
-    accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
-    secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-    fetchImpl: (async () => {
-      s3PutCalled = true;
-      return new Response(null, { status: 200 });
-    }) as typeof fetch,
-  });
-  await assert.rejects(
-    async () => {
-      await s3.put('raw/sha256/aa/test.gz', new Uint8Array([1, 2, 3, 4]), { sha256: '0'.repeat(64) });
-    },
-    /sha256 checksum mismatch/i,
-  );
-  assert.equal(s3PutCalled, false);
 });
 
 test('SEC-AUDIT-5 (M4, M5, M8 & Low): Linear O(N) HTML scanners, safe user regex guard, /v1/agent browser action allowlist, robots blank lines, and IPv6 /64 normalization', async () => {
@@ -961,120 +868,35 @@ test('SEC-V255-4 (M1, M12 & Low): Strict path-prefix LLM key isolation, loopback
   }
 });
 
-test('SEC-V255-5 (M5): createSafeOutboundFetch with pre-aborted AbortSignal never emits uncaught error events', async () => {
-  let uncaught = 0;
-  const onUncaught = () => {
-    uncaught++;
-  };
-  process.on('uncaughtException', onUncaught);
-  process.on('unhandledRejection', onUncaught);
+test('SEC-V255-6 (M9 & Low): siteId & warn/error ring isolation, EDGEFETCH_PUBLIC_ORIGIN issuer, and admin_revocations', async () => {
+  // 1. EDGEFETCH_PUBLIC_ORIGIN issuer pinning on Worker Hub
+  const originCoord = new LocalAgentHubCoordinator(':memory:');
   try {
-    const safeFetch = createSafeOutboundFetch({
-      resolver: async () => ['93.184.216.34'],
-    });
-    for (let i = 0; i < 40; i++) {
-      await assert.rejects(
-        () => safeFetch('https://example.com/', { signal: AbortSignal.abort(new Error('already_aborted')) }),
-        /already_aborted|AbortError/i,
-      );
-    }
-    await new Promise((r) => setTimeout(r, 25));
-    assert.equal(uncaught, 0);
-  } finally {
-    process.off('uncaughtException', onUncaught);
-    process.off('unhandledRejection', onUncaught);
-  }
-});
-
-test('SEC-V255-6 (M6, M8, M9 & Low): WS 1009 immediate destroy, rightmost XFF + EDGEFETCH_PUBLIC_ORIGIN, siteId & warn/error ring, admin_revocations', async () => {
-  // 1. M6: RawServerWebSocket destroys socket immediately on 1009 oversized frame and buffers 0 bytes afterwards.
-  const duplex = new PassThrough();
-  let closedCode = 0;
-  const ws = new RawServerWebSocket(
-    duplex,
-    ['site:test'],
-    () => {},
-    (_s, code) => {
-      closedCode = code;
-    },
-  );
-  // RFC 6455 §5.1: Unmasked client frame is immediately closed with 1002
-  const unmaskedDuplex = new PassThrough();
-  let unmaskedCode = 0;
-  const unmaskedWs = new RawServerWebSocket(
-    unmaskedDuplex,
-    ['site:test'],
-    () => {},
-    (_s, code) => {
-      unmaskedCode = code;
-    },
-  );
-  unmaskedDuplex.emit('data', Buffer.from([0x81, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]));
-  assert.equal(unmaskedCode, 1002);
-  void unmaskedWs;
-
-  // RFC 6455 masked client header claiming 64-bit payload = 1 TiB (`0x0000010000000000`) -> 1009 immediate destroy
-  const oversizedHeader = Buffer.from([0x81, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
-  duplex.emit('data', oversizedHeader);
-  assert.equal(closedCode, 1009);
-  assert.equal(duplex.destroyed, true, 'Socket must be destroyed immediately after 1009 close');
-  duplex.emit('data', Buffer.alloc(65_536, 0x41));
-  void ws;
-
-  // 2. M8: Rightmost X-Forwarded-For IP + strict EDGEFETCH_PUBLIC_ORIGIN ignoring X-Forwarded-Host.
-  const tmpDir = mkdtempSync(join(tmpdir(), 'ef-m8-'));
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpDir,
-    envOverrides: {
-      CALLER_TOKEN: 'm8-secret-token-0123456789abcdef',
-      EDGEFETCH_TRUST_PROXY: 'true',
-      EDGEFETCH_PUBLIC_ORIGIN: 'https://hub.trusted.example',
-    },
-  });
-  try {
-    const metaRes = await fetch(`http://127.0.0.1:${hub.port}/.well-known/oauth-authorization-server`, {
-      headers: {
-        'x-forwarded-host': 'evil.attacker.example',
-        'x-forwarded-proto': 'http',
+    const metaRes = await hubWorker.fetch(
+      new Request('http://evil.attacker.example/.well-known/oauth-authorization-server', {
+        headers: {
+          'x-forwarded-host': 'evil.attacker.example',
+          'x-forwarded-proto': 'http',
+        },
+      }),
+      {
+        AGENT_HUB: originCoord.asNamespace() as never,
+        CALLER_TOKEN: 'm8-secret-token-0123456789abcdef',
+        EDGEFETCH_PUBLIC_ORIGIN: 'https://hub.trusted.example',
       },
-    });
+    );
     assert.equal(metaRes.status, 200);
     const metaJson = (await metaRes.json()) as { issuer: string; token_endpoint: string };
     assert.equal(metaJson.issuer, 'https://hub.trusted.example');
     assert.equal(metaJson.token_endpoint, 'https://hub.trusted.example/oauth/token');
-
-    // Forged leftmost XFF IPs (`1.1.1.i`) with identical proxy-appended rightmost IP (`198.51.100.77`) MUST hit lockout!
-    let saw429 = false;
-    for (let i = 1; i <= 14; i++) {
-      const r = await fetch(`http://127.0.0.1:${hub.port}/admin/login`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded',
-          'x-forwarded-for': `1.1.1.${i}, 198.51.100.77`,
-        },
-        body: 'token=wrong-token',
-      });
-      if (r.status === 429) {
-        saw429 = true;
-        break;
-      }
-    }
-    assert.equal(saw429, true, 'Rightmost X-Forwarded-For IP should share one brute-force lockout bucket');
   } finally {
-    await hub.close();
-    rmSync(tmpDir, { recursive: true, force: true });
+    originCoord.close();
   }
 
-  // 3. M9: LocalAgentHubCoordinator preserves verified siteId, throttles agent_ready, and isolates warn/error vs info rings.
+  // 2. M9: LocalAgentHubCoordinator preserves verified siteId, throttles agent_ready, and isolates warn/error vs info rings.
   const coord = new LocalAgentHubCoordinator(':memory:');
   try {
-    const sockStream = new PassThrough();
-    coord.acceptNodeUpgrade({
-      wsKey: 'dGhlIHNhbXBsZSBub25jZQ==',
-      socket: sockStream,
-      head: Buffer.alloc(0),
+    const mockAgent = coord.connectMockAgent({
       siteId: 'verified-node-1',
       arch: 'linux-amd64',
       version: '2.6.0',
@@ -1082,27 +904,15 @@ test('SEC-V255-6 (M6, M8, M9 & Low): WS 1009 immediate destroy, rightmost XFF + 
       publicIp: '203.0.113.10',
     });
 
-    // Helper to build a client->server masked RFC 6455 text frame
-    const makeMaskedTextFrame = (txt: string): Buffer => {
-      const payload = Buffer.from(txt, 'utf8');
-      const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
-      const masked = Buffer.alloc(payload.length);
-      for (let i = 0; i < payload.length; i++) masked[i] = payload[i]! ^ mask[i & 3]!;
-      return Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, masked]);
-    };
-
     for (let i = 0; i < 5; i++) {
-      sockStream.emit(
-        'data',
-        makeMaskedTextFrame(
-          JSON.stringify({
-            type: 'agent_hello',
-            siteId: 'SPOOFED_ADMIN_SITE',
-            version: '2.6.0',
-            arch: 'linux-amd64',
-            goVersion: 'go1.24.0',
-          }),
-        ),
+      mockAgent.sendFromAgent(
+        JSON.stringify({
+          type: 'agent_hello',
+          siteId: 'SPOOFED_ADMIN_SITE',
+          version: '2.6.0',
+          arch: 'linux-amd64',
+          goVersion: 'go1.24.0',
+        }),
       );
     }
 
@@ -1135,7 +945,7 @@ test('SEC-V255-6 (M6, M8, M9 & Low): WS 1009 immediate destroy, rightmost XFF + 
       '260 info events must never evict warn/error security events from getPortalState!',
     );
 
-    // 4. Low: Dedicated admin_revocations survives >100 auth_failures lockout buckets (SQLite + Memory).
+    // 3. Low: Dedicated admin_revocations survives >100 auth_failures lockout buckets (SQLite + Memory).
     const now = Date.now();
     coord.oauth.recordAuthFailure('revoked_admin:session-hash-abc', now, 86_400_000, 1);
     const memOAuth = createMemoryOAuthStore();
@@ -1146,6 +956,7 @@ test('SEC-V255-6 (M6, M8, M9 & Low): WS 1009 immediate destroy, rightmost XFF + 
     }
     assert.equal(coord.oauth.checkAuthLockout('revoked_admin:session-hash-abc', now + 1_000, 1).allowed, false);
     assert.equal(memOAuth.checkAuthLockout('revoked_admin:session-hash-abc', now + 1_000, 1).allowed, false);
+    mockAgent.close();
   } finally {
     coord.close();
   }
@@ -3131,129 +2942,37 @@ test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forge
   assert.equal(/<script\b/i.test(extMd), false, `Twin markdown in /v1/extract must strip <script>: ${extMd}`);
   assert.equal(/\]\(\s*javascript:/i.test(extMd), false, `Twin markdown in /v1/extract must strip javascript: links: ${extMd}`);
 
-  // 5. `R5-M5` (Per-IP In-Flight Cap), Low `Host` OAuth Issuer Protection, Malformed `%` -> `400`, Admin `nosniff`, & `/v1/catalog` `maxBytes`
-  assert.equal(
-    resolvePublicOrigin({
-      canonicalOrigin: 'http://hub.local:8787',
-      trustProxy: true,
-      hasExplicitPublicOrigin: false,
-      hostHeader: 'evil.test',
-      forwardedProtoHeader: 'https',
-    }).origin,
-    'https://hub.local:8787',
-  );
-
-  const tmpHubDir = mkdtempSync(join(tmpdir(), 'ef-r5-hub-'));
+  // 5. Malformed `%` -> `400` & Admin `nosniff` on Worker Hub
   const r5Token = 'r5-owner-token-0123456789abcdef012345';
-  const r5Hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpHubDir,
-    maxInflightPerIp: 2,
-    envOverrides: {
-      CALLER_TOKEN: r5Token,
-      EDGEFETCH_TRUST_PROXY: 'true',
-      EDGEFETCH_PUBLIC_ORIGIN: '',
-    },
-  });
+  const r5Coord = new LocalAgentHubCoordinator(':memory:');
+  const r5Env = {
+    AGENT_HUB: r5Coord.asNamespace() as never,
+    CALLER_TOKEN: r5Token,
+  };
   try {
-    // OAuth metadata ignores `Host: evil.test` when `EDGEFETCH_PUBLIC_ORIGIN` is unset even with `EDGEFETCH_TRUST_PROXY=true`
-    const rawOAuth = await sendRawTcpRequest(
-      r5Hub.port,
-      'GET /.well-known/oauth-authorization-server HTTP/1.1\r\nHost: evil.test\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n',
-    );
-    assert.equal(rawOAuth.includes('evil.test'), false, `OAuth metadata must NOT reflect untrusted Host: evil.test: ${rawOAuth}`);
-
     // Malformed `%E0%A4%A` path param returns `400` (not `503` uncaught URIError)
-    const badPctRes = await fetch(`http://127.0.0.1:${r5Hub.port}/v1/catalog/%E0%A4%A`, {
-      headers: { authorization: `Bearer ${r5Token}` },
-    });
+    const badPctRes = await hubWorker.fetch(
+      new Request('https://hub.example.com/v1/catalog/%E0%A4%A', {
+        headers: { authorization: `Bearer ${r5Token}` },
+      }),
+      r5Env,
+    );
     assert.equal(badPctRes.status, 400);
-    const badCompatPctRes = await fetch(`http://127.0.0.1:${r5Hub.port}/v2/crawl/%E0%A4%A`, {
-      headers: { authorization: `Bearer ${r5Token}` },
-    });
+    const badCompatPctRes = await hubWorker.fetch(
+      new Request('https://hub.example.com/v2/crawl/%E0%A4%A', {
+        headers: { authorization: `Bearer ${r5Token}` },
+      }),
+      r5Env,
+    );
     assert.equal(badCompatPctRes.status, 400);
 
     // Admin JSON response includes `x-content-type-options: nosniff`
-    const adminUnauth = await fetch(`http://127.0.0.1:${r5Hub.port}/admin/api/state`);
+    const adminUnauth = await hubWorker.fetch(new Request('https://hub.example.com/admin/api/state'), r5Env);
     assert.equal(adminUnauth.status, 401);
     assert.equal(adminUnauth.headers.get('x-content-type-options'), 'nosniff');
-
-    // `R5-M5`: Hold 2 slow-body POST sockets open from the same IP; 3rd request from that IP gets `429`, while another IP (`198.51.100.88`) still succeeds (`200`)!
-    const openSlowPost = (): Promise<{ destroy: () => void }> =>
-      new Promise((resolveConn, rejectConn) => {
-        const s = createConnection({ host: '127.0.0.1', port: r5Hub.port }, () => {
-          s.write(
-            `POST /v1/search HTTP/1.1\r\nHost: 127.0.0.1:${r5Hub.port}\r\nAuthorization: Bearer ${r5Token}\r\nX-Forwarded-For: 203.0.113.55\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{"q":`,
-          );
-          setTimeout(() => resolveConn({ destroy: () => s.destroy() }), 35);
-        });
-        s.on('error', rejectConn);
-      });
-
-    const slow1 = await openSlowPost();
-    const slow2 = await openSlowPost();
-    try {
-      const blockedSameIp = await fetch(`http://127.0.0.1:${r5Hub.port}/health`, {
-        headers: { 'x-forwarded-for': '203.0.113.55' },
-      });
-      assert.equal(blockedSameIp.status, 429, '3rd concurrent request from same IP must hit 429 per-IP slot cap');
-
-      const otherIpOk = await fetch(`http://127.0.0.1:${r5Hub.port}/health`, {
-        headers: { 'x-forwarded-for': '198.51.100.88' },
-      });
-      assert.equal(otherIpOk.status, 200, 'Other client IP must remain unaffected by slow IP');
-    } finally {
-      slow1.destroy();
-      slow2.destroy();
-    }
   } finally {
-    await r5Hub.close();
-    rmSync(tmpHubDir, { recursive: true, force: true });
+    r5Coord.close();
   }
-
-  // 6. Low `safe-fetch.ts`: HTTP `100 Continue` permitted (`<= 3`), caller `Content-Length` stripped/recomputed, `MAX_SAFE_FETCH_TIMEOUT_MS = 60_000`
-  assert.equal(MAX_SAFE_FETCH_TIMEOUT_MS, 60_000);
-  let seenContentLength = '';
-  const rawContinueSrv = createTcpServer((sock) => {
-    let reqBuf = '';
-    let sent100 = false;
-    let replied200 = false;
-    sock.on('data', (chunk) => {
-      reqBuf += chunk.toString('utf8');
-      const hdrEnd = reqBuf.indexOf('\r\n\r\n');
-      if (hdrEnd >= 0 && !sent100) {
-        sent100 = true;
-        const clMatch = /\r\ncontent-length:\s*(\d+)\r\n/i.exec(reqBuf.slice(0, hdrEnd + 2));
-        seenContentLength = clMatch?.[1] ?? '';
-        sock.write('HTTP/1.1 100 Continue\r\n\r\n');
-      }
-      if (hdrEnd >= 0 && !replied200 && reqBuf.slice(hdrEnd + 4).length >= 4) {
-        replied200 = true;
-        sock.write(
-          'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong',
-        );
-        sock.end();
-      }
-    });
-  });
-  await new Promise<void>((res) => rawContinueSrv.listen(0, '127.0.0.1', () => res()));
-  try {
-    const srvAddr = rawContinueSrv.address() as { port: number };
-    const sf = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true });
-    const sfRes = await sf(`http://127.0.0.1:${srvAddr.port}/test`, {
-      method: 'POST',
-      headers: { 'content-length': '999999', expect: '100-continue' },
-      body: 'ping',
-      signal: AbortSignal.timeout(45_000),
-    });
-    assert.equal(sfRes.status, 200);
-    assert.equal(await sfRes.text(), 'pong');
-    assert.equal(seenContentLength, '4', 'safe-fetch must strip forged Content-Length and send exact byte length');
-  } finally {
-    await new Promise<void>((res) => rawContinueSrv.close(() => res()));
-  }
-  void createHttpServer;
 
   // 7. Remaining Hub Lows (`jobs.ts` company match + scrape cap + `x402`, `overflow.ts` empty `User-agent:`, `llm.ts` query redaction)
   const stripeTokens = new Set(['stripe']);
@@ -3502,259 +3221,8 @@ test('SEC-M1B-1: OTLP zero-secret, zero-query-string, & zero-session-id canary a
   }
 });
 
-test('SEC-M1C-1: safe-fetch.ts pre-URL loopback bypass guard, callback lookup, streams, redirects & adapter-sandbox non-configurable globals', async () => {
-  // 1. isPublicIpAddress edge cases
-  assert.equal(isPublicIpAddress(null as unknown as string), false);
-  assert.equal(isPublicIpAddress('fe80::1%eth0'), false);
-  assert.equal(isPublicIpAddress('::ffff:127.0.0.1'), false);
-  assert.equal(isPublicIpAddress('64:ff9b::10.0.0.1'), false);
-  assert.equal(isPublicIpAddress('2001:db8::1'), false);
-  assert.equal(isPublicIpAddress('2606:4700:4700::1111'), true);
-  assert.equal(isPublicIpAddress('not-an-ip'), false);
-
-  // 2. createPublicOnlyLookup callback 3-arg resolver & promise resolver edge cases
-  const cbLookupOk = createPublicOnlyLookup((_h, _o, cb) => cb(null, [{ address: '93.184.216.34', family: 4 }]));
-  await new Promise<void>((res, rej) => {
-    cbLookupOk('example.com', { all: true }, (err, addrs) => {
-      if (err) return rej(err);
-      assert.ok(Array.isArray(addrs) && addrs[0]?.address === '93.184.216.34');
-      res();
-    });
-  });
-  const cbLookupEmpty = createPublicOnlyLookup((_h, _o, cb) => cb(null, []));
-  await new Promise<void>((res) => {
-    cbLookupEmpty('empty.example.com', { all: true }, (err, addrs) => {
-      assert.ok(err && Array.isArray(addrs) && addrs.length === 0);
-      res();
-    });
-  });
-  const cbLookupErr = createPublicOnlyLookup((_h, _o, cb) => cb(new Error('dns fail'), []));
-  await new Promise<void>((res) => {
-    cbLookupErr('err.example.com', {}, (err) => {
-      assert.ok(err instanceof Error);
-      res();
-    });
-  });
-  const syncThrowLookup = createPublicOnlyLookup(() => {
-    throw new Error('sync boom');
-  });
-  await new Promise<void>((res) => {
-    syncThrowLookup('throw.example.com', {}, (err) => {
-      assert.match(String(err), /sync boom/);
-      res();
-    });
-  });
-
-  // 3. Pre-new URL() obfuscated loopback rejection even when allowExplicitLoopbackUrls: true
-  const localSrv = createHttpServer((req, res) => {
-    if (req.url === '/204') {
-      res.writeHead(204, { 'content-length': '5' });
-      res.end();
-      return;
-    }
-    if (req.url === '/big') {
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.write('0123456789');
-      res.end('abcdefghij');
-      return;
-    }
-    if (req.url === '/redir') {
-      res.writeHead(302, { location: 'https://other.example.com/target' });
-      res.end();
-      return;
-    }
-    if (req.url === '/redir-http') {
-      res.writeHead(302, { location: 'http://other.example.com/plain' });
-      res.end();
-      return;
-    }
-    if (req.url === '/redir-noloc') {
-      res.writeHead(302);
-      res.end();
-      return;
-    }
-    if (req.url === '/redir-loop') {
-      res.writeHead(302, { location: 'https://loop.example.com/step' });
-      res.end();
-      return;
-    }
-    res.writeHead(200, { 'content-type': 'text/plain', 'x-dup': ['a', 'b'] });
-    res.end('ok');
-  });
-  await new Promise<void>((res) => localSrv.listen(0, '127.0.0.1', () => res()));
-  const localPort = (localSrv.address() as { port: number }).port;
-  try {
-    const loopbackFetch = createSafeOutboundFetch({
-      allowExplicitLoopbackUrls: true,
-      maxResponseBytes: 12,
-      defaultTimeoutMs: 5_000,
-    });
-
-    // Allowed canonical loopback works
-    const okRes = await loopbackFetch(new URL(`http://127.0.0.1:${localPort}/ok`), {
-      method: 'POST',
-      body: new Uint8Array([65, 66]),
-    });
-    assert.equal(okRes.status, 200);
-    assert.equal(await okRes.text(), 'ok');
-
-    // Obfuscated / userinfo / trailing-dot / port-0 loopback MUST be blocked BEFORE new URL() bypass
-    for (const badLoopback of [
-      `http://2130706433:${localPort}/`,
-      `http://0x7f000001:${localPort}/`,
-      `http://0177.0.0.1:${localPort}/`,
-      `http://127.1:${localPort}/`,
-      `http://[0:0:0:0:0:0:0:1]:${localPort}/`,
-      `http://user:pass@127.0.0.1:${localPort}/`,
-      `http://localhost.:${localPort}/`,
-      'http://127.0.0.1:0/',
-    ]) {
-      await assert.rejects(() => loopbackFetch(badLoopback));
-    }
-
-    // Unsupported protocol
-    await assert.rejects(() => loopbackFetch('ftp://example.com/a'), /Unsupported protocol/);
-
-    // 204 bogus framing & HEAD
-    const r204 = await loopbackFetch(`http://127.0.0.1:${localPort}/204`);
-    assert.equal(r204.status, 204);
-    const rHead = await loopbackFetch(`http://127.0.0.1:${localPort}/ok`, { method: 'HEAD' });
-    assert.equal(rHead.status, 200);
-
-    // Stream byte cap exceeded (>12 bytes) & stream cancel
-    const bigRes = await loopbackFetch(`http://127.0.0.1:${localPort}/big`);
-    await assert.rejects(() => bigRes.text(), /exceeds 12 bytes/);
-    const cancelRes = await loopbackFetch(`http://127.0.0.1:${localPort}/ok`);
-    await cancelRes.body?.cancel();
-
-    // redirect: 'error' and redirect: 'follow' cross-origin header stripping (proxy-authorization, auth, cookies, API keys)
-    await assert.rejects(
-      () => loopbackFetch(`http://127.0.0.1:${localPort}/redir`, { redirect: 'error' }),
-      /Unexpected redirect/,
-    );
-    await assert.rejects(
-      () => loopbackFetch(`http://127.0.0.1:${localPort}/redir-http`, { redirect: 'follow' }),
-      /Refusing redirect to non-HTTPS URL/,
-    );
-    const noLocRes = await loopbackFetch(`http://127.0.0.1:${localPort}/redir-noloc`, { redirect: 'follow' });
-    assert.equal(noLocRes.status, 302);
-    await noLocRes.body?.cancel();
-
-    {
-      const origHttpsRequest = https.request;
-      const capturedHops: Array<{ url: string; method: string; headers: Record<string, string | string[] | undefined> }> = [];
-      (https as unknown as { request: typeof https.request }).request = ((
-        urlOrOpts: URL | string | https.RequestOptions,
-        optsOrCb?: https.RequestOptions | ((res: unknown) => void),
-        maybeCb?: (res: unknown) => void,
-      ) => {
-        const opts = (typeof optsOrCb === 'function' ? {} : optsOrCb ?? {}) as https.RequestOptions;
-        const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (res: unknown) => void;
-        const targetStr = urlOrOpts instanceof URL ? urlOrOpts.toString() : String(urlOrOpts);
-        capturedHops.push({
-          url: targetStr,
-          method: String(opts.method ?? 'GET'),
-          headers: { ...((opts.headers ?? {}) as Record<string, string | string[] | undefined>) },
-        });
-        const reqEmitter = new EventEmitter() as EventEmitter & {
-          socket?: unknown;
-          write: () => boolean;
-          end: () => void;
-          destroy: () => void;
-        };
-        reqEmitter.write = () => true;
-        reqEmitter.destroy = () => undefined;
-        reqEmitter.end = () => {
-          queueMicrotask(() => {
-            if (targetStr.includes('loop.example.com')) {
-              const loopRes = Object.assign(new PassThrough(), {
-                statusCode: 302,
-                statusMessage: 'Found',
-                headers: { location: 'https://loop.example.com/step' },
-                complete: true,
-              });
-              cb(loopRes);
-              queueMicrotask(() => loopRes.end());
-              return;
-            }
-            const okHopRes = Object.assign(new PassThrough(), {
-              statusCode: 200,
-              statusMessage: 'OK',
-              headers: { 'content-type': 'text/plain' },
-              complete: true,
-            });
-            cb(okHopRes);
-            queueMicrotask(() => okHopRes.end('redir-ok'));
-          });
-        };
-        return reqEmitter as unknown as ReturnType<typeof https.request>;
-      }) as typeof https.request;
-      try {
-        const followRes = await loopbackFetch(`http://127.0.0.1:${localPort}/redir`, {
-          method: 'POST',
-          body: 'secret-body',
-          redirect: 'follow',
-          headers: {
-            authorization: 'Bearer secret-token',
-            'proxy-authorization': 'Basic c2VjcmV0',
-            cookie: 'session=abc123',
-            'x-api-key': 'ef-api-secret',
-            'x-goog-api-key': 'goog-secret',
-            'content-type': 'application/json',
-            'x-custom-keep': 'kept-value',
-          },
-        });
-        assert.equal(followRes.status, 200);
-        assert.equal(await followRes.text(), 'redir-ok');
-        assert.equal(capturedHops.length, 1);
-        assert.equal(capturedHops[0]!.url, 'https://other.example.com/target');
-        assert.equal(capturedHops[0]!.method, 'GET');
-        assert.equal(capturedHops[0]!.headers['authorization'], undefined);
-        assert.equal(capturedHops[0]!.headers['proxy-authorization'], undefined);
-        assert.equal(capturedHops[0]!.headers['cookie'], undefined);
-        assert.equal(capturedHops[0]!.headers['x-api-key'], undefined);
-        assert.equal(capturedHops[0]!.headers['x-goog-api-key'], undefined);
-        assert.equal(capturedHops[0]!.headers['content-type'], undefined);
-        assert.equal(capturedHops[0]!.headers['content-length'], undefined);
-        assert.equal(capturedHops[0]!.headers['x-custom-keep'], 'kept-value');
-
-        await assert.rejects(
-          () => loopbackFetch(`http://127.0.0.1:${localPort}/redir-loop`, { redirect: 'follow' }),
-          /Too many redirects/,
-        );
-      } finally {
-        (https as unknown as { request: typeof https.request }).request = origHttpsRequest;
-      }
-    }
-    const streamPost = await loopbackFetch(`http://127.0.0.1:${localPort}/ok`, {
-      method: 'POST',
-      body: new Blob(['hi']).stream(),
-    });
-    assert.equal(streamPost.status, 200);
-    const abPost = await loopbackFetch(new Request(`http://127.0.0.1:${localPort}/ok`, { method: 'POST', body: 'x' }), {
-      body: new TextEncoder().encode('ab').buffer,
-    });
-    assert.equal(abPost.status, 200);
-
-    // Timeout path
-    const slowSrv = createHttpServer((_req, _res) => {
-      // leave open until socket destroyed
-    });
-    await new Promise<void>((res) => slowSrv.listen(0, '127.0.0.1', () => res()));
-    const slowPort = (slowSrv.address() as { port: number }).port;
-    try {
-      const fastTimeoutFetch = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true, defaultTimeoutMs: 40 });
-      await assert.rejects(() => fastTimeoutFetch(`http://127.0.0.1:${slowPort}/`), /timed out/i);
-    } finally {
-      slowSrv.closeAllConnections?.();
-      await new Promise<void>((res) => slowSrv.close(() => res()));
-    }
-  } finally {
-    localSrv.closeAllConnections?.();
-    await new Promise<void>((res) => localSrv.close(() => res()));
-  }
-
-  // 4. adapter-sandbox.ts non-configurable global catch branches (lines 52-54, 67, 74, 77-79) + runUntrustedAdapterInDynamicWorker
+test('SEC-M1C-1: adapter-sandbox non-configurable globals & runUntrustedAdapterInDynamicWorker', async () => {
+  // adapter-sandbox.ts non-configurable global catch branches + runUntrustedAdapterInDynamicWorker
   const sandboxOut = runAdapterSyncInBulkhead(
     'test-err',
     () => {
@@ -4690,207 +4158,6 @@ test('SEC-R2-B1: adapter-sandbox, auth, spa-fallback, bot-auth, otel & safe-fetc
   Object.defineProperty(wsLikeResp, 'webSocket', { value: {} });
   Object.defineProperty(wsLikeResp.headers, 'set', { value: () => { throw new TypeError('immutable'); } });
   assert.equal(injectTraceHeaders(wsLikeResp, healthTracer), wsLikeResp);
-
-  // --- 6. portable/safe-fetch.ts ---
-  assert.equal(isPublicIpAddress(123 as unknown as string), false);
-  assert.equal(isPublicIpAddress('2001:4860:4860::8888'), true);
-  assert.equal(isPublicIpAddress('2001:db8::1'), false);
-  assert.equal(isPublicIpAddress('2606:4700:4700::1111'), true);
-  assert.equal(isPublicIpAddress('::ffff:127.0.0.1'), false);
-  assert.equal(isPublicIpAddress('2001:db8::192.0.2.1'), false);
-
-  // createPublicOnlyLookup edge paths: wantAll=false, callback resolver (3-arg), double-settle, empty/bad entry, throwing resolver
-  const lookupSingle = createPublicOnlyLookup(async () => [{ address: '93.184.216.34', family: 4 }]);
-  await new Promise<void>((res, rej) => {
-    lookupSingle('example.com', 4 as unknown as Record<string, unknown>, (err, addr, fam) => {
-      if (err) return rej(err);
-      assert.equal(addr, '93.184.216.34');
-      assert.equal(fam, 4);
-      res();
-    });
-  });
-  const lookupEmpty = createPublicOnlyLookup(async () => []);
-  await new Promise<void>((res) => {
-    lookupEmpty('empty.example.com', { all: true }, (err) => {
-      assert.match(String(err), /returned no addresses/);
-      res();
-    });
-  });
-  const lookupBadEntry = createPublicOnlyLookup(async () => [{ address: '', family: 4 }]);
-  await new Promise<void>((res) => {
-    lookupBadEntry('badentry.example.com', { all: false }, (err) => {
-      assert.match(String(err), /non-public IP/);
-      res();
-    });
-  });
-  const lookupRejectStr = createPublicOnlyLookup(async () => {
-    throw 'dns_str_fail';
-  });
-  await new Promise<void>((res) => {
-    lookupRejectStr('rej.example.com', { all: false }, (err) => {
-      assert.match(String(err), /dns_str_fail/);
-      res();
-    });
-  });
-  const lookupCbDouble = createPublicOnlyLookup((_h, _o, cb) => {
-    cb(null, [{ address: '93.184.216.34', family: 4 }]);
-    cb(new Error('late_cb'), []);
-  });
-  await new Promise<void>((res, rej) => {
-    lookupCbDouble('cb.example.com', { all: false }, (err, addr) => {
-      if (err) return rej(err);
-      assert.equal(addr, '93.184.216.34');
-      res();
-    });
-  });
-  const lookupCbErr = createPublicOnlyLookup((_h, _o, cb) => {
-    cb(Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }), []);
-  });
-  await new Promise<void>((res) => {
-    lookupCbErr('miss.example.com', { all: false }, (err) => {
-      assert.match(String(err), /ENOTFOUND/);
-      res();
-    });
-  });
-  const lookupCbThrows = createPublicOnlyLookup((_h, _o, _cb) => {
-    throw 'sync_cb_resolver_throw';
-  });
-  await new Promise<void>((res) => {
-    lookupCbThrows('throw.example.com', { all: false }, (err) => {
-      assert.match(String(err), /sync_cb_resolver_throw/);
-      res();
-    });
-  });
-
-  // Raw TCP server for 101 upgrade, 102 info, 4x 100 info, premature close, immediate destroy
-  const rawSrv = createTcpServer((sock) => {
-    let reqBuf = '';
-    sock.on('data', (d) => {
-      reqBuf += d.toString('utf8');
-      const hdrEnd = reqBuf.indexOf('\r\n\r\n');
-      if (hdrEnd < 0) return;
-      const curReq = reqBuf.slice(0, hdrEnd);
-      reqBuf = reqBuf.slice(hdrEnd + 4);
-      if (curReq.startsWith('GET /upgrade ')) {
-        sock.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
-      } else if (curReq.startsWith('GET /info102 ')) {
-        sock.write('HTTP/1.1 102 Processing\r\n\r\n');
-      } else if (curReq.startsWith('GET /info-loop ')) {
-        sock.write('HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n');
-      } else if (curReq.startsWith('GET /premature ')) {
-        sock.write('HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial');
-        sock.destroy();
-      } else if (curReq.startsWith('GET /drop ')) {
-        sock.destroy();
-      } else if (curReq.startsWith('GET /redir-body ')) {
-        sock.write('HTTP/1.1 302 Found\r\nLocation: https://other.example.com/\r\nContent-Length: 4\r\nConnection: close\r\n\r\nmove');
-      } else if (curReq.startsWith('GET /set-cookie-arr ')) {
-        sock.write('HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
-      } else if (curReq.startsWith('GET /204-clean ')) {
-        sock.write('HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n');
-      } else if (curReq.startsWith('GET /abort-stream ')) {
-        sock.write('HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\nhello');
-      }
-    });
-  });
-  await new Promise<void>((res) => rawSrv.listen(0, '127.0.0.1', () => res()));
-  const rawPort = (rawSrv.address() as { port: number }).port;
-  try {
-    const sfRaw = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true, defaultTimeoutMs: 2_000 });
-    await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/upgrade`), /101 Switching Protocols/);
-    await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/info102`), /Disallowed HTTP 102/);
-    await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/info-loop`), /Disallowed HTTP 100/);
-    const premRes = await sfRaw(`http://127.0.0.1:${rawPort}/premature`);
-    await assert.rejects(() => premRes.text(), /Premature close|aborted/);
-    await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/drop`), /Socket closed|socket hang up/i);
-    await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/redir-body`, { redirect: 'error' }), /Unexpected redirect/);
-    const arrRes = await sfRaw(`http://127.0.0.1:${rawPort}/set-cookie-arr`);
-    assert.equal(await arrRes.text(), 'ok');
-    const clean204 = await sfRaw(`http://127.0.0.1:${rawPort}/204-clean`);
-    assert.equal(clean204.status, 204);
-
-    // Pre-aborted signal & mid-stream abort with activeRes
-    const preAborted = new AbortController();
-    preAborted.abort('custom_abort_reason');
-    await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/204-clean`, { signal: preAborted.signal }), /custom_abort_reason/);
-
-    const defaultSf = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true });
-    const midAbort = new AbortController();
-    const abortRes = await defaultSf(`http://127.0.0.1:${rawPort}/abort-stream`, { signal: midAbort.signal });
-    midAbort.abort(new Error('mid_abort'));
-    await assert.rejects(() => abortRes.text());
-
-    // Synchronous http.request throw + CONNECT event + pre-start res error
-    const origHttpReq = http.request;
-    (http as unknown as { request: typeof http.request }).request = (() => {
-      throw new Error('sync_req_boom');
-    }) as typeof http.request;
-    try {
-      await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/204-clean`), /sync_req_boom/);
-    } finally {
-      (http as unknown as { request: typeof http.request }).request = origHttpReq;
-    }
-
-    // Mocked http.request emitting 102 informational response via res callback, connect event, pre-stream res error, and premature close without error
-    const origHttpReq2 = http.request;
-    let mockMode: 'res1xx' | 'connect' | 'pre_stream_err' | 'premature_close' = 'res1xx';
-    (http as unknown as { request: typeof http.request }).request = ((
-      _u: unknown,
-      _o: unknown,
-      cb?: (r: unknown) => void,
-    ) => {
-      const reqEm = new EventEmitter() as EventEmitter & { write: () => boolean; end: () => void; destroy: () => void };
-      reqEm.write = () => true;
-      reqEm.destroy = () => undefined;
-      reqEm.end = () => {
-        queueMicrotask(() => {
-          if (mockMode === 'connect') {
-            const fakeSock = new EventEmitter() as EventEmitter & { destroy: () => void };
-            fakeSock.destroy = () => undefined;
-            reqEm.emit('connect', {}, fakeSock);
-            return;
-          }
-          if (mockMode === 'res1xx') {
-            const fakeRes = Object.assign(new PassThrough(), { statusCode: 150, headers: {}, socket: { destroy: () => undefined } });
-            cb?.(fakeRes);
-            return;
-          }
-          if (mockMode === 'premature_close') {
-            const fakeResPrem = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: false });
-            cb?.(fakeResPrem);
-            queueMicrotask(() => fakeResPrem.emit('close'));
-            return;
-          }
-          const fakeResErr = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: false });
-          const origPause = fakeResErr.pause.bind(fakeResErr);
-          fakeResErr.pause = () => {
-            const out = origPause();
-            fakeResErr.emit('error', new Error('early_stream_err'));
-            return out;
-          };
-          cb?.(fakeResErr);
-        });
-      };
-      return reqEm as unknown as ReturnType<typeof http.request>;
-    }) as typeof http.request;
-    try {
-      mockMode = 'res1xx';
-      await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/204-clean`), /informational response/);
-      mockMode = 'connect';
-      await assert.rejects(() => sfRaw(`http://127.0.0.1:${rawPort}/204-clean`), /HTTP CONNECT is not allowed/);
-      mockMode = 'premature_close';
-      const mockPremRes = await sfRaw(`http://127.0.0.1:${rawPort}/204-clean`);
-      await assert.rejects(() => mockPremRes.text(), /Premature close/);
-      mockMode = 'pre_stream_err';
-      const earlyErrRes = await sfRaw(`http://127.0.0.1:${rawPort}/204-clean`);
-      await assert.rejects(() => earlyErrRes.text(), /early_stream_err/);
-    } finally {
-      (http as unknown as { request: typeof http.request }).request = origHttpReq2;
-    }
-  } finally {
-    rawSrv.closeAllConnections?.();
-    await new Promise<void>((res) => rawSrv.close(() => res()));
-  }
 });
 
 test('SEC-R2-B2: waf.ts and scrape-advanced.ts line and branch closure', async () => {
@@ -6578,55 +5845,6 @@ test('SEC-R2-B6: final line and branch closure across all 12 assigned modules', 
   assert.equal(singleOfferProd?.price, 19.5);
   assert.equal(singleOfferProd?.variants, undefined);
 
-  // --- 4. portable/safe-fetch.ts remaining lines (439, 448, 522-523, 528-531) ---
-  const origHttpReqSf = http.request;
-  let sfMockCase: 'close_complete' | 'req_close_early' = 'close_complete';
-  (http as unknown as { request: typeof http.request }).request = ((
-    _u: unknown,
-    _o: unknown,
-    cb?: (r: unknown) => void,
-  ) => {
-    const reqEm = new EventEmitter() as EventEmitter & { write: () => boolean; end: () => void; destroy: () => void };
-    reqEm.write = () => true;
-    reqEm.destroy = () => undefined;
-    reqEm.end = () => {
-      queueMicrotask(() => {
-        if (sfMockCase === 'req_close_early') {
-          reqEm.emit('close');
-          return;
-        }
-        const fakeResComp = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: true });
-        cb?.(fakeResComp);
-        queueMicrotask(() => {
-          fakeResComp.emit('close');
-          fakeResComp.emit('end');
-        });
-      });
-    };
-    return reqEm as unknown as ReturnType<typeof http.request>;
-  }) as typeof http.request;
-  try {
-    const sfMock = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true, defaultTimeoutMs: 2_000 });
-    sfMockCase = 'close_complete';
-    const compRes = await sfMock('http://127.0.0.1:8080/comp');
-    assert.equal(await compRes.text(), '');
-    sfMockCase = 'req_close_early';
-    await assert.rejects(() => sfMock('http://127.0.0.1:8080/early'), /Socket closed before HTTP response/);
-
-    // Abort mid-body read before executeSingleRequest runs (hits lines 527-531 / 264-267)
-    const acMidBody = new AbortController();
-    const slowBody = new ReadableStream({
-      start(c) {
-        c.enqueue(new TextEncoder().encode('a'));
-        acMidBody.abort('aborted_during_body_read');
-        c.close();
-      },
-    });
-    await assert.rejects(() => sfMock('http://127.0.0.1:8080/post', { method: 'POST', body: slowBody, signal: acMidBody.signal }));
-  } finally {
-    (http as unknown as { request: typeof http.request }).request = origHttpReqSf;
-  }
-
   // --- 5. overflow.ts remaining lines (440-444, 547, 586, 634-649, 665, 868-881, 958-961, 1049-1050) ---
   assert.equal(isSafePublicHostname('bad:host.com'), false);
   assert.equal(isSafePublicHostname('metadata.goog'), false);
@@ -7691,294 +6909,6 @@ test('SEC-R3-B3: scrape-advanced.ts prompt injection, selectors, product fallbac
   assert.equal(encodeBodyToRawBase64({}), undefined);
 });
 
-test('SEC-R3-B4: safe-fetch.ts IPv6/lookup/redirect 301/303/307/error, backpressure, signal-abort & close paths', async () => {
-  // IPv6 & non-string IP branches
-  assert.equal(isPublicIpAddress(123 as unknown as string), false);
-  assert.equal(isPublicIpAddress('2001:0:4136:e378::1'), false); // 2001::/23 (Teredo)
-  assert.equal(isPublicIpAddress('2001:4860:4860::8888'), true); // Public unicast
-  assert.equal(isPublicIpAddress('2606:4700:4700::1111'), true);
-  assert.equal(isPublicIpAddress('[2606:4700:4700::1111]'), true);
-  assert.equal(isPublicIpAddress('2000::1.2.3.4'), true); // embedded IPv4 in global unicast
-  assert.equal(isPublicIpAddress('fe80::1%eth0'), false);
-
-  // createPublicOnlyLookup edge cases: duplicate callback, empty addrs, bad entry family, promise non-Error, callback getter throw
-  const dupLookup = createPublicOnlyLookup((_h, _o, cb) => {
-    cb(null, [{ address: '1.1.1.1', family: 4 }]);
-    cb(null, [{ address: '1.1.1.1', family: 4 }]);
-  });
-  await new Promise<void>((resolve, reject) => {
-    dupLookup('dup.example', { all: true }, (err, addrs) => {
-      try {
-        assert.equal(err, null);
-        assert.equal((addrs as unknown as Array<{ address: string }>).length, 1);
-        resolve();
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
-
-  const emptyLookup = createPublicOnlyLookup(async () => []);
-  await new Promise<void>((resolve) => {
-    emptyLookup('empty.example', {}, (err) => {
-      assert.match(err?.message ?? '', /no addresses/);
-      resolve();
-    });
-  });
-
-  const badFamLookup = createPublicOnlyLookup(async () => [{ address: '1.1.1.1', family: 99 as 4 }]);
-  await new Promise<void>((resolve) => {
-    badFamLookup('badfam.example', {}, (err, addr) => {
-      assert.equal(err, null);
-      assert.equal(addr, '1.1.1.1');
-      resolve();
-    });
-  });
-
-  const nonErrRejectLookup = createPublicOnlyLookup(async () => {
-    throw 'string-dns-fail';
-  });
-  await new Promise<void>((resolve) => {
-    nonErrRejectLookup('reject.example', { all: true }, (err) => {
-      assert.equal(err?.message, 'string-dns-fail');
-      resolve();
-    });
-  });
-
-  const throwGetterEntry = {} as { address: string; family: number };
-  Object.defineProperty(throwGetterEntry, 'address', {
-    get() {
-      throw new Error('getter-boom');
-    },
-  });
-  const cbThrowLookup = createPublicOnlyLookup((_h, _o, cb) => {
-    cb(null, [throwGetterEntry as never]);
-  });
-  await new Promise<void>((resolve) => {
-    cbThrowLookup('cbthrow.example', {}, (err) => {
-      assert.equal(err?.message, 'getter-boom');
-      resolve();
-    });
-  });
-
-  // Explicit loopback validation rejections (`@`, port > 65535) + non-public IP literal + unsupported protocol
-  const loopbackFetch = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true });
-  await assert.rejects(() => loopbackFetch('http://user@127.0.0.1:8080/'), /SSRF|refusing/);
-  await assert.rejects(() => loopbackFetch('http://127.0.0.1:70000/'), /Invalid URL/);
-  await assert.rejects(() => loopbackFetch('ftp://example.com/'), /Unsupported protocol/);
-  await assert.rejects(() => loopbackFetch('https://10.0.0.1/'), /SSRF blocked/);
-
-  // Pre-aborted signal with custom string reason
-  const preAborted = new AbortController();
-  preAborted.abort('custom-abort-reason');
-  await assert.rejects(() => loopbackFetch('https://example.com/', { signal: preAborted.signal }), (err) => err === 'custom-abort-reason');
-
-  // Mocked https.request covering 301/303/307 redirects, missing Location, redirect:'error', 204/205 bogus framing,
-  // 100/103 allowed informational + 4th disallowed, upgrade, backpressure desiredSize<=0, premature close, and abort during hop/mod.request!
-  const origHttpsReq = https.request;
-  const origHttpReq = http.request;
-  let capturedRedirectMethods: string[] = [];
-  let capturedBodies: Array<string | null> = [];
-  let scenario = '';
-
-  const makeMockReq = (
-    handler: (
-      urlStr: string,
-      opts: https.RequestOptions,
-      cb: (res: unknown) => void,
-      reqEm: EventEmitter & { socket?: EventEmitter & { destroy: () => void }; write: (b: unknown) => boolean; end: () => void; destroy: (e?: Error) => void },
-    ) => void,
-  ) =>
-    ((urlOrOpts: URL | string | https.RequestOptions, optsOrCb?: https.RequestOptions | ((res: unknown) => void), maybeCb?: (res: unknown) => void) => {
-      const opts = (typeof optsOrCb === 'function' ? {} : optsOrCb ?? {}) as https.RequestOptions;
-      const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (res: unknown) => void;
-      const urlStr = urlOrOpts instanceof URL ? urlOrOpts.toString() : String(urlOrOpts);
-      const chunks: Buffer[] = [];
-      const reqEm = new EventEmitter() as EventEmitter & {
-        socket?: EventEmitter & { destroy: () => void };
-        write: (b: unknown) => boolean;
-        end: () => void;
-        destroy: (e?: Error) => void;
-      };
-      reqEm.socket = Object.assign(new EventEmitter(), { destroy: () => undefined });
-      reqEm.write = (b: unknown) => {
-        chunks.push(Buffer.isBuffer(b) ? b : Buffer.from(String(b)));
-        return true;
-      };
-      reqEm.destroy = () => undefined;
-      reqEm.end = () => {
-        capturedRedirectMethods.push(String(opts.method ?? 'GET'));
-        capturedBodies.push(chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : null);
-        handler(urlStr, opts, cb, reqEm);
-      };
-      return reqEm as unknown as ReturnType<typeof https.request>;
-    }) as typeof https.request;
-
-  try {
-    const mockFetch = createSafeOutboundFetch({
-      resolver: async () => [{ address: '93.184.216.34', family: 4 }],
-      maxResponseBytes: 1024 * 1024,
-    });
-
-    // 1. 301, 303 (POST -> GET, body cleared) and 307 (POST preserved with body)
-    (https as unknown as { request: typeof https.request }).request = makeMockReq((urlStr, _opts, cb) => {
-      queueMicrotask(() => {
-        if (urlStr.endsWith('/r301')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 301, headers: { location: 'https://r.example.com/r307' }, complete: true });
-          cb(r);
-          r.end();
-        } else if (urlStr.endsWith('/r307')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 307, headers: { location: 'https://r.example.com/r303' }, complete: true });
-          cb(r);
-          r.end();
-        } else if (urlStr.endsWith('/r303')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 303, headers: { location: 'https://r.example.com/final' }, complete: true });
-          cb(r);
-          r.end();
-        } else if (urlStr.endsWith('/noloc')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 302, headers: {}, complete: true });
-          cb(r);
-          r.end();
-        } else if (urlStr.endsWith('/http-redir')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 302, headers: { location: 'http://insecure.example.com/x' }, complete: true });
-          cb(r);
-          r.end();
-        } else {
-          const r = Object.assign(new PassThrough(), { statusCode: 200, headers: { 'set-cookie': ['a=1', 'b=2'] }, complete: true });
-          cb(r);
-          r.end('done');
-        }
-      });
-    });
-
-    capturedRedirectMethods = [];
-    capturedBodies = [];
-    const r301 = await mockFetch('https://r.example.com/r301', { method: 'POST', body: 'payload', redirect: 'follow' });
-    assert.equal(r301.status, 200);
-    assert.equal(await r301.text(), 'done');
-    assert.deepEqual(capturedRedirectMethods, ['POST', 'GET', 'GET', 'GET']);
-
-    // 307 alone preserves POST + body
-    capturedRedirectMethods = [];
-    capturedBodies = [];
-    const r307 = await mockFetch('https://r.example.com/r307', { method: 'POST', body: 'kept-body', redirect: 'follow' });
-    assert.equal(r307.status, 200);
-    assert.equal(await r307.text(), 'done');
-    assert.deepEqual(capturedRedirectMethods, ['POST', 'POST', 'GET']);
-    assert.equal(capturedBodies[1], 'kept-body');
-
-    // redirect:'error' on 302
-    await assert.rejects(() => mockFetch('https://r.example.com/r301', { redirect: 'error' }), /Unexpected redirect HTTP 301/);
-
-    // 302 without Location header returns 302
-    const noLoc = await mockFetch('https://r.example.com/noloc', { redirect: 'follow' });
-    assert.equal(noLoc.status, 302);
-
-    // Non-HTTPS redirect rejected
-    await assert.rejects(() => mockFetch('https://r.example.com/http-redir', { redirect: 'follow' }), /non-HTTPS URL/);
-
-    // 2. 205 with bogus content-length, 100/103 informational frames (>3 rejected), upgrade 101, backpressure (>64KiB), premature close
-    (https as unknown as { request: typeof https.request }).request = makeMockReq((urlStr, _opts, cb, reqEm) => {
-      queueMicrotask(() => {
-        if (urlStr.endsWith('/205-bogus')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 205, headers: { 'content-length': '10' }, complete: true });
-          cb(r);
-          r.end();
-        } else if (urlStr.endsWith('/info-flood')) {
-          reqEm.emit('information', { statusCode: 100 });
-          reqEm.emit('information', { statusCode: 103 });
-          reqEm.emit('information', { statusCode: 100 });
-          reqEm.emit('information', { statusCode: 100 }); // 4th exceeds limit -> reject
-        } else if (urlStr.endsWith('/upgrade')) {
-          const sock = Object.assign(new EventEmitter(), { destroy: () => undefined });
-          reqEm.emit('upgrade', {}, sock);
-        } else if (urlStr.endsWith('/premature')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: false });
-          cb(r);
-          queueMicrotask(() => {
-            r.write('part');
-            r.destroy();
-          });
-        } else if (urlStr.endsWith('/backpressure')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: true });
-          cb(r);
-          // Emit >32 chunks so desiredSize <= 0 triggers res.pause(), then end
-          for (let i = 0; i < 20; i++) r.write(Buffer.alloc(4096, 65));
-          r.end();
-        } else if (urlStr.endsWith('/abort-hop0')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 302, headers: { location: 'https://r.example.com/final' }, complete: true });
-          cb(r);
-          r.end();
-        } else if (urlStr.endsWith('/abort-mid')) {
-          const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: false });
-          cb(r);
-        } else if (urlStr.endsWith('/abort-prehdr')) {
-          // Hold before headers so abort fires while activeRes is still null
-        }
-      });
-    });
-
-    const r205 = await mockFetch('https://r.example.com/205-bogus');
-    assert.equal(r205.status, 205);
-    await assert.rejects(() => mockFetch('https://r.example.com/info-flood'), /Disallowed HTTP 100/);
-    await assert.rejects(() => mockFetch('https://r.example.com/upgrade'), /HTTP 101 Switching Protocols/);
-    const premRes = await mockFetch('https://r.example.com/premature');
-    await assert.rejects(() => premRes.text(), /Premature close/);
-    const bpRes = await mockFetch('https://r.example.com/backpressure');
-    const bpBuf = await bpRes.arrayBuffer();
-    assert.equal(bpBuf.byteLength, 20 * 4096);
-
-    // Abort mid-stream (activeRes !== null) AND before headers (activeRes === null) with non-Error reason
-    const midAbort = new AbortController();
-    const midRes = await mockFetch('https://r.example.com/abort-mid', { signal: midAbort.signal });
-    setTimeout(() => midAbort.abort('mid-abort-str'), 15);
-    await assert.rejects(() => midRes.text(), /mid-abort-str/);
-
-    const preHdrAbort = new AbortController();
-    const preHdrPromise = mockFetch('https://r.example.com/abort-prehdr', { signal: preHdrAbort.signal });
-    setTimeout(() => preHdrAbort.abort('pre-hdr-str'), 15);
-    await assert.rejects(() => preHdrPromise, (e) => e === 'pre-hdr-str');
-
-    // Synchronous abort inside mod.request (lines 527-532) & abort between redirect hops (lines 263-267)
-    const syncAbort = new AbortController();
-    (https as unknown as { request: typeof https.request }).request = ((
-      _u: URL | string | https.RequestOptions,
-      _o?: https.RequestOptions | ((res: unknown) => void),
-      _c?: (res: unknown) => void,
-    ) => {
-      syncAbort.abort('sync-inside-request');
-      const reqEm = new EventEmitter() as EventEmitter & { write: () => boolean; end: () => void; destroy: () => void };
-      reqEm.write = () => true;
-      reqEm.end = () => undefined;
-      reqEm.destroy = () => undefined;
-      return reqEm as unknown as ReturnType<typeof https.request>;
-    }) as typeof https.request;
-    await assert.rejects(() => mockFetch('https://r.example.com/sync-abort', { signal: syncAbort.signal }), (e) => e === 'sync-inside-request');
-
-    // Abort triggered during hop 0 redirect body cancel before hop 1 starts (lines 263-267)
-    const hopAbort = new AbortController();
-    scenario = 'hop0';
-    (https as unknown as { request: typeof https.request }).request = makeMockReq((_u, _o, cb) => {
-      if (scenario === 'hop0') {
-        scenario = 'hop1';
-        const r = Object.assign(new PassThrough(), { statusCode: 302, headers: { location: 'https://r.example.com/next' }, complete: true });
-        r.destroy = () => {
-          hopAbort.abort('aborted-between-hops');
-          return r;
-        };
-        cb(r);
-      }
-    });
-    await assert.rejects(
-      () => mockFetch('https://r.example.com/hop-abort', { redirect: 'follow', signal: hopAbort.signal }),
-      (e) => e === 'aborted-between-hops',
-    );
-  } finally {
-    (https as unknown as { request: typeof https.request }).request = origHttpsReq;
-    (http as unknown as { request: typeof http.request }).request = origHttpReq;
-  }
-});
-
 test('SEC-R3-B5: overflow.ts URI normalization, robots parser/signals/allowlist/URL validation & overflow fetch paths', async () => {
   assert.equal(normalizeRobotsURI('/%41%7A%30%2D%2E%5F%7E%2F%ZZ'), '/Az0-._~%2F%ZZ');
   assert.equal(matchRobotsPattern('/exact$', '/exact'), true);
@@ -8674,7 +7604,7 @@ test('SEC-R3-B7: safe-input.ts body cap, scanners, split-tag guards, escapeOutsi
   assert.equal(normalizeClientRateLimitIp('not:an:ip:zzz'), 'not:an:ip:zzz');
 });
 
-test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, waf, overflow, safe-fetch & safe-input', async () => {
+test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, waf, overflow & safe-input', async () => {
   // 1. framework-detect.ts remaining branches
   assert.deepEqual(scanGeneratorMetaTagsLinear('<meta name><meta name='), []);
   assert.equal(
@@ -8989,139 +7919,6 @@ test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, w
     (await fetchOverflowRobots('https://r8.example.com', 'EdgeFetch', async () => new Response(null, { status: 404 }), Date.now() + 5000)).unreachable,
     false,
   );
-
-  // 5. safe-fetch.ts remaining branches
-  assert.equal(isPublicIpAddress(''), false);
-  assert.equal(isPublicIpAddress('2606::1.2.3.4'), true);
-
-  const dupFailLookup = createPublicOnlyLookup((_h, _o, cb) => {
-    cb(new Error('first'), []);
-    cb(new Error('second'), []);
-  });
-  await new Promise<void>((resolve) => {
-    dupFailLookup('d.example', {}, () => resolve());
-  });
-  const nullArrLookup = createPublicOnlyLookup(async () => null as unknown as []);
-  await new Promise<void>((resolve) => {
-    nullArrLookup('n.example', {}, (e) => {
-      assert.ok(e);
-      resolve();
-    });
-  });
-  const badEntryLookup = createPublicOnlyLookup(async () => [null as unknown as { address: string; family: 4 }]);
-  await new Promise<void>((resolve) => {
-    badEntryLookup('be.example', {}, (e) => {
-      assert.ok(e);
-      resolve();
-    });
-  });
-  const errRejectLookup = createPublicOnlyLookup(async () => {
-    throw new Error('async-err');
-  });
-  await new Promise<void>((resolve) => {
-    errRejectLookup('er.example', {}, (e) => {
-      assert.equal(e?.message, 'async-err');
-      resolve();
-    });
-  });
-  const syncThrowLookup = createPublicOnlyLookup((_h, _o, _cb) => {
-    throw new Error('sync-throw');
-  });
-  await new Promise<void>((resolve) => {
-    syncThrowLookup('st.example', {}, (e) => {
-      assert.equal(e?.message, 'sync-throw');
-      resolve();
-    });
-  });
-
-  const origHttpsReq2 = https.request;
-  const origHttpReq2 = http.request;
-  try {
-    (http as unknown as { request: typeof http.request }).request = ((
-      _u: URL | string | http.RequestOptions,
-      optsOrCb?: http.RequestOptions | ((res: unknown) => void),
-      maybeCb?: (res: unknown) => void,
-    ) => {
-      const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (res: unknown) => void;
-      const reqEm = new EventEmitter() as EventEmitter & { write: () => boolean; end: () => void; destroy: () => void };
-      reqEm.write = () => true;
-      reqEm.destroy = () => undefined;
-      reqEm.end = () => {
-        queueMicrotask(() => {
-          const r = Object.assign(new PassThrough(), { statusCode: 204, headers: { 'transfer-encoding': 'chunked' }, complete: true });
-          cb(r);
-          r.end();
-        });
-      };
-      return reqEm as unknown as ReturnType<typeof http.request>;
-    }) as typeof http.request;
-    const lbFetch2 = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true });
-    assert.equal((await lbFetch2('http://localhost:8080/x', { headers: { host: 'evil', 'content-length': '99' } })).status, 204);
-    assert.equal((await lbFetch2('http://[::1]:8080/x')).status, 204);
-    assert.equal((await lbFetch2('http://127.0.0.1/x')).status, 204);
-
-    // https mock: 102 info, connect, duplicate req error+close, 304, HEAD, ReadableStream cancel(), res error before start, redirect:'follow'/'error' on 200, Error abort reason
-    (https as unknown as { request: typeof https.request }).request = ((
-      urlOrOpts: URL | string | https.RequestOptions,
-      optsOrCb?: https.RequestOptions | ((res: unknown) => void),
-      maybeCb?: (res: unknown) => void,
-    ) => {
-      const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (res: unknown) => void;
-      const u = urlOrOpts instanceof URL ? urlOrOpts.toString() : String(urlOrOpts);
-      const reqEm = new EventEmitter() as EventEmitter & { socket?: EventEmitter & { destroy: () => void }; write: () => boolean; end: () => void; destroy: () => void };
-      reqEm.socket = Object.assign(new EventEmitter(), { destroy: () => undefined });
-      reqEm.write = () => true;
-      reqEm.destroy = () => undefined;
-      reqEm.end = () => {
-        queueMicrotask(() => {
-          if (u.endsWith('/102')) reqEm.emit('information', { statusCode: 102 });
-          else if (u.endsWith('/connect')) reqEm.emit('connect', {}, Object.assign(new EventEmitter(), { destroy: () => undefined }));
-          else if (u.endsWith('/err-close')) {
-            reqEm.emit('error', new Error('boom'));
-            reqEm.emit('close');
-          } else if (u.endsWith('/304')) {
-            const r = Object.assign(new PassThrough(), { statusCode: 304, headers: {}, complete: true });
-            cb(r);
-            r.end();
-          } else if (u.endsWith('/head')) {
-            const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: true });
-            cb(r);
-            r.end();
-          } else if (u.endsWith('/cancel')) {
-            const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: true });
-            cb(r);
-          } else if (u.endsWith('/abort-err')) {
-            const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: false });
-            cb(r);
-          } else {
-            const r = Object.assign(new PassThrough(), { statusCode: 200, headers: {}, complete: true });
-            cb(r);
-            r.end('ok');
-          }
-        });
-      };
-      return reqEm as unknown as ReturnType<typeof https.request>;
-    }) as typeof https.request;
-
-    const mf2 = createSafeOutboundFetch({ resolver: async () => [{ address: '1.1.1.1', family: 4 }] });
-    await assert.rejects(() => mf2('https://x.example/102'), /Disallowed HTTP 102/);
-    await assert.rejects(() => mf2('https://x.example/connect'), /CONNECT is not allowed/);
-    await assert.rejects(() => mf2('https://x.example/err-close'), /boom/);
-    assert.equal((await mf2('https://x.example/304')).status, 304);
-    assert.equal((await mf2('https://x.example/head', { method: 'HEAD' })).status, 200);
-    const cancelRes = await mf2('https://x.example/cancel');
-    await cancelRes.body?.cancel();
-    await cancelRes.body?.cancel();
-    assert.equal((await mf2('https://x.example/ok', { redirect: 'follow' })).status, 200);
-    assert.equal((await mf2('https://x.example/ok', { redirect: 'error' })).status, 200);
-    const errCtrl = new AbortController();
-    const errAbRes = await mf2('https://x.example/abort-err', { signal: errCtrl.signal });
-    setTimeout(() => errCtrl.abort(new Error('err-reason')), 10);
-    await assert.rejects(() => errAbRes.text(), /err-reason/);
-  } finally {
-    (https as unknown as { request: typeof https.request }).request = origHttpsReq2;
-    (http as unknown as { request: typeof http.request }).request = origHttpReq2;
-  }
 
   // 6. safe-input.ts remaining branches
   assert.equal(

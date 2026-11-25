@@ -1170,6 +1170,17 @@ const devTelemetrySettingCache = new WeakMap<object, { value: string | null; exp
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (typeof env.EDGEFETCH_PUBLIC_ORIGIN === 'string' && env.EDGEFETCH_PUBLIC_ORIGIN.trim() !== '') {
+      try {
+        const pub = new URL(env.EDGEFETCH_PUBLIC_ORIGIN.trim());
+        if ((pub.protocol === 'https:' || pub.protocol === 'http:') && !pub.username && !pub.password) {
+          url.protocol = pub.protocol;
+          url.host = pub.host;
+        }
+      } catch {
+        // Ignore malformed EDGEFETCH_PUBLIC_ORIGIN and fall back to request URL
+      }
+    }
     const rootTracer = RequestTracer.fromRequest(request, { suppressWhenUnsampledHealth: true });
     const shardNames = (env.HUB_SHARDS ?? 'global')
       .split(',')

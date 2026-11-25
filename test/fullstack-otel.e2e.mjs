@@ -27,15 +27,17 @@
 import test, { after, before, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import http from 'node:http';
+import { stripTypeScriptTypes } from 'node:module';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -293,61 +295,77 @@ function buildEdgefetchBinary(outDir) {
   return { bin: outBin, useWslGo: true };
 }
 
-async function bundleTypeScriptDeps(outDir) {
-  const esbuildPath = path.join(REPO_ROOT, 'hub', 'node_modules', 'esbuild', 'lib', 'main.js');
-  const esbuild = await import(pathToFileURL(esbuildPath).href);
-  const { ensureCoreWasmBuilt } = await import(
-    pathToFileURL(path.join(REPO_ROOT, 'hub', 'scripts', 'build-wasm.mjs')).href
-  );
-  const { createNodeWasmPlugin } = await import(
-    pathToFileURL(path.join(REPO_ROOT, 'hub', 'scripts', 'esbuild-wasm-plugin.mjs')).href
-  );
-  const coreWasmPath = ensureCoreWasmBuilt();
-  const entryTs = path.join(outDir, 'fullstack-deps-entry.ts');
-  const outMjs = path.join(outDir, 'fullstack-deps.mjs');
+async function importStrippedTs(absPath) {
+  let src = readFileSync(absPath, 'utf8');
+  src = src.replace(/constructor\(([^)]*)\)/g, (m) => m.replace(/\b(?:public|private|protected)\s+(?:readonly\s+)?/g, ''));
+  const js = stripTypeScriptTypes(src, { mode: 'strip' });
+  const dataUrl = `data:text/javascript;base64,${Buffer.from(js, 'utf8').toString('base64')}`;
+  return import(dataUrl);
+}
 
-  const portablePath = path.join(REPO_ROOT, 'hub', 'portable', 'portable-server.ts').replace(/\\/g, '/');
-  const sdkPath = path.join(REPO_ROOT, 'sdk', 'ts', 'edgefetch-client.ts').replace(/\\/g, '/');
-  const botAuthPath = path.join(REPO_ROOT, 'hub', 'src', 'bot-auth.ts').replace(/\\/g, '/');
+async function bundleTypeScriptDeps() {
+  const sdkMod = await importStrippedTs(path.join(REPO_ROOT, 'sdk', 'ts', 'edgefetch-client.ts'));
+  const botAuthMod = await importStrippedTs(path.join(REPO_ROOT, 'hub', 'src', 'bot-auth.ts'));
 
-  writeFileSync(
-    entryTs,
-    [
-      `export { startPortableHub } from '${portablePath}';`,
-      `export { EdgeFetchClient, EdgeFetchError } from '${sdkPath}';`,
-      `export {`,
-      `  computeEd25519JwkThumbprint,`,
-      `  generateBotAuthKeyPair,`,
-      `  signDirectoryResponse,`,
-      `  signOutboundBotHeaders,`,
-      `  verifyBotRequestSignature,`,
-      `  verifyDirectoryResponseSignature,`,
-      `} from '${botAuthPath}';`,
-      `export { WebSocketServer, WebSocket as WsClient } from 'ws';`,
-    ].join('\n'),
-    'utf8',
-  );
+  const startPortableHub = async ({ port = 0, host = '127.0.0.1', dataDir = '', envOverrides = {} } = {}) => {
+    const chosenPort = port > 0 ? port : await allocPort();
+    const child = trackChild(
+      spawn(goBin, ['--mode=hub', `--addr=${host}:${chosenPort}`], {
+        env: {
+          ...process.env,
+          EDGEFETCH_DATA_DIR: dataDir,
+          EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
+          OTEL_BSP_SCHEDULE_DELAY: '50',
+          ...envOverrides,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+    const deadline = Date.now() + 10_000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) {
+        throw new Error(`Go hub exited early (${child.exitCode})\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      }
+      try {
+        const r = await fetch(`http://${host}:${chosenPort}/healthz`);
+        if (r.ok) {
+          ready = true;
+          break;
+        }
+      } catch {
+        // retry
+      }
+      await delay(50);
+    }
+    if (!ready) {
+      await killChildCleanly(child);
+      throw new Error(`Go hub failed to become ready on ${host}:${chosenPort}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+    return {
+      port: chosenPort,
+      async close() {
+        await delay(120);
+        await killChildCleanly(child);
+      },
+    };
+  };
 
-  await esbuild.build({
-    entryPoints: [entryTs],
-    bundle: true,
-    platform: 'node',
-    target: 'node22',
-    format: 'esm',
-    nodePaths: [path.join(REPO_ROOT, 'hub', 'node_modules')],
-    banner: {
-      js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);",
-    },
-    alias: {
-      'cloudflare:workers': path.join(REPO_ROOT, 'hub', 'portable', 'cloudflare-shim.ts'),
-    },
-    loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text' },
-    plugins: [createNodeWasmPlugin({ wasmAbsPath: coreWasmPath })],
-    external: ['node:*'],
-    outfile: outMjs,
-  });
-
-  return import(pathToFileURL(outMjs).href);
+  return {
+    startPortableHub,
+    EdgeFetchClient: sdkMod.EdgeFetchClient,
+    EdgeFetchError: sdkMod.EdgeFetchError,
+    computeEd25519JwkThumbprint: botAuthMod.computeEd25519JwkThumbprint,
+    generateBotAuthKeyPair: botAuthMod.generateBotAuthKeyPair,
+    signDirectoryResponse: botAuthMod.signDirectoryResponse,
+    signOutboundBotHeaders: botAuthMod.signOutboundBotHeaders,
+    verifyBotRequestSignature: botAuthMod.verifyBotRequestSignature,
+    verifyDirectoryResponseSignature: botAuthMod.verifyDirectoryResponseSignature,
+  };
 }
 
 const activeChildren = new Set();
@@ -420,8 +438,69 @@ async function killChildCleanly(child) {
  *    (`http://127.0.0.1:<mockPort>`) so the real Go `--mode=agent` binary executes live `robots.txt`,
  *    RFC 9421 signing, HTTP fetches, and OTLP exports against local ephemeral servers with zero external DNS.
  */
-async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin, WebSocketServer, WsClient }) {
-      const reverseUrlMap = new Map();
+function encodeWsFrame(payloadBuf, opcode = 0x1, maskFrame = false) {
+  const len = payloadBuf.length;
+  const maskBit = maskFrame ? 0x80 : 0;
+  let hdr;
+  if (len < 126) {
+    hdr = Buffer.from([0x80 | opcode, maskBit | len]);
+  } else if (len < 65536) {
+    hdr = Buffer.alloc(4);
+    hdr[0] = 0x80 | opcode;
+    hdr[1] = maskBit | 126;
+    hdr.writeUInt16BE(len, 2);
+  } else {
+    hdr = Buffer.alloc(10);
+    hdr[0] = 0x80 | opcode;
+    hdr[1] = maskBit | 127;
+    hdr.writeBigUInt64BE(BigInt(len), 2);
+  }
+  if (!maskFrame) return Buffer.concat([hdr, payloadBuf]);
+  const mask = randomBytes(4);
+  const masked = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) masked[i] = payloadBuf[i] ^ mask[i & 3];
+  return Buffer.concat([hdr, mask, masked]);
+}
+
+function attachWsFrameDecoder(socket, initialHead, onFrame) {
+  let buf = initialHead && initialHead.length ? Buffer.from(initialHead) : Buffer.alloc(0);
+  const drain = () => {
+    while (buf.length >= 2) {
+      const opcode = buf[0] & 0x0f;
+      const isMasked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) return;
+        len = Number(buf.readBigUInt64BE(2));
+        off = 10;
+      }
+      const maskLen = isMasked ? 4 : 0;
+      if (buf.length < off + maskLen + len) return;
+      let payload = buf.subarray(off + maskLen, off + maskLen + len);
+      if (isMasked) {
+        const maskKey = buf.subarray(off, off + 4);
+        const unmasked = Buffer.alloc(len);
+        for (let i = 0; i < len; i++) unmasked[i] = payload[i] ^ maskKey[i & 3];
+        payload = unmasked;
+      }
+      buf = buf.subarray(off + maskLen + len);
+      onFrame(opcode, payload);
+    }
+  };
+  socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    drain();
+  });
+  drain();
+}
+
+async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin }) {
+  const reverseUrlMap = new Map();
 
   function rewriteOutboundUrl(rawUrl) {
     if (typeof rawUrl !== 'string') return rawUrl;
@@ -451,8 +530,7 @@ async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin, WebSock
     return rawUrl;
   }
 
-  const wss = new WebSocketServer({ noServer: true });
-  const openPairs = new Set();
+  const openSockets = new Set();
 
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -461,7 +539,9 @@ async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin, WebSock
       let bodyBuf = Buffer.concat(chunks);
       if (req.method === 'POST' && (req.url || '').startsWith('/agent/reply')) {
         try {
-          const parsed = JSON.parse(bodyBuf.toString('utf8'));
+          const isGz = (req.headers['content-encoding'] || '').toLowerCase().includes('gzip');
+          const rawJsonBuf = isGz ? gunzipSync(bodyBuf) : bodyBuf;
+          const parsed = JSON.parse(rawJsonBuf.toString('utf8'));
           if (Array.isArray(parsed?.results)) {
             for (const item of parsed.results) {
               if (item && typeof item === 'object') {
@@ -470,6 +550,7 @@ async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin, WebSock
               }
             }
             bodyBuf = Buffer.from(JSON.stringify(parsed), 'utf8');
+            delete req.headers['content-encoding'];
           }
         } catch {
           // forward raw bytes if non-JSON
@@ -499,80 +580,106 @@ async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin, WebSock
     });
   });
 
-  server.on('upgrade', (req, socket, head) => {
-    socket.on('error', () => undefined);
-    const upstreamHeaders = {};
+  server.on('upgrade', (req, agentSock, agentHead) => {
+    agentSock.on('error', () => undefined);
+    const secKey = req.headers['sec-websocket-key'];
+    if (!secKey) {
+      agentSock.destroy();
+      return;
+    }
+    const acceptVal = createHash('sha1')
+      .update(`${secKey}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64');
+
+    const upstreamHeaders = {
+      Connection: 'Upgrade',
+      Upgrade: 'websocket',
+      'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
+      'Sec-WebSocket-Version': '13',
+    };
     for (const [k, v] of Object.entries(req.headers)) {
       const lower = k.toLowerCase();
-      if (
-        lower === 'authorization' ||
-        lower.startsWith('x-agent-') ||
-        lower === 'user-agent'
-      ) {
+      if (lower === 'authorization' || lower.startsWith('x-agent-') || lower === 'user-agent' || lower === 'sec-websocket-protocol') {
         upstreamHeaders[k] = v;
       }
     }
 
-    wss.handleUpgrade(req, socket, head, (agentWs) => {
-      const hubWs = new WsClient(`ws://127.0.0.1:${hubPort}${req.url || '/agent/ws'}`, ['edgefetch-agent'], {
-        headers: upstreamHeaders,
-      });
-      const pair = { agentWs, hubWs };
-      openPairs.add(pair);
-      const pendingToHub = [];
-      let hubOpen = false;
+    const upReq = http.request({
+      host: '127.0.0.1',
+      port: hubPort,
+      path: req.url || '/agent/ws',
+      method: 'GET',
+      headers: upstreamHeaders,
+    });
+    upReq.on('error', () => agentSock.destroy());
+    upReq.on('response', (res) => {
+      agentSock.write(`HTTP/1.1 ${res.statusCode || 401} Unauthorized\r\nConnection: close\r\n\r\n`);
+      agentSock.destroy();
+    });
+    upReq.on('upgrade', (upRes, hubSock, hubHead) => {
+      hubSock.on('error', () => undefined);
+      openSockets.add(agentSock);
+      openSockets.add(hubSock);
 
-      hubWs.on('open', () => {
-        hubOpen = true;
-        while (pendingToHub.length > 0) {
-          const item = pendingToHub.shift();
-          hubWs.send(item.data, { binary: item.isBinary });
+      const subProto = upRes.headers['sec-websocket-protocol'];
+      const respLines = [
+        'HTTP/1.1 101 Switching Protocols',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Accept: ${acceptVal}`,
+      ];
+      if (subProto) respLines.push(`Sec-WebSocket-Protocol: ${subProto}`);
+      respLines.push('', '');
+      agentSock.write(respLines.join('\r\n'));
+
+      const closeBoth = () => {
+        openSockets.delete(agentSock);
+        openSockets.delete(hubSock);
+        agentSock.destroy();
+        hubSock.destroy();
+      };
+      agentSock.on('close', closeBoth);
+      hubSock.on('close', closeBoth);
+
+      attachWsFrameDecoder(agentSock, agentHead, (opcode, payload) => {
+        if (opcode === 0x8) {
+          closeBoth();
+          return;
         }
-      });
-
-      agentWs.on('message', (data, isBinary) => {
-        const payload = isBinary ? data : data.toString('utf8');
-        if (hubOpen && hubWs.readyState === WsClient.OPEN) {
-          hubWs.send(payload, { binary: isBinary });
-        } else {
-          pendingToHub.push({ data: payload, isBinary });
+        if (opcode === 0x9) {
+          agentSock.write(encodeWsFrame(payload, 0x0a, false));
+          return;
         }
+        hubSock.write(encodeWsFrame(payload, opcode, true));
       });
 
-      hubWs.on('message', (data, isBinary) => {
-        if (agentWs.readyState !== WsClient.OPEN) return;
-        if (!isBinary) {
-          const text = data.toString('utf8');
+      attachWsFrameDecoder(hubSock, hubHead, (opcode, payload) => {
+        if (opcode === 0x8) {
+          closeBoth();
+          return;
+        }
+        if (opcode === 0x9) {
+          hubSock.write(encodeWsFrame(payload, 0x0a, true));
+          return;
+        }
+        if (opcode === 0x1) {
           try {
-            const msg = JSON.parse(text);
+            const msg = JSON.parse(payload.toString('utf8'));
             if (msg && msg.type === 'dispatch' && Array.isArray(msg.call?.requests)) {
               for (const r of msg.call.requests) {
-                if (r && typeof r.url === 'string') {
-                  r.url = rewriteOutboundUrl(r.url);
-                }
+                if (r && typeof r.url === 'string') r.url = rewriteOutboundUrl(r.url);
               }
-              agentWs.send(JSON.stringify(msg));
+              agentSock.write(encodeWsFrame(Buffer.from(JSON.stringify(msg), 'utf8'), 0x1, false));
               return;
             }
           } catch {
             // forward untouched
           }
-          agentWs.send(text);
-          return;
         }
-        agentWs.send(data, { binary: true });
+        agentSock.write(encodeWsFrame(payload, opcode, false));
       });
-
-      const closeBoth = () => {
-        openPairs.delete(pair);
-        try { agentWs.close(); } catch {}
-        try { hubWs.close(); } catch {}
-      };
-      agentWs.on('close', closeBoth);
-      agentWs.on('error', closeBoth);
-      hubWs.on('close', closeBoth);
-      hubWs.on('error', closeBoth);
     });
+    upReq.end();
   });
 
   await new Promise((resolve, reject) => {
@@ -586,12 +693,10 @@ async function startAgentLocalOriginBridge({ hubPort, hostToLocalOrigin, WebSock
     port,
     url: `http://127.0.0.1:${port}`,
     async close() {
-      for (const { agentWs, hubWs } of openPairs) {
-        try { agentWs.terminate(); } catch {}
-        try { hubWs.terminate(); } catch {}
+      for (const s of openSockets) {
+        try { s.destroy(); } catch {}
       }
-      openPairs.clear();
-      wss.close();
+      openSockets.clear();
       await closeServerCleanly(server);
     },
   };
@@ -1055,8 +1160,6 @@ describe('F16: Cross-Process Full-Stack OTLP E2E (EdgeFetchClient -> Portable Hu
         'paywall.example.com': origin.url,
         'cs-blocked.example.com': csOrigin.url,
       },
-      WebSocketServer,
-      WsClient,
     });
 
     const siteId = 'e2e-agent';

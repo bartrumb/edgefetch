@@ -9,9 +9,8 @@
  *  Total: 76 tests.
  *
  * Strictly zero external dependencies: uses Node 22+ built-ins + in-repo
- * `hub/dist/portable-server.mjs`, `sdk/ts/edgefetch-client.ts`,
- * `sdk/py/edgefetch_client.py`,
- * `scripts/all-in-one-entrypoint.sh`, and compiled Go `cmd/edgefetch`.
+ * `sdk/ts/edgefetch-client.ts`, `sdk/py/edgefetch_client.py`,
+ * `scripts/all-in-one-entrypoint.sh`, and compiled Go `cmd/edgefetch` (`--mode=hub`, `--mode=agent`, `--mode=mcp`).
  */
 
 import test, { after, before, describe } from 'node:test';
@@ -36,8 +35,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { gunzipSync, gzipSync } from 'node:zlib';
-
-import { startPortableHub } from '../hub/dist/portable-server.mjs';
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -364,6 +361,28 @@ async function startMockOrigin(customHandler) {
 // ---------------------------------------------------------------------------
 // 3. Portable Hub + Mock WebSocket Agent Harness
 // ---------------------------------------------------------------------------
+
+async function startPortableHub({ port = 0, host = '127.0.0.1', dataDir = '', envOverrides = {} } = {}) {
+  const addrArg = port > 0 ? `--addr=${host}:${port}` : `--addr=${host}:{PORT}`;
+  const hub = await startGoHub({
+    bin: goBin,
+    args: ['--mode=hub', addrArg],
+    env: {
+      EDGEFETCH_DATA_DIR: dataDir,
+      EDGEFETCH_DISABLE_UPDATE_CHECK: '1',
+      OTEL_BSP_SCHEDULE_DELAY: '50',
+      ...envOverrides,
+    },
+  });
+  const actualPort = port > 0 ? port : hub.port;
+  return {
+    port: actualPort,
+    async close() {
+      await delay(110);
+      await hub.close();
+    },
+  };
+}
 
 async function startTestHub(envOverrides = {}, suiteDataParent) {
   const tokens = makeTokens();
@@ -1289,14 +1308,25 @@ async function runEntrypointHarness({
   mkdirSync(fakeBinDir, { recursive: true });
 
   const nodePosix = process.execPath.replace(/\\/g, '/');
-  writeFileSync(
-    mockHubPath,
-    `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(hubEnvFile)}, JSON.stringify(process.env));\nsetTimeout(() => process.exit(0), ${hubExitMs});\n`,
-    'utf8',
-  );
+  const hubSleepSec = Math.max(1, Math.ceil(hubExitMs / 1000));
   writeFileSync(
     mockAgentPath,
-    `#!/bin/sh\nprintf '%s\\n' "$*" > "${agentArgsFile}"\n"${nodePosix}" -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify(process.env));" "${agentEnvFile}"\nexit 0\n`,
+    [
+      '#!/bin/sh',
+      'case "${1:-}" in',
+      '  --mode=hub)',
+      `    "${nodePosix}" -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify(process.env));" "${hubEnvFile}"`,
+      `    sleep ${hubSleepSec}`,
+      '    exit 0',
+      '    ;;',
+      '  *)',
+      `    printf '%s\\n' "$*" > "${agentArgsFile}"`,
+      `    "${nodePosix}" -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify(process.env));" "${agentEnvFile}"`,
+      '    exit 0',
+      '    ;;',
+      'esac',
+      '',
+    ].join('\n'),
     { mode: 0o755 },
   );
 
@@ -1321,7 +1351,6 @@ async function runEntrypointHarness({
 
   let script = readFileSync(path.join(REPO_ROOT, 'scripts', 'all-in-one-entrypoint.sh'), 'utf8')
     .replace(/\r\n/g, '\n')
-    .replace(/\/app\/hub\/dist\/portable-server\.mjs/g, mockHubPath)
     .replace(/\/usr\/local\/bin\/edgefetch/g, mockAgentPath);
 
   if (fakeUidZero) {
@@ -1329,9 +1358,6 @@ async function runEntrypointHarness({
     script = `export PATH="${msysFakeBin}:$PATH"\n` + script.replace(/^#!\/bin\/sh\n/, '').replace(/\/data(\/hub)?\b/g, (_, sub) => `${posixDataRoot}${sub || ''}`);
     script = `#!/bin/sh\n${script}`;
   }
-
-  // Ensure `node` binary resolves reliably even if PATH is customized (without rewriting `node:node` user/group)
-  script = script.replace(/(^|\s)node\s+("?[^&\n]*mock-hub\.mjs"?)/gm, `$1"${nodePosix}" $2`);
 
   const scriptPath = path.join(runDir, 'entrypoint.sh');
   writeFileSync(scriptPath, script, { mode: 0o755 });
@@ -3499,7 +3525,7 @@ describe('Tier 2 — Area B Boundaries: Go Hub, Agent SSRF, MCP Stdio & Collecto
     });
     try {
       const cases = [
-        { path: '/v1/capabilities', method: 'GET', hdrs: {}, status: 401 },
+        { path: '/v1/capabilities', method: 'GET', hdrs: {}, status: 401, unauthSuppressedOtlp: true },
         { path: '/v1/scrape', method: 'POST', hdrs: { authorization: `Bearer ${callerToken}`, 'content-type': 'application/json' }, body: '{bad', status: 400 },
         { path: '/does-not-exist', method: 'GET', hdrs: { authorization: `Bearer ${callerToken}` }, status: 404 },
         { path: '/fetch?target=agent', method: 'POST', hdrs: { authorization: `Bearer ${callerToken}`, 'content-type': 'application/json' }, body: JSON.stringify({ maxSeconds: 10, options: { includeBody: true }, requests: [{ id: 'r1', url: 'https://t2-b2.invalid/no-agent', kind: 'scrape' }] }), status: 503 },
@@ -3513,6 +3539,11 @@ describe('Tier 2 — Area B Boundaries: Go Hub, Agent SSRF, MCP Stdio & Collecto
         });
         assert.equal(res.status, tc.status, `Go Hub ${tc.path} expected ${tc.status}, got ${res.status}`);
         assertTraceHeaders(res, { expectedTraceId: traceId, tag: `[F7/M2 Go Hub ${tc.status}]` });
+        if (tc.unauthSuppressedOtlp) {
+          await delay(80);
+          assert.equal(collector.findByTraceId(traceId).length, 0, '[H9] unauthenticated 401 must suppress OTLP export');
+          continue;
+        }
         await collector.waitForSpans((e) => e.some((x) => x.span.traceId === traceId && x.span.status?.code === 2), 2500);
         assert.ok(
           collector.findByTraceId(traceId).some((x) => x.span.status?.code === 2),
@@ -4185,9 +4216,9 @@ describe('Tier 2 — Area E Boundaries: Entrypoint Validation & Permissions', ()
       assert.equal(existsSync(path.join(run.dataRoot, 'hub', 'edgefetch-hub.sqlite')), true, 'legacy sqlite was not migrated to /data/hub');
       assert.match(run.opsLog, /chmod 0710 /);
       assert.match(run.opsLog, /chmod 0700 /);
-      assert.match(run.opsLog, /chown root:node /);
-      assert.match(run.opsLog, /chown -R node:node /);
-      assert.match(run.opsLog, /su-exec node:node /);
+      assert.match(run.opsLog, /chown root:1000 /);
+      assert.match(run.opsLog, /chown -R 1000:1000 /);
+      assert.match(run.opsLog, /su-exec 1000:1000 /);
       assert.match(run.opsLog, /su-exec 65532:65532 /);
     } finally {
       run.cleanup();

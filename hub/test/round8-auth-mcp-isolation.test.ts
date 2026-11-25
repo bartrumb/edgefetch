@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
+import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks.ts';
 import { startOrExecuteAgentCall } from '../src/agent-runner.ts';
 import {
   GITHUB_ORG_REVERIFY_TTL_MS,

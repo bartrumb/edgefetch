@@ -1173,7 +1173,7 @@ test('R11-M8/M9/S6-audit: Hub DO/Portable resealServerSecret wiring, agent list_
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const { LocalAgentHubCoordinator } = await import('../portable/node-adapters');
+  const { LocalAgentHubCoordinator } = await import('./stubs/cf-storage-mocks');
   const hubWorkerMod = await import('../src/index');
   const hubWorker = hubWorkerMod.default as { fetch(r: Request, e: unknown): Promise<Response> };
 

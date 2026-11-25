@@ -28,7 +28,7 @@ import {
   RELEASE_SIGNING_PUBLIC_KEY_SPKI_B64,
   UPDATE_CHECK_TTL_MS,
 } from '../src/update-check.ts';
-import { LocalAgentHubCoordinator } from '../portable/node-adapters.ts';
+import { LocalAgentHubCoordinator } from './stubs/cf-storage-mocks.ts';
 
 const OWNER_SECRET = 'owner-secret-token-0123456789abcdef';
 

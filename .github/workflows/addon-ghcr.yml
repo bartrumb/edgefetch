@@ -51,7 +51,6 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund
           npm run adapter:check
           npm run psl:check
-          npm run build:portable
           npm test
           npm run type-check
           npm run deploy:dry

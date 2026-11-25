@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters';
+import { NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks';
 import { r2ArtifactKey } from '../src/storage';
 import {
   cancelAgentRun,
@@ -3791,17 +3791,18 @@ test('AGENT-16: M1-C Iter3 catalog.ts remaining lines and branches', async () =>
 
   // 5) time_budget_exceeded via mocked Date.now in try/finally
   const realDateNow = Date.now;
-  let clockCall = 0;
-  Date.now = () => {
-    clockCall++;
-    return clockCall <= 2 ? 1_000_000 : 1_250_000;
-  };
+  let fetchedFirstPage = false;
+  Date.now = () => (fetchedFirstPage ? 1_250_000 : 1_000_000);
   try {
     const timeBudgetRun = await executeCatalogCall({
       payload: { url: 'https://timebudget.example.com', platform: 'shopify', maxPages: 2 },
       env: {},
       sleepFn: async () => undefined,
-      executeHubFetch: async () => ({ status: 200, body: utf8Json }),
+      executeHubFetch: async ({ url }) => {
+        if (url.endsWith('/robots.txt')) return { status: 404, body: '' };
+        fetchedFirstPage = true;
+        return { status: 200, body: twoProd };
+      },
     });
     assert.equal(timeBudgetRun.body.reason, 'time_budget_exceeded');
   } finally {

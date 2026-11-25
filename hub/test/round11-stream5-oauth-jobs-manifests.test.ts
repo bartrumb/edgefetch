@@ -32,7 +32,7 @@ import {
   parseWikipediaArticleUrl,
   resetWikipediaStateForTests,
 } from '../src/wikipedia';
-import { LocalAgentHubCoordinator } from '../portable/node-adapters';
+import { LocalAgentHubCoordinator } from './stubs/cf-storage-mocks';
 import { validateManifest } from '../scripts/compile-manifests.mjs';
 import {
   analyzeHtmlForManifestProposal,

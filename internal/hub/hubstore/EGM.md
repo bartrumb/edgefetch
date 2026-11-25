@@ -1,0 +1,30 @@
+# hubstore
+
+## Overview
+Package `hubstore` implements the zero-external-dependency storage, search, and tracker-list engine for the native Go Hub (`edgefetch --hub`), providing persistent/in-memory gzipped artifact and state management, tenant-isolated Markdown slice pagination, pure-Go BM25 collection search, Reciprocal Rank Fusion (`k = 60`) multi-provider web search with secret-free OTLP tracing, and runtime EasyPrivacy tracker list validation and distribution.
+
+## Interface
+- `[doc.go]`, `[storage.go:Store]`, `[storage.go:NewStore]`, `[storage.go:Store.DataDir]`: `func NewStore(dataDir string, maxMemBytes int) (*Store, error)` — creates `0700` `artifacts/` and `state/` directories when `dataDir != ""` or operates purely in memory with FIFO ring eviction (`DefaultMaxMemBytes = 64 MiB`).
+- `[storage.go:Store.PutGzipBlob]`, `[storage.go:Store.PutRawBlob]`, `[storage.go:Store.GetGzipBlob]`, `[storage.go:Store.GetDecodedBlob]`: Content-addressed and SHA-256-verified gzip blob storage with decompression-bomb byte ceilings (`MaxArtifactContentBytes = 16 MiB`, `MaxArtifactStoredBytes = 18 MiB`).
+- `[storage.go:Store.PersistMarkdownArtifact]`, `[storage.go:Store.ReadArtifactPage]`: Persists sanitized Markdown documents with CommonMark fence checkpoints (`extract.ComputeMarkdownSliceCheckpoints`) and serves UTF-8-aligned, fence-closed slices (`extract.SanitizeMarkdownPageSlice`) enforcing private owner isolation (`404` on unauthorized access).
+- `[storage.go:Store.PutScrapeCache]`, `[storage.go:Store.GetScrapeCache]`: Freshness-bounded (`maxAgeMs`) scrape cache supporting RFC 9110 `ETag` / `If-None-Match` (`304` `notModified`).
+- `[storage.go:Store.RecordHostTelemetry]`, `[storage.go:Store.ListHosts]`, `[storage.go:Store.ListHostGaps]`: Per-host WAF/outcome/latency telemetry and unadapted host gap ranking.
+- `[storage.go:Store.PutJob]`, `[storage.go:Store.GetJob]`, `[storage.go:Store.DeleteOrCancelJob]`, `[storage.go:Store.GetSetting]`, `[storage.go:Store.SetSetting]`, `[storage.go:Store.AppendEvent]`, `[storage.go:Store.ListEvents]`, `[storage.go:Store.ClearEvents]`: Tenant-isolated async job store, Hub key-value settings, and bounded (`500`) operational event log.
+- `[search_index.go:CollectionHit]`, `[search_index.go:CollectionIndex]`, `[search_index.go:NewCollectionIndex]`, `[search_index.go:ResolveCollectionKey]`, `[search_index.go:CollectionIndex.ReplacePageChunks]`, `[search_index.go:CollectionIndex.Search]`: Multi-tenant (`u:<userID>:<collection>` for non-owners) pure-Go BM25 (`k1 = 1.2`, `b = 0.75`) inverted index over ~1,000-char sanitized Markdown chunks with prefix-match fallback and hostname filtering.
+- `[web_search.go:SearchConfig]`, `[web_search.go:SearchParams]`, `[web_search.go:ExecuteWebSearch]`, `[web_search.go:CanonicalizeSearchURL]`: Concurrent search across local `CollectionIndex` and configured external APIs (`SearXNG`, `Serper`, `Brave`, `Tavily`) fused via RRF (`k = 60`) with `edgefetch.search.<provider>` OTLP client spans.
+- `[tracker_list.go:TrackerConfig]`, `[tracker_list.go:TrackerManager]`, `[tracker_list.go:NewTrackerManager]`, `[tracker_list.go:ValidateEasyPrivacyList]`, `[tracker_list.go:BuildTrackerListFrames]`: Zero-startup-fetch EasyPrivacy loader, strict validator, delayed background refresher (`3m` initial delay, `6h` poll cadence, `24h` refresh age), and WebSocket `tracker_list` / `tracker_list_chunk` frame serializer.
+
+## Invariants
+- `[doc.go:atomicWriteFile]`: Writes state and blob files via `0600` temp file + `Sync` + `Close` + `Rename` (with Windows remove+rename fallback under caller mutex).
+- `[storage.go:Store.PersistMarkdownArtifact]`, `[storage.go:Store.ReadArtifactPage]`: Namespace-hashes `artifactID` (`priv:<owner>` vs `pub`) so private and public artifacts never collide; `ReadArtifactPage` validates `^[0-9a-f]{64}$`, enforces `art.OwnerID == callerOwnerID` when `art.IsPrivate && !callerIsOwner`, aligns slice boundaries to UTF-8 rune starts, and closes split code fences/spans via `extract.SanitizeMarkdownPageSlice`.
+- `[search_index.go:ResolveCollectionKey]`, `[search_index.go:CollectionIndex.ReplacePageChunks]`: Non-owner collection keys are strictly prefixed with `u:<safeUser>:`; `ReplacePageChunks` sanitizes metadata/Markdown via `extract.SanitizeScrapedMeta` and `extract.SanitizeScrapedMarkdown` before atomic page replacement.
+- `[web_search.go:doTracedProviderRequest]`, `[web_search.go:ExecuteWebSearch]`: Sanitizes every span `url.full` via `otel.SanitizeURL` (never emitting query strings or API keys), strips tracking query parameters (`utm_*`, `gclid`, `fbclid`, etc.), and sanitizes provider titles/snippets via `extract.SanitizeScrapedMeta`.
+- `[tracker_list.go:NewTrackerManager]`, `[tracker_list.go:ValidateEasyPrivacyList]`, `[tracker_list.go:BuildTrackerListFrames]`: `NewTrackerManager` performs zero network I/O; `ValidateEasyPrivacyList` enforces `200 KiB..10 MiB`, `! Title: EasyPrivacy`, `! Version:`, pure `||domain^` rules with registrable PSL domains (`extract.GetRegistrableDomain(host) != ""`), never-block WAF/SDK suffix exclusions, `5,000..200,000` hosts, and `<= 20%` delta against the prior count; `BuildTrackerListFrames` emits a single `tracker_list` frame when `<= 768 KiB` and `450,000`-char `tracker_list_chunk` frames when larger.
+
+## Side Effects
+- `[storage.go:NewStore]`, `[search_index.go:NewCollectionIndex]`: Create `0700` `artifacts/` and `state/` directories and atomically write JSON/gzip files under `dataDir` when non-empty.
+- `[web_search.go:ExecuteWebSearch]`: Issues outbound HTTP requests via `OperatorClient` to configured search providers and records OTLP client spans to `OtelExporter`.
+- `[tracker_list.go:TrackerManager.StartBackground]`, `[tracker_list.go:TrackerManager.RefreshNow]`: Starts a background timer/ticker goroutine (honoring `EDGEFETCH_TRACKER_LIST` and `EDGEFETCH_TRACKER_INITIAL_DELAY_MS`), fetches `SourceURL` over HTTP, persists validated gzipped hosts to `Store`, and invokes `OnUpdate`.
+
+## Verification
+- Run: `go test -race ./internal/hub/hubstore/...`

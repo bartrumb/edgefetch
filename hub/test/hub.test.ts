@@ -9,20 +9,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { WebSocket as WsClient } from 'ws';
 import { EdgeFetchClient, EdgeFetchError } from '../../sdk/ts/edgefetch-client.ts';
-import {
-  DurableObject as ShimDurableObject,
-  tracing as shimTracing,
-  WorkflowEntrypoint as ShimWorkflowEntrypoint,
-} from '../portable/cloudflare-shim.ts';
-import {
-  parseStrictSingleHost as parsePortableStrictSingleHost,
-  resolvePublicOrigin as resolvePortablePublicOrigin,
-  startPortableHub,
-} from '../portable/portable-server.ts';
-import { buildSigV4Headers, S3ArtifactBucket } from '../portable/s3-bucket.ts';
-import { TursoHttpD1Database } from '../portable/turso-d1.ts';
+import meta0001Sql from '../migrations/meta/0001_tracking.sql';
+import search0001Sql from '../migrations/search/0001_fts.sql';
 import { formatYamlFrontmatterCard, resolveSiteExtractorTwin } from '../src/extractors/registry.ts';
 import {
   ACTIVITY_SQLITE_SCHEMA,
@@ -214,8 +203,7 @@ import {
   LocalAgentHubCoordinator,
   NodeFsR2Bucket,
   NodeSqliteD1Database,
-  RawServerWebSocket,
-} from '../portable/node-adapters.ts';
+} from './stubs/cf-storage-mocks.ts';
 
 function memoryCooldowns(): CooldownStore {
   const map = new Map<string, number>();
@@ -1589,48 +1577,59 @@ test('V2-8: Vendor-agnostic OTLP/HTTP exporter, W3C traceparent stitch, and Edge
   assert.equal(hitUrls.length, 2);
 });
 
-test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1/capabilities, and /mcp over node:sqlite + fs artifacts', async () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'ef-portable-test-'));
+test('V2-9: Worker Hub serves /health, /admin, /v1/capabilities, and /mcp over node:sqlite + fs artifacts', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'ef-worker-v29-'));
   const tok = 'portable-owner-secret-0123456789ab';
   const agentTok = 'portable-agent-secret-0123456789ab';
-  const started = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    envOverrides: {
-      CALLER_TOKEN: tok,
-      AGENT_TOKEN: agentTok,
-    },
-  });
+  const coord = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
+  const metaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001Sql }]);
+  const searchDb = new NodeSqliteD1Database(':memory:', [{ name: 'search/0001_fts.sql', sql: search0001Sql }]);
+  const bucket = new NodeFsR2Bucket(join(dataDir, 'r2'));
+  const env = {
+    AGENT_HUB: coord.asNamespace() as never,
+    META: metaDb as never,
+    SEARCH: searchDb as never,
+    ARTIFACTS: bucket as never,
+    CALLER_TOKEN: tok,
+    AGENT_TOKEN: agentTok,
+  };
   try {
-    const base = `http://127.0.0.1:${started.port}`;
-    const health = await fetch(`${base}/health`);
+    const base = 'https://hub.example.com';
+    const health = await hubWorker.fetch(new Request(`${base}/health`), env);
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), { ok: true });
 
-    const capsRes = await fetch(`${base}/v1/capabilities`, {
-      headers: { authorization: `Bearer ${tok}` },
-    });
+    const capsRes = await hubWorker.fetch(
+      new Request(`${base}/v1/capabilities`, {
+        headers: { authorization: `Bearer ${tok}` },
+      }),
+      env,
+    );
     assert.equal(capsRes.status, 200);
     const caps = (await capsRes.json()) as { capabilities: Record<string, boolean> };
     assert.equal(caps.capabilities.artifacts, true);
     assert.equal(caps.capabilities.tracking, true);
     assert.equal(caps.capabilities.search, true);
 
-    const adminPage = await fetch(`${base}/admin`);
+    const adminPage = await hubWorker.fetch(new Request(`${base}/admin`), env);
     assert.equal(adminPage.status, 200);
     assert.match(await adminPage.text(), /EdgeFetch Hub/);
 
-    const mcpTools = await fetch(`${base}/mcp`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
-    });
+    const mcpTools = await hubWorker.fetch(
+      new Request(`${base}/mcp`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      }),
+      env,
+    );
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
     assert.equal(mcpJson.result.tools.length, 17);
   } finally {
-    await started.close();
+    coord.close();
+    metaDb.close();
+    searchDb.close();
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
@@ -1798,130 +1797,57 @@ Fielding, et al.             Standards Track                   [Page 42]</pre>
   assert.match(redditOut.markdown, /\*\*u\/builder\*\* \(45\): Works great on Raspberry Pi 5\./);
 });
 
-test('V2-11: WebCrypto AWS SigV4 S3ArtifactBucket, TursoHttpD1Database /v2/pipeline, and MV3 POST /v1/ingest-tab FTS5 clip indexing', async () => {
-  // 1. Deterministic AWS SigV4 signing check + S3ArtifactBucket conditional PUT/GET/HEAD
-  const sigHeaders = await buildSigV4Headers({
-    method: 'PUT',
-    url: 'https://s3.us-east-1.amazonaws.com/edgefetch-bucket/raw/sha256/aa/test.gz',
-    region: 'us-east-1',
-    accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
-    secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-    payloadSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
-    now: new Date('2026-11-20T00:00:00Z'),
-  });
-  assert.match(sigHeaders.authorization ?? '', /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20261120\/us-east-1\/s3\/aws4_request/);
-
-  const memObjects = new Map<string, { bytes: Uint8Array; headers: Record<string, string> }>();
-  const s3 = new S3ArtifactBucket({
-    endpoint: 'https://s3.example.internal',
-    bucket: 'ef-artifacts',
-    accessKeyId: 'test-key',
-    secretAccessKey: 'test-secret',
-    fetchImpl: async (input, init) => {
-      const url = String(input);
-      const method = init?.method ?? 'GET';
-      const reqHeaders = (init?.headers ?? {}) as Record<string, string>;
-      if (method === 'PUT') {
-        if (reqHeaders['if-none-match'] === '*' && memObjects.has(url)) {
-          return new Response(null, { status: 412 });
-        }
-        const body = init?.body as Uint8Array;
-        memObjects.set(url, { bytes: new Uint8Array(body), headers: reqHeaders });
-        return new Response(null, { status: 200, headers: { etag: '"abc123"' } });
-      }
-      const existing = memObjects.get(url);
-      if (!existing) return new Response(null, { status: 404 });
-      const resHeaders: Record<string, string> = {
-        'content-length': String(existing.bytes.byteLength),
-        'content-type': existing.headers['content-type'] ?? 'application/octet-stream',
-        etag: '"abc123"',
-      };
-      for (const [k, v] of Object.entries(existing.headers)) {
-        if (k.startsWith('x-amz-meta-')) resHeaders[k] = v;
-      }
-      return new Response(method === 'HEAD' ? null : (existing.bytes as BodyInit), { status: 200, headers: resHeaders });
-    },
-  });
-
-  const firstPut = await s3.put('tmp/test.txt', 'hello sigv4', {
-    onlyIf: new Headers({ 'if-none-match': '*' }),
-    customMetadata: { contentSha256: 'deadbeef' },
-  });
-  assert.ok(firstPut);
-  const dupPut = await s3.put('tmp/test.txt', 'hello sigv4', { onlyIf: new Headers({ 'if-none-match': '*' }) });
-  assert.equal(dupPut, null);
-  const gotS3 = await s3.get('tmp/test.txt');
-  assert.equal(await gotS3?.text(), 'hello sigv4');
-  assert.equal(gotS3?.customMetadata?.contentsha256, 'deadbeef');
-
-  // 2. TursoHttpD1Database /v2/pipeline batch execution
-  let capturedPipelineUrl = '';
-  const turso = new TursoHttpD1Database({
-    url: 'libsql://edgefetch-org.turso.io',
-    authToken: 'turso-jwt-token',
-    fetchImpl: async (input, init) => {
-      capturedPipelineUrl = String(input);
-      const body = JSON.parse(String(init?.body ?? '{}')) as { requests: Array<{ type: string }> };
-      assert.equal(body.requests.at(-1)?.type, 'close');
-      return Response.json({
-        results: [
-          {
-            type: 'ok',
-            response: {
-              type: 'execute',
-              result: {
-                cols: [{ name: 'id' }, { name: 'title' }],
-                rows: [[{ type: 'integer', value: '7' }, { type: 'text', value: 'Turso Row' }]],
-                affected_row_count: 1,
-              },
-            },
-          },
-          { type: 'ok', response: { type: 'close' } },
-        ],
-      });
-    },
-  });
-  const row = await turso.prepare('SELECT id, title FROM pages WHERE id = ?').bind(7).first<{ id: number; title: string }>();
-  assert.equal(capturedPipelineUrl, 'https://edgefetch-org.turso.io/v2/pipeline');
-  assert.deepEqual(row, { id: 7, title: 'Turso Row' });
-
-  // 3. MV3 Browser Extension `POST /v1/ingest-tab` -> immediate FTS5 collection search!
+test('V2-11: MV3 POST /v1/ingest-tab FTS5 clip indexing', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'ef-clip-test-'));
   const tok = 'clipper-owner-secret-0123456789ab';
-  const started = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir,
-    envOverrides: { CALLER_TOKEN: tok, AGENT_TOKEN: 'clipper-agent-secret-0123456789ab' },
-  });
+  const coord = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
+  const metaDb = new NodeSqliteD1Database(':memory:', [{ name: 'meta/0001_tracking.sql', sql: meta0001Sql }]);
+  const searchDb = new NodeSqliteD1Database(':memory:', [{ name: 'search/0001_fts.sql', sql: search0001Sql }]);
+  const bucket = new NodeFsR2Bucket(join(dataDir, 'r2'));
+  const env = {
+    AGENT_HUB: coord.asNamespace() as never,
+    META: metaDb as never,
+    SEARCH: searchDb as never,
+    ARTIFACTS: bucket as never,
+    CALLER_TOKEN: tok,
+    AGENT_TOKEN: 'clipper-agent-secret-0123456789ab',
+  };
   try {
-    const base = `http://127.0.0.1:${started.port}`;
-    const clipRes = await fetch(`${base}/v1/ingest-tab`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        url: 'https://internal.example.com/runbooks/failover',
-        html: '<!doctype html><html><head><title>Failover Runbook</title></head><body><main><h1>Failover Runbook</h1><p>Promote standby hub via Tailscale quorum.</p></main></body></html>',
-        collectionId: 'team-runbooks',
+    const base = 'https://hub.example.com';
+    const clipRes = await hubWorker.fetch(
+      new Request(`${base}/v1/ingest-tab`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          url: 'https://internal.example.com/runbooks/failover',
+          html: '<!doctype html><html><head><title>Failover Runbook</title></head><body><main><h1>Failover Runbook</h1><p>Promote standby hub via Tailscale quorum.</p></main></body></html>',
+          collectionId: 'team-runbooks',
+        }),
       }),
-    });
+      env,
+    );
     assert.equal(clipRes.status, 200);
     const clipJson = (await clipRes.json()) as { ok: boolean; indexedChunks: number; markdown: string };
     assert.equal(clipJson.ok, true);
     assert.equal(clipJson.indexedChunks >= 1, true);
     assert.match(clipJson.markdown, /Tailscale quorum/);
 
-    const ftsRes = await fetch(`${base}/v1/collections/team-runbooks/search`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ query: 'Tailscale quorum' }),
-    });
+    const ftsRes = await hubWorker.fetch(
+      new Request(`${base}/v1/collections/team-runbooks/search`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ query: 'Tailscale quorum' }),
+      }),
+      env,
+    );
     assert.equal(ftsRes.status, 200);
     const ftsJson = (await ftsRes.json()) as { hits: Array<{ url: string }> };
     assert.equal(ftsJson.hits.length, 1);
     assert.equal(ftsJson.hits[0]?.url, 'https://internal.example.com/runbooks/failover');
   } finally {
-    await started.close();
+    coord.close();
+    metaDb.close();
+    searchDb.close();
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
@@ -3166,26 +3092,26 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
   assert.ok(decayed.recommendedPauseMs < escalated.recommendedPauseMs, 'consecutive 200 OKs must decay recommendedPauseMs');
   assert.equal(decayed.okCount, 6);
 
-  // Verify end-to-end Portable Hub `GET /v1/hosts` + `GET /.well-known/http-message-signatures-directory` + TS SDK `hosts()`
+  // Verify end-to-end Worker Hub `GET /v1/hosts` + `GET /.well-known/http-message-signatures-directory` + TS SDK `hosts()`
   const tmpHubDir = mkdtempSync(join(tmpdir(), 'ef-v24-hub-'));
-  const portable = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpHubDir,
-    envOverrides: {
-      CALLER_TOKEN: 'v24-owner-secret-0123456789abcdef',
-      BOT_SIGNING_PRIVATE_KEY: kp.privateKeySeed,
-    },
-  });
+  const v24Coord = new LocalAgentHubCoordinator(join(tmpHubDir, 'hub.sqlite'));
+  const v24Env = {
+    AGENT_HUB: v24Coord.asNamespace() as never,
+    CALLER_TOKEN: 'v24-owner-secret-0123456789abcdef',
+    BOT_SIGNING_PRIVATE_KEY: kp.privateKeySeed,
+  };
+  const v24Fetch: typeof fetch = (input, init) =>
+    hubWorker.fetch(input instanceof Request && !init ? input : new Request(input, init), v24Env);
   try {
-    const pubDirRes = await fetch(`http://127.0.0.1:${portable.port}/.well-known/http-message-signatures-directory`);
+    const pubDirRes = await v24Fetch('https://hub.example.com/.well-known/http-message-signatures-directory');
     assert.equal(pubDirRes.status, 200);
     const pubDirJson = (await pubDirRes.json()) as { keys: Array<{ kid: string }> };
     assert.equal(pubDirJson.keys[0]?.kid, kp.kid);
 
     const sdk = new EdgeFetchClient({
-      baseUrl: `http://127.0.0.1:${portable.port}`,
+      baseUrl: 'https://hub.example.com',
       token: 'v24-owner-secret-0123456789abcdef',
+      fetchFn: v24Fetch,
     });
     const caps = await sdk.capabilities();
     assert.equal(caps.version, '2.7.8');
@@ -3194,7 +3120,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
     assert.equal(hostsOut.ok, true);
     assert.ok(Array.isArray(hostsOut.hosts));
   } finally {
-    await portable.close();
+    v24Coord.close();
     rmSync(tmpHubDir, { recursive: true, force: true });
   }
 
@@ -5761,197 +5687,8 @@ test('M1-B-R2: /v2/agent & /compat/firecrawl/v2/agent async no-ctx flush + catal
   }
 });
 
-test('M1-C Portable 1: cloudflare-shim, TursoHttpD1Database & S3ArtifactBucket full branch coverage', async () => {
-  // 1. portable/cloudflare-shim.ts
-  const wf = new ShimWorkflowEntrypoint();
-  const dobj = new ShimDurableObject();
-  assert.ok(wf instanceof ShimWorkflowEntrypoint);
-  assert.ok(dobj instanceof ShimDurableObject);
-  let shimSpanSet = false;
-  const spanOut = shimTracing.enterSpan('test.span', (sp) => {
-    sp.setAttribute('k', 'v');
-    shimSpanSet = true;
-    return 42;
-  });
-  assert.equal(spanOut, 42);
-  assert.equal(shimSpanSet, true);
-
-  // 2. portable/turso-d1.ts
-  const tursoCalls: Array<{ url: string; auth?: string; body: { requests: Array<{ type: string; stmt?: { sql: string; args: unknown[] } }> } }> = [];
-  let tursoMode: 'ok' | 'http500' | 'sqlerr' | 'empty' = 'ok';
-  const tursoDb = new TursoHttpD1Database({
-    url: 'libsql://db.turso.io/v2/pipeline',
-    fetchImpl: async (url, init) => {
-      const parsed = JSON.parse(String(init?.body ?? '{}'));
-      tursoCalls.push({
-        url: String(url),
-        auth: (init?.headers as Record<string, string>)?.authorization,
-        body: parsed,
-      });
-      if (tursoMode === 'http500') return new Response('err', { status: 500 });
-      if (tursoMode === 'sqlerr') {
-        return Response.json({ results: [{ type: 'error', error: { message: 'syntax boom' } }] });
-      }
-      if (tursoMode === 'empty') {
-        return Response.json({
-          results: [{ type: 'ok', response: { type: 'execute', result: { cols: [], rows: [] } } }],
-        });
-      }
-      const reqs = parsed.requests.filter((r: { type: string }) => r.type === 'execute');
-      return Response.json({
-        results: reqs.map(() => ({
-          type: 'ok',
-          response: {
-            type: 'execute',
-            result: {
-              cols: [{ name: 'id' }, { name: 'score' }, { name: 'blob_col' }, { name: 'empty_col' }],
-              rows: [
-                [
-                  { type: 'integer', value: '7' },
-                  { type: 'float', value: 3.5 },
-                  { type: 'blob', base64: btoa('hi') },
-                  { type: 'null' },
-                ],
-              ],
-              affected_row_count: 1,
-              last_insert_rowid: '7',
-            },
-          },
-        })),
-      });
-    },
-  });
-  assert.equal(tursoDb.asD1Database(), tursoDb as unknown as D1Database);
-  const blobInput = new Uint8Array([1, 2]);
-  const abInput = new Uint8Array([3, 4]).buffer;
-  const boundStmt = tursoDb
-    .prepare('SELECT * FROM t WHERE a=? AND b=? AND c=? AND d=? AND e=? AND f=? AND g=?')
-    .bind(null, true, false, 3.25, 99n, blobInput, abInput);
-  const runRes = await boundStmt.run();
-  assert.equal(runRes.meta.changes, 1);
-  assert.equal(runRes.meta.last_row_id, 7);
-  const firstRow = await boundStmt.first<{ id: number }>();
-  assert.equal(firstRow?.id, 7);
-  const firstScore = await boundStmt.first<number>('score');
-  assert.equal(firstScore, 3.5);
-  const firstMissingCol = await boundStmt.first<unknown>('missing');
-  assert.equal(firstMissingCol, null);
-  const rawRows = await boundStmt.raw<unknown[]>();
-  assert.equal(rawRows.length, 1);
-  assert.ok(rawRows[0]![2] instanceof Uint8Array);
-  assert.equal(rawRows[0]![3], null);
-
-  const batchRes = await tursoDb.batch([tursoDb.prepare('SELECT 1'), tursoDb.prepare('SELECT 2')]);
-  assert.equal(batchRes.length, 2);
-  const emptyExec = await tursoDb.exec('   ');
-  assert.equal(emptyExec.count, 0);
-  const multiExec = await tursoDb.exec('CREATE TABLE a(x INT);\nINSERT INTO a VALUES (1);');
-  assert.equal(multiExec.count, 2);
-  assert.equal(tursoCalls[0]!.url, 'https://db.turso.io/v2/pipeline');
-  assert.equal(tursoCalls[0]!.auth, undefined);
-
-  tursoMode = 'empty';
-  assert.equal(await tursoDb.prepare('SELECT 1').first(), null);
-  tursoMode = 'http500';
-  await assert.rejects(() => tursoDb.prepare('SELECT 1').all(), /status 500/);
-  tursoMode = 'sqlerr';
-  await assert.rejects(() => tursoDb.prepare('BAD').all(), /syntax boom/);
-
-  // 3. portable/s3-bucket.ts
-  const s3Store = new Map<string, { bytes: Uint8Array; ct: string; meta: Record<string, string> }>();
-  let forceS3ErrorStatus: number | null = null;
-  const s3 = new S3ArtifactBucket({
-    endpoint: 'https://s3.example.com/prefix',
-    bucket: 'my-bucket',
-    accessKeyId: 'AKIAEXAMPLE',
-    secretAccessKey: 'SECRETEXAMPLE',
-    forcePathStyle: false,
-    fetchImpl: async (url, init) => {
-      const u = new URL(String(url));
-      assert.equal(u.hostname, 'my-bucket.s3.example.com');
-      const key = u.pathname.replace(/^\/prefix\//, '');
-      const method = (init?.method ?? 'GET').toUpperCase();
-      if (forceS3ErrorStatus !== null) {
-        return new Response('boom', { status: forceS3ErrorStatus });
-      }
-      if (method === 'PUT') {
-        const hdrs = new Headers(init?.headers);
-        if (hdrs.get('if-none-match') === '*' && s3Store.has(key)) {
-          return new Response('', { status: 409 });
-        }
-        const rawBytes = new Uint8Array(await new Response(init?.body).arrayBuffer());
-        const meta: Record<string, string> = {};
-        hdrs.forEach((v, k) => {
-          if (k.toLowerCase().startsWith('x-amz-meta-')) meta[k.toLowerCase().slice(11)] = v;
-        });
-        s3Store.set(key, { bytes: rawBytes, ct: hdrs.get('content-type') ?? 'application/octet-stream', meta });
-        return new Response('', { status: 200, headers: { etag: '"e1"', 'last-modified': new Date().toUTCString() } });
-      }
-      if (method === 'HEAD') {
-        const rec = s3Store.get(key);
-        if (!rec) return new Response('', { status: 404 });
-        const h = new Headers({ 'content-length': String(rec.bytes.byteLength), 'content-type': rec.ct, etag: '"e1"' });
-        for (const [mk, mv] of Object.entries(rec.meta)) h.set(`x-amz-meta-${mk}`, mv);
-        return new Response(null, { status: 200, headers: h });
-      }
-      if (method === 'GET') {
-        const rec = s3Store.get(key);
-        if (!rec) return new Response('', { status: 404 });
-        return new Response(rec.bytes as BodyInit, {
-          status: 200,
-          headers: { 'content-length': String(rec.bytes.byteLength), 'content-type': rec.ct, etag: '"e1"' },
-        });
-      }
-      if (method === 'DELETE') {
-        if (!s3Store.has(key)) return new Response('', { status: 404 });
-        s3Store.delete(key);
-        return new Response(null, { status: 204 });
-      }
-      return new Response('', { status: 405 });
-    },
-  });
-  assert.equal(s3.asR2Bucket(), s3 as unknown as R2Bucket);
-  assert.equal(await s3.head('missing.txt'), null);
-  assert.equal(await s3.get('missing.txt'), null);
-
-  const jsonPayload = '{"ok":true}';
-  const jsonBytes = new TextEncoder().encode(jsonPayload);
-  const shaAb = await crypto.subtle.digest('SHA-256', jsonBytes);
-  const shaU8 = new Uint8Array(shaAb);
-  await s3.put('a.json', null);
-  await s3.put('b.json', jsonBytes.buffer, { sha256: shaAb, httpMetadata: { contentType: 'application/json' }, customMetadata: { tag: 'v1' } });
-  await s3.put('c.json', new Blob([jsonBytes]), { sha256: shaU8 });
-  await s3.put('d.json', new Blob([jsonBytes]).stream());
-  const condDup = await s3.put('b.json', jsonBytes, { onlyIf: { etagDoesNotMatch: '*' } });
-  assert.equal(condDup, null);
-  await assert.rejects(() => s3.put('bad.json', jsonBytes, { sha256: '00'.repeat(32) }), /checksum mismatch/);
-
-  const headObj = await s3.head('b.json');
-  assert.ok(headObj);
-  const outHdrs = new Headers();
-  headObj.writeHttpMetadata(outHdrs);
-  assert.equal(outHdrs.get('content-type'), 'application/json');
-  assert.equal(headObj.customMetadata?.tag, 'v1');
-
-  const getObj = await s3.get('b.json');
-  assert.ok(getObj);
-  assert.equal((await getObj.json<{ ok: boolean }>()).ok, true);
-  assert.equal((await getObj.arrayBuffer()).byteLength, jsonBytes.byteLength);
-  assert.equal((await getObj.blob()).size, jsonBytes.byteLength);
-  assert.equal(await new Response(getObj.body).text(), jsonPayload);
-
-  await s3.delete(['a.json', 'missing-del.json']);
-  assert.equal(await s3.head('a.json'), null);
-
-  forceS3ErrorStatus = 500;
-  await assert.rejects(() => s3.head('b.json'), /HTTP 500/);
-  await assert.rejects(() => s3.get('b.json'), /HTTP 500/);
-  await assert.rejects(() => s3.put('b.json', 'x'), /HTTP 500/);
-  await assert.rejects(() => s3.delete('b.json'), /HTTP 500/);
-});
-
-test('M1-C Portable 2: NodeDigestStream, NodeSqliteD1Database, NodeFsR2Bucket, RawServerWebSocket & LocalAgentHubCoordinator', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ef-node-adapters-'));
+test('M1-C Storage Mocks: NodeDigestStream, NodeSqliteD1Database, NodeFsR2Bucket & LocalAgentHubCoordinator', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ef-storage-mocks-'));
   try {
     // 1. NodeDigestStream polyfill
     const DigestCtor = (globalThis.crypto as unknown as {
@@ -6009,54 +5746,25 @@ test('M1-C Portable 2: NodeDigestStream, NodeSqliteD1Database, NodeFsR2Bucket, R
     await r2.delete(['empty', 'ab', 'u8', 'blob', 'stream']);
     assert.equal(await r2.head('blob'), null);
 
-    // 4. RawServerWebSocket (Duplex branch + close/terminate/error/send closed)
-    const pt = new PassThrough();
-    let closedReason = '';
-    const rawWs = new RawServerWebSocket(pt, ['site:duplex'], () => {}, (_w, _c, r) => {
-      closedReason = r;
-    });
-    rawWs.terminate();
-    assert.equal(closedReason, 'shutdown');
-    assert.equal(rawWs.readyState, WsClient.CLOSED);
-    assert.throws(() => rawWs.send('not-open'), /websocket_closed/);
-
-    // 5. LocalAgentHubCoordinator + live WS upgrade + ping/pong + binary 1003 + cooldown/health/affinities/namespace
+    // 4. LocalAgentHubCoordinator + mock agent + ping/pong + cooldown/health/affinities/namespace
     const coord = new LocalAgentHubCoordinator(':memory:');
     const ns = coord.asNamespace() as { get(id: string): Record<string, (...a: unknown[]) => Promise<unknown>> };
-    const stub = ns.get(coord.asNamespace() as never);
-    const coordSrv = createHttpServer();
-    coordSrv.on('upgrade', (req, socket, head) => {
-      coord.acceptNodeUpgrade({
-        wsKey: String(req.headers['sec-websocket-key']),
-        socket,
-        head,
-        siteId: 'site-coord',
-        arch: 'linux/amd64',
-        version: '2.7.0',
-        browserVersion: '130',
-        browserSandbox: 'docker',
-        capabilities: 'browser,http',
-        publicIp: '198.51.100.5',
-        subprotocol: 'edgefetch-agent',
-      });
+    const stub = ns.get('global');
+    const mockAgent = coord.connectMockAgent({
+      siteId: 'site-coord',
+      arch: 'linux/amd64',
+      version: '2.7.0',
+      browserVersion: '130',
+      browserSandbox: 'docker',
+      capabilities: 'browser,http',
+      publicIp: '198.51.100.5',
     });
-    await new Promise<void>((res) => coordSrv.listen(0, '127.0.0.1', () => res()));
-    const coordPort = (coordSrv.address() as { port: number }).port;
-    const wsClient = new WsClient(`ws://127.0.0.1:${coordPort}/agent/ws`, 'edgefetch-agent');
-    const msgs: string[] = [];
-    await new Promise<void>((res, rej) => {
-      wsClient.on('error', rej);
-      wsClient.on('message', (data, isBin) => {
-        if (!isBin) msgs.push(data.toString());
-        if (msgs.length === 1) {
-          wsClient.send('ping');
-          wsClient.send(JSON.stringify({ type: 'agent_hello', version: '2.7.0', arch: 'amd64', goVersion: '1.26', capabilities: ['http'], reconnectAttempt: 1 }));
-        } else if (msgs.includes('pong')) {
-          res();
-        }
-      });
-    });
-    assert.ok(msgs.includes('pong'));
+    mockAgent.sendFromAgent('ping');
+    mockAgent.sendFromAgent(
+      JSON.stringify({ type: 'agent_hello', version: '2.7.0', arch: 'amd64', goVersion: '1.26', capabilities: ['http'], reconnectAttempt: 1 }),
+    );
+    assert.ok(mockAgent.sentMessages.includes('pong'));
+
     // Exercise namespace RPCs & SQLite stores
     await stub.recordHostOutcome({ host: 'h1.example.com', outcome: 'ok', status: 200, ttfbMs: 50 });
     await stub.recordHostOutcome({ host: 'h1.example.com', outcome: 'rate_limit', status: 429, ttfbMs: 120 });
@@ -6072,114 +5780,14 @@ test('M1-C Portable 2: NodeDigestStream, NodeSqliteD1Database, NodeFsR2Bucket, R
     const upgradeRes = (await stub.fetch()) as Response;
     assert.equal(upgradeRes.status, 426);
 
-    // Binary frame triggers 1003 close
-    wsClient.send(Buffer.from([1, 2, 3]), { binary: true });
-    await new Promise<void>((res) => wsClient.once('close', () => res()));
+    mockAgent.close();
     coord.close();
-    await new Promise<void>((res) => coordSrv.close(() => res()));
   } finally {
     try {
       rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 });
     } catch {
       // Windows Defender / SQLite WAL handle release may lag slightly in temp dirs
     }
-  }
-});
-
-test('M1-C Portable 3: portable-server.ts & deno-server.ts full Node-reachable + scoped globalThis.Deno mock coverage', async () => {
-  // 1. portable-server.ts helpers
-  assert.equal(parsePortableStrictSingleHost(['a.example.com', 'b.example.com']), null);
-  assert.equal(parsePortableStrictSingleHost(['single.example.com:8443']), 'single.example.com:8443');
-  assert.equal(parsePortableStrictSingleHost('bad:99999'), null);
-  assert.throws(() =>
-    resolvePortablePublicOrigin({
-      canonicalOrigin: 'http://127.0.0.1:8787',
-      trustProxy: false,
-      hasExplicitPublicOrigin: false,
-      hostHeader: ['a.example.com', 'b.example.com'],
-    }),
-  );
-  const loopbackPortRes = resolvePortablePublicOrigin({
-    canonicalOrigin: 'http://127.0.0.1:8787',
-    trustProxy: true,
-    hasExplicitPublicOrigin: false,
-    hostHeader: 'localhost:8787',
-    forwardedHostHeader: 'localhost:8787',
-    forwardedProtoHeader: 'http, https',
-  });
-  assert.equal(loopbackPortRes.origin, 'https://localhost:8787');
-  assert.equal(loopbackPortRes.trustedForwardedHost, 'localhost:8787');
-
-  // 2. startPortableHub with migrationsDir, maxInflightTotal, /agent/ws 404/400/401/valid, >20 MiB body
-  const portDir = mkdtempSync(join(tmpdir(), 'ef-portable-srv-'));
-  const migRoot = join(portDir, 'migrations');
-  mkdirSync(join(migRoot, 'meta'), { recursive: true });
-  mkdirSync(join(migRoot, 'search'), { recursive: true });
-  writeFileSync(join(migRoot, 'meta', '0001_tracking.sql'), readFileSync(resolve('migrations/meta/0001_tracking.sql'), 'utf8'));
-  writeFileSync(join(migRoot, 'search', '0001_fts.sql'), readFileSync(resolve('migrations/search/0001_fts.sql'), 'utf8'));
-
-  const hubSrv = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: join(portDir, 'data'),
-    migrationsDir: migRoot,
-    maxInflightPerIp: 10,
-    maxInflightTotal: 10,
-    envOverrides: {
-      CALLER_TOKEN: 'portable-test-caller-token-123456',
-      AGENT_TOKEN: 'portable-test-agent-token-123456',
-      EDGEFETCH_PUBLIC_ORIGIN: 'not-a-valid-url',
-      EDGEFETCH_TRUST_PROXY: '1',
-    },
-  });
-  try {
-    // Valid /agent/ws upgrade + 404/401 upgrade errors via raw TCP
-    const badWs404 = await new Promise<string>((res) => {
-      const ws = new WsClient(`ws://127.0.0.1:${hubSrv.port}/wrong-path`);
-      ws.on('error', () => undefined);
-      ws.once('unexpected-response', (_req, resp) => {
-        resp.resume();
-        res(String(resp.statusCode));
-      });
-    });
-    assert.equal(badWs404, '404');
-
-    const badWs401 = await new Promise<string>((res) => {
-      const ws = new WsClient(`ws://127.0.0.1:${hubSrv.port}/agent/ws`);
-      ws.on('error', () => undefined);
-      ws.once('unexpected-response', (_req, resp) => {
-        resp.resume();
-        res(String(resp.statusCode));
-      });
-    });
-    assert.equal(badWs401, '401');
-
-    const wsOk = new WsClient(`ws://127.0.0.1:${hubSrv.port}/agent/ws`, 'edgefetch-agent', {
-      headers: { authorization: 'Bearer portable-test-agent-token-123456', 'x-agent-site': 'p-site' },
-    });
-    await new Promise<void>((res, rej) => {
-      wsOk.once('error', rej);
-      wsOk.once('message', () => res());
-    });
-    wsOk.close();
-
-    // GET /health + raw HTTP malformed Host -> 400
-    const reqIgnored = await fetch(`http://127.0.0.1:${hubSrv.port}/health`);
-    assert.equal(reqIgnored.status, 200);
-    const netMod = await import('node:net');
-    const badHostRaw = await new Promise<string>((res, rej) => {
-      const sock = netMod.createConnection({ host: '127.0.0.1', port: hubSrv.port }, () => {
-        sock.write('GET /health HTTP/1.1\r\nHost: [\r\nConnection: close\r\n\r\n');
-      });
-      let buf = '';
-      sock.on('data', (c) => (buf += c.toString('utf8')));
-      sock.on('end', () => res(buf));
-      sock.on('error', rej);
-    });
-    assert.match(badHostRaw, /^HTTP\/1\.1 400 /);
-  } finally {
-    await hubSrv.close();
-    rmSync(portDir, { recursive: true, force: true });
   }
 });
 
@@ -7382,7 +6990,7 @@ test('M1-C Closure 2: AgentHubDO full dispatch/reply/artifact/OAuth lifecycle, W
 });
 
 
-test('M1-C-R2 Batch 1: turso-d1, activity-log, admin, compat, storage, ingest, node-adapters, portable-server & deno-server', async () => {
+test('M1-C-R2 Batch 1: activity-log, admin, compat, storage, ingest & LocalAgentHubCoordinator', async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'ef-r2-b1-'));
   const metaDb = new NodeSqliteD1Database(join(workDir, 'meta.sqlite'), [resolve('migrations/meta/0001_tracking.sql')]);
   const searchDb = new NodeSqliteD1Database(join(workDir, 'search.sqlite'), [resolve('migrations/search/0001_fts.sql')]);
@@ -7390,44 +6998,6 @@ test('M1-C-R2 Batch 1: turso-d1, activity-log, admin, compat, storage, ingest, n
   const doSqlite = new DatabaseSync(join(workDir, 'do.sqlite'));
 
   try {
-    // ── 1. portable/turso-d1.ts remaining branches ──
-    let tMode: 'emptyObj' | 'errNoMsg' | 'noResult' | 'unnamedCol' = 'emptyObj';
-    const tDb = new TursoHttpD1Database({
-      url: 'https://db.turso.io',
-      authToken: 'tok-turso',
-      fetchImpl: async () => {
-        if (tMode === 'emptyObj') return Response.json({});
-        if (tMode === 'errNoMsg') return Response.json({ results: [{ type: 'error' }] });
-        if (tMode === 'noResult') return Response.json({ results: [{ type: 'ok' }] });
-        return Response.json({
-          results: [
-            {
-              type: 'ok',
-              response: {
-                type: 'execute',
-                result: {
-                  cols: [{}],
-                  rows: [[{ type: 'text' }, undefined]],
-                },
-              },
-            },
-          ],
-        });
-      },
-    });
-    await assert.rejects(() => tDb.prepare('SELECT ?').bind({ custom: 1 }).all(), /unknown error/);
-    tMode = 'errNoMsg';
-    await assert.rejects(() => tDb.prepare('SELECT 1').all(), /unknown error/);
-    tMode = 'noResult';
-    const noRes = await tDb.prepare('SELECT 1').first();
-    assert.equal(noRes, null);
-    tMode = 'unnamedCol';
-    const unnamedRes = await tDb.prepare('SELECT 1').all<Record<string, unknown>>();
-    assert.equal(unnamedRes.results?.[0]?.col_0, null);
-    const rawFallbackCell = await tDb.prepare('SELECT 1').raw<unknown[]>();
-    assert.equal(rawFallbackCell[0]?.[0], null);
-    assert.equal(rawFallbackCell[0]?.[1], null);
-
     // ── 2. src/activity-log.ts remaining lines/branches ──
     assert.equal(redactUrlForLog('   '), '');
     assert.equal(redactUrlForLog('relative-token?a=1#b'), 'relative-token');
@@ -8369,7 +7939,7 @@ test('M1-C-R2 Batch 1: turso-d1, activity-log, admin, compat, storage, ingest, n
     });
     assert.equal(bytesMis.status, 'rejected');
 
-    // ── 6. portable/node-adapters.ts, portable-server.ts & deno-server.ts remaining branches ──
+    // ── 6. LocalAgentHubCoordinator remaining branches ──
     const coord = new LocalAgentHubCoordinator(':memory:');
     const ns = coord.asNamespace() as { get(id: string): Record<string, (...a: unknown[]) => Promise<unknown>> };
     const stub = ns.get('global');
@@ -8378,69 +7948,6 @@ test('M1-C-R2 Batch 1: turso-d1, activity-log, admin, compat, storage, ingest, n
     assert.equal((await stub.listHostHealth(5)).length, 1);
     assert.equal(coord.engine.listAgents().connected, 0);
     coord.close();
-
-    assert.equal(parsePortableStrictSingleHost('a..b'), null);
-    assert.equal(parsePortableStrictSingleHost('[::1]'), null);
-    assert.equal(parsePortableStrictSingleHost('a'.repeat(260)), null);
-    assert.equal(
-      resolvePortablePublicOrigin({
-        canonicalOrigin: 'http://127.0.0.1:8787',
-        trustProxy: true,
-        hasExplicitPublicOrigin: false,
-        hostHeader: 'evil.example.com',
-      }).origin,
-      'http://127.0.0.1:8787',
-    );
-    const portDir2 = mkdtempSync(join(tmpdir(), 'ef-r2-port2-'));
-    const hub2 = await startPortableHub({
-      port: 0,
-      host: '127.0.0.1',
-      dataDir: portDir2,
-      maxInflightPerIp: 1,
-      maxInflightTotal: 1,
-      envOverrides: {
-        CALLER_TOKEN: 'port2-caller-token-0123456789abcd',
-        EDGEFETCH_PUBLIC_ORIGIN: 'https://public.example.com',
-        EDGEFETCH_TRUST_PROXY: '1',
-      },
-    });
-    try {
-      // Malformed request-target + GET with Content-Length + POST /admin/login Set-Cookie forwarding
-      const netMod = await import('node:net');
-      const badTarget = await new Promise<string>((res, rej) => {
-        const s = netMod.createConnection({ host: '127.0.0.1', port: hub2.port }, () => {
-          s.write('GET http://evil.example.com/x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
-        });
-        let buf = '';
-        s.on('data', (c) => (buf += c.toString('utf8')));
-        s.on('end', () => res(buf));
-        s.on('error', rej);
-      });
-      assert.match(badTarget, /^HTTP\/1\.1 400 /);
-
-      const getWithBody = await new Promise<string>((res, rej) => {
-        const s = netMod.createConnection({ host: '127.0.0.1', port: hub2.port }, () => {
-          s.write('GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nX-Forwarded-For: 198.51.100.2, zz0\r\n\r\nhello');
-        });
-        let buf = '';
-        s.on('data', (c) => (buf += c.toString('utf8')));
-        s.on('end', () => res(buf));
-        s.on('error', rej);
-      });
-      assert.match(getWithBody, /^HTTP\/1\.1 200 /);
-
-      const loginResp = await fetch(`http://127.0.0.1:${hub2.port}/admin/login`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': '::ffff:198.51.100.3' },
-        body: 'token=' + encodeURIComponent('port2-caller-token-0123456789abcd'),
-        redirect: 'manual',
-      });
-      assert.equal(loginResp.status, 302);
-      assert.ok(loginResp.headers.get('set-cookie'));
-    } finally {
-      await hub2.close();
-      rmSync(portDir2, { recursive: true, force: true });
-    }
   } finally {
     try { doSqlite.exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;'); } catch {}
     try { doSqlite.close(); } catch {}
@@ -10692,7 +10199,7 @@ test('M1-C-R2 Batch 4: src/scrape.ts runPdfOcrFallback, executeScrapeCall & exec
   }
 });
 
-test('M1-C-R2 Batch 5: index.ts, oauth.ts, mcp.ts, storage.ts, ingest.ts, scrape.ts & portable edge closure', async () => {
+test('M1-C-R2 Batch 5: index.ts, oauth.ts, mcp.ts, storage.ts, ingest.ts & scrape.ts edge closure', async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'ef-r2-b5-'));
   const metaDb = new NodeSqliteD1Database(join(workDir, 'meta.sqlite'), [resolve('migrations/meta/0001_tracking.sql')]);
   const searchDb = new NodeSqliteD1Database(join(workDir, 'search.sqlite'), [resolve('migrations/search/0001_fts.sql')]);
@@ -11406,144 +10913,24 @@ test('M1-C-R2 Batch 5: index.ts, oauth.ts, mcp.ts, storage.ts, ingest.ts, scrape
   }
 });
 
-test('M1-C-R2 Combine: final Node-reachable closure for portable-server, node-adapters, index.ts, scrape.ts & ingest.ts', async () => {
+test('M1-C-R2 Combine: final Node-reachable closure for LocalAgentHubCoordinator, index.ts, scrape.ts & ingest.ts', async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'ef-r2-comb-'));
-  const hubDir = join(workDir, 'hub-data');
-  const tursoDir = join(workDir, 'turso-data');
   const metaDb = new NodeSqliteD1Database(join(workDir, 'meta.sqlite'), [resolve('migrations/meta/0001_tracking.sql')]);
   const searchDb = new NodeSqliteD1Database(join(workDir, 'search.sqlite'), [resolve('migrations/search/0001_fts.sql')]);
   const bucket = new NodeFsR2Bucket(join(workDir, 'r2'));
   const doSqlite = new DatabaseSync(':memory:');
 
   try {
-    // 1) portable-server.ts: resolvePublicOrigin array hostHeader + startPortableHub Turso/S3 wiring + active WS upgrade & close
-    assert.throws(
-      () =>
-        resolvePortablePublicOrigin({
-          canonicalOrigin: 'http://127.0.0.1:8787',
-          trustProxy: true,
-          hasExplicitPublicOrigin: false,
-          hostHeader: ['bad host'],
-        }),
-      TypeError,
-    );
-    assert.equal(parsePortableStrictSingleHost('localhost:99999'), null);
-    assert.equal(parsePortableStrictSingleHost('   '), null);
-    assert.equal(parsePortableStrictSingleHost('a..b'), null);
-
-    const tursoHub = await startPortableHub({
-      port: 0,
-      host: '127.0.0.1',
-      dataDir: tursoDir,
-      envOverrides: {
-        EDGEFETCH_PUBLIC_ORIGIN: 'not-a-valid-url',
-        META_TURSO_URL: 'https://meta-turso.example.com',
-        META_TURSO_AUTH_TOKEN: 'turso-tok',
-        SEARCH_TURSO_URL: 'https://search-turso.example.com',
-        SEARCH_TURSO_AUTH_TOKEN: 'turso-tok',
-        S3_ENDPOINT: 'https://s3.example.com',
-        S3_BUCKET: 'edgefetch-test',
-        S3_ACCESS_KEY_ID: 'ak',
-        S3_SECRET_ACCESS_KEY: 'sk',
-      },
-    });
-    try {
-      const hRes = await fetch(`http://127.0.0.1:${tursoHub.port}/health`);
-      assert.equal(hRes.status, 200);
-    } finally {
-      await tursoHub.close();
-    }
-
-    const agentTok = 'comb-agent-tok-0123456789abcdef';
-    const callerTok = 'comb-caller-tok-0123456789abcdef';
-    const pHub = await startPortableHub({
-      port: 0,
-      host: '127.0.0.1',
-      dataDir: hubDir,
-      envOverrides: {
-        AGENT_TOKEN: agentTok,
-        CALLER_TOKEN: callerTok,
-        EDGEFETCH_PUBLIC_ORIGIN: 'https://pub.edgefetch.example.com',
-      },
-    });
-    try {
-      // Connect a real WebSocket client so upgrade + ping + binary frame + active client close() are exercised
-      const ws1 = new WsClient(`ws://127.0.0.1:${pHub.port}/agent/ws`, ['edgefetch-agent'], {
-        headers: {
-          'x-agent-token': agentTok,
-          'x-agent-site': 'site-comb-1',
-          'x-agent-arch': 'amd64',
-          'x-agent-version': '2.7.1',
-        },
-      });
-      await new Promise<void>((resolveOpen, rejectOpen) => {
-        ws1.once('open', () => resolveOpen());
-        ws1.once('error', rejectOpen);
-      });
-      // Wait briefly for initial hello frame then send ping + keep ws2 open across close()
-      await new Promise((r) => setTimeout(r, 30));
-      ws1.send('ping');
-      const ws2 = new WsClient(`ws://127.0.0.1:${pHub.port}/agent/ws`, ['edgefetch-agent'], {
-        headers: { 'x-agent-token': agentTok, 'x-agent-site': 'site-comb-2' },
-      });
-      await new Promise<void>((resolveOpen, rejectOpen) => {
-        ws2.once('open', () => resolveOpen());
-        ws2.once('error', rejectOpen);
-      });
-      // Send binary frame on ws1 -> triggers 1003 binary_frames_unsupported in RawServerWebSocket
-      ws1.send(Buffer.from([1, 2, 3]), { binary: true });
-      await new Promise((r) => setTimeout(r, 40));
-
-      // Cancel / stream abort on POST body + 20 MiB overflow check
-      const abortCtrl = new AbortController();
-      const slowStream = new ReadableStream<Uint8Array>({
-        start(c) {
-          c.enqueue(new TextEncoder().encode('{"url":'));
-        },
-      });
-      const abortPromise = fetch(`http://127.0.0.1:${pHub.port}/v1/scrape`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${callerTok}`, 'content-type': 'application/json' },
-        body: slowStream,
-        duplex: 'half',
-        signal: abortCtrl.signal,
-      } as RequestInit).catch(() => null);
-      setTimeout(() => abortCtrl.abort(), 15);
-      await abortPromise;
-
-      // Multi-value custom header + valid POST passThroughOnException
-      const multiRes = await fetch(`http://127.0.0.1:${pHub.port}/v1/capabilities`, {
-        headers: {
-          authorization: `Bearer ${callerTok}`,
-          'x-custom-multi': 'a',
-        },
-      });
-      assert.equal(multiRes.status, 200);
-    } finally {
-      // Closing while ws2 is still open exercises wss.clients terminate loop (lines 648-653)
-      await pHub.close();
-    }
-
-    // 2) node-adapters.ts: LocalAgentHubCoordinator SQLite cooldowns, hostWindows, affinities & RawServerWebSocket closed-send
+    // 1) LocalAgentHubCoordinator SQLite cooldowns, hostWindows & hostHealth
     const coord = new LocalAgentHubCoordinator(join(workDir, 'coord.sqlite'));
     try {
       const stub = (coord.asNamespace() as { get: (id: unknown) => Record<string, (...a: unknown[]) => unknown> }).get(
         'global',
       );
-      // Use engine internals via public methods: waitForHostWindow sets host_windows; recordHostOutcome sets host_health
       await stub.waitForHostWindow(['comb.example.com'], 20, Date.now() + 2000);
       await stub.waitForHostWindow(['comb.example.com'], 20, Date.now() + 2000);
       await stub.recordHostOutcome({ host: 'comb.example.com', status: 429, ok: false, ttfbMs: 50, retryAfterMs: 5000 });
       await stub.recordHostOutcome({ host: 'comb.example.com', status: 200, ok: true, ttfbMs: 40 });
-      // RawServerWebSocket closed send error + array rawData
-      const fakeStream = new PassThrough();
-      const closedEvents: Array<{ code: number; reason: string }> = [];
-      const rawWs = new RawServerWebSocket(fakeStream, ['site:s1'], () => undefined, (_ws, code, reason) => {
-        closedEvents.push({ code, reason });
-      });
-      rawWs.close(1000, 'done');
-      assert.throws(() => rawWs.send('after-close'), /websocket_closed/);
-      assert.equal(closedEvents.length, 1);
     } finally {
       coord.close();
     }
@@ -11654,6 +11041,8 @@ test('M1-C-R2 Combine: final Node-reachable closure for portable-server, node-ad
         return typeof v === 'function' ? v.bind(target) : v;
       },
     });
+    const callerTok = 'comb-caller-token-0123456789abcdef';
+    const agentTok = 'comb-agent-token-0123456789abcdef';
     const cEnv = {
       CALLER_TOKEN: callerTok,
       AGENT_TOKEN: agentTok,
@@ -13051,326 +12440,36 @@ test('M1-C-R3 Group 2: src/index.ts AgentHubDO SQLite/RPCs, Worker routes, batch
   }
 });
 
-test('M1-C-R3 Group 3: portable-server.ts stream/headers/upgrade, node-adapters.ts WS/SQLite', async () => {
+test('M1-C-R3 Group 3: LocalAgentHubCoordinator SQLite cooldowns/affinities & NodeFsR2Bucket', async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'edgefetch-m1c-r3-g3-'));
-  const portDataDir = join(workDir, 'portable-data');
 
   try {
-    // portable/portable-server.ts: >20 MiB streaming overflow (118-128), rate-limit 429 (485-495), array set-cookie header (325), IPv6 bracket (46), malformed upgrade (600-633)
-    const hub = await startPortableHub({
-      host: '127.0.0.1',
-      port: 0,
-      dataDir: portDataDir,
-      maxInflightPerIp: 1,
-      envOverrides: {
-        EDGEFETCH_TRUST_PROXY: '1',
-        CALLER_TOKEN: 'portable-caller-secret-0001',
-        AGENT_TOKEN: 'portable-agent-secret-0001',
-      },
-    });
-    try {
-      // IPv6 bracketed X-Forwarded-For (line 46) + array Set-Cookie header in IncomingMessage (line 325)
-      await new Promise<void>((resDone) => {
-        const req = httpRequest(
-          {
-            host: '127.0.0.1',
-            port: hub.port,
-            path: '/health',
-            method: 'GET',
-            headers: {
-              'x-forwarded-for': '[2001:db8::99]:1234',
-              'set-cookie': ['c1=1', 'c2=2'],
-            },
-          },
-          (res) => {
-            res.resume();
-            res.on('end', () => resDone());
-            res.on('close', () => resDone());
-          },
-        );
-        req.on('error', () => resDone());
-        req.end();
-      });
-
-      // Verify invalid/unauthorized /agent/ws upgrade returns 401 cleanly before connecting valid agent
-      const unauthWsStatus = await new Promise<number>((resCode, rejCode) => {
-        const badWs = new WsClient(`ws://127.0.0.1:${hub.port}/agent/ws`, 'edgefetch-agent', {
-          headers: { authorization: 'Bearer wrong-portable-agent-secret-0001', 'x-agent-site': 's-port' },
-        });
-        badWs.on('error', () => undefined);
-        badWs.once('unexpected-response', (_req, res) => {
-          res.resume();
-          resCode(res.statusCode ?? 0);
-        });
-        badWs.once('open', () => rejCode(new Error('expected 401 upgrade rejection')));
-      });
-      assert.equal(unauthWsStatus, 401);
-
-      // Connect a WS agent to hold a pending job open for (a) 429 maxInflightPerIp=1 and (b) 21 MiB POST /agent/reply streaming overflow (118-128)
-      const portWs = new WsClient(`ws://127.0.0.1:${hub.port}/agent/ws`, 'edgefetch-agent', {
-        headers: { authorization: 'Bearer portable-agent-secret-0001', 'x-agent-site': 's-port' },
-      });
-      let pendingJob: { jobId: string; jobNonce: string } | null = null;
-      let resolveJobSeen!: () => void;
-      const jobSeenPromise = new Promise<void>((r) => {
-        resolveJobSeen = r;
-      });
-      portWs.on('message', (data) => {
-        const msg = JSON.parse(data.toString()) as { jobId?: string; jobNonce?: string };
-        if (msg.jobId && msg.jobNonce) {
-          pendingJob = { jobId: msg.jobId, jobNonce: msg.jobNonce };
-          resolveJobSeen();
-        }
-      });
-      await new Promise<void>((resOpen, rejOpen) => {
-        portWs.once('open', () => resOpen());
-        portWs.once('error', rejOpen);
-      });
-      await new Promise((r) => setTimeout(r, 25));
-
-      const inflightFetch = fetch(`http://127.0.0.1:${hub.port}/fetch?target=agent&site=s-port`, {
-        method: 'POST',
-        headers: { authorization: 'Bearer portable-caller-secret-0001', 'content-type': 'application/json' },
-        body: JSON.stringify({ maxSeconds: 5, options: { respectRobots: true }, requests: [{ id: '1', url: 'https://inflight.example.com/', kind: 'page' }] }),
-      }).catch(() => null);
-      await jobSeenPromise;
-
-      // Concurrent 2nd request from same IP hits maxInflightPerIp=1 -> 429 (485-495)
-      const rlRes = await fetch(`http://127.0.0.1:${hub.port}/health`);
-      assert.equal(rlRes.status, 429);
-
-      // Stream 21 MiB body into POST /agent/reply (readAgentReplyBody reads up to 20 MiB -> triggers safeNodeReqToWebStream >20 MiB overflow at lines 118-128)
-      const bigUploadRes = await new Promise<{ status?: number; err?: Error }>((resolveP) => {
-        let settled = false;
-        const done = (v: { status?: number; err?: Error }) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolveP(v);
-        };
-        const req = httpRequest(
-          {
-            host: '127.0.0.1',
-            port: hub.port,
-            path: '/agent/reply',
-            method: 'POST',
-            headers: {
-              authorization: 'Bearer portable-agent-secret-0001',
-              'x-agent-site': 's-port',
-              'x-forwarded-for': '203.0.113.55',
-              'content-length': String(21 * 1024 * 1024),
-              'x-job-id': pendingJob!.jobId,
-              'x-job-nonce': pendingJob!.jobNonce,
-            },
-          },
-          (res) => {
-            res.resume();
-            res.on('end', () => done({ status: res.statusCode }));
-            res.on('close', () => done({ status: res.statusCode }));
-          },
-        );
-        const timer = setTimeout(() => {
-          req.destroy();
-          done({ status: 400 });
-        }, 2_000);
-        req.on('error', (err) => done({ err }));
-        req.on('close', () => done({ status: 400 }));
-        const chunk = Buffer.alloc(1024 * 1024, 0x20);
-        for (let i = 0; i < 21; i++) {
-          if (!req.destroyed) req.write(chunk);
-        }
-        req.end();
-      });
-      assert.ok(bigUploadRes.status !== undefined || bigUploadRes.err !== undefined);
-
-      // Fail pending job cleanly and close WS
-      await fetch(`http://127.0.0.1:${hub.port}/agent/reply`, {
-        method: 'POST',
-        headers: {
-          authorization: 'Bearer portable-agent-secret-0001',
-          'x-agent-site': 's-port',
-          'x-job-id': pendingJob!.jobId,
-          'x-job-nonce': pendingJob!.jobNonce,
-        },
-        body: JSON.stringify({ results: [{ id: '1', url: 'https://inflight.example.com/', status: 200, outcome: 'ok' }] }),
-      }).catch(() => null);
-      await inflightFetch;
-      portWs.terminate();
-
-      // Aborted mid-stream request -> exercises onErr/onEnd/cancel (141-201)
-      await new Promise<void>((resolveP) => {
-        let settled = false;
-        const done = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolveP();
-        };
-        const req = httpRequest({
-          host: '127.0.0.1',
-          port: hub.port,
-          path: '/v1/scrape',
-          method: 'POST',
-          headers: {
-            authorization: 'Bearer portable-caller-secret-0001',
-            'content-type': 'application/json',
-            'content-length': '1000',
-          },
-        });
-        const timer = setTimeout(() => {
-          req.destroy();
-          done();
-        }, 1_000);
-        req.on('error', done);
-        req.on('close', done);
-        req.write('{"url":');
-        setTimeout(() => {
-          req.destroy(new Error('client_abort'));
-        }, 15);
-      });
-
-      // Raw TCP Upgrade to wrong path / bad host / missing ws-key (592-633)
-      const badUpgradeResp = await new Promise<string>((resolveP) => {
-        let settled = false;
-        let data = '';
-        const sock = createConnection({ host: '127.0.0.1', port: hub.port }, () => {
-          sock.write('GET /agent/ws HTTP/1.1\r\nHost: [\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
-        });
-        const done = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          sock.destroy();
-          resolveP(data);
-        };
-        const timer = setTimeout(done, 1_000);
-        sock.on('data', (d) => {
-          data += d.toString();
-        });
-        sock.on('end', done);
-        sock.on('close', done);
-        sock.on('error', done);
-      });
-      assert.match(badUpgradeResp, /400 Bad Request/);
-    } finally {
-      await hub.close();
-    }
-
-    // 3) portable/node-adapters.ts: RawServerWebSocket WS_ERR_* codes, socket errors, LocalAgentHubCoordinator SQLite cooldowns/affinities, NodeFsR2Bucket Windows path escape
     const coord = new LocalAgentHubCoordinator(':memory:');
     try {
-      const fakeStream = new PassThrough();
-      const closedList: Array<{ code: number; reason: string }> = [];
-      const rawWs = new RawServerWebSocket(fakeStream, ['site:s-node'], () => undefined, (_ws, code, reason) => {
-        closedList.push({ code, reason });
-      });
-      // Send a masked client WebSocket text frame with invalid UTF-8 (0x81 0x82 mask + 0xff 0xfe) -> triggers WS_ERR_INVALID_UTF8 (305, 369-374, 393-399)
-      const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
-      const badUtf8 = Buffer.from([0xff ^ 0x12, 0xfe ^ 0x34]);
-      fakeStream.write(Buffer.concat([Buffer.from([0x81, 0x82]), mask, badUtf8]));
-      await new Promise((r) => setTimeout(r, 20));
-      assert.ok(closedList.length >= 1);
-
-      // Oversized frame (>1 MiB) -> triggers WS_ERR_UNSUPPORTED_MESSAGE_LENGTH (302-304)
-      const stream2 = new PassThrough();
-      const closed2: Array<{ code: number; reason: string }> = [];
-      new RawServerWebSocket(stream2, ['site:s-node2'], () => undefined, (_ws, code, reason) => {
-        closed2.push({ code, reason });
-      });
-      // Masked text frame claiming 2 MiB payload length (0x81, 0xff, 8-byte length = 2*1024*1024)
-      const hdr = Buffer.alloc(14);
-      hdr[0] = 0x81;
-      hdr[1] = 0xff;
-      hdr.writeBigUInt64BE(BigInt(2 * 1024 * 1024), 2);
-      stream2.write(hdr);
-      await new Promise((r) => setTimeout(r, 20));
-      assert.equal(closed2[0]?.code, 1009);
-
-      // Socket error & terminate paths
-      const stream3 = new PassThrough();
-      const closed3: Array<{ code: number; reason: string }> = [];
-      const rawWs3 = new RawServerWebSocket(stream3, ['site:s-node3'], () => undefined, (_ws, code, reason) => {
-        closed3.push({ code, reason });
-      });
-      stream3.emit('error', new Error('boom'));
-      rawWs3.terminate();
-      assert.equal(closed3[0]?.code, 1011);
-
-      // tcp_closed via destroy (379-380) & real net.Socket close flush (465-479)
-      const stream4 = new PassThrough();
-      const closed4: Array<{ code: number; reason: string }> = [];
-      new RawServerWebSocket(stream4, ['site:s-node4'], () => undefined, (_ws, code, reason) => {
-        closed4.push({ code, reason });
-      });
-      stream4.destroy();
-      await new Promise((r) => setTimeout(r, 15));
-      assert.equal(closed4[0]?.reason, 'tcp_closed');
-
-      const tcpSrv = createHttpServer();
-      await new Promise<void>((r) => tcpSrv.listen(0, '127.0.0.1', () => r()));
-      const tcpPort = (tcpSrv.address() as { port: number }).port;
-      const [srvSock, cliSock] = await Promise.all([
-        new Promise<import('node:net').Socket>((r) => tcpSrv.once('connection', (s) => r(s))),
-        new Promise<import('node:net').Socket>((r) => {
-          const c = createConnection({ host: '127.0.0.1', port: tcpPort }, () => r(c));
-        }),
-      ]);
-      try {
-        const closedTcp: Array<{ code: number; reason: string }> = [];
-        const rawTcpWs = new RawServerWebSocket(srvSock, ['site:s-tcp'], () => undefined, (_ws, code, reason) => {
-          closedTcp.push({ code, reason });
-        });
-        rawTcpWs.close(1000, 'graceful');
-        assert.equal(closedTcp[0]?.code, 1000);
-      } finally {
-        cliSock.destroy();
-        srvSock.destroy();
-        await new Promise<void>((r) => {
-          tcpSrv.close(() => r());
-          tcpSrv.closeAllConnections?.();
-        });
-      }
-
-      // LocalAgentHubCoordinator SQLite cooldowns & affinities via real WS upgrade + asNamespace()
       const stub = (coord.asNamespace() as { get(id: string): Record<string, (...a: unknown[]) => Promise<unknown>> }).get('global');
-      const wsSrv = createHttpServer();
-      wsSrv.on('upgrade', (req, sock, head) => {
-        coord.acceptNodeUpgrade({
-          req,
-          wsKey: String(req.headers['sec-websocket-key'] ?? ''),
-          socket: sock,
-          head,
-          siteId: 's-coord',
-          arch: 'amd64',
-          version: '2.7.0',
-          capabilities: 'http',
-          publicIp: '198.51.100.7',
-          subprotocol: 'edgefetch-agent',
-        });
-      });
-      await new Promise<void>((resListen) => wsSrv.listen(0, '127.0.0.1', () => resListen()));
-      const wsPort = (wsSrv.address() as { port: number }).port;
-      const wsClient = new WsClient(`ws://127.0.0.1:${wsPort}/agent/ws`, 'edgefetch-agent');
-      try {
-        wsClient.on('message', (data) => {
-          const msg = JSON.parse(data.toString()) as { jobId?: string; jobNonce?: string; call?: { requests: Array<{ id: string; url: string; kind: string }> } };
+      const mockAgent = coord.connectMockAgent({
+        siteId: 's-coord',
+        arch: 'amd64',
+        version: '2.7.0',
+        capabilities: 'http',
+        publicIp: '198.51.100.7',
+        onServerMessage: (raw) => {
+          const msg = JSON.parse(raw) as { jobId?: string; jobNonce?: string; call?: { requests: Array<{ id: string; url: string; kind: string }> } };
           if (msg.jobId && msg.jobNonce && msg.call) {
             const r0 = msg.call.requests[0]!;
             const status = r0.url.includes('rate429') ? 429 : 200;
-            void stub.completeJob!(
-              msg.jobId,
-              msg.jobNonce,
-              's-coord',
-              JSON.stringify({ results: [{ id: r0.id, url: r0.url, kind: r0.kind, status, outcome: status === 429 ? 'rate_limited' : 'ok' }] }),
-            );
+            queueMicrotask(() => {
+              void stub.completeJob!(
+                msg.jobId,
+                msg.jobNonce,
+                's-coord',
+                JSON.stringify({ results: [{ id: r0.id, url: r0.url, kind: r0.kind, status, outcome: status === 429 ? 'rate_limited' : 'ok' }] }),
+              );
+            });
           }
-        });
-        await new Promise<void>((resOpen, rejOpen) => {
-          wsClient.once('open', () => resOpen());
-          wsClient.once('error', rejOpen);
-        });
-        // Wait briefly for server acceptWebSocket to register socket
-        await new Promise((r) => setTimeout(r, 25));
+        },
+      });
+      try {
         await stub.dispatchFetch!(
           JSON.stringify({ maxSeconds: 30, options: { respectRobots: true, pauseMs: 5 }, requests: [{ id: '1', url: 'https://coord.example.com/ok', kind: 'page' }] }),
           {},
@@ -13388,11 +12487,7 @@ test('M1-C-R3 Group 3: portable-server.ts stream/headers/upgrade, node-adapters.
           {},
         );
       } finally {
-        try { wsClient.terminate(); } catch {}
-        await new Promise<void>((resC) => {
-          wsSrv.close(() => resC());
-          wsSrv.closeAllConnections?.();
-        });
+        mockAgent.close();
       }
       await stub.failJob!('no_job', 'no_nonce', 's-coord', 'err', true);
       await stub.recordHubEvents!([{ level: 'info', category: 'crawl', event: 'e1', summary: 's1' }]);
@@ -13417,14 +12512,13 @@ test('M1-C-R3 Group 3: portable-server.ts stream/headers/upgrade, node-adapters.
       await r2.delete(['k-null', 'k-ab']);
     } finally {
       coord.close();
-      coord.close();
     }
   } finally {
     rmSync(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 });
   }
 });
 
-test('M1-C-R3 Group 4: src/oauth.ts, src/otel.ts, src/admin.ts, src/auth.ts, src/compat.ts, portable/s3-bucket.ts, turso-d1.ts, activity-log.ts, spa-fallback.ts', async () => {
+test('M1-C-R3 Group 4: src/oauth.ts, src/otel.ts, src/admin.ts, src/auth.ts, src/compat.ts, activity-log.ts, spa-fallback.ts', async () => {
   const workDir = mkdtempSync(join(tmpdir(), 'edgefetch-m1c-r3-g4-'));
   const origFetch = globalThis.fetch;
 
@@ -13581,71 +12675,6 @@ test('M1-C-R3 Group 4: src/oauth.ts, src/otel.ts, src/admin.ts, src/auth.ts, src
       false,
     );
 
-    // 4) portable/turso-d1.ts: first() on empty result + executeBatch unnamed column fallback
-    const tursoDb = new TursoHttpD1Database({
-      url: 'libsql://demo.turso.io',
-      fetchImpl: async () =>
-        new Response(
-          JSON.stringify({
-            results: [
-              {
-                type: 'ok',
-                response: { type: 'execute', result: { cols: [{}], rows: [[{ type: 'text', value: 'v1' }]], affected_row_count: 0 } },
-              },
-            ],
-          }),
-          { status: 200 },
-        ),
-    });
-    const tursoEmptyDb = new TursoHttpD1Database({
-      url: 'libsql://demo.turso.io',
-      fetchImpl: async () =>
-        new Response(
-          JSON.stringify({
-            results: [{ type: 'ok', response: { type: 'execute', result: { cols: [], rows: [] } } }],
-          }),
-          { status: 200 },
-        ),
-    });
-    assert.deepEqual(await tursoDb.prepare('SELECT 1').all(), {
-      success: true,
-      results: [{ col_0: 'v1' }],
-      meta: { duration: 0, size_after: 0, rows_read: 1, rows_written: 0, last_row_id: 0, changed_db: false, changes: 0 },
-    });
-    assert.equal(await tursoEmptyDb.prepare('SELECT 1').first(), null);
-
-    // 5) portable/s3-bucket.ts: ArrayBuffer/Uint8Array sha256, etagDoesNotMatch, duplicate query keys, Blob/ReadableStream put, missing etag
-    const s3 = new S3ArtifactBucket({
-      endpoint: 'https://s3.example.com',
-      bucket: 'bkt',
-      accessKeyId: 'ak',
-      secretAccessKey: 'sk',
-      forcePathStyle: false,
-      fetchImpl: async (u, init) => {
-        if ((init?.method ?? 'GET') === 'HEAD') {
-          return new Response(null, { status: 200, headers: { 'content-length': '3' } });
-        }
-        if ((init?.method ?? 'GET') === 'PUT') {
-          return new Response(null, { status: 200, headers: {} });
-        }
-        return new Response('abc', { status: 200 });
-      },
-    });
-    const sigHdrs = await buildSigV4Headers({
-      method: 'GET',
-      url: 'https://s3.example.com/?a=2&a=1',
-      region: 'auto',
-      accessKeyId: 'ak',
-      secretAccessKey: 'sk',
-      now: new Date(now),
-    });
-    assert.ok(sigHdrs.authorization.includes('AWS4-HMAC-SHA256'));
-    const rawShaBytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('hello')));
-    await s3.put('obj1', new Blob(['hello']), { sha256: rawShaBytes, onlyIf: { etagDoesNotMatch: '*' } });
-    await s3.put('obj2', new Blob(['hello']).stream(), { sha256: rawShaBytes.buffer });
-    const s3Head = await s3.head('obj1');
-    assert.equal(s3Head?.version, '1');
-
     // 6) src/activity-log.ts: buildCrawlActivityEvents level branches
     const actEvents = buildCrawlActivityEvents({
       source: 'test',
@@ -13796,23 +12825,21 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
   assert.equal(sanitizeOpenApiOrigin('javascript:alert(1)'), 'https://edgefetch.dev');
   assert.equal(sanitizeOpenApiOrigin(''), 'https://edgefetch.dev');
 
-  // 2. Live Portable Hub `GET /openapi.json` + `OPTIONS /openapi.json` CORS preflight + `Accept` negotiation
-  const tmpData = mkdtempSync(join(tmpdir(), 'ef-openapi-hub-'));
-  const hub = await startPortableHub({
-    port: 0,
-    host: '127.0.0.1',
-    dataDir: tmpData,
-    envOverrides: { CALLER_TOKEN: 'caller-secret-token-0123456789abcdef' },
-  });
+  // 2. Worker Hub `GET /openapi.json` + `OPTIONS /openapi.json` CORS preflight + `Accept` negotiation
+  const oaCoord = new LocalAgentHubCoordinator(':memory:');
+  const oaEnv = {
+    AGENT_HUB: oaCoord.asNamespace() as never,
+    CALLER_TOKEN: 'caller-secret-token-0123456789abcdef',
+  };
   let liveSpecText = '';
   let liveSpec: Record<string, unknown>;
   try {
-    const preflight = await fetch(`http://127.0.0.1:${hub.port}/openapi.json`, { method: 'OPTIONS' });
+    const preflight = await hubWorker.fetch(new Request('https://hub.example.com/openapi.json', { method: 'OPTIONS' }), oaEnv);
     assert.equal(preflight.status, 204);
     assert.equal(preflight.headers.get('access-control-allow-origin'), '*');
     assert.equal(preflight.headers.get('x-content-type-options'), 'nosniff');
 
-    const res = await fetch(`http://127.0.0.1:${hub.port}/openapi.json`);
+    const res = await hubWorker.fetch(new Request('https://hub.example.com/openapi.json'), oaEnv);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(res.headers.get('access-control-allow-origin'), '*');
@@ -13821,14 +12848,16 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
     liveSpec = JSON.parse(liveSpecText) as Record<string, unknown>;
     assert.equal(liveSpec.openapi, '3.1.0');
 
-    const oaRes = await fetch(`http://127.0.0.1:${hub.port}/openapi.json`, {
-      headers: { Accept: 'application/openapi+json' },
-    });
+    const oaRes = await hubWorker.fetch(
+      new Request('https://hub.example.com/openapi.json', {
+        headers: { Accept: 'application/openapi+json' },
+      }),
+      oaEnv,
+    );
     assert.equal(oaRes.status, 200);
     assert.match(String(oaRes.headers.get('content-type')), /^application\/openapi\+json;\s*charset=utf-8$/i);
   } finally {
-    await hub.close();
-    rmSync(tmpData, { recursive: true, force: true });
+    oaCoord.close();
   }
 
   const info = liveSpec.info as { version: string; license: { name: string; url: string } };

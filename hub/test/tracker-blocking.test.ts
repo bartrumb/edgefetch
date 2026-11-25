@@ -1346,19 +1346,35 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(statsFreshInstance.generation, statsBeforeOversized.generation + 1);
       assert.equal(statsFreshInstance.memoryBytes, statsFreshInstance.initialMemoryBytes);
 
-      // Sub-8 MiB board (`~6.3 MiB` I/O, below `WASM_EVICT_IO_BYTES`) that expands Go linear memory by >28 MiB
-      // must ALSO evict `cachedReactor` via `WASM_MAX_MEMORY_GROWTH_BYTES` alone!
-      const mediumGhJson = buildLargeGhBoard('mediumco', 385);
-      assert.ok(mediumGhJson.length > 6_000_000 && mediumGhJson.length < 7_500_000);
-      const medFmt = resolveAtsPreFetchSpec('https://boards.greenhouse.io/mediumco')!.format(
-        mediumGhJson,
-        'https://boards.greenhouse.io/mediumco',
-      );
-      assert.equal(medFmt?.total, 385);
+      // Ordinary 2 MB documents (`2M` `<` sanitize -> `~77.5 MiB` total) must NOT trigger reactor rebuilds across
+      // 12 consecutive calls (`generation` stays constant, zero `~50 ms` rebuild stalls or dual-instance overlap).
+      const { sanitizeInlineHtmlInMarkdown: sanitizeInline2M } = await import('../src/scrape');
+      const twoMillionLt = '<'.repeat(2_000_000);
+      const genBefore2M = getWasmReactorStats().generation;
+      for (let runIdx = 0; runIdx < 12; runIdx++) {
+        const sanitized2M = sanitizeInline2M(twoMillionLt);
+        assert.equal(sanitized2M.length, 8_000_000);
+      }
+      const statsAfter2M = getWasmReactorStats();
+      assert.equal(statsAfter2M.active, true, '12 consecutive 2M `<` sanitize calls must keep cachedReactor active');
       assert.equal(
-        getWasmReactorStats().active,
-        false,
-        '6.4 MiB board growing WASM memory >28 MiB must evict cachedReactor via growth threshold',
+        statsAfter2M.generation,
+        genBefore2M,
+        '12 consecutive 2M `<` sanitize calls must have 0 reactor rebuilds',
+      );
+      assert.ok(statsAfter2M.memoryBytes <= 96 * 1024 * 1024);
+
+      // Oversized (>8 MiB) failing WASM inputs (`> 48 MiB` `ef_in_ptr` rejection) must NOT allocate a second retry reactor instance!
+      const genBeforeFailedHuge = getWasmReactorStats().generation;
+      assert.throws(
+        () => callCoreWasmRawPair('detect_prompt_injection', 'ok', 'z'.repeat(49 * 1024 * 1024)),
+        /WASM input buffer allocation failed/,
+      );
+      assert.equal(getWasmReactorStats().active, false);
+      assert.equal(
+        getWasmReactorStats().generation,
+        genBeforeFailedHuge,
+        'Failed >8 MiB WASM call must evict without spawning a retry instance during error handling',
       );
 
       // Test 2: `callCoreWasmRawMetaPair` and `callCoreWasmRawPair` use exact UTF-8 byte lengths (`0` `rawB.length * 3`).
@@ -1437,8 +1453,8 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(ringFirst.exec('ring-overwrite-1023'), null);
       assert.equal(ringFirst.exec('ring-origin-777')?.groups?.num, '777', 'Evicted ring handle must recompile and preserve groups');
 
-      // Test 5: Lite Greenhouse board (`?content=false`) across `verify` mode AND `domains` slug-existence probes (`runSlugProbeWave`),
-      // with isolated `|lite` cache keys so subsequent `search` calls still fetch full `?content=true` board descriptions.
+      // Test 5: Lite Greenhouse board (`?content=false`) across `verify`, `runSlugProbeWave`, AND `search` (`runCandidateWave`),
+      // with bounded (`<= 6`) per-posting `/jobs/{id}` enrichment populating `pay` & `snippet` (zero `?content=true` board downloads!).
       resetJobsCacheForTests();
       const liteGhBoardSpec = resolveAtsPreFetchSpec('https://job-boards.greenhouse.io/anthropic', { liteBoard: true });
       const liteGhJobSpec = resolveAtsPreFetchSpec('https://job-boards.greenhouse.io/anthropic/jobs/5462972008', { liteBoard: true });
@@ -1454,6 +1470,17 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
         if (u === 'https://stealthco.com/careers') {
           // Stays on `/careers` with 200 OK but zero ATS links -> triggers `runSlugProbeWave`!
           return { status: 200, body: { ok: true, finalUrl: u, rawHtml: '<html><body><h1>Join StealthCo</h1></body></html>', links: [] } };
+        }
+        if (u === 'https://bigghco.com/careers') {
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              finalUrl: u,
+              rawHtml: '<a href="https://job-boards.greenhouse.io/bigghco">Careers</a>',
+              links: ['https://job-boards.greenhouse.io/bigghco'],
+            },
+          };
         }
         if (u === 'https://boards.greenhouse.io/stealthco' || u === 'https://job-boards.greenhouse.io/stealthco') {
           const isLite = args.atsLiteBoard === true;
@@ -1483,6 +1510,77 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
             },
           };
         }
+        if (u === 'https://job-boards.greenhouse.io/stealthco/jobs/5001') {
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              extractorId: 'greenhouse-job',
+              jobPosting: {
+                title: 'Systems Engineer',
+                hiringOrganization: 'StealthCo',
+                workplaceType: 'remote',
+                jobLocation: ['Remote - US'],
+                pay: { currency: 'USD', min: 180_000, max: 220_000, period: 'year', basis: 'base', raw: '$180k-$220k' },
+                datePosted: '2026-11-24T00:00:00Z',
+                url: u,
+                applyUrl: u,
+                source: 'greenhouse',
+              },
+              markdown: '# Systems Engineer @ StealthCo\n\nSingle-posting description body with $180k-$220k USD base compensation.',
+            },
+          };
+        }
+        if (u === 'https://job-boards.greenhouse.io/bigghco' || u === 'https://boards.greenhouse.io/bigghco') {
+          assert.equal(args.atsLiteBoard, true, 'Search-mode Greenhouse board fetch must ALWAYS pass atsLiteBoard: true');
+          const roleTeams = ['Runtime', 'Storage', 'Networking', 'Security', 'Edge', 'Kernel', 'Compiler', 'Platform'];
+          const liteJobs = roleTeams.map((team, idx) => ({
+            title: `Systems Engineer, ${team}`,
+            company: 'BigGhCo',
+            url: `https://job-boards.greenhouse.io/bigghco/jobs/${6001 + idx}`,
+            applyUrl: `https://job-boards.greenhouse.io/bigghco/jobs/${6001 + idx}`,
+            workplaceType: 'remote',
+            locations: ['Remote - US'],
+            pay: null,
+            postedAt: '2026-11-24T00:00:00Z',
+            source: 'greenhouse',
+          }));
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              extractorId: 'greenhouse-board',
+              total: 8,
+              returned: 8,
+              truncated: false,
+              links: liteJobs.map((j) => j.url),
+              jobs: liteJobs,
+            },
+          };
+        }
+        if (/^https:\/\/job-boards\.greenhouse\.io\/bigghco\/jobs\/600\d$/.test(u)) {
+          const roleTeams = ['Runtime', 'Storage', 'Networking', 'Security', 'Edge', 'Kernel', 'Compiler', 'Platform'];
+          const teamName = roleTeams[Number(u.slice(-1)) - 1] ?? 'Core';
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              extractorId: 'greenhouse-job',
+              jobPosting: {
+                title: `Systems Engineer, ${teamName}`,
+                hiringOrganization: 'BigGhCo',
+                workplaceType: 'remote',
+                jobLocation: ['Remote - US'],
+                pay: { currency: 'USD', min: 195_000, max: 240_000, period: 'year', basis: 'base', raw: '$195k-$240k' },
+                datePosted: '2026-11-24T00:00:00Z',
+                url: u,
+                applyUrl: u,
+                source: 'greenhouse',
+              },
+              markdown: `Single-posting detail body for ${u} with $195k-$240k base salary.`,
+            },
+          };
+        }
         return { status: 404, body: { ok: false } };
       };
 
@@ -1505,8 +1603,8 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       assert.equal(vStealthRes[0]?.status, 'live');
       assert.equal(vStealthRes[1]?.status, 'closed');
 
-      // First verify on a cold cache that `runSlugProbeWave` itself sends `ephemeral: true` + `atsLiteBoard: true`,
-      // while `runCandidateWave` does NOT reuse the `|lite` entry and fetches the full `?content=true` board!
+      // On a cold cache, BOTH `runSlugProbeWave` AND `runCandidateWave` use `atsLiteBoard: true` (zero `?content=true` board downloads!),
+      // `runCandidateWave` reuses the `|lite` board cache entry, and single-posting `/jobs/5001` enrichment populates `pay` & `snippet`!
       seenJobsScrapeCalls.length = 0;
       resetJobsCacheForTests();
       const slugProbeSearch = await executeJobsCall({
@@ -1521,11 +1619,38 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
         executeScrape: mockJobsScrape,
       });
       assert.equal(slugProbeSearch.status, 200);
-      const ghSlugProbeCall = seenJobsScrapeCalls.find((c) => c.url === 'https://boards.greenhouse.io/stealthco' && c.atsLiteBoard === true);
-      const ghFullWaveCall = seenJobsScrapeCalls.find((c) => c.url === 'https://boards.greenhouse.io/stealthco' && c.atsLiteBoard !== true);
-      assert.ok(ghSlugProbeCall && ghSlugProbeCall.ephemeral === true, 'runSlugProbeWave must use ephemeral + atsLiteBoard: true');
-      assert.ok(ghFullWaveCall && ghFullWaveCall.ephemeral === true, 'runCandidateWave must not reuse |lite cache entry and must fetch full board');
-      assert.equal((slugProbeSearch.body.jobs as unknown[]).length, 1, 'Full board fetch in runCandidateWave must supply strictPay compensation');
+      const ghLiteBoardCalls = seenJobsScrapeCalls.filter((c) => c.url === 'https://boards.greenhouse.io/stealthco' && c.atsLiteBoard === true);
+      const ghFullBoardCalls = seenJobsScrapeCalls.filter((c) => c.url === 'https://boards.greenhouse.io/stealthco' && c.atsLiteBoard !== true);
+      const ghDetailCalls = seenJobsScrapeCalls.filter((c) => c.url === 'https://job-boards.greenhouse.io/stealthco/jobs/5001');
+      assert.equal(ghLiteBoardCalls.length, 1, 'runCandidateWave must reuse runSlugProbeWave |lite board cache entry');
+      assert.equal(ghFullBoardCalls.length, 0, 'Search mode must NEVER download full ?content=true Greenhouse boards');
+      assert.equal(ghDetailCalls.length, 1, 'Search mode must enrich matching Greenhouse posting via /jobs/{id}');
+      const enrichedStealthJobs = slugProbeSearch.body.jobs as Array<{ pay: { min: number } | null; snippet?: string }>;
+      assert.equal(enrichedStealthJobs.length, 1);
+      assert.equal(enrichedStealthJobs[0]?.pay?.min, 180_000);
+      assert.ok(enrichedStealthJobs[0]?.snippet?.includes('Single-posting description body'));
+
+      // Direct `/careers` -> Greenhouse board (`domains: ["bigghco.com"]`) also uses `atsLiteBoard: true`, caps per-posting
+      // detail lookups at `<= 6`, and reports `payUnverifiedCount: 2` under `strictPay: true`!
+      seenJobsScrapeCalls.length = 0;
+      resetJobsCacheForTests();
+      const bigGhSearch = await executeJobsCall({
+        payload: {
+          domains: ['bigghco.com'],
+          query: 'Systems Engineer',
+          minBase: 170_000,
+          strictPay: true,
+          limit: 10,
+        },
+        env: { JOBS_SHARED_CACHE: true },
+        executeSearch: async () => ({ status: 200, body: { results: [] } }),
+        executeScrape: mockJobsScrape,
+      });
+      assert.equal(bigGhSearch.status, 200);
+      const bigGhDetailCalls = seenJobsScrapeCalls.filter((c) => /\/bigghco\/jobs\/600\d$/.test(c.url));
+      assert.equal(bigGhDetailCalls.length, 6, 'Per-posting Greenhouse detail lookups must cap at <= 6');
+      assert.equal((bigGhSearch.body.jobs as unknown[]).length, 6);
+      assert.equal(bigGhSearch.body.payUnverifiedCount, 2);
 
       // Test 6: `parseHtmlDoc` / `HtmlNode` DOM handles check reactor generation IN JS before calling Go and return empty
       // across reactor eviction, never instantiating or reading from a recycled `docId` (`1..32`) on a new reactor.

@@ -29,12 +29,14 @@ const EMPTY_BYTES = new Uint8Array(0);
 
 // WebAssembly linear memory pages (`64 KiB` each) can never shrink once grown.
 // Measured under `debug.SetMemoryLimit(48 << 20)` (`initialMemoryBytes ≈ 50.5–51.0 MiB`):
-//   - Normal `< 8 MiB` sanitizer calls (`7M` `[` -> `+9.0 MiB`, `2M` `<` -> `+25.0 MiB`) peak at `+25.0 MiB`.
-//   - Multi-MiB structured payloads (`6.32 MiB` board -> `+34.5 MiB`, `7.66 MiB` -> `+35.0 MiB`, `9+ MiB` -> `> +35 MiB`).
-// Keep `WASM_MAX_MEMORY_GROWTH_BYTES` at `28 MiB` (do NOT raise to silence slow tests): evicts `cachedReactor` after any
-// `> 8 MiB` I/O call or `> 28 MiB` growth above baseline so V8 reclaims the grown `WebAssembly.Memory` instance.
+//   - Ordinary 2 MB documents (`2M` `<` sanitize -> `77.5 MiB` total, `+26.5 MiB`) stabilize below `80 MiB` across
+//     repeated calls; an aggressive `+28 MiB` growth cap would rebuild the instance every ~3rd call (`~50 ms` stall +
+//     brief `78 + 51 ≈ 129 MiB` old/new instance overlap before V8 GC).
+//   - Evict ONLY after multi-MiB calls (`> 8 MiB` in or out) OR when total linear memory exceeds `96 MiB` (`WASM_MAX_TOTAL_MEMORY_BYTES`),
+//     and never allocate a second retry instance when the failing input itself exceeded `8 MiB` (`WASM_MAX_RETRY_INPUT_BYTES`).
 const WASM_EVICT_IO_BYTES = 8 * 1024 * 1024;
-const WASM_MAX_MEMORY_GROWTH_BYTES = 28 * 1024 * 1024;
+const WASM_MAX_TOTAL_MEMORY_BYTES = 96 * 1024 * 1024;
+const WASM_MAX_RETRY_INPUT_BYTES = 8 * 1024 * 1024;
 const EXACT_UTF8_ENCODE_THRESHOLD_CHARS = 524_288;
 
 let cachedReactor: CoreReactorExports | null = null;
@@ -66,14 +68,18 @@ export function resetWasmReactor(): void {
   cachedReactorInitMemBytes = 0;
 }
 
-function maybeEvictOversizedReactor(reactor: CoreReactorExports, inBytes: number, outBytes: number): void {
+function maybeEvictOversizedReactor(
+  reactor: CoreReactorExports,
+  inBytes: number,
+  outBytes: number,
+  skipTotalCeiling = false,
+): void {
   if (cachedReactor !== reactor) return;
   const memBytes = reactor.memory.buffer.byteLength;
-  const growthBytes = cachedReactorInitMemBytes > 0 ? memBytes - cachedReactorInitMemBytes : 0;
   if (
     inBytes > WASM_EVICT_IO_BYTES ||
     outBytes > WASM_EVICT_IO_BYTES ||
-    growthBytes > WASM_MAX_MEMORY_GROWTH_BYTES
+    (!skipTotalCeiling && memBytes > WASM_MAX_TOTAL_MEMORY_BYTES)
   ) {
     cachedReactor = null;
     cachedReactorInitMemBytes = 0;
@@ -233,8 +239,9 @@ export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: u
       inLen = writeInputBytes(reactor, reqBytes);
       outLen = reactor.ef_call(inLen) >>> 0;
     } catch (err) {
-      // Fault-isolated auto-recovery if the WASI reactor ever traps
+      // Fault-isolated auto-recovery if the WASI reactor ever traps (skip retry on >8 MiB inputs to avoid dual-instance OOM)
       resetWasmReactor();
+      if (reqBytes.byteLength > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       inLen = writeInputBytes(reactor, reqBytes);
       outLen = reactor.ef_call(inLen) >>> 0;
@@ -245,7 +252,7 @@ export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: u
       jsonText = utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
     }
   } finally {
-    maybeEvictOversizedReactor(reactor, inLen, outLen);
+    maybeEvictOversizedReactor(reactor, inLen, outLen, op === 'dom_parse');
   }
   const parsed = JSON.parse(jsonText) as T & { error?: string };
   if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string' && !('ok' in parsed)) {
@@ -361,6 +368,7 @@ export function callCoreWasmRaw<T = Record<string, unknown>>(op: string, meta: u
       outLen = reactor.ef_call_raw(metaLen, totalLen) >>> 0;
     } catch (err) {
       resetWasmReactor();
+      if (rawStr.length > WASM_MAX_RETRY_INPUT_BYTES || usedTotalLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
       usedTotalLen = totalLen;
@@ -417,6 +425,7 @@ export function callCoreWasmRawMetaPair<T = Record<string, unknown>>(
       outLen = run(reactor);
     } catch (err) {
       resetWasmReactor();
+      if (allocLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       outLen = run(reactor);
       void err;
@@ -462,6 +471,7 @@ export function callCoreWasmRawPair<T = Record<string, unknown>>(op: string, raw
       outLen = run(reactor);
     } catch (err) {
       resetWasmReactor();
+      if (allocLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       outLen = run(reactor);
       void err;
@@ -492,6 +502,7 @@ export function callCoreWasmRawString(op: string, meta: unknown, rawStr: string)
       outLen = reactor.ef_call_raw_str(metaLen, totalLen) >>> 0;
     } catch (err) {
       resetWasmReactor();
+      if (rawStr.length > WASM_MAX_RETRY_INPUT_BYTES || usedTotalLen > WASM_MAX_RETRY_INPUT_BYTES) throw err;
       reactor = getReactor();
       const { metaLen, totalLen } = writeMetaAndRawStrings(reactor, metaBytes, rawStr);
       usedTotalLen = totalLen;
@@ -557,6 +568,7 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
       } catch (err) {
         resetWasmReactor();
         boundReactor = null;
+        if (subjBytes.byteLength > WASM_MAX_RETRY_INPUT_BYTES) throw err;
         r = getReactor();
         if (ensureHandle(r) <= 0) return false;
         const retryLen = writeInputBytes(r, subjBytes);
@@ -585,6 +597,7 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
         } catch (err) {
           resetWasmReactor();
           boundReactor = null;
+          if (subjBytes.byteLength > WASM_MAX_RETRY_INPUT_BYTES) throw err;
           r = getReactor();
           if (ensureHandle(r) <= 0) return null;
           const retryLen = writeInputBytes(r, subjBytes);

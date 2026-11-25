@@ -2179,12 +2179,14 @@ export async function executeJobsCall(params: {
               }
             }
             const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
+            const isGhBoard = Boolean(info?.platform.startsWith('greenhouse') && info.isBoard);
             return executeScrape({
               url: scrapeUrl,
               renderMode: srBoard ? 'off' : 'auto',
               discoverLlmsTxt: false,
               preferOriginMarkdown: false,
               ephemeral: true,
+              ...(isGhBoard ? { atsLiteBoard: true } : {}),
               formats: needLinks ? ['markdown', 'links'] : ['markdown'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -2331,28 +2333,30 @@ export async function executeJobsCall(params: {
               });
             }
             {
-              const seenWdDedup = new Set<string>();
-              const wdCandidates: Array<{ rec: StructuredJobRecord; rank: number }> = [];
+              const seenDetailDedup = new Set<string>();
+              const detailCandidates: Array<{ rec: StructuredJobRecord; rank: number }> = [];
               for (const r of boardJobs) {
-                if (r.source !== 'workday' || r.pay !== null || !/\/job\//i.test(r.url)) continue;
+                const isWorkdayNeedsPay = r.source === 'workday' && r.pay === null && /\/job\//i.test(r.url);
+                const isLiteGhNeedsDetail = r.source === 'greenhouse' && !r.snippet && /\/jobs\/\d+/i.test(r.url);
+                if (!isWorkdayNeedsPay && !isLiteGhNeedsDetail) continue;
                 if (!matchesPreEnrichJobFilters(r)) continue;
                 const dk = canonicalJobKey(r.company, r.title);
-                if (seenWdDedup.has(dk)) continue;
-                seenWdDedup.add(dk);
+                if (seenDetailDedup.has(dk)) continue;
+                seenDetailDedup.add(dk);
                 const rel = query ? matchesJobQueryRelevance(r.title, r.snippet, query) : 'company_filter';
                 const rank = rel === 'phrase' ? 0 : rel === 'all_tokens' ? 1 : 2;
-                wdCandidates.push({ rec: r, rank });
+                detailCandidates.push({ rec: r, rank });
               }
-              if (wdCandidates.length > 0) {
-                wdCandidates.sort((a, b) => a.rank - b.rank);
-                const maxWdPerCall = minBase !== undefined ? 6 : 5;
+              if (detailCandidates.length > 0) {
+                detailCandidates.sort((a, b) => a.rank - b.rank);
+                const maxDetailPerCall = minBase !== undefined ? 6 : 5;
                 const remainingEnrichSlots = Math.max(0, 10 - smartRecruitersPostingsToEnrich.length);
-                const wdCap = Math.min(limit, maxWdPerCall, remainingEnrichSlots);
-                for (const { rec: wdRec } of wdCandidates.slice(0, wdCap)) {
-                  smartRecruitersPostingsToEnrich.push(wdRec);
+                const detailCap = Math.min(limit, maxDetailPerCall, remainingEnrichSlots);
+                for (const { rec: dRec } of detailCandidates.slice(0, detailCap)) {
+                  smartRecruitersPostingsToEnrich.push(dRec);
                 }
-                for (const { rec: skippedWd } of wdCandidates.slice(wdCap)) {
-                  unverifiedPayUrls.add(skippedWd.url.toLowerCase());
+                for (const { rec: skippedRec } of detailCandidates.slice(detailCap)) {
+                  if (skippedRec.pay === null) unverifiedPayUrls.add(skippedRec.url.toLowerCase());
                 }
               }
             }

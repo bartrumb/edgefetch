@@ -1565,4 +1565,18 @@ connected</pre>
 			t.Fatalf("expected Go Playground toolbar chrome %q to be stripped, got:\n%s", leaked, res.Markdown)
 		}
 	}
+
+	fullDoc := ExtractHTMLDocumentFull(rawHTML, FullExtractOptions{
+		BaseURL:         "https://pkg.go.dev/github.com/coder/websocket",
+		OnlyMainContent: true,
+		IncludeImages:   true,
+	})
+	if fullDoc.ExtractorID != "pkg-go-dev" {
+		t.Fatalf("expected full document extractorId=pkg-go-dev, got %q", fullDoc.ExtractorID)
+	}
+	for _, leaked := range []string{"\nShare\n", "\nFormat\n", "\nRun\n", "Share Format Run"} {
+		if strings.Contains(fullDoc.Markdown+"\n", leaked) {
+			t.Fatalf("expected ExtractHTMLDocumentFull to strip Go Playground toolbar chrome %q, got:\n%s", leaked, fullDoc.Markdown)
+		}
+	}
 }

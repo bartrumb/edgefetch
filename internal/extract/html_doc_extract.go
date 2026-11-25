@@ -5054,7 +5054,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			}
 			links = merged
 		}
-	} else if hasDefaultHTMLScoping {
+	} else if hasDefaultHTMLScoping && hasClosedTag {
 		var parsedBase *url.URL
 		hostLower := ""
 		if baseURL != "" {

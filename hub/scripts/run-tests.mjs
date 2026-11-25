@@ -123,17 +123,21 @@ try {
     childEnv.NODE_V8_COVERAGE = covDir;
   }
 
-  const testConcurrency = coverageEnabled ? Math.min(2, availableParallelism()) : Math.min(4, availableParallelism());
+  const testConcurrency = Math.min(2, availableParallelism());
   let testErr = null;
   try {
     execFileSync(
       process.execPath,
-      ['--test', `--test-concurrency=${testConcurrency}`, '--test-force-exit', ...nodeTestFiles, e2eTestFile],
+      ['--test', `--test-concurrency=${testConcurrency}`, '--test-force-exit', ...nodeTestFiles],
       {
         stdio: 'inherit',
         env: childEnv,
       },
     );
+    execFileSync(process.execPath, ['--test', '--test-force-exit', e2eTestFile], {
+      stdio: 'inherit',
+      env: childEnv,
+    });
   } catch (err) {
     testErr = err;
   }

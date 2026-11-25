@@ -1779,13 +1779,15 @@ func testInjectionPatternAgainstVariantsPIGo(
 
 func stripSimpleQuoteFreeTagsToSpacePIGo(src string) string {
 	n := len(src)
-	rel := strings.IndexByte(src, '<')
-	if rel < 0 {
+	pos := 0
+	for pos < n && src[pos] != '<' {
+		pos++
+	}
+	if pos >= n {
 		return src
 	}
 	buf := make([]byte, 0, minIntSliceGo(n, 262144))
 	cursor := 0
-	pos := rel
 	for pos < n {
 		if pos+2 > n {
 			break
@@ -1804,11 +1806,10 @@ func stripSimpleQuoteFreeTagsToSpacePIGo(src string) string {
 			p++
 		}
 		if !validStart {
-			nx := strings.IndexByte(src[pos+1:], '<')
-			if nx < 0 {
-				break
+			pos++
+			for pos < n && src[pos] != '<' {
+				pos++
 			}
-			pos = pos + 1 + nx
 			continue
 		}
 		for p < n && !isTagNameBoundaryByteSliceGo(src[p]) {
@@ -1817,24 +1818,22 @@ func stripSimpleQuoteFreeTagsToSpacePIGo(src string) string {
 		if p >= n {
 			break
 		}
-		gtRel := strings.IndexByte(src[p:], '>')
-		if gtRel < 0 {
+		for p < n && src[p] != '>' {
+			p++
+		}
+		if p >= n {
 			break
 		}
-		end := p + gtRel + 1
+		end := p + 1
 		if pos > cursor {
 			buf = append(buf, src[cursor:pos]...)
 		}
 		buf = append(buf, ' ')
 		cursor = end
-		if cursor >= n {
-			break
+		pos = cursor
+		for pos < n && src[pos] != '<' {
+			pos++
 		}
-		nx := strings.IndexByte(src[cursor:], '<')
-		if nx < 0 {
-			break
-		}
-		pos = cursor + nx
 	}
 	if cursor == 0 {
 		return src
@@ -1983,14 +1982,13 @@ func DetectPromptInjection(markdown, rawHTML string) PromptInjectionResult {
 			noCloseSgl := false
 
 			for scanPos < htmlLen {
-				ltRel := strings.IndexByte(rawForHidden[scanPos:], '<')
-				if ltRel < 0 {
+				for scanPos < htmlLen && rawForHidden[scanPos] != '<' {
+					scanPos++
+				}
+				if scanPos+1 >= htmlLen {
 					break
 				}
-				lt := scanPos + ltRel
-				if lt+1 >= htmlLen {
-					break
-				}
+				lt := scanPos
 				p := lt + 1
 				c1 := lowerForHidden[p]
 				isClosing := false
@@ -2034,11 +2032,13 @@ func DetectPromptInjection(markdown, rawHTML string) PromptInjectionResult {
 					}
 				}
 				if isClosing {
-					gtRel := strings.IndexByte(rawForHidden[p:], '>')
-					if gtRel < 0 {
+					gt := p
+					for gt < htmlLen && rawForHidden[gt] != '>' {
+						gt++
+					}
+					if gt >= htmlLen {
 						break
 					}
-					gt := p + gtRel
 					tagNameLower := lowerForHidden[nameStart:p]
 					if closeFirstByTag == nil {
 						closeFirstByTag = make(map[string]int)
@@ -2098,9 +2098,12 @@ func DetectPromptInjection(markdown, rawHTML string) PromptInjectionResult {
 					nameLen := p - nameStart
 					immediateClose := -1
 					if !selfClosing && j+1 < htmlLen {
-						nextLtRel := strings.IndexByte(rawForHidden[j+1:minIntSliceGo(htmlLen, j+1+257)], '<')
-						if nextLtRel >= 0 {
-							nextLt := j + 1 + nextLtRel
+						lim := minIntSliceGo(htmlLen, j+1+257)
+						nextLt := j + 1
+						for nextLt < lim && rawForHidden[nextLt] != '<' {
+							nextLt++
+						}
+						if nextLt < lim {
 							if nextLt+2+nameLen < htmlLen &&
 								rawForHidden[nextLt+1] == '/' &&
 								rawForHidden[nextLt+2+nameLen] == '>' &&

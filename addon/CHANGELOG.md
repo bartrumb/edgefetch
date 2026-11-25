@@ -2,6 +2,12 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] - 2026-11-25
+
+### Changed
+- **Go-First Architecture Consolidation & EasyPrivacy Tracker Blocking:**
+  - Unified extraction, CommonMark `S1`–`S5` sanitization, ATS `jobs`, storefront `catalog`, BYO-LLM `agentloop`, and AES-256-GCM `mcpfed` engines in Go (`v2.8.0`), with Hub-distributed EasyPrivacy third-party tracker blocking (`metadata.blockedTrackers`) on headless Chromium workers (`browser-v1`).
+
 ## [2.7.8] - 2026-11-23
 
 ### Added

@@ -17,6 +17,7 @@ import (
 )
 
 func TestJSONResponseHarvesterSameOriginIsolationAndBounds(t *testing.T) {
+	t.Parallel()
 	bodies := map[string]struct {
 		body string
 		b64  bool
@@ -340,10 +341,12 @@ func TestJSONResponseHarvesterSameOriginIsolationAndBounds(t *testing.T) {
 }
 
 func TestLiveChromiumHiddenDOMPruningAndDetailsPreservationIfInstalled(t *testing.T) {
+	t.Parallel()
 	bin := FindChromeBinary()
 	if bin == "" {
 		t.Skip("no local Chrome/Chromium binary installed")
 	}
+	acquireLiveChromeSlot(t)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")

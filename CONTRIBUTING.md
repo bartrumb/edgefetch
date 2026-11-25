@@ -30,12 +30,12 @@ Every change in EdgeFetch must preserve these ethical, security, and supply-chai
    - **No anti-bot, TLS/browser fingerprinting, or CAPTCHA bypasses:** Anti-bot evasion, TLS/JA3/JA4/HTTP2 fingerprint spoofing, stealth browser patches, Turnstile/reCAPTCHA/hCaptcha solvers, and residential proxy rotation pools are permanently out of scope. EdgeFetch classifies challenges (`outcome: "challenge"`) and stops immediately on the first attempt.
    - **Zero default background phone-home:** `edgefetch scrape` and `edgefetch mcp` must make **zero** background telemetry or update-check calls by default (`EDGEFETCH_DEV_TELEMETRY` and `EDGEFETCH_CHECK_UPDATES` are strictly opt-in, and `DO_NOT_TRACK=1` hard-disables both).
    - **Explicit deadlines on every outbound request:** Every `fetch` / `http.Client.Do` call in Hub or Go code must attach a bounded `AbortSignal` or `context.WithTimeout` deadline and drain or cancel unread response bodies.
-2. **Two-Ring Change Isolation & Adapter Diff Gate:**
-   - **Ring 1 (`internal/extract/manifests/*.yaml`):** All `57` built-in site adapters are pure declarative YAML compiled via [`hub/scripts/compile-manifests.mjs`](hub/scripts/compile-manifests.mjs) into `internal/extract/manifests/compiled.json`, running inside a zero-secret, zero-network bulkhead (`runAdapterSyncInBulkhead`). Adapter-only changes are verified by [`hub/scripts/verify-adapter-only-diff.mjs`](hub/scripts/verify-adapter-only-diff.mjs), which blocks any domain widening or `fetchUrl` host change without explicit human review.
+2. **Two-Ring Change Isolation & Adapter Validation Gate:**
+   - **Ring 1 (`internal/extract/manifests/*.yaml`):** All `56` built-in site adapters are pure declarative YAML compiled via [`hub/scripts/compile-manifests.mjs`](hub/scripts/compile-manifests.mjs) into `internal/extract/manifests/compiled.json`, running inside a zero-secret, zero-network Go WASM / native bulkhead (`npm run adapter:test`).
    - **Ring 0 (`cmd/`, `internal/`, `hub/src/`, `.github/`, `keys/`):** Core engine, auth, vault, sanitizer, SSRF, and workflow files require direct maintainer review and human-gated `release` environment approval before Ed25519 binary signing.
-3. **Minimal, Auditable Supply Chain:**
-   - **Go (`go.mod`):** Strictly **`1` external dependency** (`github.com/coder/websocket`, `0` transitive dependencies) with `CGO_ENABLED=0`. CI fails if `go list -m all` gains any unexpected module.
-   - **TypeScript Hub (`hub/package.json`):** Runtime dependencies are restricted to **`6` pinned packages** (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`). Do not add runtime npm packages without maintainer approval.
+3. **Minimal, Auditable Supply Chain & Go-First Architecture:**
+   - **Go-First Single Implementation (`cmd/`, `internal/`):** All domain, extraction, sanitization, jobs/ATS, storefront catalog, BYO-LLM agent, MCP federation, and self-hosted Hub (`edgefetch --mode=hub`) logic lives once in Go (`go.mod`: strictly **`1` external dependency**, `github.com/coder/websocket`, `0` transitive dependencies, `CGO_ENABLED=0`). Do not duplicate Go domain logic in TypeScript; Cloudflare Workers invoke Go via `cmd/edgefetch-wasm` (`edgefetch-core.wasm`).
+   - **Cloudflare Worker Edge Router (`hub/package.json`):** Runtime dependencies are restricted to **`2` pinned packages** (`jose`, `oauth4webapi`). Do not add runtime npm packages without maintainer approval.
 4. **Keyless Built-In Adapters (`MIT`):**
    - Built-in site and ATS adapters under [`internal/extract/manifests/`](internal/extract/manifests/) and [`hub/src/extractors/`](hub/src/extractors/) are open-source (`MIT`) and work with public JSON/XML endpoints, feeds, JSON-LD, or HTML selectors — never requiring paid B2B API keys.
 5. **Licensing (`Inbound = MIT + DCO`):**
@@ -56,21 +56,20 @@ go vet ./...
 go test -race ./...
 ```
 
-### TypeScript Hub & Portable Runtime (`Node.js 22.5+`)
+### Cloudflare Worker Hub & Go WASM (`Node.js 22.5+`)
 
 ```bash
 cd hub
 npm ci
 npm run adapter:check
-npm run build:portable
 npm run type-check
 npm test
 npm run deploy:dry
 ```
 
-### Reproducible Extraction & Comparison Benchmarks
+### Reproducible Extraction & Go Hot-Path Benchmarks
 
 ```bash
-node bench/compare.mjs
 node bench/run-bench.mjs
+go test -bench=. -benchmem ./...
 ```

@@ -95,13 +95,21 @@ if [ "$CUR_UID" = "0" ]; then
   chown -R 1000:1000 "$EDGEFETCH_DATA_DIR"
   chmod 0700 "$EDGEFETCH_DATA_DIR"
 
-  su-exec 1000:1000 /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
+  if [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ]; then
+    env EDGEFETCH_DISABLE_FALLBACK_CRAWLER=1 EDGEFETCH_CHROME_BIN="" su-exec 1000:1000 /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
+  else
+    su-exec 1000:1000 /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
+  fi
   HUB_PID=$!
 else
   EDGEFETCH_DATA_DIR="${EDGEFETCH_DATA_DIR:-/data/hub}"
   export EDGEFETCH_DATA_DIR
   mkdir -p "$EDGEFETCH_DATA_DIR" 2>/dev/null || true
-  /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
+  if [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ]; then
+    env EDGEFETCH_DISABLE_FALLBACK_CRAWLER=1 EDGEFETCH_CHROME_BIN="" /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
+  else
+    /usr/local/bin/edgefetch --mode=hub --addr="0.0.0.0:${PORT}" &
+  fi
   HUB_PID=$!
 fi
 

@@ -19,6 +19,7 @@ import (
 )
 
 func TestSSRFProxyBlocksPlainHTTPNon443AndPrivateLANIPs(t *testing.T) {
+	t.Parallel()
 	allow := func(u *url.URL) error {
 		if u.Scheme != "https" || (u.Port() != "" && u.Port() != "443") {
 			return errors.New("https:443 required")
@@ -83,6 +84,7 @@ func TestSSRFProxyBlocksPlainHTTPNon443AndPrivateLANIPs(t *testing.T) {
 }
 
 func TestSSRFProxyBidirectionalConnectRelay(t *testing.T) {
+	t.Parallel()
 	upstreamLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -150,6 +152,7 @@ func rawConnectStatus(t *testing.T, proxyAddr, target string) int {
 }
 
 func TestRendererExecuteInteractAndChallengeStopOverCDP(t *testing.T) {
+	t.Parallel()
 	serveChallenge := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
@@ -275,6 +278,7 @@ func TestRendererExecuteInteractAndChallengeStopOverCDP(t *testing.T) {
 }
 
 func TestStartupReasonKeepsTheFatalLine(t *testing.T) {
+	t.Parallel()
 	reason := ""
 	for _, line := range []string{
 		"[8:26:1119/061255.270716:ERROR:dbus/bus.cc:408] Failed to connect to the bus",
@@ -293,6 +297,7 @@ func TestStartupReasonKeepsTheFatalLine(t *testing.T) {
 }
 
 func TestRendererWaitsForAsyncXHRNetworkIdleOverCDP(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {

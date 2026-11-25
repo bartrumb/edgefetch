@@ -140,6 +140,7 @@ type Callbacks struct {
 	ExecuteAdminFetch func(ctx context.Context, req AdminFetchRequest) (status int, via string, body []byte, err error)
 	ClearAffinities   func(ctx context.Context, siteID string) error
 	ClearEvents       func(ctx context.Context) error
+	OnTelemetryToggle func(enabled bool)
 }
 
 // Config configures a hubauth Manager.
@@ -311,6 +312,9 @@ func NewManager(cfg Config) (*Manager, error) {
 			return nil, err
 		}
 	}
+	if m.st.TelemetryOptIn != nil && !otel.IsDoNotTrack(m.getenv("DO_NOT_TRACK")) && cfg.Callbacks.OnTelemetryToggle != nil {
+		cfg.Callbacks.OnTelemetryToggle(*m.st.TelemetryOptIn)
+	}
 	return m, nil
 }
 
@@ -438,7 +442,12 @@ func hmacB64URL(key, msg string) string {
 }
 
 func constantTimeEqual(a, b string) bool {
-	return a != "" && len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+	if a == "" || b == "" {
+		return false
+	}
+	ha := sha256.Sum256([]byte(a))
+	hb := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }
 
 func isHTTPSOrigin(origin string) bool {

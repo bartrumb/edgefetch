@@ -25,6 +25,7 @@ import (
 )
 
 func TestOriginScopedExtraHeadersViaCDPFetchAndWarmBrowserRecycle(t *testing.T) {
+	t.Parallel()
 	var (
 		wsConns              atomic.Int32
 		setExtraHeadersCalls atomic.Int32
@@ -273,6 +274,7 @@ func TestOriginScopedExtraHeadersViaCDPFetchAndWarmBrowserRecycle(t *testing.T) 
 }
 
 func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.T) {
+	t.Parallel()
 	// 1. Verify canonicalURLOrigin and Fetch.requestPaused strict scheme + host + effective port scoping.
 	if canonicalURLOrigin("https://Victim.Test.:443/path") != canonicalURLOrigin("https://victim.test/other") {
 		t.Fatal("expected explicit :443 and trailing dot to canonicalize to https://victim.test:443")
@@ -469,6 +471,7 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 }
 
 func TestResumedNavigateOriginScopingAndCrossOrigin302HeaderStripping(t *testing.T) {
+	t.Parallel()
 	var (
 		mu          sync.Mutex
 		hasOverride = make(map[string]bool)
@@ -744,13 +747,20 @@ func TestResumedNavigateOriginScopingAndCrossOrigin302HeaderStripping(t *testing
 	}
 }
 
-func allowNoSandboxInTestOnRestrictedLinuxHost(t *testing.T) {
+var liveChromeTestSem = make(chan struct{}, 4)
+
+func acquireLiveChromeSlot(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS != "linux" {
+	liveChromeTestSem <- struct{}{}
+	t.Cleanup(func() { <-liveChromeTestSem })
+}
+
+func enableNoSandboxOnRestrictedLinuxHost(r *Renderer) {
+	if runtime.GOOS != "linux" || r == nil {
 		return
 	}
 	if linuxSandboxBlockedByHostPolicy() {
-		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+		r.SetAllowNoSandbox(true)
 		return
 	}
 	for _, sysctlPath := range []string{
@@ -764,13 +774,14 @@ func allowNoSandboxInTestOnRestrictedLinuxHost(t *testing.T) {
 		val := strings.TrimSpace(string(raw))
 		if (strings.HasSuffix(sysctlPath, "apparmor_restrict_unprivileged_userns") && val == "1") ||
 			(strings.HasSuffix(sysctlPath, "max_user_namespaces") && val == "0") {
-			t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+			r.SetAllowNoSandbox(true)
 			return
 		}
 	}
 }
 
 func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *testing.T) {
+	t.Parallel()
 	args := buildChromiumLaunchArgsWithSandbox("127.0.0.1:8888", "/tmp/ef-prof", true)
 	var sawPipe, sawPort bool
 	for _, a := range args {
@@ -792,9 +803,10 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R6 pipe transport check")
 	}
-	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+	acquireLiveChromeSlot(t)
 
 	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.7.0", 1, nil)
+	enableNoSandboxOnRestrictedLinuxHost(r)
 	defer r.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -891,6 +903,7 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 }
 
 func TestMockRendererEmitsBrowserRenderChildSpan(t *testing.T) {
+	t.Parallel()
 	var challengeMode atomic.Bool
 	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
@@ -1028,6 +1041,7 @@ func TestMockRendererEmitsBrowserRenderChildSpan(t *testing.T) {
 }
 
 func TestR6InitiatorProvenHeaderScopingAndRedirectChainProvenance(t *testing.T) {
+	t.Parallel()
 	var (
 		mu          sync.Mutex
 		hasOverride = make(map[string]bool)
@@ -1313,6 +1327,7 @@ func TestR6InitiatorProvenHeaderScopingAndRedirectChainProvenance(t *testing.T) 
 }
 
 func TestR6DirectPipeCDPTransportFramingAndCaps(t *testing.T) {
+	t.Parallel()
 	// 1. Multi-frame + byte-by-byte + escaped \u0000 + empty \0\0\0 handling.
 	{
 		toChromeR, toChromeW, err := os.Pipe()
@@ -1399,6 +1414,7 @@ func TestR6DirectPipeCDPTransportFramingAndCaps(t *testing.T) {
 }
 
 func TestR7NestedSubframeDocumentRenavigationHeaderLeakMockCDP(t *testing.T) {
+	t.Parallel()
 	var (
 		mu          sync.Mutex
 		hasOverride = make(map[string]bool)
@@ -1660,11 +1676,12 @@ func TestR7NestedSubframeDocumentRenavigationHeaderLeakMockCDP(t *testing.T) {
 }
 
 func TestR7LiveHeadlessChromeNestedSubframeNoReferrerAndPositiveControls(t *testing.T) {
+	t.Parallel()
 	bin := FindChromeBinary()
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R7 nested subframe CDP test")
 	}
-	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+	acquireLiveChromeSlot(t)
 
 	type hitRecord struct {
 		Host   string
@@ -1800,6 +1817,7 @@ document.body.appendChild(gc2);
 	crossPortURL = "https://example.com:" + portNum
 
 	r := NewRenderer(bin, func(u *url.URL) error { return nil }, "EdgeFetchTest/2.7.0", 1, nil)
+	enableNoSandboxOnRestrictedLinuxHost(r)
 	r.extraFlags = []string{"--ignore-certificate-errors"}
 	r.proxyDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		_, p, err := net.SplitHostPort(addr)
@@ -1889,6 +1907,7 @@ document.body.appendChild(gc2);
 }
 
 func TestV271ResolveCDPKeySpecUnit(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		raw      string
 		wantKey  string
@@ -1922,11 +1941,12 @@ func TestV271ResolveCDPKeySpecUnit(t *testing.T) {
 }
 
 func TestV271LiveHeadlessChromeFormEnterSubmitClickNavSSRFAndNoEffect(t *testing.T) {
+	t.Parallel()
 	bin := FindChromeBinary()
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live v2.7.1 form Enter + ActionResult test")
 	}
-	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+	acquireLiveChromeSlot(t)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1973,6 +1993,7 @@ func TestV271LiveHeadlessChromeFormEnterSubmitClickNavSSRFAndNoEffect(t *testing
 		return nil
 	}
 	r := NewRenderer(bin, allowPublic, "EdgeFetchTest/2.7.1", 1, nil)
+	enableNoSandboxOnRestrictedLinuxHost(r)
 	r.extraFlags = []string{"--ignore-certificate-errors"}
 	r.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, srvAddr)

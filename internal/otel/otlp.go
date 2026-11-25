@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
@@ -406,10 +407,12 @@ type Exporter struct {
 	client          *http.Client
 	tickInterval    time.Duration
 
-	ch     chan Span
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	once   sync.Once
+	ch              chan Span
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	once            sync.Once
+	getenv          func(string) string
+	runtimeDevOptIn atomic.Int32
 }
 
 func isTruthyEnv(v string) bool {
@@ -424,6 +427,39 @@ func isTruthyEnv(v string) bool {
 // `EDGEFETCH_OTEL_STDOUT=1` / `OTEL_EXPORTER_OTLP_ENDPOINT=stdout` is set for local issue debugging), or `nil` when unset.
 func NewExporterFromEnv(getenv func(string) string, defaultService, version string, transport http.RoundTripper) *Exporter {
 	return newExporterFromEnv(getenv, defaultService, version, transport, os.Stderr, time.Second)
+}
+
+// NewStandbyDevTelemetryExporter constructs an idle `*Exporter` for Hub mode when no OTLP endpoint or env telemetry
+// flag is set at startup, so `/admin` runtime opt-in (`SetRuntimeDevTelemetry(true)`) works live without restart while
+// incurring zero channel/network work while idle (`DO_NOT_TRACK=1` still returns `nil`).
+func NewStandbyDevTelemetryExporter(getenv func(string) string, defaultService, version string, transport http.RoundTripper) *Exporter {
+	if getenv != nil && IsDoNotTrack(getenv("DO_NOT_TRACK")) {
+		return nil
+	}
+	svc := defaultService
+	if getenv != nil {
+		if s := strings.TrimSpace(getenv("OTEL_SERVICE_NAME")); s != "" {
+			svc = s
+		}
+	}
+	if svc == "" {
+		svc = "edgefetch-go-hub"
+	}
+	if version == "" {
+		version = "2.7.8"
+	}
+	e := &Exporter{
+		serviceName:    svc,
+		serviceVersion: version,
+		client:         &http.Client{Transport: transport, Timeout: 5 * time.Second},
+		tickInterval:   time.Second,
+		ch:             make(chan Span, 256),
+		stopCh:         make(chan struct{}),
+		getenv:         getenv,
+	}
+	e.wg.Add(1)
+	go e.loop()
+	return e
 }
 
 func newExporterFromEnv(
@@ -456,12 +492,9 @@ func newExporterFromEnv(
 	if version == "" {
 		version = "2.7.8"
 	}
-	var client *http.Client
-	if tracesURL != "" || devTelURL != "" {
-		client = &http.Client{
-			Transport: transport,
-			Timeout:   5 * time.Second,
-		}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
 	}
 	var stdoutWriter io.Writer
 	if wantStdout {
@@ -486,15 +519,31 @@ func newExporterFromEnv(
 		tickInterval:    tickInterval,
 		ch:              make(chan Span, 256),
 		stopCh:          make(chan struct{}),
+		getenv:          getenv,
 	}
 	e.wg.Add(1)
 	go e.loop()
 	return e
 }
 
-// Record enqueues `s` without blocking; drops silently if the collector queue is full.
+// SetRuntimeDevTelemetry updates the runtime structural dev-telemetry toggle (`DO_NOT_TRACK=1` always overrides to off).
+func (e *Exporter) SetRuntimeDevTelemetry(enabled bool) {
+	if e == nil {
+		return
+	}
+	if enabled {
+		e.runtimeDevOptIn.Store(1)
+	} else {
+		e.runtimeDevOptIn.Store(-1)
+	}
+}
+
+// Record enqueues `s` without blocking; drops silently if the collector queue is full or exporter is idle.
 func (e *Exporter) Record(s Span) {
 	if e == nil || len(s.TraceID) != 32 {
+		return
+	}
+	if e.tracesURL == "" && e.stdoutOut == nil && e.devTelemetryURL == "" && e.runtimeDevOptIn.Load() <= 0 {
 		return
 	}
 	if len(s.SpanID) != 16 {

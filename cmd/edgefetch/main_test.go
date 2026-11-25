@@ -17,6 +17,7 @@ import (
 )
 
 func TestValidateServerSecurity(t *testing.T) {
+	t.Parallel()
 	// Non-loopback without token or explicit opt-in must fail closed.
 	if err := validateServerSecurity(":8080", "", false); err == nil {
 		t.Fatal("SECURITY: expected unauthenticated :8080 bind to fail closed")
@@ -49,6 +50,7 @@ func TestValidateServerSecurity(t *testing.T) {
 }
 
 func TestNewHTTPServerAndTransports(t *testing.T) {
+	t.Parallel()
 	srv := newHTTPServer("127.0.0.1:8080", http.NotFoundHandler())
 	if srv.ReadHeaderTimeout != 10*time.Second {
 		t.Fatalf("expected ReadHeaderTimeout=10s, got %s", srv.ReadHeaderTimeout)
@@ -71,6 +73,7 @@ func TestNewHTTPServerAndTransports(t *testing.T) {
 }
 
 func TestFlagEnvAndAgentModeHelpers(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	haOpts := filepath.Join(dir, "options.json")
 	if err := os.WriteFile(haOpts, []byte(`{}`), 0o600); err != nil {
@@ -127,6 +130,7 @@ func TestFlagEnvAndAgentModeHelpers(t *testing.T) {
 }
 
 func TestCLIVersionHelpAndDoctor(t *testing.T) {
+	t.Parallel()
 	if !isOneShotCLI([]string{"version"}) || !isOneShotCLI([]string{"doctor"}) || !isOneShotCLI([]string{"scrape"}) || !isOneShotCLI([]string{"--help"}) {
 		t.Fatal("expected one-shot CLI args recognized")
 	}
@@ -190,6 +194,7 @@ func TestCLIVersionHelpAndDoctor(t *testing.T) {
 }
 
 func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
+	t.Parallel()
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/robots.txt":
@@ -371,6 +376,7 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 }
 
 func TestBugReportUnreachableURLScrubsEmbeddedQueryAndFragment(t *testing.T) {
+	t.Parallel()
 	failTransport := &http.Transport{
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("dial tcp: simulated unreachable host timeout")

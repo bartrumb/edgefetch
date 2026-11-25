@@ -137,10 +137,29 @@ func (m *Manager) recordFailedLogin(bucket string, now time.Time) bool {
 	nowMs := now.UnixMilli()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.loginFails) > 512 {
+	if _, exists := m.loginFails[bucket]; !exists && len(m.loginFails) >= 512 {
 		for k, v := range m.loginFails {
 			if v.ResetAt <= nowMs {
 				delete(m.loginFails, k)
+			}
+		}
+		if len(m.loginFails) >= 512 {
+			var evictKey string
+			var evictReset int64
+			for k, v := range m.loginFails {
+				if v.Count < loginMaxFails && (evictKey == "" || v.ResetAt < evictReset) {
+					evictKey, evictReset = k, v.ResetAt
+				}
+			}
+			if evictKey == "" {
+				for k, v := range m.loginFails {
+					if evictKey == "" || v.ResetAt < evictReset {
+						evictKey, evictReset = k, v.ResetAt
+					}
+				}
+			}
+			if evictKey != "" {
+				delete(m.loginFails, evictKey)
 			}
 		}
 	}

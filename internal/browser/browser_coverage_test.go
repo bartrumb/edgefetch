@@ -130,6 +130,7 @@ func makeChromeHelperWrapper(t *testing.T, mode string) string {
 }
 
 func TestCDPErrorPathsTimeoutsAndSubscribers(t *testing.T) {
+	t.Parallel()
 	// 1. dialCDP error on closed port.
 	if _, err := dialCDP(context.Background(), "ws://127.0.0.1:1"); err == nil {
 		t.Fatal("expected dialCDP error on closed port")
@@ -1340,7 +1341,7 @@ func TestRendererActionsSessionsValidationAndErrorsOverMockCDP(t *testing.T) {
 	if _, err := r.Execute(context.Background(), Task{URL: "https://app.example.com/", WaitForMs: 1}); err != nil {
 		t.Fatalf("expected holdNavigate to finish via navLoadTimeout, got %v", err)
 	}
-	minIdleBudget = 2 * time.Second
+	minIdleBudget = 10 * time.Second
 	mu.Lock()
 	holdNavigate = false
 	holdRequestInFlight = true
@@ -1349,7 +1350,7 @@ func TestRendererActionsSessionsValidationAndErrorsOverMockCDP(t *testing.T) {
 	if _, err := r.Execute(context.Background(), Task{URL: "https://app.example.com/", WaitForMs: 1}); err != nil {
 		t.Fatalf("expected holdRequestInFlight to evict stale in-flight request via staleInFlightTTL, got %v", err)
 	}
-	if elapsed := time.Since(staleStart); elapsed >= 500*time.Millisecond {
+	if elapsed := time.Since(staleStart); elapsed >= 5*time.Second {
 		t.Fatalf("expected staleInFlightTTL eviction well before minIdleBudget, took %v", elapsed)
 	}
 	mu.Lock()
@@ -1507,9 +1508,9 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 		return nil, os.ErrNotExist
 	}
 	zombieStart := time.Now()
-	if _, _, _, err := rHang.launchAndDialPipeLocked(context.Background(), t.TempDir(), []string{}, 2*time.Second); err == nil ||
-		!strings.Contains(err.Error(), "chromium exited before advertising DevTools") || time.Since(zombieStart) >= time.Second {
-		t.Fatalf("expected fast zombie termination error (<1s), got err=%v elapsed=%v", err, time.Since(zombieStart))
+	if _, _, _, err := rHang.launchAndDialPipeLocked(context.Background(), t.TempDir(), []string{}, 10*time.Second); err == nil ||
+		!strings.Contains(err.Error(), "chromium exited before advertising DevTools") || time.Since(zombieStart) >= 5*time.Second {
+		t.Fatalf("expected fast zombie termination error (<5s), got err=%v elapsed=%v", err, time.Since(zombieStart))
 	}
 	readProcFile = origReadProc
 

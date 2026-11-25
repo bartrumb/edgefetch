@@ -127,13 +127,18 @@ func (m *Manager) HandleAdminTelemetry(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	m.mu.Lock()
+	var toggled *bool
 	if !otel.IsDoNotTrack(m.getenv("DO_NOT_TRACK")) {
 		v := *body.Enabled
 		m.st.TelemetryOptIn = &v
+		toggled = &v
 		_ = m.saveLocked()
 	}
 	view := m.currentTelemetryViewLocked()
 	m.mu.Unlock()
+	if toggled != nil && m.cfg.Callbacks.OnTelemetryToggle != nil {
+		m.cfg.Callbacks.OnTelemetryToggle(*toggled)
+	}
 	writeJSONResp(w, isHTTPS, http.StatusOK, map[string]any{"ok": true, "telemetry": view, "devTelemetry": view})
 }
 

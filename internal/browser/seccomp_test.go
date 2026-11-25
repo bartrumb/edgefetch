@@ -17,6 +17,7 @@ import (
 )
 
 func TestR10S6SeccompProfileForbids32BitArchitecturesAndSocketcallBypass(t *testing.T) {
+	t.Parallel()
 	seccompPath := filepath.Join("..", "..", "deploy", "seccomp", "chromium-sandbox.json")
 	raw, err := os.ReadFile(seccompPath)
 	if err != nil {
@@ -124,7 +125,7 @@ func TestR10S6SeccompProfileForbids32BitArchitecturesAndSocketcallBypass(t *test
 		if bin == "" {
 			return
 		}
-		allowNoSandboxInTestOnRestrictedLinuxHost(t)
+		acquireLiveChromeSlot(t)
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(`<!doctype html><html><head><title>S6 Probe</title></head><body><main>seccomp-64bit-ok</main></body></html>`))
@@ -133,6 +134,7 @@ func TestR10S6SeccompProfileForbids32BitArchitecturesAndSocketcallBypass(t *test
 		srvAddr := srv.Listener.Addr().String()
 
 		r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch-R10-Seccomp/1.0", 1, nil)
+		enableNoSandboxOnRestrictedLinuxHost(r)
 		r.extraFlags = []string{"--ignore-certificate-errors"}
 		r.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, network, srvAddr)

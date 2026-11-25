@@ -2,7 +2,7 @@
 
 ## Overview
 
-`hub/src` implements the Cloudflare Worker runtime (`edgefetch-hub`), Hibernating WebSocket Durable Object coordinator (`AgentHubDO`), self-hosted OAuth 2.1 authorization server, Streamable HTTP Model Context Protocol (`/mcp`) server, `/admin` operator control center, `/v1/*` and Firecrawl/Tavily compatibility HTTP APIs, Cloudflare Tier-2 overflow fetcher, R2/D1 three-layer artifact & FTS5 search storage pipeline, multi-provider web search, ATS job discovery, and autonomous research agent runner.
+`hub/src` implements the thin Cloudflare Worker edge router (`edgefetch-hub`), Hibernating WebSocket Durable Object coordinator (`AgentHubDO`), Cloudflare Workflows (`CrawlWorkflow`, `IngestWorkflow`), self-hosted OAuth 2.1 + GitHub OAuth authorization server, Streamable HTTP Model Context Protocol (`/mcp`) server, `/admin` operator control center, `/v1/*` and Firecrawl/Tavily compatibility HTTP APIs, R2/D1 three-layer artifact & FTS5 search storage pipeline, and the `wasm-bridge.ts` WASI reactor host delegating pure-CPU HTML/PDF/JSON extraction, sanitization, jobs/ATS intelligence, storefront catalog diffing, BYO-LLM agent orchestration, and MCP federation to Go (`cmd/edgefetch-wasm` / `edgefetch-core.wasm`).
 
 ## Interface
 

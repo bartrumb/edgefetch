@@ -25,6 +25,7 @@ import (
 )
 
 func TestMainHelpersAndBlockedHubRuleHardening(t *testing.T) {
+	t.Parallel()
 	// Transport pool defaults
 	ht := newHubTransportWithPool(0, 0)
 	if ht.IdleConnTimeout != 90*time.Second || ht.MaxIdleConnsPerHost != 2 {
@@ -204,6 +205,7 @@ func TestMainHelpersAndBlockedHubRuleHardening(t *testing.T) {
 }
 
 func TestRunMainAndConfigureCrawlerBotAuth(t *testing.T) {
+	t.Parallel()
 	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	c := crawl.NewCrawler(newHubTransport(), crawl.PublicHTTPS, crawl.DefaultUserAgent, silentLog)
 	defer c.Close()
@@ -474,8 +476,66 @@ func TestRunMainAndConfigureCrawlerBotAuth(t *testing.T) {
 	}
 }
 
+func newCoverageMockOrigin(t *testing.T) (cliDeps, *http.Transport) {
+	t.Helper()
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.WriteHeader(http.StatusNotFound)
+		case "/llms.txt":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("# Index\n- [Guide](https://docs.example.com/guide)\n- [Insecure](http://docs.example.com/bad)\n"))
+		case "/sitemap.xml":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<urlset><url><loc>https://docs.example.com/api</loc></url><url><loc>https://docs.example.com/api</loc></url></urlset>`))
+		case "/utf8":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><body><main><p>Héllo 世界 EdgeFetch</p></main></body></html>`))
+		case "/waf":
+			w.Header().Set("cf-ray", "12345-ORD")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<html><title>Just a moment...</title><body>Checking your browser before accessing... Cloudflare</body></html>`))
+		case "/many":
+			w.Header().Set("Content-Type", "text/html")
+			var links strings.Builder
+			for i := 0; i < 12; i++ {
+				links.WriteString(`<a href="https://docs.example.com/p/` + string(rune('a'+i)) + `">p</a>`)
+			}
+			links.WriteString(`<a href="http://docs.example.com/http">h</a><a href="https://other.example.com/ext">e</a>`)
+			_, _ = w.Write([]byte(`<html><body><main>` + links.String() + `</main></body></html>`))
+		case "/empty":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html><body><main><a href="https://docs.example.com/blog">Blog</a><a href="https://docs.example.com/blog#sec">Dup</a></main></body></html>`))
+		}
+	}))
+	t.Cleanup(origin.Close)
+
+	originAddr := origin.Listener.Addr().String()
+	tlsCfg := origin.Client().Transport.(*http.Transport).TLSClientConfig
+	mockTr := &http.Transport{
+		TLSClientConfig: tlsCfg,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+	deps := cliDeps{
+		getenv:    func(string) string { return "" },
+		transport: mockTr,
+		allow: func(u *url.URL) error {
+			if u.Scheme != "https" {
+				return errors.New("https only")
+			}
+			return nil
+		},
+	}
+	return deps, mockTr
+}
+
 func TestCLISubcommandsMapCrawlScrapeBugReportAndDoctorEdges(t *testing.T) {
-	// Non-parallel because we use t.Setenv for Chrome-absent doctor test
+	// Non-parallel because we use t.Setenv for Chrome-absent doctor & --render tests
 	var out, errBuf bytes.Buffer
 
 	// runOneShotCLI: custom haPath, empty args, unknown subcommand
@@ -519,60 +579,23 @@ func TestCLISubcommandsMapCrawlScrapeBugReportAndDoctorEdges(t *testing.T) {
 		t.Fatalf("unexpected keygen-bot-auth json: rc=%d out=%q", rc, out.String())
 	}
 
-	// Mock HTTPS origin for map, crawl, scrape, bug-report
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/robots.txt":
-			w.WriteHeader(http.StatusNotFound)
-		case "/llms.txt":
-			w.Header().Set("Content-Type", "text/plain")
-			_, _ = w.Write([]byte("# Index\n- [Guide](https://docs.example.com/guide)\n- [Insecure](http://docs.example.com/bad)\n"))
-		case "/sitemap.xml":
-			w.Header().Set("Content-Type", "application/xml")
-			_, _ = w.Write([]byte(`<urlset><url><loc>https://docs.example.com/api</loc></url><url><loc>https://docs.example.com/api</loc></url></urlset>`))
-		case "/utf8":
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(`<!doctype html><html><body><main><p>Héllo 世界 EdgeFetch</p></main></body></html>`))
-		case "/waf":
-			w.Header().Set("cf-ray", "12345-ORD")
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`<html><title>Just a moment...</title><body>Checking your browser before accessing... Cloudflare</body></html>`))
-		case "/many":
-			w.Header().Set("Content-Type", "text/html")
-			var links strings.Builder
-			for i := 0; i < 12; i++ {
-				links.WriteString(`<a href="https://docs.example.com/p/` + string(rune('a'+i)) + `">p</a>`)
-			}
-			links.WriteString(`<a href="http://docs.example.com/http">h</a><a href="https://other.example.com/ext">e</a>`)
-			_, _ = w.Write([]byte(`<html><body><main>` + links.String() + `</main></body></html>`))
-		case "/empty":
-			w.Header().Set("Content-Type", "text/html")
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte(`<html><body><main><a href="https://docs.example.com/blog">Blog</a><a href="https://docs.example.com/blog#sec">Dup</a></main></body></html>`))
-		}
-	}))
-	defer origin.Close()
-
-	originAddr := origin.Listener.Addr().String()
-	tlsCfg := origin.Client().Transport.(*http.Transport).TLSClientConfig
-	mockTr := &http.Transport{
-		TLSClientConfig: tlsCfg,
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
-		},
-	}
-	deps := cliDeps{
+	// Chrome-absent --render branches for scrape, crawl, and bug-report
+	deps, mockTr := newCoverageMockOrigin(t)
+	if rc := runOneShotCLI(context.Background(), []string{"scrape", "--render", "--timeout-ms=5000", "https://docs.example.com/"}, &out, &errBuf, cliDeps{
 		getenv:    func(string) string { return "" },
 		transport: mockTr,
-		allow: func(u *url.URL) error {
-			if u.Scheme != "https" {
-				return errors.New("https only")
-			}
-			return nil
-		},
+		allow:     deps.allow,
+	}); rc != 1 {
+		_ = rc
 	}
+	_ = runOneShotCLI(context.Background(), []string{"crawl", "--render", "--limit=1", "--max-depth=0", "https://docs.example.com/"}, &out, &errBuf, deps)
+	_ = runOneShotCLI(context.Background(), []string{"bug-report", "--render", "https://docs.example.com/"}, &out, &errBuf, deps)
+}
+
+func TestCLIScrapeMapAndBugReportEdges(t *testing.T) {
+	t.Parallel()
+	var out, errBuf bytes.Buffer
+	deps, mockTr := newCoverageMockOrigin(t)
 
 	// runScrapeCLI flag & error branches
 	badScrapeCases := [][]string{
@@ -599,15 +622,6 @@ func TestCLISubcommandsMapCrawlScrapeBugReportAndDoctorEdges(t *testing.T) {
 		t.Fatalf("expected rc=2 for bad UA, got %d", rc)
 	}
 
-	// scrape --render against error transport + valid --timeout-ms + UTF-8 truncation + --json on non-OK
-	if rc := runOneShotCLI(context.Background(), []string{"scrape", "--render", "--timeout-ms=5000", "https://docs.example.com/"}, &out, &errBuf, cliDeps{
-		getenv:    func(string) string { return "" },
-		transport: mockTr,
-		allow:     deps.allow,
-	}); rc != 1 {
-		// render without working chrome or blocked target returns 1 (or 0 if chrome succeeds, handle either cleanly)
-		_ = rc
-	}
 	out.Reset()
 	if rc := runOneShotCLI(context.Background(), []string{"scrape", "--max-chars=2", "https://docs.example.com/utf8"}, &out, &errBuf, deps); rc != 0 || len(strings.TrimSpace(out.String())) > 2 {
 		t.Fatalf("expected UTF-8 truncated scrape, rc=%d out=%q", rc, out.String())
@@ -676,62 +690,6 @@ func TestCLISubcommandsMapCrawlScrapeBugReportAndDoctorEdges(t *testing.T) {
 		t.Fatalf("slugifyURLForFilename punct = %q", got)
 	}
 
-	// runCrawlCLI edges
-	for _, badCrawl := range [][]string{
-		{"crawl"},
-		{"crawl", "--limit=0", "https://docs.example.com/"},
-		{"crawl", "--max-depth=-1", "https://docs.example.com/"},
-		{"crawl", "--bogus", "https://docs.example.com/"},
-		{"crawl", "https://a.example", "https://b.example"},
-		{"crawl", "http://127.0.0.1/"},
-	} {
-		if rc := runOneShotCLI(context.Background(), badCrawl, &out, &errBuf, deps); rc != 2 {
-			t.Fatalf("expected rc=2 for %v, got %d", badCrawl, rc)
-		}
-	}
-	existingFile := filepath.Join(tmpDir, "not-a-dir")
-	_ = os.WriteFile(existingFile, []byte("x"), 0o600)
-	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--out=" + existingFile, "https://docs.example.com/"}, &out, &errBuf, deps); rc != 1 {
-		t.Fatalf("expected rc=1 for MkdirAll on existing file, got %d", rc)
-	}
-	out.Reset()
-	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--json", "--limit=200", "--max-depth=10", "https://docs.example.com/many"}, &out, &errBuf, cliDeps{
-		getenv: func(k string) string {
-			if k == "EDGEFETCH_USER_AGENT" {
-				return "bad\nua"
-			}
-			return ""
-		},
-		transport: mockTr,
-		allow:     deps.allow,
-	}); rc != 0 || !strings.Contains(out.String(), `"fetched":`) {
-		t.Fatalf("unexpected crawl --json /many output: rc=%d out=%q", rc, out.String())
-	}
-	// len(wave) > rem (limit=11 on /many with 12 links)
-	out.Reset()
-	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--limit=11", "--max-depth=1", "https://docs.example.com/many"}, &out, &errBuf, deps); rc != 0 {
-		t.Fatalf("unexpected crawl --limit=11 output: rc=%d", rc)
-	}
-	// --render & ValidateCallWithCrawler break
-	_ = runOneShotCLI(context.Background(), []string{"crawl", "--render", "--limit=1", "--max-depth=0", "https://docs.example.com/"}, &out, &errBuf, deps)
-	crawlBlockDeps := deps
-	crawlBlockDeps.allow = func(u *url.URL) error {
-		if u.Path == "/blocked-crawl" {
-			return errors.New("blocked")
-		}
-		return deps.allow(u)
-	}
-	// Root allowed if not /blocked-crawl; or test direct break by blocking after parse? Better: use allow rejecting second call via atomic counter
-	var crawlAllowCount atomic.Int32
-	crawlBreakDeps := deps
-	crawlBreakDeps.allow = func(u *url.URL) error {
-		if crawlAllowCount.Add(1) > 1 {
-			return errors.New("blocked on validate")
-		}
-		return nil
-	}
-	_ = runOneShotCLI(context.Background(), []string{"crawl", "--limit=1", "https://docs.example.com/"}, &out, &errBuf, crawlBreakDeps)
-
 	// sanitizeURLForBugReport & runBugReportCLI edges
 	if got := sanitizeURLForBugReport("://bad"); got != "<invalid-url>" {
 		t.Fatalf("expected <invalid-url>, got %q", got)
@@ -753,24 +711,75 @@ func TestCLISubcommandsMapCrawlScrapeBugReportAndDoctorEdges(t *testing.T) {
 	if rc := runOneShotCLI(context.Background(), []string{"bug-report", "--json", "https://docs.example.com/waf"}, &out, &errBuf, deps); rc != 0 || !strings.Contains(out.String(), `"wafVendor": "cloudflare"`) {
 		t.Fatalf("expected bug-report cloudflare WAF vendor, rc=%d out=%s", rc, out.String())
 	}
-	_ = runOneShotCLI(context.Background(), []string{"bug-report", "--render", "https://docs.example.com/"}, &out, &errBuf, deps)
 
 	// One-shot serve & desktop dispatch with short timeout ctx
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer shortCancel()
-	_ = runOneShotCLI(shortCtx, []string{"serve", "--port=0"}, &out, &errBuf, deps)
+	_ = runOneShotCLI(shortCtx, []string{"serve", "--port=0"}, io.Discard, io.Discard, deps)
 	shortCtx2, shortCancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer shortCancel2()
-	_ = runOneShotCLI(shortCtx2, []string{"desktop", "--port=0", "--no-open"}, &out, &errBuf, deps)
+	_ = runOneShotCLI(shortCtx2, []string{"desktop", "--port=0", "--no-open"}, io.Discard, io.Discard, deps)
 }
 
-func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
-	// Non-parallel because we use t.Setenv for HOME / PATH / EDGEFETCH_CHROME_BIN
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-	t.Setenv("PATH", tmpHome)
-	t.Setenv("EDGEFETCH_CHROME_BIN", "")
+func TestCLICrawlMaxLimitAndDepthEdges(t *testing.T) {
+	t.Parallel()
+	var out, errBuf bytes.Buffer
+	deps, mockTr := newCoverageMockOrigin(t)
 
+	for _, badCrawl := range [][]string{
+		{"crawl"},
+		{"crawl", "--limit=0", "https://docs.example.com/"},
+		{"crawl", "--max-depth=-1", "https://docs.example.com/"},
+		{"crawl", "--bogus", "https://docs.example.com/"},
+		{"crawl", "https://a.example", "https://b.example"},
+		{"crawl", "http://127.0.0.1/"},
+	} {
+		if rc := runOneShotCLI(context.Background(), badCrawl, &out, &errBuf, deps); rc != 2 {
+			t.Fatalf("expected rc=2 for %v, got %d", badCrawl, rc)
+		}
+	}
+	existingFile := filepath.Join(t.TempDir(), "not-a-dir")
+	_ = os.WriteFile(existingFile, []byte("x"), 0o600)
+	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--out=" + existingFile, "https://docs.example.com/"}, &out, &errBuf, deps); rc != 1 {
+		t.Fatalf("expected rc=1 for MkdirAll on existing file, got %d", rc)
+	}
+	out.Reset()
+	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--json", "--limit=200", "--max-depth=10", "https://docs.example.com/many"}, &out, &errBuf, cliDeps{
+		getenv: func(k string) string {
+			if k == "EDGEFETCH_USER_AGENT" {
+				return "bad\nua"
+			}
+			return ""
+		},
+		transport: mockTr,
+		allow:     deps.allow,
+	}); rc != 0 || !strings.Contains(out.String(), `"fetched":`) {
+		t.Fatalf("unexpected crawl --json /many output: rc=%d out=%q", rc, out.String())
+	}
+
+	var crawlAllowCount atomic.Int32
+	crawlBreakDeps := deps
+	crawlBreakDeps.allow = func(u *url.URL) error {
+		if crawlAllowCount.Add(1) > 1 {
+			return errors.New("blocked on validate")
+		}
+		return nil
+	}
+	_ = runOneShotCLI(context.Background(), []string{"crawl", "--limit=1", "https://docs.example.com/"}, &out, &errBuf, crawlBreakDeps)
+}
+
+func TestCLICrawlWaveSliceEdges(t *testing.T) {
+	t.Parallel()
+	var out, errBuf bytes.Buffer
+	deps, _ := newCoverageMockOrigin(t)
+	// len(wave) > rem (limit=11 on /many with 12 links)
+	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--limit=11", "--max-depth=1", "https://docs.example.com/many"}, &out, &errBuf, deps); rc != 0 {
+		t.Fatalf("unexpected crawl --limit=11 output: rc=%d", rc)
+	}
+}
+
+func TestMCPStdioProtocolAndBatchEdges(t *testing.T) {
+	t.Parallel()
 	// Mock origin with >4KiB body for fetch_batch truncation & /llms.txt + /sitemap.xml
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -790,7 +799,7 @@ func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
 			_, _ = w.Write([]byte(`<main><p>Hello 世界!</p><a href="https://docs.example.com/c">c</a></main>`))
 		}
 	}))
-	defer origin.Close()
+	t.Cleanup(origin.Close)
 
 	originAddr := origin.Listener.Addr().String()
 	tlsCfg := origin.Client().Transport.(*http.Transport).TLSClientConfig
@@ -819,8 +828,7 @@ func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
 		t.Fatalf("expected rc=0 on cancelled ctx, got %d", rc)
 	}
 
-	// 2. Full JSON-RPC protocol & tool edge cases (with Chrome absent so renderMode = "off")
-	var allowCalls atomic.Int32
+	// 2. Full JSON-RPC protocol & tool edge cases
 	deps := cliDeps{
 		getenv: func(k string) string {
 			if k == "EDGEFETCH_HUB_URL" {
@@ -830,7 +838,6 @@ func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
 		},
 		transport: mockTr,
 		allow: func(u *url.URL) error {
-			allowCalls.Add(1)
 			if u.Scheme != "https" || strings.HasSuffix(u.Path, "/reject-validate") {
 				return errors.New("disallowed")
 			}
@@ -852,7 +859,6 @@ func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":123}`,
 		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"doctor","arguments":{},"_meta":{"x-trace-id":"4bf92f3577b34da6a3ce929d0e0e4736","x-span-id":"00f067aa0ba902b7"}}}`,
 		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"scrape","arguments":{"url":"https://docs.example.com/","maxChars":5}}}`,
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"scrape","arguments":{"url":"https://docs.example.com/","render":true}}}`,
 		`{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"scrape","arguments":{"url":"http://127.0.0.1/"}}}`,
 		`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"fetch_url","arguments":{"url":"http://127.0.0.1/"}}}`,
 		`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"fetch_batch","arguments":{"urls":[]}}}`,
@@ -870,6 +876,23 @@ func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "-32700") || !strings.Contains(out.String(), "-32601") || !strings.Contains(out.String(), "-32602") || !strings.Contains(out.String(), `"protocolVersion":"2024-11-05"`) {
 		t.Fatalf("missing expected JSON-RPC frames in output:\n%s", out.String())
+	}
+}
+
+func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
+	// Non-parallel because we use t.Setenv for HOME / PATH / EDGEFETCH_CHROME_BIN
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("PATH", tmpHome)
+	t.Setenv("EDGEFETCH_CHROME_BIN", "")
+
+	var out, errBuf bytes.Buffer
+	deps, _ := newCoverageMockOrigin(t)
+
+	// Exercise MCP scrape with render=true when Chrome is absent (renderMode falls back to "off")
+	renderFrame := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"scrape","arguments":{"url":"https://docs.example.com/","render":true}}}` + "\n"
+	if rc := runMCPStdio(context.Background(), strings.NewReader(renderFrame), &out, &errBuf, deps); rc != 0 {
+		t.Fatalf("runMCPStdio render=true Chrome-absent failed: %d", rc)
 	}
 
 	// Helper unit edges
@@ -937,25 +960,25 @@ func TestMCPStdioInstallServeAndDesktopCoverage(t *testing.T) {
 	}
 
 	// runServeMode & runDesktopMode edges
-	if rc := runServeModeWithDeps(context.Background(), []string{"--port=99999"}, &out, &errBuf, cliDeps{}); rc != 1 {
+	if rc := runServeModeWithDeps(context.Background(), []string{"--port=99999"}, io.Discard, io.Discard, cliDeps{}); rc != 1 {
 		t.Fatalf("expected rc=1 for invalid serve port, got %d", rc)
 	}
-	if rc := runDesktopModeWithDeps(context.Background(), []string{"--port=99999"}, &out, &errBuf, cliDeps{}); rc != 1 {
+	if rc := runDesktopModeWithDeps(context.Background(), []string{"--port=99999"}, io.Discard, io.Discard, cliDeps{}); rc != 1 {
 		t.Fatalf("expected rc=1 for invalid desktop port, got %d", rc)
 	}
 	serveCtx, serveCancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer serveCancel()
-	_ = runServeMode(serveCtx, []string{"--port=0", "--allow-private"}, &out, &errBuf)
+	_ = runServeMode(serveCtx, []string{"--port=0", "--allow-private"}, io.Discard, io.Discard)
 	serveDefCtx, serveDefCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer serveDefCancel()
-	_ = runServeModeWithDeps(serveDefCtx, nil, &out, &errBuf, cliDeps{getenv: func(string) string { return "" }})
+	_ = runServeModeWithDeps(serveDefCtx, nil, io.Discard, io.Discard, cliDeps{getenv: func(string) string { return "" }})
 
 	deskCtx, deskCancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer deskCancel()
-	_ = runDesktopMode(deskCtx, []string{"--port=0"}, &out, &errBuf) // exercises !noOpen -> openBrowserBestEffort with empty PATH
+	_ = runDesktopMode(deskCtx, []string{"--port=0"}, io.Discard, io.Discard) // exercises !noOpen -> openBrowserBestEffort with empty PATH
 	deskDefCtx, deskDefCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer deskDefCancel()
-	_ = runDesktopModeWithDeps(deskDefCtx, []string{"--no-open"}, &out, &errBuf, cliDeps{getenv: func(string) string { return "" }})
+	_ = runDesktopModeWithDeps(deskDefCtx, []string{"--no-open"}, io.Discard, io.Discard, cliDeps{getenv: func(string) string { return "" }})
 
 	// runInstallService defaults, actual write, MkdirAll error, WriteFile error
 	if rc := runInstallService([]string{"--dry-run"}, &out, &errBuf); rc != 0 {

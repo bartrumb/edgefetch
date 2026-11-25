@@ -132,6 +132,7 @@ func startMockOTLPCollector(t *testing.T) (*httptest.Server, func() ([]otlpCaptu
 }
 
 func TestMCPStdioOTLPAndPureStdout(t *testing.T) {
+	t.Parallel()
 	collector, snapshot := startMockOTLPCollector(t)
 
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -238,6 +239,7 @@ func TestMCPStdioOTLPAndPureStdout(t *testing.T) {
 }
 
 func TestServeAndDesktopModeOTLP(t *testing.T) {
+	t.Parallel()
 	reListenURL := regexp.MustCompile(`http://127\.0\.0\.1:\d+`)
 
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -248,7 +250,7 @@ func TestServeAndDesktopModeOTLP(t *testing.T) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(`<html><body><main><h1>Serve Desktop OTLP</h1></main></body></html>`))
 	}))
-	defer origin.Close()
+	t.Cleanup(origin.Close)
 
 	originAddr := origin.Listener.Addr().String()
 	tlsCfg := origin.Client().Transport.(*http.Transport).TLSClientConfig
@@ -267,7 +269,9 @@ func TestServeAndDesktopModeOTLP(t *testing.T) {
 		{"serve", "edgefetch-serve", []string{"--port=0"}},
 		{"desktop", "edgefetch-desktop", []string{"--port=0", "--no-open"}},
 	} {
+		tc := tc
 		t.Run(tc.mode, func(t *testing.T) {
+			t.Parallel()
 			collector, snapshot := startMockOTLPCollector(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -353,6 +357,7 @@ func TestServeAndDesktopModeOTLP(t *testing.T) {
 }
 
 func TestShouldAllowPrivateOriginAndAgentCrawlPolicy(t *testing.T) {
+	t.Parallel()
 	if shouldAllowPrivateOrigin(nil, nil) {
 		t.Fatal("SECURITY: default shouldAllowPrivateOrigin must be false")
 	}
@@ -551,6 +556,7 @@ func TestShouldAllowPrivateOriginAndAgentCrawlPolicy(t *testing.T) {
 }
 
 func TestAgentPrivateTransportDialControlHubGuard(t *testing.T) {
+	t.Parallel()
 	const hubPort = "18787"
 	const originPort = "19999"
 
@@ -706,6 +712,7 @@ func TestAgentPrivateTransportDialControlHubGuard(t *testing.T) {
 }
 
 func TestCLIModeMCPFlagAlignment(t *testing.T) {
+	t.Parallel()
 	for _, yes := range [][]string{
 		{"mcp"},
 		{"--mode=mcp"},

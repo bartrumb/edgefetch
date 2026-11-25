@@ -121,6 +121,11 @@ func (s *Server) initSubsystems() {
 				}
 				return nil
 			},
+			OnTelemetryToggle: func(enabled bool) {
+				if s.cfg.OtelExporter != nil {
+					s.cfg.OtelExporter.SetRuntimeDevTelemetry(enabled)
+				}
+			},
 		},
 	})
 	if aErr == nil {

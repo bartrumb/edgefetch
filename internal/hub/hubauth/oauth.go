@@ -175,6 +175,13 @@ func (m *Manager) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		oauthJSONErr(w, isHTTPS, finish, http.StatusMethodNotAllowed, "method_not_allowed", "method_not_allowed")
 		return
 	}
+	now := m.cfg.Now()
+	regBucket := "reg:" + ResolveClientIP(r, m.cfg.TrustProxy, m.cfg.TrustFly)
+	if m.isLoginLocked(regBucket, now) || m.recordFailedLogin(regBucket, now) {
+		w.Header().Set("Retry-After", "600")
+		oauthJSONErr(w, isHTTPS, finish, http.StatusTooManyRequests, "rate_limited", "Too many client registrations.")
+		return
+	}
 	buf, tooBig, err := readCappedBody(w, r, 16384)
 	if tooBig {
 		oauthJSONErr(w, isHTTPS, finish, http.StatusRequestEntityTooLarge, "payload_too_large", "invalid_client_metadata")
@@ -200,8 +207,26 @@ func (m *Manager) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	} else if len(name) > 80 {
 		name = name[:80]
 	}
-	now, clientID := m.cfg.Now(), "mcp_"+randomHex(12)
+	clientID := "mcp_" + randomHex(12)
 	m.mu.Lock()
+	if len(m.st.Clients) >= 512 {
+		activeClients := map[string]bool{}
+		for _, g := range m.st.Grants {
+			if !g.Revoked {
+				activeClients[g.ClientID] = true
+			}
+		}
+		var oldestID string
+		var oldestAt int64
+		for cid, cl := range m.st.Clients {
+			if !activeClients[cid] && (oldestID == "" || cl.CreatedAt < oldestAt) {
+				oldestID, oldestAt = cid, cl.CreatedAt
+			}
+		}
+		if oldestID != "" {
+			delete(m.st.Clients, oldestID)
+		}
+	}
 	m.st.Clients[clientID] = OAuthClient{ClientID: clientID, ClientName: name, RedirectURIs: req.RedirectURIs, CreatedAt: now.UnixMilli()}
 	_ = m.saveLocked()
 	m.mu.Unlock()
@@ -343,6 +368,12 @@ func (m *Manager) HandleAuthorize(w http.ResponseWriter, r *http.Request, origin
 		return
 	}
 
+	clientBucket := "oauth:" + ResolveClientIP(r, m.cfg.TrustProxy, m.cfg.TrustFly)
+	if m.isLoginLocked(clientBucket, now) {
+		w.Header().Set("Retry-After", "600")
+		oauthHTMLErr(w, isHTTPS, finish, http.StatusTooManyRequests, "rate_limited", "Too many failed attempts.")
+		return
+	}
 	userID, role, authed := "owner", "owner", false
 	sess, hasSess := m.verifySessionFromRequest(r, isHTTPS, now)
 	suppliedTok := strings.TrimSpace(formMap["owner_token"])
@@ -352,11 +383,12 @@ func (m *Manager) HandleAuthorize(w http.ResponseWriter, r *http.Request, origin
 	if suppliedTok != "" && (constantTimeEqual(suppliedTok, strings.TrimSpace(m.cfg.CallerToken)) ||
 		constantTimeEqual(suppliedTok, strings.TrimSpace(m.cfg.McpToken))) {
 		authed = true
+		m.clearFailedLogin(clientBucket)
 	} else if hasSess && sess.Kind == "github" {
 		authed, userID, role = true, sess.UserID, sess.Role
 	}
 	if !authed {
-		if m.recordFailedLogin("oauth:"+ResolveClientIP(r, m.cfg.TrustProxy, m.cfg.TrustFly), now) {
+		if m.recordFailedLogin(clientBucket, now) {
 			w.Header().Set("Retry-After", "600")
 			oauthHTMLErr(w, isHTTPS, finish, http.StatusTooManyRequests, "rate_limited", "Too many failed attempts.")
 			return

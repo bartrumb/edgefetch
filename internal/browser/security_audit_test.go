@@ -84,11 +84,12 @@ func TestBuildChromiumLaunchArgsWithSandboxToggleAndPolicy(t *testing.T) {
 }
 
 func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
+	t.Parallel()
 	chromeBin := FindChromeBinary()
 	if chromeBin == "" {
 		t.Skip("Chromium/Chrome binary not installed on host; live container smoke runs in docker-multiarch CI")
 	}
-	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+	acquireLiveChromeSlot(t)
 
 	var victimHits atomic.Int32
 	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,6 +111,7 @@ func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
 	}
 
 	r := NewRenderer(chromeBin, allowHTTPSPublicOnly, "EdgeFetchTest/2.5.5", 1, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	enableNoSandboxOnRestrictedLinuxHost(r)
 	defer r.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
@@ -185,6 +187,7 @@ func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
 }
 
 func TestValidateFinalURLChecksRobotsEvenOnResumedInteractSession(t *testing.T) {
+	t.Parallel()
 	var checked []string
 	r := NewRenderer("", func(u *url.URL) error {
 		if u.Scheme != "https" {
@@ -214,6 +217,7 @@ func TestValidateFinalURLChecksRobotsEvenOnResumedInteractSession(t *testing.T) 
 }
 
 func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *testing.T) {
+	t.Parallel()
 	var (
 		mu              sync.Mutex
 		disposedCtxs    int
@@ -423,6 +427,7 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 }
 
 func TestR8TopNavAndSubresourceSecFetchSiteHeaderResidual(t *testing.T) {
+	t.Parallel()
 	const boundOrigin = "https://victim.example.com:443"
 
 	// 1. Unit checks on hasPositiveSameOriginProof (Round 9 H8: positive Origin/Referer required; dead Sec-Fetch-Site clause removed):
@@ -663,11 +668,12 @@ func TestR8TopNavAndSubresourceSecFetchSiteHeaderResidual(t *testing.T) {
 }
 
 func TestR8LiveChromeNestedGrandchildTopNavBlocked(t *testing.T) {
+	t.Parallel()
 	bin := FindChromeBinary()
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R8 nested grandchild top-nav test")
 	}
-	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+	acquireLiveChromeSlot(t)
 
 	type hit struct {
 		Path string
@@ -715,6 +721,7 @@ func TestR8LiveChromeNestedGrandchildTopNavBlocked(t *testing.T) {
 
 	srvAddr := srv.Listener.Addr().String()
 	r := NewRenderer(bin, func(u *url.URL) error { return nil }, "EdgeFetchTest/2.7.3", 1, nil)
+	enableNoSandboxOnRestrictedLinuxHost(r)
 	r.extraFlags = []string{"--ignore-certificate-errors"}
 	r.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
@@ -764,6 +771,7 @@ func TestR8LiveChromeNestedGrandchildTopNavBlocked(t *testing.T) {
 }
 
 func TestR9H8All15TaintAndOriginProofScenariosMockAndLive(t *testing.T) {
+	t.Parallel()
 	// Part A: Deterministic Mock-CDP harness exercising all 15 Round 9 H8 scenarios across isolated sessions.
 	runScenario := func(t *testing.T, name string, emit func(navSID string, send func(any), waitCont func(string))) map[string]bool {
 		t.Helper()
@@ -1137,7 +1145,7 @@ func TestR9H8All15TaintAndOriginProofScenariosMockAndLive(t *testing.T) {
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live Part B of R9 H8 test")
 	}
-	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+	acquireLiveChromeSlot(t)
 
 	var (
 		liveMu     sync.Mutex
@@ -1181,6 +1189,7 @@ func TestR9H8All15TaintAndOriginProofScenariosMockAndLive(t *testing.T) {
 
 	liveAddr := liveSrv.Listener.Addr().String()
 	rLive := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetchTest/2.7.4", 1, nil)
+	enableNoSandboxOnRestrictedLinuxHost(rLive)
 	rLive.extraFlags = []string{"--ignore-certificate-errors"}
 	rLive.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, liveAddr)

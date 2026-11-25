@@ -89,6 +89,7 @@ func generateTestSigningKeyPEM(t *testing.T) (ed25519.PrivateKey, string) {
 }
 
 func TestPinnedReleaseSigningKeyMatchesRepoKeyFile(t *testing.T) {
+	t.Parallel()
 	repoKeyBytes, err := os.ReadFile(filepath.Join("..", "..", "keys", "release-signing-pub.pem"))
 	if err != nil {
 		t.Fatalf("read keys/release-signing-pub.pem: %v", err)
@@ -106,6 +107,7 @@ func TestPinnedReleaseSigningKeyMatchesRepoKeyFile(t *testing.T) {
 }
 
 func TestEdgeFetchUpdateEd25519VerifiedAndTamperRejected(t *testing.T) {
+	t.Parallel()
 	priv, pubPEM := generateTestSigningKeyPEM(t)
 	_, wrongPubPEM := generateTestSigningKeyPEM(t)
 
@@ -275,6 +277,7 @@ func TestEdgeFetchUpdateEd25519VerifiedAndTamperRejected(t *testing.T) {
 }
 
 func TestEdgeFetchInitTelemetryPromptTTYAndDoNotTrackInvariants(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	jsonCfg := filepath.Join(tmpDir, "mcp.json")
 	tomlCfg := filepath.Join(tmpDir, "config.toml")
@@ -375,6 +378,7 @@ func TestEdgeFetchInitTelemetryPromptTTYAndDoNotTrackInvariants(t *testing.T) {
 }
 
 func TestWorkflowsPinExact40HexCommitSHAs(t *testing.T) {
+	t.Parallel()
 	reUses := regexp.MustCompile(`(?m)^\s*(?:-\s*)?uses:\s*([^\s#]+)`)
 	rePinned := regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$`)
 
@@ -421,6 +425,7 @@ func TestWorkflowsPinExact40HexCommitSHAs(t *testing.T) {
 }
 
 func TestR7UpdateDowngradeGuardAndAtomicCrashRecovery(t *testing.T) {
+	t.Parallel()
 	priv, pubPEM := generateTestSigningKeyPEM(t)
 
 	oldLinuxPayload := []byte("#!/bin/sh\necho edgefetch-v2.6.2-old\n")
@@ -564,6 +569,7 @@ func TestR7UpdateDowngradeGuardAndAtomicCrashRecovery(t *testing.T) {
 }
 
 func TestMCPBackgroundUpdateCheckDefaultOffAndOptInInvariants(t *testing.T) {
+	t.Parallel()
 	var hits atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -696,6 +702,7 @@ func TestMCPBackgroundUpdateCheckDefaultOffAndOptInInvariants(t *testing.T) {
 }
 
 func TestR9UpdateFloorFailClosedOnBuildMetaDevAndUnparseableVersions(t *testing.T) {
+	t.Parallel()
 	priv, pubPEM := generateTestSigningKeyPEM(t)
 
 	payload262 := []byte("#!/bin/sh\necho edgefetch-v2.6.2\n")

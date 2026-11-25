@@ -143,6 +143,20 @@ function getReactor(): CoreReactorExports {
   return exports;
 }
 
+// Pre-warm the WASI reactor at module load on Node.js so cold `_initialize()` never inflates per-call timers;
+// falls back lazily on Cloudflare Workers (`workerd`), which disallows `Date.now()` / `getRandomValues()` in global scope.
+if (
+  typeof process !== 'undefined' &&
+  process.release?.name === 'node' &&
+  (typeof navigator === 'undefined' || !String(navigator.userAgent).includes('Cloudflare-Workers'))
+) {
+  try {
+    getReactor();
+  } catch {
+    cachedReactor = null;
+  }
+}
+
 function writeInputBytes(reactor: CoreReactorExports, bytes: Uint8Array): number {
   const ptr = reactor.ef_in_ptr(bytes.byteLength) >>> 0;
   if (ptr === 0 && bytes.byteLength > 0) {

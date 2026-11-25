@@ -1009,16 +1009,31 @@ func ClassifyContentState(status int, rawHTML, markdown, finalURL, title string)
 
 	boundedMD := capStringBytesUTF8CSGo(markdown, maxHTMLScanCharsCSGo)
 	withoutFences := stripMarkdownFencesOnlyCSGo(boundedMD)
-	proseOnly := strings.TrimSpace(reProseLeakBlocksCSGo.ReplaceAllString(withoutFences, " "))
+	if strings.Contains(withoutFences, "</") {
+		withoutFences = reProseLeakBlocksCSGo.ReplaceAllString(withoutFences, " ")
+	}
+	proseOnly := strings.TrimSpace(withoutFences)
+	words := countWordsFromTextCSGo(proseOnly)
+
 	cleanVisibleHTML := ""
-	if rawHTML != "" {
-		cleanVisibleHTML = reVisibleHTMLDropCSGo.ReplaceAllString(capStringBytesUTF8CSGo(rawHTML, maxHTMLScanCharsCSGo), " ")
+	needVisibleHTML := rawHTML != "" && (strings.TrimSpace(title) == "" || words < 110)
+	if needVisibleHTML {
+		boundedRaw := capStringBytesUTF8CSGo(rawHTML, maxHTMLScanCharsCSGo)
+		lowRaw := strings.ToLower(boundedRaw)
+		if strings.Contains(lowRaw, "</script") ||
+			strings.Contains(lowRaw, "</style") ||
+			strings.Contains(lowRaw, "</noscript") ||
+			strings.Contains(lowRaw, "</template") ||
+			strings.Contains(lowRaw, "</svg") {
+			cleanVisibleHTML = reVisibleHTMLDropCSGo.ReplaceAllString(boundedRaw, " ")
+		} else {
+			cleanVisibleHTML = boundedRaw
+		}
 	}
 	if strings.TrimSpace(title) == "" && cleanVisibleHTML != "" {
 		title = extractRawTitle(cleanVisibleHTML)
 	}
 
-	words := countWordsFromTextCSGo(proseOnly)
 	topProse := capStringBytesUTF8CSGo(proseOnly, 900)
 	topSlice := title + "\n" + topProse
 

@@ -142,7 +142,13 @@ await t.test('R6-STREAM-B-1 (R6-H4): Portable Hub caps per-IP raw TCP & pre-head
       ),
     );
 
-    await new Promise((r) => setTimeout(r, 80));
+    const drainDeadline = Date.now() + 280; // strictly < headersTimeoutMs (400ms)
+    while (
+      Date.now() < drainDeadline &&
+      attackerSockets.filter((x) => !x.closed && !x.sock.destroyed).length > 16
+    ) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
     const openAttackerCount = attackerSockets.filter((x) => !x.closed && !x.sock.destroyed).length;
     assert.ok(
       openAttackerCount <= 16,

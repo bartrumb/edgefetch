@@ -644,7 +644,7 @@ func replacePairedHTMLElementsLinearFullDocGo(
 	hasAny := false
 	for _, t := range tagNamesLower {
 		targetSet[t] = true
-		if !hasAny && strings.Contains(lower, "<"+t) {
+		if !hasAny && strings.Contains(lower, "<"+t) && (strings.Contains(lower, "</"+t) || strings.Contains(lower, "/>")) {
 			hasAny = true
 		}
 	}
@@ -4006,9 +4006,13 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	var substackPreload *substackPreloadFullDocGo
 	var hnExtracted *hnExtractedResultFullDocGo
 
-	if hasDefaultHTMLScoping {
-		ytMeta = ExtractYouTubeWatchMetadataFromHTML(boundedRawHTML, baseURL)
-		substackPreload = extractSubstackPreloadDataFullDocGo(boundedRawHTML)
+	if hasDefaultHTMLScoping && hasClosedTag {
+		if strings.Contains(boundedRawHTML, "ytInitial") || strings.Contains(baseURL, "youtube") || strings.Contains(baseURL, "youtu.be") {
+			ytMeta = ExtractYouTubeWatchMetadataFromHTML(boundedRawHTML, baseURL)
+		}
+		if strings.Contains(boundedRawHTML, "_preloads") {
+			substackPreload = extractSubstackPreloadDataFullDocGo(boundedRawHTML)
+		}
 		if substackPreload != nil {
 			if substackPreload.title != "" {
 				title = substackPreload.title
@@ -4023,7 +4027,9 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				publishedTime = substackPreload.publishedTime
 			}
 		}
-		hnExtracted = extractHackerNewsMarkdownFullDocGo(boundedRawHTML, baseURL)
+		if strings.Contains(boundedRawHTML, "hnmain") || strings.Contains(boundedRawHTML, "athing") {
+			hnExtracted = extractHackerNewsMarkdownFullDocGo(boundedRawHTML, baseURL)
+		}
 		if hnExtracted != nil {
 			if hnExtracted.title != "" {
 				title = hnExtracted.title
@@ -4145,7 +4151,10 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	}
 
 	extractedMarkdownBodyOnly := false
-	if len(includeTags) > 0 {
+	workHasClosedTag := strings.IndexByte(work, '<') >= 0 && strings.IndexByte(work, '>') >= 0
+	if !workHasClosedTag {
+		// Fast path for plain text or unclosed-tag fragments (`work` contains zero closed HTML tags).
+	} else if len(includeTags) > 0 {
 		work = applyIncludeAndExcludeTagSelectorsFullDocGo(work, includeTags, excludeTags)
 	} else if onlyMainContent {
 		work = stripHTMLTagsLinearFullDocGo(work, []string{"nav", "footer", "aside", "dialog", "menu"}, "", maxHTMLScanCharsFullDocGo)
@@ -4280,107 +4289,391 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	}
 
 	var codeStash []string
-	stashCode := func(renderedCodeMD string) string {
-		idx := len(codeStash)
-		codeStash = append(codeStash, renderedCodeMD)
-		return "@@EFCODE_" + strconv.Itoa(idx) + "@@"
-	}
-	stashFence := func(fenceMD string) string {
-		idx := len(codeStash)
-		codeStash = append(codeStash, strings.TrimSpace(fenceMD))
-		return "\n\n@@EFFENCE_" + strconv.Itoa(idx) + "@@\n\n"
-	}
-	stashInline := func(spanMD string) string {
-		if spanMD == "" {
-			return ""
+	var links []string
+	images := make([]ImageInfo, 0)
+	var md string
+
+	if !workHasClosedTag {
+		md = work
+	} else {
+		stashCode := func(renderedCodeMD string) string {
+			idx := len(codeStash)
+			codeStash = append(codeStash, renderedCodeMD)
+			return "@@EFCODE_" + strconv.Itoa(idx) + "@@"
 		}
-		idx := len(codeStash)
-		codeStash = append(codeStash, spanMD)
-		return "`@@EFINLINE_" + strconv.Itoa(idx) + "@@`"
-	}
-
-	work = standardizeElementsInHTMLFullDocGo(work, stashCode, stashInline)
-
-	collectAnchorLinks := func(htmlSource string) []string {
-		outLinks := make([]string, 0)
-		seen := make(map[string]bool)
-		replacePairedHTMLElementsLinearFullDocGo(htmlSource, []string{"a"}, func(_, _, attrStr, _ string) string {
-			if len(outLinks) >= 250 {
+		stashFence := func(fenceMD string) string {
+			idx := len(codeStash)
+			codeStash = append(codeStash, strings.TrimSpace(fenceMD))
+			return "\n\n@@EFFENCE_" + strconv.Itoa(idx) + "@@\n\n"
+		}
+		stashInline := func(spanMD string) string {
+			if spanMD == "" {
 				return ""
 			}
-			attrs := parseTagAttrsFullDocGo(attrStr)
-			if resolved := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, false); resolved != "" && !seen[resolved] {
-				seen[resolved] = true
-				outLinks = append(outLinks, resolved)
-			}
-			return ""
-		}, maxHTMLScanCharsFullDocGo, 16384)
-		return outLinks
-	}
-
-	links := collectAnchorLinks(work)
-	if (len(links) == 0 || extractedMarkdownBodyOnly) && onlyMainContent {
-		seenLinkSet := make(map[string]bool, len(links))
-		for _, l := range links {
-			seenLinkSet[l] = true
+			idx := len(codeStash)
+			codeStash = append(codeStash, spanMD)
+			return "`@@EFINLINE_" + strconv.Itoa(idx) + "@@`"
 		}
-		for _, l := range collectAnchorLinks(withoutCommentsAndScripts) {
-			if !seenLinkSet[l] {
+
+		work = standardizeElementsInHTMLFullDocGo(work, stashCode, stashInline)
+
+		collectAnchorLinks := func(htmlSource string) []string {
+			outLinks := make([]string, 0)
+			seen := make(map[string]bool)
+			replacePairedHTMLElementsLinearFullDocGo(htmlSource, []string{"a"}, func(_, _, attrStr, _ string) string {
+				if len(outLinks) >= 250 {
+					return ""
+				}
+				attrs := parseTagAttrsFullDocGo(attrStr)
+				if resolved := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, false); resolved != "" && !seen[resolved] {
+					seen[resolved] = true
+					outLinks = append(outLinks, resolved)
+				}
+				return ""
+			}, maxHTMLScanCharsFullDocGo, 16384)
+			return outLinks
+		}
+
+		links = collectAnchorLinks(work)
+		if (len(links) == 0 || extractedMarkdownBodyOnly) && onlyMainContent {
+			seenLinkSet := make(map[string]bool, len(links))
+			for _, l := range links {
 				seenLinkSet[l] = true
-				links = append(links, l)
-				if len(links) >= 250 {
-					break
+			}
+			for _, l := range collectAnchorLinks(withoutCommentsAndScripts) {
+				if !seenLinkSet[l] {
+					seenLinkSet[l] = true
+					links = append(links, l)
+					if len(links) >= 250 {
+						break
+					}
 				}
 			}
 		}
-	}
 
-	images := make([]ImageInfo, 0)
-	seenImages := make(map[string]bool)
-	if includeImages {
-		scanHTMLTagsLinearFullDocGo(work, func(tag scannedTagFullDocGo) bool {
-			if tag.isClosing || tag.tagNameLower != "img" {
+		seenImages := make(map[string]bool)
+		if includeImages {
+			scanHTMLTagsLinearFullDocGo(work, func(tag scannedTagFullDocGo) bool {
+				if tag.isClosing || tag.tagNameLower != "img" {
+					return true
+				}
+				attrs := parseTagAttrsFullDocGo(tag.attrs)
+				primarySrc := ""
+				if attrs["src"] != "" && !isLazyPlaceholderImageURLFullDocGo(attrs["src"]) {
+					primarySrc = attrs["src"]
+				}
+				bestCand := primarySrc
+				for _, fallback := range []string{
+					attrs["data-src"],
+					attrs["data-lazy-src"],
+					attrs["data-original"],
+					ExtractLargestURLFromSrcset(firstNonEmptyFullDocGo(attrs["srcset"], attrs["data-srcset"], attrs["data-lazy-srcset"])),
+					attrs["src"],
+				} {
+					if bestCand != "" {
+						break
+					}
+					bestCand = fallback
+				}
+				src := resolveHTTPSHrefFullDocGo(bestCand, baseURL, false)
+				if src != "" && !seenImages[src] && !isDecorativeOrTinyImageFullDocGo(attrs, src) {
+					seenImages[src] = true
+					images = append(images, ImageInfo{URL: src, Alt: strings.TrimSpace(attrs["alt"])})
+					if len(images) >= 60 {
+						return false
+					}
+				}
 				return true
-			}
-			attrs := parseTagAttrsFullDocGo(tag.attrs)
-			primarySrc := ""
-			if attrs["src"] != "" && !isLazyPlaceholderImageURLFullDocGo(attrs["src"]) {
-				primarySrc = attrs["src"]
-			}
-			bestCand := primarySrc
-			for _, fallback := range []string{
-				attrs["data-src"],
-				attrs["data-lazy-src"],
-				attrs["data-original"],
-				ExtractLargestURLFromSrcset(firstNonEmptyFullDocGo(attrs["srcset"], attrs["data-srcset"], attrs["data-lazy-srcset"])),
-				attrs["src"],
-			} {
-				if bestCand != "" {
-					break
-				}
-				bestCand = fallback
-			}
-			src := resolveHTTPSHrefFullDocGo(bestCand, baseURL, false)
-			if src != "" && !seenImages[src] && !isDecorativeOrTinyImageFullDocGo(attrs, src) {
-				seenImages[src] = true
-				images = append(images, ImageInfo{URL: src, Alt: strings.TrimSpace(attrs["alt"])})
-				if len(images) >= 60 {
-					return false
-				}
-			}
-			return true
-		}, maxHTMLScanCharsFullDocGo, false)
-	}
+			}, maxHTMLScanCharsFullDocGo, false)
+		}
 
-	formatTableCellMarkdown := func(cellHTML string) string {
-		withInline := reAdjacentAnchorsFullDocGo.ReplaceAllString(cellHTML, "$1 $2")
-		withInline = replaceHTMLOpenTagsLinearFullDocGo(withInline, []string{"br"}, func(scannedTagFullDocGo) string {
-			return " / "
-		}, 16384)
-		withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"code"}, func(_, _, _, c string) string {
-			return stashInline(formatInlineCodeSpanGo(cleanInlineHTMLFullDocGo(c)))
-		}, 16384, 8192)
-		withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"a"}, func(_, _, attrStr, inner string) string {
+		formatTableCellMarkdown := func(cellHTML string) string {
+			withInline := reAdjacentAnchorsFullDocGo.ReplaceAllString(cellHTML, "$1 $2")
+			withInline = replaceHTMLOpenTagsLinearFullDocGo(withInline, []string{"br"}, func(scannedTagFullDocGo) string {
+				return " / "
+			}, 16384)
+			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"code"}, func(_, _, _, c string) string {
+				return stashInline(formatInlineCodeSpanGo(cleanInlineHTMLFullDocGo(c)))
+			}, 16384, 8192)
+			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"a"}, func(_, _, attrStr, inner string) string {
+				attrs := parseTagAttrsFullDocGo(attrStr)
+				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
+				label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
+				if label == "" {
+					return " "
+				}
+				if href != "" {
+					dupSuf := " (" + href + ")"
+					if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
+						if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
+							label = stripped
+						}
+					}
+					return "[" + label + "](" + href + ")"
+				}
+				return label
+			}, 16384, 8192)
+			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"strong", "b"}, func(_, _, _, inner string) string {
+				txt := cleanInlineHTMLFullDocGo(inner)
+				if txt == "" {
+					return " "
+				}
+				return "**" + txt + "**"
+			}, 16384, 8192)
+			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"em", "i"}, func(_, _, _, inner string) string {
+				txt := cleanInlineHTMLFullDocGo(inner)
+				if txt == "" {
+					return " "
+				}
+				return "*" + txt + "*"
+			}, 16384, 8192)
+			return strings.ReplaceAll(cleanInlineHTMLFullDocGo(withInline), "|", `\|`)
+		}
+
+		md = replaceHTMLOpenTagsLinearFullDocGo(work, []string{"wbr"}, func(scannedTagFullDocGo) string { return "" }, maxHTMLScanCharsFullDocGo)
+		md = reAdjacentAnchorsFullDocGo.ReplaceAllString(md, "$1 $2")
+		md = reAdjacentCodeFullDocGo.ReplaceAllString(md, "$1 $2")
+		md = reAlnumBeforeAnchorFullDocGo.ReplaceAllString(md, "$1 $2")
+
+		// Strip Expressive Code empty header figcaptions.
+		if strings.Contains(asciiLowerExtractString(md), "<figcaption") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"figcaption"}, func(full, _, attrStr, inner string) string {
+				if !hasClassTokenFullDocGo(attrStr, "header") || len(inner) > 600 {
+					return full
+				}
+				lowIn := asciiLowerExtractString(inner)
+				if strings.Contains(lowIn, "title") && strings.Contains(lowIn, "sr-only") {
+					withoutSr := replacePairedHTMLElementsLinearFullDocGo(inner, []string{"span"}, func(sf, _, sAttr, _ string) string {
+						if hasClassTokenFullDocGo(sAttr, "sr-only") {
+							return ""
+						}
+						return sf
+					}, 600, 600)
+					if cleanInlineHTMLFullDocGo(withoutSr) == "" {
+						return ""
+					}
+				}
+				return full
+			}, maxHTMLScanCharsFullDocGo, 600)
+		}
+
+		// `<pre>` blocks (optionally wrapping `<code ...>...</code>`)
+		if strings.Contains(asciiLowerExtractString(md), "<pre") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"pre"}, func(_, _, preAttrs, preInner string) string {
+				codeAttrs := ""
+				rawCodeHTML := preInner
+				trimmedPre := strings.TrimSpace(preInner)
+				lowTrimmed := asciiLowerExtractString(trimmedPre)
+				if strings.HasPrefix(lowTrimmed, "<code") && strings.HasSuffix(lowTrimmed, "</code>") {
+					replacePairedHTMLElementsLinearFullDocGo(trimmedPre, []string{"code"}, func(_, _, cAttrs, cInner string) string {
+						if codeAttrs == "" {
+							codeAttrs = cAttrs
+							rawCodeHTML = cInner
+						}
+						return ""
+					}, len(trimmedPre), len(trimmedPre))
+				}
+				lang := inferCodeFenceLangFullDocGo(preAttrs, codeAttrs)
+				withEcLines := rawCodeHTML
+				if strings.Contains(rawCodeHTML, "ec-line") {
+					noNL := strings.NewReplacer("\r\n", "", "\n", "").Replace(rawCodeHTML)
+					withEcLines = replaceHTMLOpenTagsLinearFullDocGo(noNL, []string{"div"}, func(t scannedTagFullDocGo) string {
+						if hasClassTokenFullDocGo(t.attrs, "ec-line") {
+							return "\n"
+						}
+						return t.rawTag
+					}, maxHTMLScanCharsFullDocGo)
+				}
+				decodedCode := strings.TrimSpace(DecodeHTMLEntities(stripHTMLTagsQuoteAwareLinearFullDocGo(withEcLines, "", maxHTMLScanCharsFullDocGo)))
+				return stashFence(MakeSafeCodeFence(decodedCode, lang, false))
+			}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
+		}
+
+		// `<figure>` with `<img>` and optional `<figcaption>`
+		if strings.Contains(asciiLowerExtractString(md), "<figure") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"figure"}, func(full, _, _, figInner string) string {
+				if strings.Contains(asciiLowerExtractString(figInner), "<figure") {
+					return full
+				}
+				withoutCap := stripHTMLTagsLinearFullDocGo(figInner, []string{"figcaption"}, "", 8000)
+				lowNoCap := asciiLowerExtractString(withoutCap)
+				if strings.Contains(lowNoCap, "<pre") || strings.Contains(lowNoCap, "<table") || strings.Contains(lowNoCap, "<p") {
+					return full
+				}
+				var ia map[string]string
+				scanHTMLTagsLinearFullDocGo(figInner, func(t scannedTagFullDocGo) bool {
+					if !t.isClosing && t.tagNameLower == "img" {
+						ia = parseTagAttrsFullDocGo(t.attrs)
+						return false
+					}
+					return true
+				}, 8000, false)
+				if ia == nil {
+					return full
+				}
+				primary := ""
+				if ia["src"] != "" && !isLazyPlaceholderImageURLFullDocGo(ia["src"]) {
+					primary = ia["src"]
+				}
+				bestSrc := firstNonEmptyFullDocGo(
+					primary,
+					ia["data-src"],
+					ExtractLargestURLFromSrcset(firstNonEmptyFullDocGo(ia["srcset"], ia["data-srcset"])),
+					ia["src"],
+				)
+				resolvedSrc := resolveHTTPSHrefFullDocGo(bestSrc, baseURL, false)
+				if resolvedSrc == "" || isDecorativeOrTinyImageFullDocGo(ia, resolvedSrc) {
+					return full
+				}
+				alt := cleanInlineHTMLFullDocGo(ia["alt"])
+				capText := ""
+				replacePairedHTMLElementsLinearFullDocGo(figInner, []string{"figcaption"}, func(_, _, _, cInner string) string {
+					if capText == "" {
+						capText = cleanInlineHTMLFullDocGo(cInner)
+					}
+					return ""
+				}, 8000, 1200)
+				if !includeImages {
+					if capText != "" {
+						return "\n\n*" + capText + "*\n\n"
+					}
+					return ""
+				}
+				if capText != "" && capText != alt {
+					return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n*" + capText + "*\n\n"
+				}
+				return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n"
+			}, maxHTMLScanCharsFullDocGo, 8000)
+		}
+
+		// GFM `<table>` conversion
+		if strings.Contains(asciiLowerExtractString(md), "<table") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"table"}, func(full, _, _, tbl string) string {
+				if strings.Contains(asciiLowerExtractString(tbl), "<table") {
+					return full
+				}
+				var rows [][]string
+				replacePairedHTMLElementsLinearFullDocGo(tbl, []string{"tr"}, func(_, _, _, rInner string) string {
+					var cells []string
+					replacePairedHTMLElementsLinearFullDocGo(rInner, []string{"th", "td"}, func(_, _, _, cInner string) string {
+						cells = append(cells, formatTableCellMarkdown(cInner))
+						return ""
+					}, 65536, 16384)
+					hasNonEmpty := false
+					for _, c := range cells {
+						if c != "" {
+							hasNonEmpty = true
+							break
+						}
+					}
+					if hasNonEmpty {
+						rows = append(rows, cells)
+					}
+					return ""
+				}, maxHTMLScanCharsFullDocGo, 65536)
+				if len(rows) == 0 {
+					return ""
+				}
+				cols := 0
+				for _, r := range rows {
+					if len(r) > cols {
+						cols = len(r)
+					}
+				}
+				if cols == 0 {
+					return ""
+				}
+				padRow := func(r []string) string {
+					padded := make([]string, cols)
+					copy(padded, r)
+					return "| " + strings.Join(padded, " | ") + " |"
+				}
+				sepCells := make([]string, cols)
+				for i := range sepCells {
+					sepCells[i] = "---"
+				}
+				outLines := make([]string, 0, len(rows)+1)
+				outLines = append(outLines, padRow(rows[0]))
+				outLines = append(outLines, "| "+strings.Join(sepCells, " | ")+" |")
+				for _, r := range rows[1:] {
+					outLines = append(outLines, padRow(r))
+				}
+				return "\n\n" + strings.Join(outLines, "\n") + "\n\n"
+			}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
+		}
+
+		// Inline `<code>` and `<kbd>`
+		if lowMd := asciiLowerExtractString(md); strings.Contains(lowMd, "<code") || strings.Contains(lowMd, "<kbd") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"code", "kbd"}, func(_, _, _, c string) string {
+				return stashInline(formatInlineCodeSpanGo(cleanInlineHTMLFullDocGo(c)))
+			}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
+		}
+
+		// Links wrapping headings (`<a href="..."><h2>Title</h2></a>`)
+		if lowMd := asciiLowerExtractString(md); strings.Contains(lowMd, "<a") && strings.Contains(lowMd, "<h") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
+				trimmed := strings.TrimSpace(inner)
+				if len(trimmed) < 7 || trimmed[0] != '<' || (trimmed[1] != 'h' && trimmed[1] != 'H') || trimmed[2] < '1' || trimmed[2] > '6' {
+					return full
+				}
+				lvl := 0
+				hInnerMatched := ""
+				replacePairedHTMLElementsLinearFullDocGo(trimmed, []string{"h1", "h2", "h3", "h4", "h5", "h6"}, func(hf, ht, _, hInner string) string {
+					if lvl == 0 && len(hf) == len(trimmed) {
+						lvl = int(ht[1] - '0')
+						hInnerMatched = hInner
+					}
+					return ""
+				}, len(trimmed), len(trimmed))
+				if lvl == 0 {
+					return full
+				}
+				attrs := parseTagAttrsFullDocGo(attrStr)
+				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
+				txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(hInnerMatched))
+				if txt == "" {
+					return ""
+				}
+				hashes := strings.Repeat("#", lvl)
+				if href != "" {
+					return "\n\n" + hashes + " [" + txt + "](" + href + ")\n\n"
+				}
+				return "\n\n" + hashes + " " + txt + "\n\n"
+			}, maxHTMLScanCharsFullDocGo, 8192)
+		}
+
+		// Headings `<h1>`..`<h6>`
+		if strings.Contains(asciiLowerExtractString(md), "<h") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"h1", "h2", "h3", "h4", "h5", "h6"}, func(_, tag, _, inner string) string {
+				txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(inner))
+				if txt == "" {
+					return ""
+				}
+				lvl := int(tag[1] - '0')
+				return "\n\n" + strings.Repeat("#", lvl) + " " + txt + "\n\n"
+			}, maxHTMLScanCharsFullDocGo, 8192)
+		}
+
+		// `<summary>`
+		if strings.Contains(asciiLowerExtractString(md), "<summary") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"summary"}, func(_, _, _, inner string) string {
+				cleaned := reSummarySeeAllFullDocGo.ReplaceAllString(cleanInlineHTMLFullDocGo(inner), "")
+				txt := cleanHeadingPermalinksFullDocGo(cleaned)
+				if txt == "" {
+					return ""
+				}
+				if strings.HasPrefix(txt, "#") {
+					return "\n\n" + txt + "\n\n"
+				}
+				return "\n\n**" + txt + "**\n\n"
+			}, maxHTMLScanCharsFullDocGo, 4096)
+		}
+
+		// Inline links, strikethrough, mark, bold, italic, `<dt>`, `<blockquote>`
+		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
+			if reBlockInsideInlineFullDocGo.MatchString(inner) {
+				return full
+			}
 			attrs := parseTagAttrsFullDocGo(attrStr)
 			href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
 			label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
@@ -4397,540 +4690,267 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				return "[" + label + "](" + href + ")"
 			}
 			return label
-		}, 16384, 8192)
-		withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"strong", "b"}, func(_, _, _, inner string) string {
+		}, maxHTMLScanCharsFullDocGo, 16384)
+
+		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"del", "s", "strike"}, func(full, _, _, inner string) string {
+			if reBlockInsideInlineFullDocGo.MatchString(inner) {
+				return full
+			}
+			txt := cleanInlineHTMLFullDocGo(inner)
+			if txt == "" {
+				return ""
+			}
+			return "~~" + txt + "~~"
+		}, maxHTMLScanCharsFullDocGo, 8192)
+
+		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"mark"}, func(full, _, _, inner string) string {
+			if reBlockInsideInlineFullDocGo.MatchString(inner) {
+				return full
+			}
+			txt := cleanInlineHTMLFullDocGo(inner)
+			if txt == "" {
+				return ""
+			}
+			return "==" + txt + "=="
+		}, maxHTMLScanCharsFullDocGo, 8192)
+
+		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"strong", "b"}, func(full, _, _, inner string) string {
+			if reBlockInsideInlineFullDocGo.MatchString(inner) {
+				return full
+			}
 			txt := cleanInlineHTMLFullDocGo(inner)
 			if txt == "" {
 				return " "
 			}
 			return "**" + txt + "**"
-		}, 16384, 8192)
-		withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"em", "i"}, func(_, _, _, inner string) string {
+		}, maxHTMLScanCharsFullDocGo, 8192)
+
+		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"em", "i"}, func(full, _, _, inner string) string {
+			if reBlockInsideInlineFullDocGo.MatchString(inner) {
+				return full
+			}
 			txt := cleanInlineHTMLFullDocGo(inner)
 			if txt == "" {
 				return " "
 			}
 			return "*" + txt + "*"
-		}, 16384, 8192)
-		return strings.ReplaceAll(cleanInlineHTMLFullDocGo(withInline), "|", `\|`)
-	}
+		}, maxHTMLScanCharsFullDocGo, 8192)
 
-	md := replaceHTMLOpenTagsLinearFullDocGo(work, []string{"wbr"}, func(scannedTagFullDocGo) string { return "" }, maxHTMLScanCharsFullDocGo)
-	md = reAdjacentAnchorsFullDocGo.ReplaceAllString(md, "$1 $2")
-	md = reAdjacentCodeFullDocGo.ReplaceAllString(md, "$1 $2")
-	md = reAlnumBeforeAnchorFullDocGo.ReplaceAllString(md, "$1 $2")
-
-	// Strip Expressive Code empty header figcaptions.
-	if strings.Contains(asciiLowerExtractString(md), "<figcaption") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"figcaption"}, func(full, _, attrStr, inner string) string {
-			if !hasClassTokenFullDocGo(attrStr, "header") || len(inner) > 600 {
-				return full
-			}
-			lowIn := asciiLowerExtractString(inner)
-			if strings.Contains(lowIn, "title") && strings.Contains(lowIn, "sr-only") {
-				withoutSr := replacePairedHTMLElementsLinearFullDocGo(inner, []string{"span"}, func(sf, _, sAttr, _ string) string {
-					if hasClassTokenFullDocGo(sAttr, "sr-only") {
+		if strings.Contains(asciiLowerExtractString(md), "<dt") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"dt"}, func(_, _, _, inner string) string {
+				compactSpans := replaceHTMLTagsQuoteAwareLinearFullDocGo(inner, func(t scannedTagFullDocGo) string {
+					if t.tagNameLower == "span" {
 						return ""
 					}
-					return sf
-				}, 600, 600)
-				if cleanInlineHTMLFullDocGo(withoutSr) == "" {
-					return ""
-				}
-			}
-			return full
-		}, maxHTMLScanCharsFullDocGo, 600)
-	}
-
-	// `<pre>` blocks (optionally wrapping `<code ...>...</code>`)
-	if strings.Contains(asciiLowerExtractString(md), "<pre") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"pre"}, func(_, _, preAttrs, preInner string) string {
-			codeAttrs := ""
-			rawCodeHTML := preInner
-			trimmedPre := strings.TrimSpace(preInner)
-			lowTrimmed := asciiLowerExtractString(trimmedPre)
-			if strings.HasPrefix(lowTrimmed, "<code") && strings.HasSuffix(lowTrimmed, "</code>") {
-				replacePairedHTMLElementsLinearFullDocGo(trimmedPre, []string{"code"}, func(_, _, cAttrs, cInner string) string {
-					if codeAttrs == "" {
-						codeAttrs = cAttrs
-						rawCodeHTML = cInner
-					}
-					return ""
-				}, len(trimmedPre), len(trimmedPre))
-			}
-			lang := inferCodeFenceLangFullDocGo(preAttrs, codeAttrs)
-			withEcLines := rawCodeHTML
-			if strings.Contains(rawCodeHTML, "ec-line") {
-				noNL := strings.NewReplacer("\r\n", "", "\n", "").Replace(rawCodeHTML)
-				withEcLines = replaceHTMLOpenTagsLinearFullDocGo(noNL, []string{"div"}, func(t scannedTagFullDocGo) string {
-					if hasClassTokenFullDocGo(t.attrs, "ec-line") {
-						return "\n"
-					}
 					return t.rawTag
-				}, maxHTMLScanCharsFullDocGo)
-			}
-			decodedCode := strings.TrimSpace(DecodeHTMLEntities(stripHTMLTagsQuoteAwareLinearFullDocGo(withEcLines, "", maxHTMLScanCharsFullDocGo)))
-			return stashFence(MakeSafeCodeFence(decodedCode, lang, false))
-		}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
-	}
-
-	// `<figure>` with `<img>` and optional `<figcaption>`
-	if strings.Contains(asciiLowerExtractString(md), "<figure") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"figure"}, func(full, _, _, figInner string) string {
-			if strings.Contains(asciiLowerExtractString(figInner), "<figure") {
-				return full
-			}
-			withoutCap := stripHTMLTagsLinearFullDocGo(figInner, []string{"figcaption"}, "", 8000)
-			lowNoCap := asciiLowerExtractString(withoutCap)
-			if strings.Contains(lowNoCap, "<pre") || strings.Contains(lowNoCap, "<table") || strings.Contains(lowNoCap, "<p") {
-				return full
-			}
-			var ia map[string]string
-			scanHTMLTagsLinearFullDocGo(figInner, func(t scannedTagFullDocGo) bool {
-				if !t.isClosing && t.tagNameLower == "img" {
-					ia = parseTagAttrsFullDocGo(t.attrs)
-					return false
-				}
-				return true
-			}, 8000, false)
-			if ia == nil {
-				return full
-			}
-			primary := ""
-			if ia["src"] != "" && !isLazyPlaceholderImageURLFullDocGo(ia["src"]) {
-				primary = ia["src"]
-			}
-			bestSrc := firstNonEmptyFullDocGo(
-				primary,
-				ia["data-src"],
-				ExtractLargestURLFromSrcset(firstNonEmptyFullDocGo(ia["srcset"], ia["data-srcset"])),
-				ia["src"],
-			)
-			resolvedSrc := resolveHTTPSHrefFullDocGo(bestSrc, baseURL, false)
-			if resolvedSrc == "" || isDecorativeOrTinyImageFullDocGo(ia, resolvedSrc) {
-				return full
-			}
-			alt := cleanInlineHTMLFullDocGo(ia["alt"])
-			capText := ""
-			replacePairedHTMLElementsLinearFullDocGo(figInner, []string{"figcaption"}, func(_, _, _, cInner string) string {
-				if capText == "" {
-					capText = cleanInlineHTMLFullDocGo(cInner)
-				}
-				return ""
-			}, 8000, 1200)
-			if !includeImages {
-				if capText != "" {
-					return "\n\n*" + capText + "*\n\n"
-				}
-				return ""
-			}
-			if capText != "" && capText != alt {
-				return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n*" + capText + "*\n\n"
-			}
-			return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n"
-		}, maxHTMLScanCharsFullDocGo, 8000)
-	}
-
-	// GFM `<table>` conversion
-	if strings.Contains(asciiLowerExtractString(md), "<table") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"table"}, func(full, _, _, tbl string) string {
-			if strings.Contains(asciiLowerExtractString(tbl), "<table") {
-				return full
-			}
-			var rows [][]string
-			replacePairedHTMLElementsLinearFullDocGo(tbl, []string{"tr"}, func(_, _, _, rInner string) string {
-				var cells []string
-				replacePairedHTMLElementsLinearFullDocGo(rInner, []string{"th", "td"}, func(_, _, _, cInner string) string {
-					cells = append(cells, formatTableCellMarkdown(cInner))
-					return ""
-				}, 65536, 16384)
-				hasNonEmpty := false
-				for _, c := range cells {
-					if c != "" {
-						hasNonEmpty = true
-						break
-					}
-				}
-				if hasNonEmpty {
-					rows = append(rows, cells)
-				}
-				return ""
-			}, maxHTMLScanCharsFullDocGo, 65536)
-			if len(rows) == 0 {
-				return ""
-			}
-			cols := 0
-			for _, r := range rows {
-				if len(r) > cols {
-					cols = len(r)
-				}
-			}
-			if cols == 0 {
-				return ""
-			}
-			padRow := func(r []string) string {
-				padded := make([]string, cols)
-				copy(padded, r)
-				return "| " + strings.Join(padded, " | ") + " |"
-			}
-			sepCells := make([]string, cols)
-			for i := range sepCells {
-				sepCells[i] = "---"
-			}
-			outLines := make([]string, 0, len(rows)+1)
-			outLines = append(outLines, padRow(rows[0]))
-			outLines = append(outLines, "| "+strings.Join(sepCells, " | ")+" |")
-			for _, r := range rows[1:] {
-				outLines = append(outLines, padRow(r))
-			}
-			return "\n\n" + strings.Join(outLines, "\n") + "\n\n"
-		}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
-	}
-
-	// Inline `<code>` and `<kbd>`
-	if lowMd := asciiLowerExtractString(md); strings.Contains(lowMd, "<code") || strings.Contains(lowMd, "<kbd") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"code", "kbd"}, func(_, _, _, c string) string {
-			return stashInline(formatInlineCodeSpanGo(cleanInlineHTMLFullDocGo(c)))
-		}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
-	}
-
-	// Links wrapping headings (`<a href="..."><h2>Title</h2></a>`)
-	if lowMd := asciiLowerExtractString(md); strings.Contains(lowMd, "<a") && strings.Contains(lowMd, "<h") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
-			trimmed := strings.TrimSpace(inner)
-			if len(trimmed) < 7 || trimmed[0] != '<' || (trimmed[1] != 'h' && trimmed[1] != 'H') || trimmed[2] < '1' || trimmed[2] > '6' {
-				return full
-			}
-			lvl := 0
-			hInnerMatched := ""
-			replacePairedHTMLElementsLinearFullDocGo(trimmed, []string{"h1", "h2", "h3", "h4", "h5", "h6"}, func(hf, ht, _, hInner string) string {
-				if lvl == 0 && len(hf) == len(trimmed) {
-					lvl = int(ht[1] - '0')
-					hInnerMatched = hInner
-				}
-				return ""
-			}, len(trimmed), len(trimmed))
-			if lvl == 0 {
-				return full
-			}
-			attrs := parseTagAttrsFullDocGo(attrStr)
-			href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-			txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(hInnerMatched))
-			if txt == "" {
-				return ""
-			}
-			hashes := strings.Repeat("#", lvl)
-			if href != "" {
-				return "\n\n" + hashes + " [" + txt + "](" + href + ")\n\n"
-			}
-			return "\n\n" + hashes + " " + txt + "\n\n"
-		}, maxHTMLScanCharsFullDocGo, 8192)
-	}
-
-	// Headings `<h1>`..`<h6>`
-	if strings.Contains(asciiLowerExtractString(md), "<h") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"h1", "h2", "h3", "h4", "h5", "h6"}, func(_, tag, _, inner string) string {
-			txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(inner))
-			if txt == "" {
-				return ""
-			}
-			lvl := int(tag[1] - '0')
-			return "\n\n" + strings.Repeat("#", lvl) + " " + txt + "\n\n"
-		}, maxHTMLScanCharsFullDocGo, 8192)
-	}
-
-	// `<summary>`
-	if strings.Contains(asciiLowerExtractString(md), "<summary") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"summary"}, func(_, _, _, inner string) string {
-			cleaned := reSummarySeeAllFullDocGo.ReplaceAllString(cleanInlineHTMLFullDocGo(inner), "")
-			txt := cleanHeadingPermalinksFullDocGo(cleaned)
-			if txt == "" {
-				return ""
-			}
-			if strings.HasPrefix(txt, "#") {
-				return "\n\n" + txt + "\n\n"
-			}
-			return "\n\n**" + txt + "**\n\n"
-		}, maxHTMLScanCharsFullDocGo, 4096)
-	}
-
-	// Inline links, strikethrough, mark, bold, italic, `<dt>`, `<blockquote>`
-	md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
-		if reBlockInsideInlineFullDocGo.MatchString(inner) {
-			return full
-		}
-		attrs := parseTagAttrsFullDocGo(attrStr)
-		href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-		label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
-		if label == "" {
-			return " "
-		}
-		if href != "" {
-			dupSuf := " (" + href + ")"
-			if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
-				if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
-					label = stripped
-				}
-			}
-			return "[" + label + "](" + href + ")"
-		}
-		return label
-	}, maxHTMLScanCharsFullDocGo, 16384)
-
-	md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"del", "s", "strike"}, func(full, _, _, inner string) string {
-		if reBlockInsideInlineFullDocGo.MatchString(inner) {
-			return full
-		}
-		txt := cleanInlineHTMLFullDocGo(inner)
-		if txt == "" {
-			return ""
-		}
-		return "~~" + txt + "~~"
-	}, maxHTMLScanCharsFullDocGo, 8192)
-
-	md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"mark"}, func(full, _, _, inner string) string {
-		if reBlockInsideInlineFullDocGo.MatchString(inner) {
-			return full
-		}
-		txt := cleanInlineHTMLFullDocGo(inner)
-		if txt == "" {
-			return ""
-		}
-		return "==" + txt + "=="
-	}, maxHTMLScanCharsFullDocGo, 8192)
-
-	md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"strong", "b"}, func(full, _, _, inner string) string {
-		if reBlockInsideInlineFullDocGo.MatchString(inner) {
-			return full
-		}
-		txt := cleanInlineHTMLFullDocGo(inner)
-		if txt == "" {
-			return " "
-		}
-		return "**" + txt + "**"
-	}, maxHTMLScanCharsFullDocGo, 8192)
-
-	md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"em", "i"}, func(full, _, _, inner string) string {
-		if reBlockInsideInlineFullDocGo.MatchString(inner) {
-			return full
-		}
-		txt := cleanInlineHTMLFullDocGo(inner)
-		if txt == "" {
-			return " "
-		}
-		return "*" + txt + "*"
-	}, maxHTMLScanCharsFullDocGo, 8192)
-
-	if strings.Contains(asciiLowerExtractString(md), "<dt") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"dt"}, func(_, _, _, inner string) string {
-			compactSpans := replaceHTMLTagsQuoteAwareLinearFullDocGo(inner, func(t scannedTagFullDocGo) string {
-				if t.tagNameLower == "span" {
+				}, 2000, false)
+				compactSpans = reDtStarSpaceFullDocGo.ReplaceAllString(compactSpans, "$1 $2")
+				compactSpans = reDtStarPlainFullDocGo.ReplaceAllString(compactSpans, "$1")
+				term := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(compactSpans))
+				if term == "" {
 					return ""
 				}
-				return t.rawTag
-			}, 2000, false)
-			compactSpans = reDtStarSpaceFullDocGo.ReplaceAllString(compactSpans, "$1 $2")
-			compactSpans = reDtStarPlainFullDocGo.ReplaceAllString(compactSpans, "$1")
-			term := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(compactSpans))
-			if term == "" {
-				return ""
-			}
-			term = strings.TrimPrefix(strings.TrimSuffix(term, "**"), "**")
-			return "\n\n**" + term + "**\n\n"
-		}, maxHTMLScanCharsFullDocGo, 1800)
-	}
-
-	if strings.Contains(asciiLowerExtractString(md), "<blockquote") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"blockquote"}, func(_, _, _, inner string) string {
-			txt := cleanInlineHTMLFullDocGo(inner)
-			if txt == "" {
-				return ""
-			}
-			return "\n\n> " + txt + "\n\n"
-		}, maxHTMLScanCharsFullDocGo, 16384)
-	}
-
-	// Standalone `<img>` tags when `IncludeImages` is enabled
-	if includeImages && strings.Contains(asciiLowerExtractString(md), "<img") {
-		md = replaceHTMLOpenTagsLinearFullDocGo(md, []string{"img"}, func(tag scannedTagFullDocGo) string {
-			if hasInlineEventHandlerAttrGo(tag.attrs) {
-				return ""
-			}
-			attrs := parseTagAttrsFullDocGo(tag.attrs)
-			primary := ""
-			if attrs["src"] != "" && !isLazyPlaceholderImageURLFullDocGo(attrs["src"]) {
-				primary = attrs["src"]
-			}
-			bestSrc := firstNonEmptyFullDocGo(
-				primary,
-				attrs["data-src"],
-				ExtractLargestURLFromSrcset(firstNonEmptyFullDocGo(attrs["srcset"], attrs["data-srcset"])),
-				attrs["src"],
-			)
-			resolvedSrc := resolveHTTPSHrefFullDocGo(bestSrc, baseURL, false)
-			if resolvedSrc == "" || isDecorativeOrTinyImageFullDocGo(attrs, resolvedSrc) {
-				return ""
-			}
-			alt := strings.NewReplacer("[", "", "]", "").Replace(cleanInlineHTMLFullDocGo(attrs["alt"]))
-			return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n"
-		}, maxHTMLScanCharsFullDocGo)
-	}
-
-	// `<ul>`/`<ol>`/`<li>` single O(N) stack pass
-	if strings.Contains(asciiLowerExtractString(md), "<li") {
-		listSrc := md
-		var listOut []string
-		listDepth := 0
-		type liFrame struct {
-			depth   int
-			emitted bool
+				term = strings.TrimPrefix(strings.TrimSuffix(term, "**"), "**")
+				return "\n\n**" + term + "**\n\n"
+			}, maxHTMLScanCharsFullDocGo, 1800)
 		}
-		var liStack []liFrame
-		lastListIdx := 0
 
-		flushListSeg := func(seg string) {
-			if seg == "" {
-				return
-			}
-			if len(liStack) == 0 {
-				listOut = append(listOut, seg)
-				return
-			}
-			active := &liStack[len(liStack)-1]
-			indentLvl := active.depth - 1
-			if indentLvl < 0 {
-				indentLvl = 0
-			} else if indentLvl > 3 {
-				indentLvl = 3
-			}
-			indent := strings.Repeat("  ", indentLvl)
-			if reListBlockContentFullDocGo.MatchString(seg) {
-				parts := SplitMarkdownByCodeFences(seg)
-				for idx := range parts {
-					if idx%2 == 0 {
-						parts[idx] = stripHTMLTagsQuoteAwareLinearFullDocGo(parts[idx], " ", maxHTMLScanCharsFullDocGo)
-					}
+		if strings.Contains(asciiLowerExtractString(md), "<blockquote") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"blockquote"}, func(_, _, _, inner string) string {
+				txt := cleanInlineHTMLFullDocGo(inner)
+				if txt == "" {
+					return ""
 				}
-				cleanedBlock := strings.TrimSpace(strings.Join(parts, ""))
-				if cleanedBlock == "" {
+				return "\n\n> " + txt + "\n\n"
+			}, maxHTMLScanCharsFullDocGo, 16384)
+		}
+
+		// Standalone `<img>` tags when `IncludeImages` is enabled
+		if includeImages && strings.Contains(asciiLowerExtractString(md), "<img") {
+			md = replaceHTMLOpenTagsLinearFullDocGo(md, []string{"img"}, func(tag scannedTagFullDocGo) string {
+				if hasInlineEventHandlerAttrGo(tag.attrs) {
+					return ""
+				}
+				attrs := parseTagAttrsFullDocGo(tag.attrs)
+				primary := ""
+				if attrs["src"] != "" && !isLazyPlaceholderImageURLFullDocGo(attrs["src"]) {
+					primary = attrs["src"]
+				}
+				bestSrc := firstNonEmptyFullDocGo(
+					primary,
+					attrs["data-src"],
+					ExtractLargestURLFromSrcset(firstNonEmptyFullDocGo(attrs["srcset"], attrs["data-srcset"])),
+					attrs["src"],
+				)
+				resolvedSrc := resolveHTTPSHrefFullDocGo(bestSrc, baseURL, false)
+				if resolvedSrc == "" || isDecorativeOrTinyImageFullDocGo(attrs, resolvedSrc) {
+					return ""
+				}
+				alt := strings.NewReplacer("[", "", "]", "").Replace(cleanInlineHTMLFullDocGo(attrs["alt"]))
+				return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n"
+			}, maxHTMLScanCharsFullDocGo)
+		}
+
+		// `<ul>`/`<ol>`/`<li>` single O(N) stack pass
+		if strings.Contains(asciiLowerExtractString(md), "<li") {
+			listSrc := md
+			var listOut []string
+			listDepth := 0
+			type liFrame struct {
+				depth   int
+				emitted bool
+			}
+			var liStack []liFrame
+			lastListIdx := 0
+
+			flushListSeg := func(seg string) {
+				if seg == "" {
+					return
+				}
+				if len(liStack) == 0 {
+					listOut = append(listOut, seg)
+					return
+				}
+				active := &liStack[len(liStack)-1]
+				indentLvl := active.depth - 1
+				if indentLvl < 0 {
+					indentLvl = 0
+				} else if indentLvl > 3 {
+					indentLvl = 3
+				}
+				indent := strings.Repeat("  ", indentLvl)
+				if reListBlockContentFullDocGo.MatchString(seg) {
+					parts := SplitMarkdownByCodeFences(seg)
+					for idx := range parts {
+						if idx%2 == 0 {
+							parts[idx] = stripHTMLTagsQuoteAwareLinearFullDocGo(parts[idx], " ", maxHTMLScanCharsFullDocGo)
+						}
+					}
+					cleanedBlock := strings.TrimSpace(strings.Join(parts, ""))
+					if cleanedBlock == "" {
+						return
+					}
+					if !active.emitted {
+						listOut = append(listOut, "\n"+indent+"- "+cleanedBlock)
+						active.emitted = true
+					} else {
+						listOut = append(listOut, "\n\n"+cleanedBlock)
+					}
+					return
+				}
+				txt := cleanInlineHTMLFullDocGo(seg)
+				if txt == "" {
 					return
 				}
 				if !active.emitted {
-					listOut = append(listOut, "\n"+indent+"- "+cleanedBlock)
+					listOut = append(listOut, "\n"+indent+"- "+txt)
 					active.emitted = true
 				} else {
-					listOut = append(listOut, "\n\n"+cleanedBlock)
+					listOut = append(listOut, " "+txt)
 				}
-				return
 			}
-			txt := cleanInlineHTMLFullDocGo(seg)
-			if txt == "" {
-				return
-			}
-			if !active.emitted {
-				listOut = append(listOut, "\n"+indent+"- "+txt)
-				active.emitted = true
-			} else {
-				listOut = append(listOut, " "+txt)
-			}
-		}
 
-		scanHTMLTagsLinearFullDocGo(listSrc, func(tag scannedTagFullDocGo) bool {
-			t := tag.tagNameLower
-			if t != "ul" && t != "ol" && t != "li" {
-				return true
-			}
-			flushListSeg(listSrc[lastListIdx:tag.index])
-			lastListIdx = tag.end
-			if !tag.isClosing && (t == "ul" || t == "ol") {
-				listDepth++
-			} else if tag.isClosing && (t == "ul" || t == "ol") {
-				for len(liStack) > 0 && liStack[len(liStack)-1].depth >= listDepth {
-					liStack = liStack[:len(liStack)-1]
+			scanHTMLTagsLinearFullDocGo(listSrc, func(tag scannedTagFullDocGo) bool {
+				t := tag.tagNameLower
+				if t != "ul" && t != "ol" && t != "li" {
+					return true
 				}
-				if listDepth > 0 {
-					listDepth--
-				}
-				if listDepth == 0 {
-					listOut = append(listOut, "\n\n")
-				}
-			} else if !tag.isClosing && t == "li" {
-				targetDepth := listDepth
-				if targetDepth < 1 {
-					targetDepth = 1
-				}
-				for len(liStack) > 0 && liStack[len(liStack)-1].depth >= targetDepth {
-					liStack = liStack[:len(liStack)-1]
-				}
-				liStack = append(liStack, liFrame{depth: targetDepth, emitted: false})
-			} else if tag.isClosing && t == "li" {
-				if len(liStack) > 0 {
-					liStack = liStack[:len(liStack)-1]
-				}
-			}
-			return true
-		}, maxHTMLScanCharsFullDocGo, false)
-		flushListSeg(listSrc[lastListIdx:])
-		md = strings.Join(listOut, "")
-	}
-
-	if strings.Contains(asciiLowerExtractString(md), "<a") {
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(_, _, attrStr, inner string) string {
-			attrs := parseTagAttrsFullDocGo(attrStr)
-			href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-			label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
-			if label == "" {
-				return ""
-			}
-			if href != "" {
-				dupSuf := " (" + href + ")"
-				if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
-					if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
-						label = stripped
+				flushListSeg(listSrc[lastListIdx:tag.index])
+				lastListIdx = tag.end
+				if !tag.isClosing && (t == "ul" || t == "ol") {
+					listDepth++
+				} else if tag.isClosing && (t == "ul" || t == "ol") {
+					for len(liStack) > 0 && liStack[len(liStack)-1].depth >= listDepth {
+						liStack = liStack[:len(liStack)-1]
+					}
+					if listDepth > 0 {
+						listDepth--
+					}
+					if listDepth == 0 {
+						listOut = append(listOut, "\n\n")
+					}
+				} else if !tag.isClosing && t == "li" {
+					targetDepth := listDepth
+					if targetDepth < 1 {
+						targetDepth = 1
+					}
+					for len(liStack) > 0 && liStack[len(liStack)-1].depth >= targetDepth {
+						liStack = liStack[:len(liStack)-1]
+					}
+					liStack = append(liStack, liFrame{depth: targetDepth, emitted: false})
+				} else if tag.isClosing && t == "li" {
+					if len(liStack) > 0 {
+						liStack = liStack[:len(liStack)-1]
 					}
 				}
-				return "[" + label + "](" + href + ")"
+				return true
+			}, maxHTMLScanCharsFullDocGo, false)
+			flushListSeg(listSrc[lastListIdx:])
+			md = strings.Join(listOut, "")
+		}
+
+		if strings.Contains(asciiLowerExtractString(md), "<a") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(_, _, attrStr, inner string) string {
+				attrs := parseTagAttrsFullDocGo(attrStr)
+				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
+				label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
+				if label == "" {
+					return ""
+				}
+				if href != "" {
+					dupSuf := " (" + href + ")"
+					if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
+						if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
+							label = stripped
+						}
+					}
+					return "[" + label + "](" + href + ")"
+				}
+				return label
+			}, maxHTMLScanCharsFullDocGo, 16384)
+		}
+
+		md = replaceHTMLTagsQuoteAwareLinearFullDocGo(md, func(tag scannedTagFullDocGo) string {
+			if !tag.isClosing && tag.tagNameLower == "hr" {
+				return "\n\n---\n\n"
 			}
-			return label
-		}, maxHTMLScanCharsFullDocGo, 16384)
+			if !tag.isClosing && tag.tagNameLower == "br" {
+				return "\n"
+			}
+			if tag.isClosing && blockCloseTagsFullDocGo[tag.tagNameLower] {
+				return "\n\n"
+			}
+			if tag.isClosing && spaceCloseTagsFullDocGo[tag.tagNameLower] {
+				return " "
+			}
+			return ""
+		}, maxHTMLScanCharsFullDocGo, true)
+	} // end if workHasClosedTag
+
+	if strings.Contains(md, "@@EFTASK") {
+		md = strings.ReplaceAll(md, "@@EFTASKX@@", "[x]")
+		md = strings.ReplaceAll(md, "@@EFTASKO@@", "[ ]")
 	}
-
-	md = replaceHTMLTagsQuoteAwareLinearFullDocGo(md, func(tag scannedTagFullDocGo) string {
-		if !tag.isClosing && tag.tagNameLower == "hr" {
-			return "\n\n---\n\n"
-		}
-		if !tag.isClosing && tag.tagNameLower == "br" {
-			return "\n"
-		}
-		if tag.isClosing && blockCloseTagsFullDocGo[tag.tagNameLower] {
-			return "\n\n"
-		}
-		if tag.isClosing && spaceCloseTagsFullDocGo[tag.tagNameLower] {
-			return " "
-		}
-		return ""
-	}, maxHTMLScanCharsFullDocGo, true)
-
-	md = strings.ReplaceAll(md, "@@EFTASKX@@", "[x]")
-	md = strings.ReplaceAll(md, "@@EFTASKO@@", "[ ]")
-	md = reSentinelEffenceFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
-		sub := reSentinelEffenceFullDocGo.FindStringSubmatch(m)
-		if len(sub) >= 2 {
-			if idx, err := strconv.Atoi(sub[1]); err == nil && idx >= 0 && idx < len(codeStash) {
-				return codeStash[idx]
+	if len(codeStash) > 0 {
+		md = reSentinelEffenceFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
+			sub := reSentinelEffenceFullDocGo.FindStringSubmatch(m)
+			if len(sub) >= 2 {
+				if idx, err := strconv.Atoi(sub[1]); err == nil && idx >= 0 && idx < len(codeStash) {
+					return codeStash[idx]
+				}
 			}
-		}
-		return ""
-	})
-	md = reSentinelEfcodeFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
-		sub := reSentinelEfcodeFullDocGo.FindStringSubmatch(m)
-		if len(sub) >= 2 {
-			if idx, err := strconv.Atoi(sub[1]); err == nil && idx >= 0 && idx < len(codeStash) {
-				return codeStash[idx]
+			return ""
+		})
+		md = reSentinelEfcodeFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
+			sub := reSentinelEfcodeFullDocGo.FindStringSubmatch(m)
+			if len(sub) >= 2 {
+				if idx, err := strconv.Atoi(sub[1]); err == nil && idx >= 0 && idx < len(codeStash) {
+					return codeStash[idx]
+				}
 			}
-		}
-		return ""
-	})
+			return ""
+		})
+	}
 
 	mdParts := SplitMarkdownByCodeFences(md)
 	for idx, part := range mdParts {
@@ -4972,26 +4992,30 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		mdParts[idx] = collapseExcessBlankLinesGo(strings.Join(keptLines, "\n"))
 	}
 	md = strings.Join(mdParts, "")
-	md = reSentinelEfinlineFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
-		sub := reSentinelEfinlineFullDocGo.FindStringSubmatch(m)
-		if len(sub) >= 2 {
-			if idx, err := strconv.Atoi(sub[1]); err == nil && idx >= 0 && idx < len(codeStash) {
-				return codeStash[idx]
+	if len(codeStash) > 0 {
+		md = reSentinelEfinlineFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
+			sub := reSentinelEfinlineFullDocGo.FindStringSubmatch(m)
+			if len(sub) >= 2 {
+				if idx, err := strconv.Atoi(sub[1]); err == nil && idx >= 0 && idx < len(codeStash) {
+					return codeStash[idx]
+				}
 			}
-		}
-		return ""
-	})
-	md = reMdnLangHeaderFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
-		sub := reMdnLangHeaderFullDocGo.FindStringSubmatch(m)
-		if len(sub) < 4 {
-			return m
-		}
-		lang := strings.TrimSpace(sub[3])
-		if lang == "" {
-			lang = normalizeFenceLangFullDocGo(sub[2])
-		}
-		return sub[1] + "```" + lang + "\n"
-	})
+			return ""
+		})
+	}
+	if strings.Contains(md, "```") {
+		md = reMdnLangHeaderFullDocGo.ReplaceAllStringFunc(md, func(m string) string {
+			sub := reMdnLangHeaderFullDocGo.FindStringSubmatch(m)
+			if len(sub) < 4 {
+				return m
+			}
+			lang := strings.TrimSpace(sub[3])
+			if lang == "" {
+				lang = normalizeFenceLangFullDocGo(sub[2])
+			}
+			return sub[1] + "```" + lang + "\n"
+		})
+	}
 	tailStart := len(md) - 800
 	if tailStart < 0 {
 		tailStart = 0

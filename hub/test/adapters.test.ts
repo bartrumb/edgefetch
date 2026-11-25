@@ -4750,4 +4750,46 @@ test('ADAPTER-21: JSR <pre><code><button><code></code> preservation & Product of
   assert.equal(shopifyDiag.data.brand, 'Allbirds');
   assert.equal(shopifyDiag.data.currency, 'USD');
   assert.equal(shopifyDiag.data.inStock, true);
+
+  // `json` output runs `sanitizeRecordUrlsDeep` so JSON-LD `url` / `@id` values percent-encode `)`, `[`, `]`, `<`, `>`
+  const { executeScrapeCall } = await import('../src/scrape');
+  const unsafeJsonLdHtml = `<html><head><title>Widget</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Widget","url":"https://shop.example.com/item(1)<x>","manufacturer":{"@id":"https://shop.example.com/brand[alpha)<y>"}}</script></head><body><main><h1>Widget</h1></main></body></html>`;
+  const jsonScrapeRes = await executeScrapeCall({
+    payload: {
+      url: 'https://shop.example.com/products/widget',
+      formats: [
+        {
+          type: 'json',
+          schema: {
+            type: 'object',
+            properties: {
+              url: { type: 'string' },
+              manufacturer: { type: 'string' },
+            },
+          },
+        },
+      ],
+    },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'cloudflare',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: '1',
+            url: 'https://shop.example.com/products/widget',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            body: unsafeJsonLdHtml,
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(jsonScrapeRes.status, 200);
+  const jsonOut = jsonScrapeRes.body.json as { url?: string; manufacturer?: string };
+  assert.equal(jsonOut.url, 'https://shop.example.com/item%281%29%3Cx%3E');
+  assert.equal(jsonOut.manufacturer, 'https://shop.example.com/brand%5Balpha%29%3Cy%3E');
 });

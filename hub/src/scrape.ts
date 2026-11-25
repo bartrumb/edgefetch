@@ -6255,7 +6255,11 @@ export async function executeScrapeCall(params: {
     : null;
   const safeProductOut = productOut ? (redactPii ? redactPiiDeep(productOut) : productOut) : null;
   const safeAttributesOut = attributesOut ? (redactPii ? redactPiiDeep(attributesOut) : attributesOut) : undefined;
-  const safeStructuredJsonOut = structuredJsonOut ? (redactPii ? redactPiiDeep(structuredJsonOut) : structuredJsonOut) : undefined;
+  const safeStructuredJsonOut = structuredJsonOut
+    ? redactPii
+      ? redactPiiDeep(sanitizeRecordUrlsDeep(structuredJsonOut))
+      : sanitizeRecordUrlsDeep(structuredJsonOut)
+    : undefined;
   const safeSummaryOut = summaryOut !== undefined ? (redactPii ? redactPiiText(summaryOut) : summaryOut) : undefined;
   const adapterTotalOut =
     customShopifyDoc?.total ??

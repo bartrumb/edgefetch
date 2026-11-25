@@ -4,16 +4,15 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 )
 
 var (
-	reWooProductTwinPath = regexp.MustCompile(`(?i)^(?:/[a-z]{2}(?:-[a-z]{2})?)?/product/([a-z0-9._~%-]+)/?$`)
-	reWooSinglePath      = regexp.MustCompile(`(?i)/product/[^/]+`)
-	reLeadingMarkdownH1  = regexp.MustCompile(`^#\s+[^\n]+\n+`)
-	reNonAlnumSlug       = regexp.MustCompile(`[^a-z0-9]+`)
+	reWooProductTwinPath = newLazyRegexp(`(?i)^(?:/[a-z]{2}(?:-[a-z]{2})?)?/product/([a-z0-9._~%-]+)/?$`)
+	reWooSinglePath      = newLazyRegexp(`(?i)/product/[^/]+`)
+	reLeadingMarkdownH1  = newLazyRegexp(`^#\s+[^\n]+\n+`)
+	reNonAlnumSlug       = newLazyRegexp(`[^a-z0-9]+`)
 )
 
 // IsWooCommerceHTMLOrHeaders detects WooCommerce storefronts from Link headers or HTML markers.

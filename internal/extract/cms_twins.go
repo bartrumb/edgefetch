@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"math"
 	"net/url"
-	"regexp"
 	"strings"
 )
 
@@ -35,8 +34,8 @@ const (
 )
 
 var (
-	reWPRestPostPathCMSGo   = regexp.MustCompile(`^/wp-json/wp/v2/(?:posts|pages)/[1-9][0-9]{0,11}/?$`)
-	reHrefAmpersandEntCMSGo = regexp.MustCompile(`(?i)&(?:amp|#0*38|#x0*26);`)
+	reWPRestPostPathCMSGo   = newLazyRegexp(`^/wp-json/wp/v2/(?:posts|pages)/[1-9][0-9]{0,11}/?$`)
+	reHrefAmpersandEntCMSGo = newLazyRegexp(`(?i)&(?:amp|#0*38|#x0*26);`)
 )
 
 // DiscoverWordPressRestTwinURL linearly scans `<head>` (`<= 96 KiB`) for WordPress's canonical per-post/page

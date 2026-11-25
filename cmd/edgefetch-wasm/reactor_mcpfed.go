@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 
 	"github.com/bartrumb/edgefetch/v2/internal/mcpfed"
@@ -54,7 +53,7 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 		}
 		return map[string]any{"ok": true, "key": clean}, true, nil
 
-	case "mcp_vault_seal_credentials":
+	case "mcp_vault_prepare_seal":
 		var p struct {
 			VaultMasterKey string               `json:"vaultMasterKey"`
 			UserID         string               `json:"userId"`
@@ -68,7 +67,7 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		return mcpfed.SealVaultCredentials(mcpfed.SealVaultParams{
+		return mcpfed.PrepareSealVaultEnvelope(mcpfed.SealVaultParams{
 			VaultMasterKey: p.VaultMasterKey,
 			UserID:         p.UserID,
 			RemoteOrigin:   p.RemoteOrigin,
@@ -79,7 +78,7 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 			Payload:        p.Payload,
 		}), true, nil
 
-	case "mcp_vault_unseal_credentials":
+	case "mcp_vault_prepare_unseal":
 		var p struct {
 			VaultMasterKey string  `json:"vaultMasterKey"`
 			UserID         string  `json:"userId"`
@@ -95,7 +94,7 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		return mcpfed.UnsealVaultCredentials(mcpfed.UnsealVaultParams{
+		return mcpfed.PrepareUnsealVaultEnvelope(mcpfed.UnsealVaultParams{
 			VaultMasterKey: p.VaultMasterKey,
 			UserID:         p.UserID,
 			RemoteOrigin:   p.RemoteOrigin,
@@ -108,61 +107,88 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 			Ciphertext:     p.Ciphertext,
 		}), true, nil
 
-	case "mcp_vault_seal_pkce":
+	case "mcp_vault_verify_unseal":
 		var p struct {
-			VaultMasterKey string               `json:"vaultMasterKey"`
-			UserID         string               `json:"userId"`
-			RemoteOrigin   string               `json:"remoteOrigin"`
-			Blob           mcpfed.OrderedObject `json:"blob"`
+			VaultMasterKey      string  `json:"vaultMasterKey"`
+			UserID              string  `json:"userId"`
+			RemoteOrigin        string  `json:"remoteOrigin"`
+			RemoteURL           string  `json:"remoteUrl"`
+			ID                  *string `json:"id"`
+			ServerID            *string `json:"serverId"`
+			Slug                *string `json:"slug"`
+			AuthType            *string `json:"authType"`
+			SecretVersion       *int    `json:"secretVersion"`
+			Ciphertext          string  `json:"ciphertext"`
+			Plaintext           string  `json:"plaintext"`
+			AttemptShouldReseal bool    `json:"attemptShouldReseal"`
 		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		ct, err := mcpfed.SealPKCEStateBlob(p.VaultMasterKey, p.UserID, p.RemoteOrigin, p.Blob)
-		if err != nil {
-			return nil, true, err
-		}
-		return map[string]any{"ok": true, "ciphertext": ct}, true, nil
+		return mcpfed.VerifyUnsealedVaultPlaintext(mcpfed.UnsealVaultParams{
+			VaultMasterKey: p.VaultMasterKey,
+			UserID:         p.UserID,
+			RemoteOrigin:   p.RemoteOrigin,
+			RemoteURL:      p.RemoteURL,
+			ID:             p.ID,
+			ServerID:       p.ServerID,
+			Slug:           p.Slug,
+			AuthType:       p.AuthType,
+			SecretVersion:  p.SecretVersion,
+			Ciphertext:     p.Ciphertext,
+		}, []byte(p.Plaintext), p.AttemptShouldReseal), true, nil
 
-	case "mcp_vault_unseal_pkce":
+	case "mcp_vault_prepare_pkce_unseal":
 		var p struct {
-			VaultMasterKey string `json:"vaultMasterKey"`
-			UserID         string `json:"userId"`
-			RemoteOrigin   string `json:"remoteOrigin"`
-			Ciphertext     string `json:"ciphertext"`
+			UserID       string `json:"userId"`
+			RemoteOrigin string `json:"remoteOrigin"`
+			Ciphertext   string `json:"ciphertext"`
 		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		blob, ok := mcpfed.UnsealPKCEStateBlob(p.VaultMasterKey, p.UserID, p.RemoteOrigin, p.Ciphertext)
+		hkdfInfo, aad, saltB64, ivB64, ctB64, _, _, _, ok := mcpfed.PreparePKCEStateUnseal(p.UserID, p.RemoteOrigin, p.Ciphertext)
+		if !ok {
+			return map[string]any{"ok": false}, true, nil
+		}
+		return map[string]any{
+			"ok":       true,
+			"hkdfInfo": hkdfInfo,
+			"aad":      aad,
+			"saltB64":  saltB64,
+			"ivB64":    ivB64,
+			"ctB64":    ctB64,
+		}, true, nil
+
+	case "mcp_vault_verify_pkce_unseal":
+		var p struct {
+			Plaintext string `json:"plaintext"`
+		}
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, true, err
+		}
+		blob, ok := mcpfed.VerifyPKCEStatePlaintext([]byte(p.Plaintext))
 		if !ok {
 			return map[string]any{"ok": false}, true, nil
 		}
 		return map[string]any{"ok": true, "blob": blob}, true, nil
 
-	case "mcp_vault_oauth_bind_hmac":
+	case "mcp_vault_prepare_oauth_bind":
 		var p struct {
-			VaultMasterKey  string  `json:"vaultMasterKey"`
-			UserID          string  `json:"userId"`
-			State           string  `json:"state"`
-			SessionCSRF     string  `json:"sessionCsrf"`
-			VerifyPresented *string `json:"verifyPresented"`
+			VaultMasterKey string `json:"vaultMasterKey"`
+			UserID         string `json:"userId"`
+			State          string `json:"state"`
+			SessionCSRF    string `json:"sessionCsrf"`
 		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		sig := mcpfed.ComputeMCPOAuthBindHMAC(p.VaultMasterKey, p.UserID, p.State, p.SessionCSRF)
-		out := map[string]any{"ok": true, "hmac": sig, "stateHash": mcpfed.SHA256Base64URL(p.State)}
-		if p.VerifyPresented != nil {
-			out["matched"] = mcpfed.VerifyMCPOAuthBindHMAC(*p.VerifyPresented, p.VaultMasterKey, p.UserID, p.State, p.SessionCSRF)
-		}
-		return out, true, nil
+		macKey, macMsg := mcpfed.BuildOAuthBindMACInputs(p.VaultMasterKey, p.UserID, p.State, p.SessionCSRF)
+		return map[string]any{"ok": true, "macKey": macKey, "macMessage": macMsg}, true, nil
 
-	case "mcp_vault_oauth_pkce_init":
+	case "mcp_vault_prepare_oauth_pkce_init":
 		var p struct {
-			VaultMasterKey        string   `json:"vaultMasterKey"`
 			UserID                string   `json:"userId"`
-			SessionCSRF           string   `json:"sessionCsrf"`
 			RemoteOrigin          string   `json:"remoteOrigin"`
 			AuthorizationEndpoint string   `json:"authorizationEndpoint"`
 			TokenEndpoint         string   `json:"tokenEndpoint"`
@@ -174,71 +200,31 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 			Resource              string   `json:"resource"`
 			ConfirmedAuthOrigin   string   `json:"confirmedAuthOrigin"`
 			Issuer                string   `json:"issuer"`
+			CodeVerifier          string   `json:"codeVerifier"`
+			CodeChallenge         string   `json:"codeChallenge"`
+			State                 string   `json:"state"`
 		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		codeVerifier, err := mcpfed.RandomBase64URL(32)
+		blob, authURLStr, err := mcpfed.BuildPKCEAuthorizationInit(
+			p.AuthorizationEndpoint, p.TokenEndpoint, p.ClientID, p.ClientSecret,
+			p.RedirectURI, p.Scope, p.ScopesSupported, p.Resource,
+			p.ConfirmedAuthOrigin, p.Issuer, p.CodeVerifier, p.CodeChallenge, p.State,
+		)
 		if err != nil {
 			return nil, true, err
 		}
-		codeChallenge := mcpfed.SHA256Base64URL(codeVerifier)
-		state, err := mcpfed.RandomBase64URL(32)
+		hkdfInfo, aad, plain, err := mcpfed.PreparePKCEStateSeal(p.UserID, p.RemoteOrigin, blob)
 		if err != nil {
 			return nil, true, err
 		}
-		stateHash := mcpfed.SHA256Base64URL(state)
-		bindCookieVal := mcpfed.ComputeMCPOAuthBindHMAC(p.VaultMasterKey, p.UserID, state, p.SessionCSRF)
-
-		blob := mcpfed.OrderedObject{
-			{Key: "codeVerifier", Value: codeVerifier},
-		}
-		if p.Issuer != "" {
-			blob.Set("issuer", p.Issuer)
-		}
-		blob.Set("tokenEndpoint", p.TokenEndpoint)
-		if p.ConfirmedAuthOrigin != "" {
-			blob.Set("confirmedAuthOrigin", p.ConfirmedAuthOrigin)
-		}
-		blob.Set("clientId", p.ClientID)
-		if p.ClientSecret != "" {
-			blob.Set("clientSecret", p.ClientSecret)
-		}
-		blob.Set("redirectUri", p.RedirectURI)
-		blob.Set("resource", p.Resource)
-
-		encryptedPkceBlob, err := mcpfed.SealPKCEStateBlob(p.VaultMasterKey, p.UserID, p.RemoteOrigin, blob)
-		if err != nil {
-			return nil, true, err
-		}
-
-		authURL, err := url.Parse(p.AuthorizationEndpoint)
-		if err != nil {
-			return nil, true, err
-		}
-		q := authURL.Query()
-		q.Set("response_type", "code")
-		q.Set("client_id", p.ClientID)
-		q.Set("redirect_uri", p.RedirectURI)
-		q.Set("code_challenge", codeChallenge)
-		q.Set("code_challenge_method", "S256")
-		q.Set("state", state)
-		effectiveScope := strings.TrimSpace(p.Scope)
-		if effectiveScope == "" && len(p.ScopesSupported) > 0 {
-			effectiveScope = strings.Join(p.ScopesSupported, " ")
-		}
-		if effectiveScope != "" {
-			q.Set("scope", effectiveScope)
-		}
-		q.Set("resource", p.Resource)
-		authURL.RawQuery = q.Encode()
-
 		return map[string]any{
-			"ok":                true,
-			"authorizationUrl":  authURL.String(),
-			"bindCookieValue":   bindCookieVal,
-			"stateHash":         stateHash,
-			"encryptedPkceBlob": encryptedPkceBlob,
+			"ok":               true,
+			"authorizationUrl": authURLStr,
+			"hkdfInfo":         hkdfInfo,
+			"aad":              aad,
+			"plaintext":        plain,
 		}, true, nil
 
 	case "mcp_vault_is_safe_id":

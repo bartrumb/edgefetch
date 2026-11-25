@@ -2,7 +2,6 @@ package catalog
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"sync"
@@ -109,7 +108,7 @@ func NewCatalogStore() *CatalogStore {
 // GenerateCatalogID produces a `cat_<16hex>` run identifier.
 func GenerateCatalogID() string {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if err := fillCatalogRandomBytes(b[:]); err != nil {
 		return "cat_fallback00000001"
 	}
 	return "cat_" + hex.EncodeToString(b[:])

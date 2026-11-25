@@ -3,7 +3,6 @@ package extract
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"slices"
 	"strings"
 )
@@ -17,10 +16,10 @@ const (
 )
 
 var (
-	reEasyPrivacyTitleHeader   = regexp.MustCompile(`(?i)^!\s*Title\s*:\s*EasyPrivacy(?:\b|$)`)
-	reEasyPrivacyVersionHeader = regexp.MustCompile(`(?i)^!\s*Version\s*:`)
-	reEasyPrivacyLastModHeader = regexp.MustCompile(`(?i)^!\s*Last\s+modified\s*:`)
-	reEasyPrivacyVersionVal    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	reEasyPrivacyTitleHeader   = newLazyRegexp(`(?i)^!\s*Title\s*:\s*EasyPrivacy(?:\b|$)`)
+	reEasyPrivacyVersionHeader = newLazyRegexp(`(?i)^!\s*Version\s*:`)
+	reEasyPrivacyLastModHeader = newLazyRegexp(`(?i)^!\s*Last\s+modified\s*:`)
+	reEasyPrivacyVersionVal    = newLazyRegexp(`^[A-Za-z0-9._-]{1,64}$`)
 
 	easyPrivacyNeverBlockSuffixes = map[string]bool{
 		// Bot-challenge & WAF hosts

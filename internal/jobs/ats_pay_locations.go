@@ -3,28 +3,27 @@ package jobs
 import (
 	"encoding/json"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 )
 
 var (
-	reAshbySalaryCompType = regexp.MustCompile(`(?i)salary|base|cash`)
-	reAshbyOrgHead        = regexp.MustCompile(`"organizationName"\s*:\s*"((?:\\.|[^"\\])*)"`)
-	reGHJunkLoc           = regexp.MustCompile(`(?i)^(?:n/a|none|null|undefined|tbd|-)$`)
-	reGHMetaLocName       = regexp.MustCompile(`(?i)^(?:job\s+posting\s+location|hiring\s+location|work\s+location|office\s+location|location|locations|country|countries|region)$`)
-	reGHMetaPayName       = regexp.MustCompile(`(?i)salary|compensation|pay|wage|remuneration|base`)
+	reAshbySalaryCompType = newLazyRegexp(`(?i)salary|base|cash`)
+	reAshbyOrgHead        = newLazyRegexp(`"organizationName"\s*:\s*"((?:\\.|[^"\\])*)"`)
+	reGHJunkLoc           = newLazyRegexp(`(?i)^(?:n/a|none|null|undefined|tbd|-)$`)
+	reGHMetaLocName       = newLazyRegexp(`(?i)^(?:job\s+posting\s+location|hiring\s+location|work\s+location|office\s+location|location|locations|country|countries|region)$`)
+	reGHMetaPayName       = newLazyRegexp(`(?i)salary|compensation|pay|wage|remuneration|base`)
 
-	reWorkdayHost       = regexp.MustCompile(`(?i)^([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com$`)
-	reLocaleSegment     = regexp.MustCompile(`^[a-z]{2}(?:-[A-Za-z]{2,4})?$`)
-	reWorkdaySiteIdent  = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,120}$`)
-	reGHSlugIdent       = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	reDigitsOnly        = regexp.MustCompile(`^\d+$`)
-	reLeverSlugIdent    = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
-	reLeverJobID        = regexp.MustCompile(`(?i)^[0-9a-f-]{20,40}$`)
-	reWorkableSlugIdent = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
-	reWorkableJobCode   = regexp.MustCompile(`^[A-Za-z0-9_-]{4,24}$`)
-	reRipplingJobUUID   = regexp.MustCompile(`^[A-Za-z0-9_-]{6,64}$`)
+	reWorkdayHost       = newLazyRegexp(`(?i)^([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com$`)
+	reLocaleSegment     = newLazyRegexp(`^[a-z]{2}(?:-[A-Za-z]{2,4})?$`)
+	reWorkdaySiteIdent  = newLazyRegexp(`^[A-Za-z0-9_.-]{1,120}$`)
+	reGHSlugIdent       = newLazyRegexp(`^[A-Za-z0-9_-]+$`)
+	reDigitsOnly        = newLazyRegexp(`^\d+$`)
+	reLeverSlugIdent    = newLazyRegexp(`^[A-Za-z0-9_.-]+$`)
+	reLeverJobID        = newLazyRegexp(`(?i)^[0-9a-f-]{20,40}$`)
+	reWorkableSlugIdent = newLazyRegexp(`^[A-Za-z0-9_-]{1,80}$`)
+	reWorkableJobCode   = newLazyRegexp(`^[A-Za-z0-9_-]{4,24}$`)
+	reRipplingJobUUID   = newLazyRegexp(`^[A-Za-z0-9_-]{6,64}$`)
 )
 
 // SalvagedAshbyBoard holds complete job objects salvaged linearly from a truncated Ashby job-board JSON payload.

@@ -4,27 +4,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
 var (
-	reWorkdaySafeExtPath = regexp.MustCompile(`^/?job/(?:[A-Za-z0-9._~%-]+/)*[A-Za-z0-9._~%-]+$`)
-	reWorkdayBadPct      = regexp.MustCompile(`(?i)%2e|%2f|%5c`)
-	reMarkdownLinkChars  = regexp.MustCompile(`([\\\[\]()])`)
-	reBracketParenStrip  = regexp.MustCompile(`[\[\]()]`)
+	reWorkdaySafeExtPath = newLazyRegexp(`^/?job/(?:[A-Za-z0-9._~%-]+/)*[A-Za-z0-9._~%-]+$`)
+	reWorkdayBadPct      = newLazyRegexp(`(?i)%2e|%2f|%5c`)
+	reMarkdownLinkChars  = newLazyRegexp(`([\\\[\]()])`)
+	reBracketParenStrip  = newLazyRegexp(`[\[\]()]`)
 
-	reSRNumericPrefix = regexp.MustCompile(`^\d{6,}-`)
-	reSRSkipSeg       = regexp.MustCompile(`(?i)^(?:api|reset|login|signin|privacy|legal|terms|cookies|search|jobs)$`)
-	reSRSkipTitle     = regexp.MustCompile(`(?i)^(?:apply|read more|learn more|view job)$`)
-	reSRSkipHTMLTitle = regexp.MustCompile(`(?i)^(?:apply|view|details)$`)
-	reSRMDLink        = regexp.MustCompile(`(?i)\[([^\[\]\n]{3,180})\]\((https://jobs\.smartrecruiters\.com/[^)\s]+)\)([^\n]{0,200})(?:\n+([^\n#\[]{0,160}))?`)
-	reSRHTMLAnchor    = regexp.MustCompile(`(?i)<a\b[^>]{0,400}\bhref=["'](https?://jobs\.smartrecruiters\.com/[^"'#?\s]+|/[A-Za-z0-9_-]+/[A-Za-z0-9_-]{6,})["'][^>]*>(?s:(.{1,600}?))</a>`)
-	reSRLeadingSep    = regexp.MustCompile(`^[ \t·|–—-]+`)
-	reSRBracketOrHTTP = regexp.MustCompile(`(?i)\[|\]|\bhttp`)
-	reBuiltInMDCard   = regexp.MustCompile(`(?i)\[([^\[\]\n]{4,120})\]\((https://(?:www\.)?builtin\.com/job/[^)\s]+)\)`)
+	reSRNumericPrefix = newLazyRegexp(`^\d{6,}-`)
+	reSRSkipSeg       = newLazyRegexp(`(?i)^(?:api|reset|login|signin|privacy|legal|terms|cookies|search|jobs)$`)
+	reSRSkipTitle     = newLazyRegexp(`(?i)^(?:apply|read more|learn more|view job)$`)
+	reSRSkipHTMLTitle = newLazyRegexp(`(?i)^(?:apply|view|details)$`)
+	reSRMDLink        = newLazyRegexp(`(?i)\[([^\[\]\n]{3,180})\]\((https://jobs\.smartrecruiters\.com/[^)\s]+)\)([^\n]{0,200})(?:\n+([^\n#\[]{0,160}))?`)
+	reSRHTMLAnchor    = newLazyRegexp(`(?i)<a\b[^>]{0,400}\bhref=["'](https?://jobs\.smartrecruiters\.com/[^"'#?\s]+|/[A-Za-z0-9_-]+/[A-Za-z0-9_-]{6,})["'][^>]*>(?s:(.{1,600}?))</a>`)
+	reSRLeadingSep    = newLazyRegexp(`^[ \t·|–—-]+`)
+	reSRBracketOrHTTP = newLazyRegexp(`(?i)\[|\]|\bhttp`)
+	reBuiltInMDCard   = newLazyRegexp(`(?i)\[([^\[\]\n]{4,120})\]\((https://(?:www\.)?builtin\.com/job/[^)\s]+)\)`)
 )
 
 func (s *ATSPreFetchSpec) formatWithNow(rawBody, origURL string, htmlToMD HTMLToMDFunc, now time.Time) *ATSFormattedResult {

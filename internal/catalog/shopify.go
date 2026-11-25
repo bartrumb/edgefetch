@@ -3,7 +3,6 @@ package catalog
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -11,20 +10,20 @@ import (
 )
 
 var (
-	reShopifyPoweredBy     = regexp.MustCompile(`(?i)\bshopify\b`)
-	reMyShopifyDomain      = regexp.MustCompile(`(?i)[a-z0-9-]\.myshopify\.com\b`)
-	reShopifyShopAssign    = regexp.MustCompile(`Shopify\.shop\s*=`)
-	reShopifyActiveCurr    = regexp.MustCompile(`Shopify\.currency\s*=\s*\{[^}]{0,240}?"active"\s*:\s*"([A-Z]{3})"`)
-	reShopifyJSONLDCurr    = regexp.MustCompile(`(?i)"priceCurrency"\s*:\s*"([A-Z]{3})"`)
-	reShopifyHandleSafe    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,160}$`)
-	reShopifyDefaultTitle  = regexp.MustCompile(`(?i)^default(?:\s+title)?$`)
-	reShopifyCollectionURL = regexp.MustCompile(`(?i)^/collections/([^/]+)/products\.json$`)
-	reShopifyColPath       = regexp.MustCompile(`(?i)^/collections/([A-Za-z0-9_-]+)`)
-	reShopifyProductPath   = regexp.MustCompile(`(?i)/products/[^/]+`)
-	reShopifyDatePrefix    = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}`)
-	reShopifyAvailTrue     = regexp.MustCompile(`(?i)InStock|PreOrder|BackOrder|OnlineOnly`)
-	reShopifyAvailFalse    = regexp.MustCompile(`(?i)OutOfStock|SoldOut|Discontinued`)
-	reShopifyPreorder      = regexp.MustCompile(`(?i)PreOrder|BackOrder`)
+	reShopifyPoweredBy     = newLazyRegexp(`(?i)\bshopify\b`)
+	reMyShopifyDomain      = newLazyRegexp(`(?i)[a-z0-9-]\.myshopify\.com\b`)
+	reShopifyShopAssign    = newLazyRegexp(`Shopify\.shop\s*=`)
+	reShopifyActiveCurr    = newLazyRegexp(`Shopify\.currency\s*=\s*\{[^}]{0,240}?"active"\s*:\s*"([A-Z]{3})"`)
+	reShopifyJSONLDCurr    = newLazyRegexp(`(?i)"priceCurrency"\s*:\s*"([A-Z]{3})"`)
+	reShopifyHandleSafe    = newLazyRegexp(`^[A-Za-z0-9_-]{1,160}$`)
+	reShopifyDefaultTitle  = newLazyRegexp(`(?i)^default(?:\s+title)?$`)
+	reShopifyCollectionURL = newLazyRegexp(`(?i)^/collections/([^/]+)/products\.json$`)
+	reShopifyColPath       = newLazyRegexp(`(?i)^/collections/([A-Za-z0-9_-]+)`)
+	reShopifyProductPath   = newLazyRegexp(`(?i)/products/[^/]+`)
+	reShopifyDatePrefix    = newLazyRegexp(`^\d{4}-\d{2}-\d{2}`)
+	reShopifyAvailTrue     = newLazyRegexp(`(?i)InStock|PreOrder|BackOrder|OnlineOnly`)
+	reShopifyAvailFalse    = newLazyRegexp(`(?i)OutOfStock|SoldOut|Discontinued`)
+	reShopifyPreorder      = newLazyRegexp(`(?i)PreOrder|BackOrder`)
 )
 
 // IsShopifyHTMLOrHeaders detects Shopify storefronts from HTTP response headers or HTML markers.

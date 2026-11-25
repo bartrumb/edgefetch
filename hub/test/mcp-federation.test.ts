@@ -18,6 +18,7 @@ import {
   resetMcpRegistryCacheForTests,
 } from '../src/mcp-registry.ts';
 import {
+  completeDownstreamMcpOAuthCallback,
   createMemoryMcpVaultStore,
   resolveCallerUserId,
   sealVaultCredentials,
@@ -1425,5 +1426,294 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
   } finally {
     coordinator.close();
     rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('MCP-FED-VAULT-KAT: Native Go <-> WebCrypto Known-Answer Tests (v2 5-field, v2 2-field, v1, v2.7.0, P6/M8 downgrade, PKCE2, 12B getRandomValues nonces, subtle.verify HMAC & Go-owned AAD)', async () => {
+  // Identical KAT vectors verified by native Go `TestVaultCrossImplKnownAnswerVectors` (`internal/mcpfed/vault_test.go`):
+  const KAT_MASTER_KEY = 'ef_phase2_vault_master_key_32chars_minimum_ok';
+  const KAT_V2_FIVE_FIELD =
+    'v2.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.ThW41skD9EZIY8WR3mTcg46ojnbEPhpj8oty1o3nH-_Wh3oeNwSzpG0TibQHDiLvZlfAjJ3aYrNsS7UB7ctAsw2Xi_kBSyUD06Sx7SYl4JONM0PIFWSL6Th84zYm5CoS0wzn9Q2QdOHKKVXDWAj0kL0t9pzPYJzWmxMd7PIQS2a3SBkyIQQnikvfVVAQlnkNRoEyWCBt7rVClAA836bcBZ_XYeLb5GjtV5bY7Rs_rc-orq-LIB5XglX94A9Xxk50oIRij-YgN1O_zSZScgULalXaoSj4GtU6tr7wRglsRcl83ZlSR41qkvOv0TKg7H3t9Qevj7yLKcT_YlrdnUh_EREFBgKYxn23U0K5biWK-MHe9JkXtGe6WH0C';
+  const KAT_V2_TWO_FIELD =
+    'v2.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.ThW41skD9EZIY8WR3mTcg46ojnbEPhpj8oty1o3nH-_Wh3oeNwSzpG0TibQHDiLvZlfAjJ3aYrNsS7UZ4cRKsxux269YU0Ye07iu7HVwroqHLAOGRiis7Ssg5zR2py4f_Fj5iFeTfODDP3mVDRj0rOR77obPeYnEilhIoKVZDFaNRAgnDFcukVPlURF1hm4LUIEocz1j6aMOyzkikw68edDbz1BfN8GPHWk';
+  const KAT_V1_LEN_PREFIXED =
+    'v1.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.5GO5JdzXAJINsO2v72Vpm5RHB3VmYjKaYz__olQEXSutfgJqLIHNJBtH--1vA001U-pypOEBscqX1UBzKYDRlG4BJh87Dyfl7IQZ-7fa5th3T3sjdaLRybYckqGn5zUjifA84B_qiiT0eQvDq5wb65dBreGsK9G3KptPSys';
+  const KAT_V270_LEGACY =
+    'v1.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.3xPoth6GY96_i-hybHp46TVh82W5J1XAtNR9M3tGIeeR20k62QZ2z8Jtp576fkjqtJCeCZmYTB0d6OSRsSq8T_UtGLE0DH1KuoE9iTcqhlpJvKl8l_ZF8Yis7mZ5eBAtV8ZhibQnmFZCufTJ51929BpA_qzdqFJvfZvUMg0';
+  const KAT_PKCE2 =
+    'pkce2.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.rIWg0dVMH4e26w-GR4-YcTbPInQjS7GJ9_DidnaKtcflpWRI5VQD1NsOhP4ut8ICUYIsKwFBkn60l4pAoyFNNUFIMwH-aWwUEH9wXhvUUpphInkveed1oaAsaXfVWN6rF83KkdcX6GwFYuM3sDPYO75cHLjs98wEVbTfXIDIF6J30KVc5-_kse72aX5WvNyIXwkceBBe4JOGdpudCPF1cru443o2NatN9-d9Qe6KzGsppm-T029CyFfPaC71UymyLbVY-01b5N6DqSM8Cd4ue2Ep9ZChBXbQGbrG_iEZ7U5mrFD_9C87Nl2zludfFyW4Haac9o-5VBtr9NO0Hjc7AShu0lPjwdZ5SFFyANtMY91d3TQPCRLOl7BlqOgIQvh3eoIgMjHIHdOFEABUONi9-OSXglnDkoai2bA4wn84QLl67lanpa85QkKTx3qNspkJJTAcqew';
+  const KAT_BIND_HMAC = 'y-yn6kpxWI0KrlHLiKia91MfSooumt-wbb79IbRSQ5g';
+
+  // 1a. Reverse KAT: JS WebCrypto `sealVaultCredentials` with fixed salt/IV produces byte-for-byte identical `KAT_V2_FIVE_FIELD` & `KAT_V2_TWO_FIELD` as native Go!
+  const origFixedRandom = crypto.getRandomValues.bind(crypto);
+  const fixedSaltBytes = Buffer.from('0123456789abcdef', 'utf8');
+  const fixedIvBytes = Buffer.from('fedcba987654', 'utf8');
+  try {
+    crypto.getRandomValues = (<T extends ArrayBufferView | null>(arr: T): T => {
+      if (arr) {
+        const view = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+        if (view.byteLength === 16) view.set(fixedSaltBytes);
+        else if (view.byteLength === 12) view.set(fixedIvBytes);
+        else origFixedRandom(view);
+      }
+      return arr;
+    }) as typeof crypto.getRandomValues;
+
+    const jsSealed5 = await sealVaultCredentials({
+      vaultMasterKey: KAT_MASTER_KEY,
+      userId: 'gh_1001',
+      remoteOrigin: 'https://mcp.linear.app',
+      id: 'mcp_row_alpha',
+      slug: 'linear-prod',
+      authType: 'headers',
+      payload: {
+        kind: 'headers',
+        pinnedOrigin: 'https://mcp.linear.app',
+        pinnedUrl: 'https://mcp.linear.app/mcp',
+        headers: { Authorization: 'Bearer lin_v2_secret_token' },
+      },
+    });
+    assert.equal(jsSealed5.ok, true);
+    if (jsSealed5.ok) {
+      assert.equal(jsSealed5.ciphertext, KAT_V2_FIVE_FIELD, 'JS WebCrypto fixed-nonce seal must match native Go KAT_V2_FIVE_FIELD byte-for-byte');
+    }
+
+    const jsSealed2 = await sealVaultCredentials({
+      vaultMasterKey: KAT_MASTER_KEY,
+      userId: 'gh_1001',
+      remoteOrigin: 'https://mcp.linear.app',
+      payload: {
+        kind: 'headers',
+        pinnedOrigin: 'https://mcp.linear.app',
+        headers: { Authorization: 'Bearer lin_v2_2field_tok' },
+      },
+    });
+    assert.equal(jsSealed2.ok, true);
+    if (jsSealed2.ok) {
+      assert.equal(jsSealed2.ciphertext, KAT_V2_TWO_FIELD, 'JS WebCrypto fixed-nonce seal must match native Go KAT_V2_TWO_FIELD byte-for-byte');
+    }
+  } finally {
+    crypto.getRandomValues = origFixedRandom;
+  }
+
+  // 1. Open native-Go v2 5-field AAD KAT row in JS WebCrypto (no reseal needed)
+  const openedV2 = await unsealVaultCredentials({
+    vaultMasterKey: KAT_MASTER_KEY,
+    userId: 'gh_1001',
+    remoteOrigin: 'https://mcp.linear.app',
+    remoteUrl: 'https://mcp.linear.app/mcp',
+    id: 'mcp_row_alpha',
+    slug: 'linear-prod',
+    authType: 'headers',
+    secretVersion: 2,
+    ciphertext: KAT_V2_FIVE_FIELD,
+  });
+  assert.equal(openedV2.ok, true);
+  if (openedV2.ok) {
+    assert.equal(openedV2.payload.headers?.Authorization, 'Bearer lin_v2_secret_token');
+    assert.equal(openedV2.resealedCiphertext, undefined);
+  }
+
+  // 2. Open pre-v2 (`v1` length-prefixed, `v2.7.0` unprefixed) & 2-field `v2` KAT rows -> auto-reseal to `v2.` + `secretVersion: 2`,
+  //    AND verify P6/M8 version-downgrade protection rejects all 3 when `secretVersion: 2`!
+  for (const [label, legacyCt, expectedToken] of [
+    ['v2_2field', KAT_V2_TWO_FIELD, 'Bearer lin_v2_2field_tok'],
+    ['v1_len_prefixed', KAT_V1_LEN_PREFIXED, 'Bearer legacy_v1_tok'],
+    ['v270_legacy', KAT_V270_LEGACY, 'Bearer legacy_v1_tok'],
+  ] as const) {
+    const downgradeAttempt = await unsealVaultCredentials({
+      vaultMasterKey: KAT_MASTER_KEY,
+      userId: 'gh_1001',
+      remoteOrigin: 'https://mcp.linear.app',
+      id: 'mcp_row_alpha',
+      slug: 'linear-prod',
+      authType: 'headers',
+      secretVersion: 2,
+      ciphertext: legacyCt,
+    });
+    assert.equal(downgradeAttempt.ok, false, `${label}: P6/M8 downgrade on secretVersion=2 MUST fail closed`);
+
+    const migrated = await unsealVaultCredentials({
+      vaultMasterKey: KAT_MASTER_KEY,
+      userId: 'gh_1001',
+      remoteOrigin: 'https://mcp.linear.app',
+      id: 'mcp_row_alpha',
+      slug: 'linear-prod',
+      authType: 'headers',
+      secretVersion: 1,
+      ciphertext: legacyCt,
+    });
+    assert.equal(migrated.ok, true, `${label}: pre-v2 row with secretVersion=1 MUST decrypt`);
+    if (migrated.ok) {
+      assert.equal(migrated.payload.headers?.Authorization, expectedToken);
+      assert.ok(migrated.resealedCiphertext?.startsWith('v2.'), `${label}: must auto-reseal to v2 envelope`);
+      assert.equal(migrated.resealedSecretVersion, 2);
+    }
+  }
+
+  // 3. Nonces come strictly from `crypto.getRandomValues` (16B salt + 12B AES-GCM IV per seal, zero derivation/reuse across 32 seals)
+  const origGetRandomValues = crypto.getRandomValues.bind(crypto);
+  const observedRandomSizes: number[] = [];
+  crypto.getRandomValues = (<T extends ArrayBufferView | null>(arr: T): T => {
+    if (arr) observedRandomSizes.push(arr.byteLength);
+    return origGetRandomValues(arr);
+  }) as typeof crypto.getRandomValues;
+
+  const seenSalts = new Set<string>();
+  const seenIvs = new Set<string>();
+  try {
+    for (let i = 0; i < 32; i++) {
+      const beforeLen = observedRandomSizes.length;
+      const sealed = await sealVaultCredentials({
+        vaultMasterKey: KAT_MASTER_KEY,
+        userId: 'gh_1001',
+        remoteOrigin: 'https://mcp.linear.app',
+        id: 'mcp_row_alpha',
+        slug: 'linear-prod',
+        authType: 'headers',
+        payload: {
+          kind: 'headers',
+          pinnedOrigin: 'https://mcp.linear.app',
+          headers: { Authorization: 'Bearer identical_plaintext_token' },
+        },
+      });
+      assert.equal(sealed.ok, true);
+      if (!sealed.ok) continue;
+      const callSizes = observedRandomSizes.slice(beforeLen);
+      assert.ok(callSizes.includes(16) && callSizes.includes(12), `Seal #${i} must draw 16B salt and 12B IV via crypto.getRandomValues`);
+      const parts = sealed.ciphertext.split('.');
+      assert.equal(parts.length, 4);
+      assert.equal(parts[0], 'v2');
+      const saltBytes = Buffer.from(parts[1]!, 'base64url');
+      const ivBytes = Buffer.from(parts[2]!, 'base64url');
+      assert.equal(saltBytes.byteLength, 16);
+      assert.equal(ivBytes.byteLength, 12, 'Each AES-GCM nonce MUST be strictly 12 bytes');
+      seenSalts.add(parts[1]!);
+      seenIvs.add(parts[2]!);
+    }
+  } finally {
+    crypto.getRandomValues = origGetRandomValues;
+  }
+  assert.equal(seenSalts.size, 32, 'All 32 per-seal salts must be unique');
+  assert.equal(seenIvs.size, 32, 'All 32 per-seal 12-byte AES-GCM nonces must be unique');
+
+  // 4. Callers cannot supply or override AAD / HKDF-info bytes (Go constructs AAD strictly from userId, remoteOrigin, serverId, slug, authType)
+  const forgedSeal = await sealVaultCredentials({
+    vaultMasterKey: KAT_MASTER_KEY,
+    userId: 'gh_1001',
+    remoteOrigin: 'https://mcp.linear.app',
+    id: 'mcp_row_alpha',
+    slug: 'linear-prod',
+    authType: 'headers',
+    // Extraneous caller-supplied AAD/hkdfInfo fields MUST be ignored by TS+Go:
+    ...({ aad: 'forged-aad', additionalData: 'forged-aad', hkdfInfo: 'forged-hkdf' } as Record<string, unknown>),
+    payload: {
+      kind: 'headers',
+      pinnedOrigin: 'https://mcp.linear.app',
+      headers: { Authorization: 'Bearer bound_secret' },
+    },
+  });
+  assert.equal(forgedSeal.ok, true);
+  if (forgedSeal.ok) {
+    const wrongSlugUnseal = await unsealVaultCredentials({
+      vaultMasterKey: KAT_MASTER_KEY,
+      userId: 'gh_1001',
+      remoteOrigin: 'https://mcp.linear.app',
+      id: 'mcp_row_alpha',
+      slug: 'different-slug',
+      authType: 'headers',
+      secretVersion: 2,
+      ...({ aad: 'forged-aad', additionalData: 'forged-aad', hkdfInfo: 'forged-hkdf' } as Record<string, unknown>),
+      ciphertext: forgedSeal.ciphertext,
+    });
+    assert.equal(wrongSlugUnseal.ok, false, 'Caller-supplied aad/hkdfInfo properties must never bypass Go 5-field AAD binding');
+
+    const exactTupleUnseal = await unsealVaultCredentials({
+      vaultMasterKey: KAT_MASTER_KEY,
+      userId: 'gh_1001',
+      remoteOrigin: 'https://mcp.linear.app',
+      id: 'mcp_row_alpha',
+      slug: 'linear-prod',
+      authType: 'headers',
+      secretVersion: 2,
+      ciphertext: forgedSeal.ciphertext,
+    });
+    assert.equal(exactTupleUnseal.ok, true);
+  }
+
+  // 5. OAuth binding MAC is checked via `crypto.subtle.verify` (constant-time) AND opens native-Go `KAT_PKCE2` state!
+  const vaultStore = createMemoryMcpVaultStore();
+  const stateHash = await sha256Base64Url('st_1');
+  await vaultStore.putOAuthState({
+    stateHash,
+    userId: 'gh_1001',
+    slug: 'acme-mcp',
+    name: 'Acme MCP',
+    remoteUrl: 'https://mcp.acme.example/mcp',
+    remoteOrigin: 'https://mcp.acme.example',
+    transport: 'streamable-http',
+    domains: [],
+    confirmedAuthOrigin: 'https://auth.acme.example',
+    encryptedPkceBlob: KAT_PKCE2,
+    expiresAt: Date.now() + 300_000,
+  });
+
+  const origSubtleVerify = crypto.subtle.verify.bind(crypto.subtle);
+  let hmacVerifyCalls = 0;
+  crypto.subtle.verify = (async (algorithm: AlgorithmIdentifier, key: CryptoKey, signature: BufferSource, data: BufferSource) => {
+    const algName = typeof algorithm === 'string' ? algorithm : algorithm.name;
+    if (algName === 'HMAC') hmacVerifyCalls++;
+    return origSubtleVerify(algorithm, key, signature, data);
+  }) as typeof crypto.subtle.verify;
+
+  try {
+    // Tampered 43-char base64url MAC must call `crypto.subtle.verify` and fail with 403 before consuming PKCE state!
+    const tamperedMac = (KAT_BIND_HMAC[0] === 'A' ? 'B' : 'A') + KAT_BIND_HMAC.slice(1);
+    const badCb = await completeDownstreamMcpOAuthCallback({
+      userId: 'gh_1001',
+      sessionCsrf: 'csrf_1',
+      bindCookieHeader: tamperedMac,
+      code: 'oauth_code_ok',
+      state: 'st_1',
+      vaultMasterKey: KAT_MASTER_KEY,
+      vaultStore,
+      fetchFn: async () => new Response('unexpected', { status: 500 }),
+    });
+    assert.equal(badCb.ok, false);
+    if (!badCb.ok) assert.equal(badCb.status, 403);
+    assert.equal(hmacVerifyCalls, 1, 'Tampered OAuth bind MAC must be checked via crypto.subtle.verify("HMAC")');
+
+    // Valid native-Go `KAT_BIND_HMAC` + native-Go `KAT_PKCE2` state succeeds end-to-end and sends exact decrypted `code_verifier`!
+    let capturedCodeVerifier = '';
+    const okCb = await completeDownstreamMcpOAuthCallback({
+      userId: 'gh_1001',
+      sessionCsrf: 'csrf_1',
+      bindCookieHeader: KAT_BIND_HMAC,
+      code: 'oauth_code_ok',
+      state: 'st_1',
+      vaultMasterKey: KAT_MASTER_KEY,
+      vaultStore,
+      fetchFn: async (input, init) => {
+        const u = String(input);
+        if (u === 'https://auth.acme.example/token') {
+          const form = new URLSearchParams(String(init?.body ?? ''));
+          capturedCodeVerifier = form.get('code_verifier') ?? '';
+          return Response.json({
+            access_token: 'acme_access_tok_kat',
+            token_type: 'Bearer',
+            expires_in: 3600,
+          });
+        }
+        if (u === 'https://mcp.acme.example/mcp') {
+          return Response.json({ jsonrpc: '2.0', id: 1, result: { tools: [] } });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    assert.equal(hmacVerifyCalls, 2, 'Valid OAuth bind MAC must also be verified via crypto.subtle.verify("HMAC")');
+    assert.equal(okCb.ok, true);
+    assert.equal(capturedCodeVerifier, 'verifier_1234567890_abcdefghijklmnopqrstuvwxyz');
+  } finally {
+    crypto.subtle.verify = origSubtleVerify;
   }
 });

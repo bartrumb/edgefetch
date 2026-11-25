@@ -2,11 +2,10 @@ package mcpfed
 
 import (
 	"encoding/json"
-	"regexp"
 	"strings"
 )
 
-var safeResourceMimeRe = regexp.MustCompile(`^(?:text/(?:plain|markdown|csv|xml)|application/(?:json|ld\+json))(?:\s*;.*)?$`)
+var safeResourceMimeRe = newLazyRegexp(`^(?:text/(?:plain|markdown|csv|xml)|application/(?:json|ld\+json))(?:\s*;.*)?$`)
 
 // SanitizeCallToolRPCResponse sanitizes a complete downstream JSON-RPC tools/call response (result or error)
 // in a single Go pass, enforcing H3/M10 block, byte, depth, and secret-redaction budgets.

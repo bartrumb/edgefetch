@@ -3,12 +3,11 @@ package mcpfed
 import (
 	"encoding/json"
 	"math"
-	"regexp"
 	"strings"
 )
 
 var (
-	whitespaceRunRe = regexp.MustCompile(`\s+`)
+	whitespaceRunRe = newLazyRegexp(`\s+`)
 )
 
 var allowedJSONSchemaTypes = map[string]bool{

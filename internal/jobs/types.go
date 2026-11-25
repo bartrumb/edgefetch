@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -275,10 +274,10 @@ var PublicJobFeeds = []PublicJobFeedSpec{
 }
 
 var (
-	reANSICSIJobs     = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
-	reMultiSpacesJobs = regexp.MustCompile(`\s+`)
-	reHexEntityJobs   = regexp.MustCompile(`(?i)&#x([0-9a-f]+);`)
-	reDecEntityJobs   = regexp.MustCompile(`&#(\d+);`)
+	reANSICSIJobs     = newLazyRegexp(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	reMultiSpacesJobs = newLazyRegexp(`\s+`)
+	reHexEntityJobs   = newLazyRegexp(`(?i)&#x([0-9a-f]+);`)
+	reDecEntityJobs   = newLazyRegexp(`&#(\d+);`)
 	namedEntityRepl   = strings.NewReplacer(
 		"&nbsp;", " ", "&NBSP;", " ",
 		"&amp;", "&", "&AMP;", "&",

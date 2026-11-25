@@ -203,6 +203,14 @@ test('Step 4: wasm_mem_stats captures exact Go runtime MemStats snapshot right a
   );
   assert.equal(reactorStats.active, true);
   assert.ok(reactorStats.initialMemoryBytes > 0);
+  assert.ok(
+    reactorStats.initialMemoryBytes <= 12 * 1024 * 1024,
+    `Fresh WASM baseline (${reactorStats.initialMemoryBytes} B) must stay <= 12 MiB (~7.25 MiB after crypto/ removal + lazy regexes)`,
+  );
+  assert.ok(
+    memStats.init.heapAlloc < 1024 * 1024,
+    `Fresh Go WASM init HeapAlloc (${memStats.init.heapAlloc} B) must stay < 1 MiB`,
+  );
   assert.ok(memStats.init.sys > 0 && memStats.current.sys >= memStats.init.sys);
 });
 
@@ -274,10 +282,10 @@ test('Step 1 & Step 6: Global 4 MiB WASM input budget & memory matrix across all
         `[Matrix ${sizeSpec.label} ${kind}] inBytes=${byteLen}, activeAfter=${after.active}, ` +
           `memAfter=${(after.memoryBytes / (1024 * 1024)).toFixed(2)} MiB, retainedGrowth=${(retainedGrowth / (1024 * 1024)).toFixed(2)} MiB`,
       );
-      // Either the reactor was evicted (`after.active === false`, freeing all grown pages) OR total WASM memory stayed <= 96 MiB (`WASM_MAX_TOTAL_MEMORY_BYTES`)!
+      // Either the reactor was evicted (`after.active === false`, freeing all grown pages) OR total WASM memory stayed <= 64 MiB (`WASM_MAX_TOTAL_MEMORY_BYTES`)!
       assert.ok(
-        !after.active || after.memoryBytes <= 96 * 1024 * 1024,
-        `${sizeSpec.label} ${kind} memoryBytes ${after.memoryBytes} exceeded 96 MiB ceiling without evicting reactor`,
+        !after.active || after.memoryBytes <= 64 * 1024 * 1024,
+        `${sizeSpec.label} ${kind} memoryBytes ${after.memoryBytes} exceeded 64 MiB ceiling without evicting reactor`,
       );
     }
   }

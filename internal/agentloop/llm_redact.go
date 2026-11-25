@@ -2,7 +2,6 @@ package agentloop
 
 import (
 	"net/url"
-	"regexp"
 	"strings"
 )
 
@@ -48,10 +47,10 @@ var allowedLLMPathSegments = map[string]bool{
 }
 
 var (
-	reSafeModelSegment = regexp.MustCompile(`(?i)^(?:gemini|gpt|claude|llama|mistral|mixtral|codestral|qwen|deepseek|o1|o3|o4|text-embedding|embedding|embed|command|phi|gemma|yi|sonar)[a-z0-9._-]{0,64}$`)
-	reSensitiveHeader  = regexp.MustCompile(`(?i)authorization|api[-_]?key|token|secret|cookie|sig|signature|password|credential`)
-	reSensitiveValue   = regexp.MustCompile(`(?i)^(?:Bearer|Basic|Digest|Token)\s+|^(?:sk-|AIza|gsk_|gh[pousr]_|xox[abprs]-|glpat-|hf_)`)
-	reFallbackUserInfo = regexp.MustCompile(`(?i)^(https?://)[^/@\s]+@`)
+	reSafeModelSegment = newLazyRegexp(`(?i)^(?:gemini|gpt|claude|llama|mistral|mixtral|codestral|qwen|deepseek|o1|o3|o4|text-embedding|embedding|embed|command|phi|gemma|yi|sonar)[a-z0-9._-]{0,64}$`)
+	reSensitiveHeader  = newLazyRegexp(`(?i)authorization|api[-_]?key|token|secret|cookie|sig|signature|password|credential`)
+	reSensitiveValue   = newLazyRegexp(`(?i)^(?:Bearer|Basic|Digest|Token)\s+|^(?:sk-|AIza|gsk_|gh[pousr]_|xox[abprs]-|glpat-|hf_)`)
+	reFallbackUserInfo = newLazyRegexp(`(?i)^(https?://)[^/@\s]+@`)
 )
 
 func redactAllowlistedPathSegment(seg, prevLowerSeg string) string {

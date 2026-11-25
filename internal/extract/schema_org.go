@@ -6,7 +6,6 @@ import (
 	"math"
 	"net"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,10 +42,10 @@ const (
 )
 
 var (
-	reUnicodeTagJSONEscapeSchemaGo = regexp.MustCompile(`(?i)\\u(?:db40\\{1,16}udc[0-7][0-9a-f]|\{[ \t]{0,4}0{0,8}e00[0-7][0-9a-f][ \t]{0,4}\})`)
-	reUnicodeTagHTMLEntitySchemaGo = regexp.MustCompile(`&(?:amp;|#0{0,6}38;?|#[xX]0{0,6}26;?){0,4}#(?:[xX]0{0,8}[eE]00[0-7][0-9a-fA-F]|0{0,8}917(?:50[4-9]|5[1-9]\d|6[0-2]\d|63[01]));?`)
-	reRichHTMLTagProbeSchemaGo     = regexp.MustCompile(`(?i)<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|code|pre|blockquote|table|a)\b`)
-	reSchemaTypeIdentSchemaGo      = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{1,63}$`)
+	reUnicodeTagJSONEscapeSchemaGo = newLazyRegexp(`(?i)\\u(?:db40\\{1,16}udc[0-7][0-9a-f]|\{[ \t]{0,4}0{0,8}e00[0-7][0-9a-f][ \t]{0,4}\})`)
+	reUnicodeTagHTMLEntitySchemaGo = newLazyRegexp(`&(?:amp;|#0{0,6}38;?|#[xX]0{0,6}26;?){0,4}#(?:[xX]0{0,8}[eE]00[0-7][0-9a-fA-F]|0{0,8}917(?:50[4-9]|5[1-9]\d|6[0-2]\d|63[01]));?`)
+	reRichHTMLTagProbeSchemaGo     = newLazyRegexp(`(?i)<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|code|pre|blockquote|table|a)\b`)
+	reSchemaTypeIdentSchemaGo      = newLazyRegexp(`^[A-Za-z][A-Za-z0-9_-]{1,63}$`)
 
 	articleTypesSchemaGo = map[string]bool{
 		"article":          true,

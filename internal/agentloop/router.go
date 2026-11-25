@@ -3,7 +3,6 @@ package agentloop
 import (
 	"math"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -116,8 +115,8 @@ var builtInATSCoreCatalog = []AdapterCatalogItem{
 }
 
 var (
-	reStripHTTPScheme = regexp.MustCompile(`https?://`)
-	reTokenSplit      = regexp.MustCompile(`[^a-z0-9._-]+`)
+	reStripHTTPScheme = newLazyRegexp(`https?://`)
+	reTokenSplit      = newLazyRegexp(`[^a-z0-9._-]+`)
 
 	defaultCatalogOnce   sync.Once
 	cachedIndexedCatalog []indexedAdapterEntry

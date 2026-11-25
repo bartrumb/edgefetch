@@ -3,7 +3,6 @@ package mcpfed
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
@@ -45,15 +44,15 @@ const (
 )
 
 var (
-	mcpDirectiveInjectionRe = regexp.MustCompile(
+	mcpDirectiveInjectionRe = newLazyRegexp(
 		`(?i)\b(?:note|instruction|message|directive|reminder)\s+to\s+(?:the\s+)?(?:ai|llm|assistant|model|agent)\b|\bcall\s+query_mcp\s*\(|\bpre-authori[sz]ed\b|\bdo\s+not\s+ask\s+(?:the\s+user\s+)?for\s+confirmation\b|\bwhen\s+summarizing[^.\n]{0,80}\b(?:append|include|output|exfiltrate)\b`,
 	)
-	dangerousMarkdownSchemeRe = regexp.MustCompile(`(?i)^(?:javascript|vbscript|data|file|blob)\s*:`)
-	untrustedBoundaryTagRe    = regexp.MustCompile(`(?i)<(\s*/?\s*untrusted_[a-z0-9_-]*)`)
-	envelopeAttrKeyRe         = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$`)
-	bearerSecretRedactRe      = regexp.MustCompile(`(?i)\bBearer\s+[^\s"',;)]+`)
-	hiddenStyleAttrRe         = regexp.MustCompile(`(?i)\bstyle\s*=`)
-	hiddenStylePropRe         = regexp.MustCompile(`(?i)(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0)`)
+	dangerousMarkdownSchemeRe = newLazyRegexp(`(?i)^(?:javascript|vbscript|data|file|blob)\s*:`)
+	untrustedBoundaryTagRe    = newLazyRegexp(`(?i)<(\s*/?\s*untrusted_[a-z0-9_-]*)`)
+	envelopeAttrKeyRe         = newLazyRegexp(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$`)
+	bearerSecretRedactRe      = newLazyRegexp(`(?i)\bBearer\s+[^\s"',;)]+`)
+	hiddenStyleAttrRe         = newLazyRegexp(`(?i)\bstyle\s*=`)
+	hiddenStylePropRe         = newLazyRegexp(`(?i)(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0)`)
 )
 
 // SanitizedTextResult reports prompt-injection scrubbing results from SanitizeRemoteMCPText.

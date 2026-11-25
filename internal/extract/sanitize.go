@@ -3,7 +3,6 @@ package extract
 import (
 	"html"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -12,19 +11,19 @@ import (
 const maxSanitizeMarkdownScanBytes = 8 << 20 // 8 MiB linear scan cap (matches TS MAX_MARKDOWN_SANITIZE_CHARS)
 
 var (
-	reMintlifyDocIndexSanGo        = regexp.MustCompile(`(?i)^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+`)
-	reMintlifyFooterSanGo          = regexp.MustCompile(`(?i)^This documentation is built and hosted on \[Mintlify\]\([^)\r\n]{1,300}\),\s*a developer documentation platform\.[ \t]*$`)
-	reMinifiedSchemaJsonFenceSanGo = regexp.MustCompile("(?i)^`{3,}json[ \\t]*\\r?\\n\\{\\s*\"@context\"\\s*:\\s*\"https?://schema\\.org\"[^\\r\\n]{80,}\\r?\\n`{3,}$")
-	reTwoslashWordSanGo            = regexp.MustCompile(`(?i)\btwoslash\b`)
-	reTwoslashCutMarkerSanGo       = regexp.MustCompile(`(?m)^[ \t]*//[ \t]*---cut(?:-(?:before|after))?---[ \t]*$`)
-	reTwoslashCutBeforeSanGo       = regexp.MustCompile(`(?m)^[ \t]*//[ \t]*---cut(?:-before)?---[ \t]*\r?\n`)
-	reTwoslashCutAfterSanGo        = regexp.MustCompile(`\r?\n[ \t]*//[ \t]*---cut-after---[ \t]*(?:\r?\n|$)`)
-	reTwoslashAnnotationSanGo      = regexp.MustCompile(`(?m)^[ \t]*//[ \t]*@(?:noErrors|errors:[ \t]*[\d \t]+|target:[ \t]*\S+|module:[ \t]*\S+|moduleResolution:[ \t]*\S+|lib:[ \t]*\S+|strict(?::[ \t]*\S+)?)[ \t]*\r?\n`)
-	reAdmonitionDirectiveSanGo     = regexp.MustCompile(`(?im)^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]{1,200}))?[ \t]*$`)
-	reAdmonitionCloseSanGo         = regexp.MustCompile(`(?im)^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:[ \t]+[^\r\n]{0,120})?|raw|v-pre))?[ \t]*$`)
-	reBracketHeadingLinkSanGo      = regexp.MustCompile(`(?i)\[\s*<h([1-6])\b[^>"\n]{0,200}>([^<\n]{1,400})</h[1-6]>\s*\]\(([^)\s\n]+)\)`)
-	reHelpfulPromptSanGo           = regexp.MustCompile(`(?i)(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes[ \t]*No|Yes[ \t]*/[ \t]*No))?[ \t]*(?:\n|$)`)
-	reOnThisPageTailSanGo          = regexp.MustCompile(`(?i)^\n##+[ \t]+On this page[ \t]*(?:\n+(?:[-*][ \t]+\[[^\[\]\n]{1,200}\]\(#[^)\n]{1,200}\)[ \t]*)+)?[ \t]*$`)
+	reMintlifyDocIndexSanGo        = newLazyRegexp(`(?i)^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+`)
+	reMintlifyFooterSanGo          = newLazyRegexp(`(?i)^This documentation is built and hosted on \[Mintlify\]\([^)\r\n]{1,300}\),\s*a developer documentation platform\.[ \t]*$`)
+	reMinifiedSchemaJsonFenceSanGo = newLazyRegexp("(?i)^`{3,}json[ \\t]*\\r?\\n\\{\\s*\"@context\"\\s*:\\s*\"https?://schema\\.org\"[^\\r\\n]{80,}\\r?\\n`{3,}$")
+	reTwoslashWordSanGo            = newLazyRegexp(`(?i)\btwoslash\b`)
+	reTwoslashCutMarkerSanGo       = newLazyRegexp(`(?m)^[ \t]*//[ \t]*---cut(?:-(?:before|after))?---[ \t]*$`)
+	reTwoslashCutBeforeSanGo       = newLazyRegexp(`(?m)^[ \t]*//[ \t]*---cut(?:-before)?---[ \t]*\r?\n`)
+	reTwoslashCutAfterSanGo        = newLazyRegexp(`\r?\n[ \t]*//[ \t]*---cut-after---[ \t]*(?:\r?\n|$)`)
+	reTwoslashAnnotationSanGo      = newLazyRegexp(`(?m)^[ \t]*//[ \t]*@(?:noErrors|errors:[ \t]*[\d \t]+|target:[ \t]*\S+|module:[ \t]*\S+|moduleResolution:[ \t]*\S+|lib:[ \t]*\S+|strict(?::[ \t]*\S+)?)[ \t]*\r?\n`)
+	reAdmonitionDirectiveSanGo     = newLazyRegexp(`(?im)^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]{1,200}))?[ \t]*$`)
+	reAdmonitionCloseSanGo         = newLazyRegexp(`(?im)^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:[ \t]+[^\r\n]{0,120})?|raw|v-pre))?[ \t]*$`)
+	reBracketHeadingLinkSanGo      = newLazyRegexp(`(?i)\[\s*<h([1-6])\b[^>"\n]{0,200}>([^<\n]{1,400})</h[1-6]>\s*\]\(([^)\s\n]+)\)`)
+	reHelpfulPromptSanGo           = newLazyRegexp(`(?i)(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes[ \t]*No|Yes[ \t]*/[ \t]*No))?[ \t]*(?:\n|$)`)
+	reOnThisPageTailSanGo          = newLazyRegexp(`(?i)^\n##+[ \t]+On this page[ \t]*(?:\n+(?:[-*][ \t]+\[[^\[\]\n]{1,200}\]\(#[^)\n]{1,200}\)[ \t]*)+)?[ \t]*$`)
 )
 
 var uriNamedEntities = map[string]string{

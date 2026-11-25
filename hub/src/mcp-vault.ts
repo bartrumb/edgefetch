@@ -285,6 +285,98 @@ export function validateVaultMasterKey(
   return { ok: true, key: res.key };
 }
 
+const vaultTextEncoder = new TextEncoder();
+const vaultTextDecoder = new TextDecoder();
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    bin += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlToBytes(raw: string): Uint8Array {
+  const b64 = raw.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+async function deriveVaultAesGcmKey(cleanMasterKey: string, salt: Uint8Array, hkdfInfo: string): Promise<CryptoKey> {
+  const baseKey = await crypto.subtle.importKey(
+    'raw',
+    vaultTextEncoder.encode(cleanMasterKey),
+    { name: 'HKDF' },
+    false,
+    ['deriveKey'],
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: salt as BufferSource,
+      info: vaultTextEncoder.encode(hkdfInfo),
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+async function sha256Base64UrlHost(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', vaultTextEncoder.encode(input));
+  return bytesToBase64Url(new Uint8Array(digest));
+}
+
+async function computeOAuthBindHmacHost(cleanMasterKey: string, userId: string, state: string, sessionCsrf: string): Promise<string> {
+  const { macKey, macMessage } = callCoreWasm<{ macKey: string; macMessage: string }>('mcp_vault_prepare_oauth_bind', {
+    vaultMasterKey: cleanMasterKey,
+    userId,
+    state,
+    sessionCsrf,
+  });
+  const key = await crypto.subtle.importKey(
+    'raw',
+    vaultTextEncoder.encode(macKey),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, vaultTextEncoder.encode(macMessage));
+  return bytesToBase64Url(new Uint8Array(sig));
+}
+
+async function verifyOAuthBindHmacHost(
+  presented: string,
+  cleanMasterKey: string,
+  userId: string,
+  state: string,
+  sessionCsrf: string,
+): Promise<boolean> {
+  if (!presented || !/^[A-Za-z0-9_-]{43}$/.test(presented)) return false;
+  const { macKey, macMessage } = callCoreWasm<{ macKey: string; macMessage: string }>('mcp_vault_prepare_oauth_bind', {
+    vaultMasterKey: cleanMasterKey,
+    userId,
+    state,
+    sessionCsrf,
+  });
+  const key = await crypto.subtle.importKey(
+    'raw',
+    vaultTextEncoder.encode(macKey),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['verify'],
+  );
+  const sigBytes = base64UrlToBytes(presented);
+  return crypto.subtle.verify('HMAC', key, sigBytes as BufferSource, vaultTextEncoder.encode(macMessage));
+}
+
 export async function sealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
   userId: string;
@@ -303,14 +395,18 @@ export async function sealVaultCredentials(params: {
       message: string;
     }
 > {
-  const res = callCoreWasm<{
+  const prep = callCoreWasm<{
     ok: boolean;
-    ciphertext?: string;
+    cleanKey?: string;
+    hkdfInfo?: string;
+    aad?: string;
+    plaintext?: string;
+    envelopeVersion?: string;
     secretVersion?: number;
     status?: 400 | 503;
     error?: 'vault_master_key_unconfigured' | 'invalid_slug';
     message?: string;
-  }>('mcp_vault_seal_credentials', {
+  }>('mcp_vault_prepare_seal', {
     vaultMasterKey: params.vaultMasterKey ?? '',
     userId: params.userId,
     remoteOrigin: params.remoteOrigin,
@@ -320,18 +416,26 @@ export async function sealVaultCredentials(params: {
     ...(params.authType !== undefined ? { authType: params.authType } : {}),
     payload: params.payload,
   });
-  if (!res.ok || !res.ciphertext) {
+  if (!prep.ok || !prep.cleanKey || !prep.hkdfInfo || prep.aad === undefined || prep.plaintext === undefined) {
     return {
       ok: false,
-      status: res.status ?? 503,
-      error: res.error ?? 'vault_master_key_unconfigured',
-      message: res.message ?? 'Vault encryption failed',
+      status: prep.status ?? 503,
+      error: prep.error ?? 'vault_master_key_unconfigured',
+      message: prep.message ?? 'Vault encryption failed',
     };
   }
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await deriveVaultAesGcmKey(prep.cleanKey, salt, prep.hkdfInfo);
+  const encryptedBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource, additionalData: vaultTextEncoder.encode(prep.aad) },
+    aesKey,
+    vaultTextEncoder.encode(prep.plaintext),
+  );
   return {
     ok: true,
-    ciphertext: res.ciphertext,
-    secretVersion: res.secretVersion ?? 1,
+    ciphertext: `${prep.envelopeVersion ?? 'v2'}.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encryptedBuf))}`,
+    secretVersion: prep.secretVersion ?? 1,
   };
 }
 
@@ -353,14 +457,7 @@ export async function unsealVaultCredentials(params: {
   if (!params.ciphertext || typeof params.ciphertext !== 'string') {
     return { ok: false, error: 'vault_decryption_failed', message: 'Malformed vault ciphertext envelope' };
   }
-  const res = callCoreWasm<{
-    ok: boolean;
-    payload?: VaultSecretPayload;
-    resealedCiphertext?: string;
-    resealedSecretVersion?: number;
-    error?: 'vault_master_key_unconfigured' | 'vault_decryption_failed';
-    message?: string;
-  }>('mcp_vault_unseal_credentials', {
+  const wireReq = {
     vaultMasterKey: params.vaultMasterKey ?? '',
     userId: params.userId,
     remoteOrigin: params.remoteOrigin,
@@ -371,20 +468,90 @@ export async function unsealVaultCredentials(params: {
     ...(params.authType !== undefined ? { authType: params.authType } : {}),
     ...(typeof params.secretVersion === 'number' ? { secretVersion: params.secretVersion } : {}),
     ciphertext: params.ciphertext,
-  });
-  if (!res.ok || !res.payload) {
+  };
+  const prep = callCoreWasm<{
+    ok: boolean;
+    cleanKey?: string;
+    saltB64?: string;
+    ivB64?: string;
+    ctB64?: string;
+    attempts?: Array<{ hkdfInfo: string; aad: string; shouldReseal: boolean; failMessage: string }>;
+    error?: 'vault_master_key_unconfigured' | 'vault_decryption_failed';
+    message?: string;
+  }>('mcp_vault_prepare_unseal', wireReq);
+  if (!prep.ok || !prep.cleanKey || !prep.saltB64 || !prep.ivB64 || !prep.ctB64 || !prep.attempts?.length) {
     return {
       ok: false,
-      error: res.error ?? 'vault_decryption_failed',
-      message: res.message ?? 'Vault decryption failed',
+      error: prep.error ?? 'vault_decryption_failed',
+      message: prep.message ?? 'Vault decryption failed',
     };
   }
-  return {
-    ok: true,
-    payload: res.payload,
-    ...(res.resealedCiphertext ? { resealedCiphertext: res.resealedCiphertext } : {}),
-    ...(res.resealedSecretVersion !== undefined ? { resealedSecretVersion: res.resealedSecretVersion } : {}),
-  };
+  const salt = base64UrlToBytes(prep.saltB64);
+  const iv = base64UrlToBytes(prep.ivB64);
+  const ct = base64UrlToBytes(prep.ctB64);
+
+  let plainText: string | null = null;
+  let shouldReseal = false;
+  let lastFailMsg = 'AES-256-GCM authentication failed';
+  for (const att of prep.attempts) {
+    lastFailMsg = att.failMessage;
+    try {
+      const aesKey = await deriveVaultAesGcmKey(prep.cleanKey, salt, att.hkdfInfo);
+      const plainBuf = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: iv as BufferSource, additionalData: vaultTextEncoder.encode(att.aad) },
+        aesKey,
+        ct as BufferSource,
+      );
+      plainText = new TextDecoder('utf-8', { fatal: true }).decode(plainBuf);
+      shouldReseal = att.shouldReseal;
+      break;
+    } catch {
+      // try next downgrade-allowed attempt
+    }
+  }
+  if (plainText === null) {
+    return { ok: false, error: 'vault_decryption_failed', message: lastFailMsg };
+  }
+
+  const verified = callCoreWasm<{
+    ok: boolean;
+    payload?: VaultSecretPayload;
+    needsReseal?: boolean;
+    error?: 'vault_master_key_unconfigured' | 'vault_decryption_failed';
+    message?: string;
+  }>('mcp_vault_verify_unseal', {
+    ...wireReq,
+    plaintext: plainText,
+    attemptShouldReseal: shouldReseal,
+  });
+  if (!verified.ok || !verified.payload) {
+    return {
+      ok: false,
+      error: verified.error ?? 'vault_decryption_failed',
+      message: verified.message ?? 'Vault decryption failed',
+    };
+  }
+  if (verified.needsReseal) {
+    const resealed = await sealVaultCredentials({
+      vaultMasterKey: prep.cleanKey,
+      userId: params.userId,
+      remoteOrigin: params.remoteOrigin,
+      ...(params.id !== undefined ? { id: params.id } : {}),
+      ...(params.serverId !== undefined ? { serverId: params.serverId } : {}),
+      ...(params.slug !== undefined ? { slug: params.slug } : {}),
+      ...(params.authType !== undefined ? { authType: params.authType } : {}),
+      payload: verified.payload,
+    });
+    if (resealed.ok) {
+      return {
+        ok: true,
+        payload: verified.payload,
+        resealedCiphertext: resealed.ciphertext,
+        resealedSecretVersion: resealed.secretVersion,
+      };
+    }
+  }
+  return { ok: true, payload: verified.payload };
 }
 
 export function sanitizeSecretHeadersInput(params: {
@@ -1188,16 +1355,20 @@ export async function startDownstreamMcpOAuth(params: {
     probePlan.confirmedOrigin && probePlan.confirmedOrigin !== urlCheck.origin ? probePlan.confirmedOrigin : undefined;
   const canonicalResource = meta.resource ?? urlCheck.normalized;
 
-  const pkceInit = callCoreWasm<{
+  const codeVerifier = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const codeChallenge = await sha256Base64UrlHost(codeVerifier);
+  const state = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const stateHash = await sha256Base64UrlHost(state);
+  const bindCookieValue = await computeOAuthBindHmacHost(keyCheck.key, params.userId, state, params.sessionCsrf);
+
+  const pkcePrep = callCoreWasm<{
     ok: boolean;
     authorizationUrl: string;
-    bindCookieValue: string;
-    stateHash: string;
-    encryptedPkceBlob: string;
-  }>('mcp_vault_oauth_pkce_init', {
-    vaultMasterKey: keyCheck.key,
+    hkdfInfo: string;
+    aad: string;
+    plaintext: string;
+  }>('mcp_vault_prepare_oauth_pkce_init', {
     userId: params.userId,
-    sessionCsrf: params.sessionCsrf,
     remoteOrigin: urlCheck.origin,
     authorizationEndpoint: meta.authorizationEndpoint,
     tokenEndpoint: meta.tokenEndpoint,
@@ -1209,11 +1380,23 @@ export async function startDownstreamMcpOAuth(params: {
     resource: canonicalResource,
     confirmedAuthOrigin: effectiveConfirmedAuthOrigin ?? '',
     issuer: meta.issuer ?? '',
+    codeVerifier,
+    codeChallenge,
+    state,
   });
+  const pkceSalt = crypto.getRandomValues(new Uint8Array(16));
+  const pkceIv = crypto.getRandomValues(new Uint8Array(12));
+  const pkceKey = await deriveVaultAesGcmKey(keyCheck.key, pkceSalt, pkcePrep.hkdfInfo);
+  const pkceCtBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: pkceIv as BufferSource, additionalData: vaultTextEncoder.encode(pkcePrep.aad) },
+    pkceKey,
+    vaultTextEncoder.encode(pkcePrep.plaintext),
+  );
+  const encryptedPkceBlob = `pkce2.${bytesToBase64Url(pkceSalt)}.${bytesToBase64Url(pkceIv)}.${bytesToBase64Url(new Uint8Array(pkceCtBuf))}`;
 
   const now = params.now ?? Date.now();
   await params.vaultStore.putOAuthState({
-    stateHash: pkceInit.stateHash,
+    stateHash,
     userId: params.userId,
     slug,
     name: cleanName,
@@ -1223,14 +1406,14 @@ export async function startDownstreamMcpOAuth(params: {
     domains: domValidation.domains,
     autoRouteScrape,
     ...(effectiveConfirmedAuthOrigin ? { confirmedAuthOrigin: effectiveConfirmedAuthOrigin } : {}),
-    encryptedPkceBlob: pkceInit.encryptedPkceBlob,
+    encryptedPkceBlob,
     expiresAt: now + MCP_OAUTH_STATE_TTL_MS,
   });
 
   return {
     ok: true,
-    authorizationUrl: pkceInit.authorizationUrl,
-    bindCookieValue: pkceInit.bindCookieValue,
+    authorizationUrl: pkcePrep.authorizationUrl,
+    bindCookieValue,
     slug,
   };
 }
@@ -1260,31 +1443,55 @@ export async function completeDownstreamMcpOAuthCallback(params: {
     return { ok: false, status: 400, error: 'missing_code_or_state', message: 'Missing OAuth authorization code or state.' };
   }
 
-  const bindVerify = callCoreWasm<{ ok: boolean; matched?: boolean; stateHash: string }>('mcp_vault_oauth_bind_hmac', {
-    vaultMasterKey: keyCheck.key,
-    userId: params.userId,
-    state: params.state,
-    sessionCsrf: params.sessionCsrf,
-    verifyPresented: params.bindCookieHeader ?? '',
-  });
-  if (!params.bindCookieHeader || !bindVerify.matched) {
+  const bindMatched = params.bindCookieHeader
+    ? await verifyOAuthBindHmacHost(params.bindCookieHeader, keyCheck.key, params.userId, params.state, params.sessionCsrf)
+    : false;
+  if (!params.bindCookieHeader || !bindMatched) {
     return { ok: false, status: 403, error: 'invalid_oauth_state_binding', message: 'OAuth state cookie binding mismatch.' };
   }
 
+  const stateHash = await sha256Base64UrlHost(params.state);
   const now = params.now ?? Date.now();
-  const pending = await params.vaultStore.consumeOAuthState(bindVerify.stateHash, params.userId, now);
+  const pending = await params.vaultStore.consumeOAuthState(stateHash, params.userId, now);
   if (!pending) {
     return { ok: false, status: 400, error: 'expired_or_unknown_state', message: 'OAuth state expired, replayed, or belongs to another user.' };
   }
 
-  const unsealedPkce = callCoreWasm<{ ok: boolean; blob?: Record<string, unknown> }>('mcp_vault_unseal_pkce', {
-    vaultMasterKey: keyCheck.key,
+  const pkceUnsealPrep = callCoreWasm<{
+    ok: boolean;
+    hkdfInfo?: string;
+    aad?: string;
+    saltB64?: string;
+    ivB64?: string;
+    ctB64?: string;
+  }>('mcp_vault_prepare_pkce_unseal', {
     userId: params.userId,
     remoteOrigin: pending.remoteOrigin,
     ciphertext: pending.encryptedPkceBlob,
   });
-  const pkce = unsealedPkce.blob;
-  if (!unsealedPkce.ok || !pkce || typeof pkce.codeVerifier !== 'string' || typeof pkce.tokenEndpoint !== 'string' || typeof pkce.clientId !== 'string') {
+  let pkce: Record<string, unknown> | undefined;
+  if (pkceUnsealPrep.ok && pkceUnsealPrep.hkdfInfo && pkceUnsealPrep.aad && pkceUnsealPrep.saltB64 && pkceUnsealPrep.ivB64 && pkceUnsealPrep.ctB64) {
+    try {
+      const pKey = await deriveVaultAesGcmKey(keyCheck.key, base64UrlToBytes(pkceUnsealPrep.saltB64), pkceUnsealPrep.hkdfInfo);
+      const pPlainBuf = await crypto.subtle.decrypt(
+        {
+          name: 'AES-GCM',
+          iv: base64UrlToBytes(pkceUnsealPrep.ivB64) as BufferSource,
+          additionalData: vaultTextEncoder.encode(pkceUnsealPrep.aad),
+        },
+        pKey,
+        base64UrlToBytes(pkceUnsealPrep.ctB64) as BufferSource,
+      );
+      const pPlainStr = vaultTextDecoder.decode(pPlainBuf);
+      const vPkce = callCoreWasm<{ ok: boolean; blob?: Record<string, unknown> }>('mcp_vault_verify_pkce_unseal', {
+        plaintext: pPlainStr,
+      });
+      if (vPkce.ok) pkce = vPkce.blob;
+    } catch {
+      pkce = undefined;
+    }
+  }
+  if (!pkce || typeof pkce.codeVerifier !== 'string' || typeof pkce.tokenEndpoint !== 'string' || typeof pkce.clientId !== 'string') {
     return { ok: false, status: 400, error: 'corrupt_pkce_state', message: 'Unable to unseal PKCE verifier.' };
   }
 

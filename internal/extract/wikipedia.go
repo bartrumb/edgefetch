@@ -2,7 +2,6 @@ package extract
 
 import (
 	"net/url"
-	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -32,24 +31,24 @@ type ParsedWikipediaArticle struct {
 }
 
 var (
-	wikipediaLangReWikiGo               = regexp.MustCompile(`(?i)^[a-z]{2,12}(?:-[a-z0-9]{1,12}){0,2}$`)
-	reQueryDisallowedWikiGo             = regexp.MustCompile(`(?i)[?&](?:diff|veaction)=`)
-	rePositiveNumericIDWikiGo           = regexp.MustCompile(`^0*([1-9][0-9]{0,14})$`)
-	rePercentDotOnlyWikiGo              = regexp.MustCompile(`(?i)^(?:%2e|\.)+$`)
-	reGuessDisallowedWikiGo             = regexp.MustCompile(`(?i)(?:^|\s)(?:site:|filetype:|intitle:|inurl:|OR\b|AND\b|NOT\b|-)|\bhttps?://|["*?]`)
-	reGuessUpperOrPunctWikiGo           = regexp.MustCompile(`[A-Z0-9/.+-]`)
-	reGuessAllUpperDigitWikiGo          = regexp.MustCompile(`^[A-Z0-9]+$`)
-	reJumpToContentWikiGo               = regexp.MustCompile(`(?i)^\[(?:Jump to content|Zum Inhalt springen|Aller au contenu)\]\(#[^)]*\)$`)
-	reWikidataStandaloneWikiGo          = regexp.MustCompile(`(?i)^\[[^\]]{1,64}\]\(https?://(?:www\.)?wikidata\.org/wiki/Special:EntityPage/[^)]*\)$`)
-	reFromWikipediaWikiGo               = regexp.MustCompile(`(?i)^(?:From Wikipedia, the free encyclopedia|Aus Wikipedia, der freien Enzyklopädie|Un article de Wikipédia, l'encyclopédie libre\.?)$`)
-	reLanguageCountWikiGo               = regexp.MustCompile(`(?i)^\d{1,4}[ \t]+(?:languages|language|Sprachen|langues|idiomas|lingue)$`)
-	reFlaggedRevsWikiGo                 = regexp.MustCompile(`(?i)^(?:\*{1,2})?(?:Checked|Gesichtet|Vérifié|Revisado)(?:\*{1,2})?$`)
-	reWikidataEntityURLWikiGo           = regexp.MustCompile(`(?i)^https?://(?:www\.)?wikidata\.org/wiki/Special:EntityPage/`)
-	reActionEditURLWikiGo               = regexp.MustCompile(`(?i)[?&]action=edit`)
-	reCiteURLWikiGo                     = regexp.MustCompile(`(?i)(?:^#cite_(?:note|ref)|Wikipedia:(?:Citation_needed|Please_clarify|Disputed_statement))`)
-	reCiteLabelWikiGo                   = regexp.MustCompile(`(?is)^(?:\d{1,4}|[a-z]|(?:note|nb|lower-alpha|upper-alpha)[ \t]*\d{1,3}|citation needed|clarification needed|when\?|who\?|dubious.{0,48})$`)
-	reEditMarkerInnerWikiGo             = regexp.MustCompile(`(?i)^(?:edit|Bearbeiten(?:[ \t]*\|[ \t]*Quelltext bearbeiten)?|modifier(?:[ \t]*\|[ \t]*modifier le code)?|editar|citation needed|clarification needed|when\?|who\?|dubious[ \t]*[–-][ \t]*discuss)$`)
-	reFnBacklinkWikiGo                  = regexp.MustCompile(`(?i)^\[\^[a-z0-9]{1,32}\][ \t]*`)
+	wikipediaLangReWikiGo               = newLazyRegexp(`(?i)^[a-z]{2,12}(?:-[a-z0-9]{1,12}){0,2}$`)
+	reQueryDisallowedWikiGo             = newLazyRegexp(`(?i)[?&](?:diff|veaction)=`)
+	rePositiveNumericIDWikiGo           = newLazyRegexp(`^0*([1-9][0-9]{0,14})$`)
+	rePercentDotOnlyWikiGo              = newLazyRegexp(`(?i)^(?:%2e|\.)+$`)
+	reGuessDisallowedWikiGo             = newLazyRegexp(`(?i)(?:^|\s)(?:site:|filetype:|intitle:|inurl:|OR\b|AND\b|NOT\b|-)|\bhttps?://|["*?]`)
+	reGuessUpperOrPunctWikiGo           = newLazyRegexp(`[A-Z0-9/.+-]`)
+	reGuessAllUpperDigitWikiGo          = newLazyRegexp(`^[A-Z0-9]+$`)
+	reJumpToContentWikiGo               = newLazyRegexp(`(?i)^\[(?:Jump to content|Zum Inhalt springen|Aller au contenu)\]\(#[^)]*\)$`)
+	reWikidataStandaloneWikiGo          = newLazyRegexp(`(?i)^\[[^\]]{1,64}\]\(https?://(?:www\.)?wikidata\.org/wiki/Special:EntityPage/[^)]*\)$`)
+	reFromWikipediaWikiGo               = newLazyRegexp(`(?i)^(?:From Wikipedia, the free encyclopedia|Aus Wikipedia, der freien Enzyklopädie|Un article de Wikipédia, l'encyclopédie libre\.?)$`)
+	reLanguageCountWikiGo               = newLazyRegexp(`(?i)^\d{1,4}[ \t]+(?:languages|language|Sprachen|langues|idiomas|lingue)$`)
+	reFlaggedRevsWikiGo                 = newLazyRegexp(`(?i)^(?:\*{1,2})?(?:Checked|Gesichtet|Vérifié|Revisado)(?:\*{1,2})?$`)
+	reWikidataEntityURLWikiGo           = newLazyRegexp(`(?i)^https?://(?:www\.)?wikidata\.org/wiki/Special:EntityPage/`)
+	reActionEditURLWikiGo               = newLazyRegexp(`(?i)[?&]action=edit`)
+	reCiteURLWikiGo                     = newLazyRegexp(`(?i)(?:^#cite_(?:note|ref)|Wikipedia:(?:Citation_needed|Please_clarify|Disputed_statement))`)
+	reCiteLabelWikiGo                   = newLazyRegexp(`(?is)^(?:\d{1,4}|[a-z]|(?:note|nb|lower-alpha|upper-alpha)[ \t]*\d{1,3}|citation needed|clarification needed|when\?|who\?|dubious.{0,48})$`)
+	reEditMarkerInnerWikiGo             = newLazyRegexp(`(?i)^(?:edit|Bearbeiten(?:[ \t]*\|[ \t]*Quelltext bearbeiten)?|modifier(?:[ \t]*\|[ \t]*modifier le code)?|editar|citation needed|clarification needed|when\?|who\?|dubious[ \t]*[–-][ \t]*discuss)$`)
+	reFnBacklinkWikiGo                  = newLazyRegexp(`(?i)^\[\^[a-z0-9]{1,32}\][ \t]*`)
 	nonEditionWikipediaSubdomainsWikiGo = map[string]bool{
 		"www":        true,
 		"m":          true,
@@ -691,7 +690,7 @@ func ParseWikipediaArticleURL(rawURL string) *ParsedWikipediaArticle {
 	}
 }
 
-var reWikiTitleSuffixWikiGo = regexp.MustCompile(`(?i)\s+[–—-]\s+(?:Wikipedia|Wikipédia|Wikipedie|Wikipédia,.*|Wikipedia,.*)$`)
+var reWikiTitleSuffixWikiGo = newLazyRegexp(`(?i)\s+[–—-]\s+(?:Wikipedia|Wikipédia|Wikipedie|Wikipédia,.*|Wikipedia,.*)$`)
 
 // ResolveWikipediaCanonicalFinalURL resolves the canonical `https://<lang>.wikipedia.org/wiki/<Title>` URL
 // from requestedURL and responseFinalURL.

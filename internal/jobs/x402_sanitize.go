@@ -5,45 +5,44 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
 var (
-	reRedirectFilterPath  = regexp.MustCompile(`(?i)/(?:role|roles|search|category|department|team|location|tag|filter|q)\b`)
-	reRedirectGenericPath = regexp.MustCompile(`(?i)^/(?:jobs?|careers?|remote|openings?)?$`)
+	reRedirectFilterPath  = newLazyRegexp(`(?i)/(?:role|roles|search|category|department|team|location|tag|filter|q)\b`)
+	reRedirectGenericPath = newLazyRegexp(`(?i)^/(?:jobs?|careers?|remote|openings?)?$`)
 
-	reBase64HeaderCand     = regexp.MustCompile(`^[A-Za-z0-9+/_=-]{8,}$`)
-	reTestnetNetwork       = regexp.MustCompile(`(?i)(?:sepolia|goerli|holesky|testnet|devnet|mumbai|amoy|fuji)`)
-	reDeceptive402Token    = regexp.MustCompile(`(?i)(?:\b(?:gratis|free|trial|complimentary|paid|prepaid|waived|comped|zero|refunded|settled|included|authorized|authorised|allowed|bypass|exempt|sponsored|covered|ok|go|yes)\b|free|gratis|complimentary|ok2fetch|oktofetch|freetrial|nocost|nofee|nocharge|prepaid|already[-_.: ]*paid|fr33|f2ee)`)
-	reX402InjectionProse   = regexp.MustCompile(`(?i)\b(?:ignore|disregard|forget|override|system[ \t]+prompt|assistant[ \t]*:|pre-?authori[sz]ed|already[ \t]+settled|fetch_url|bearer[ \t]+token|rm[ \t]+-rf|instructions?)\b`)
-	reZeroValue402Price    = regexp.MustCompile(`^[$€£]?\s*0+(?:\.0+)?(?:\b|\s|$)`)
-	reANSICSIorOSCX402     = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?`)
-	reX402DisallowedURLInl = regexp.MustCompile(`(?i)\b(?:https?|ftp|javascript|vbscript|data|file|blob):[^\s)]*`)
-	reX402SchemePrefix     = regexp.MustCompile(`(?i)^(?:https?|ftp|javascript|vbscript|data|file|blob):`)
-	reX402IdentScheme      = regexp.MustCompile(`^[A-Za-z0-9._-]{1,32}$`)
-	reX402IdentNetwork     = regexp.MustCompile(`^[A-Za-z0-9:._-]{1,48}$`)
-	reX402IdentPayTo       = regexp.MustCompile(`^[A-Za-z0-9:._@-]{1,128}$`)
-	reX402IdentInvoice     = regexp.MustCompile(`^[A-Za-z0-9+/=_.:-]{1,512}$`)
-	reX402IdentMacaroon    = regexp.MustCompile(`^[A-Za-z0-9+/=_."':-]{1,512}$`)
-	reX402HexContract      = regexp.MustCompile(`^0x[A-Za-z0-9]{4,64}$`)
-	reX402SolanaMint       = regexp.MustCompile(`^[1-9A-HJ-NP-Za-km-z]{32,44}$`)
-	reX402StandalonePrice  = regexp.MustCompile(`^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$`)
-	reX402PriceNumPart     = regexp.MustCompile(`^\$?(\d{1,12}(?:\.\d{1,8})?)`)
-	reX402PriceTailCur     = regexp.MustCompile(` [A-Z0-9]{2,10}$`)
-	reX402CurCode          = regexp.MustCompile(`^[A-Z0-9]{2,10}$`)
-	reX402Digits1to30      = regexp.MustCompile(`^\d{1,30}$`)
-	reX402AuthScheme       = regexp.MustCompile(`(?i)^(?:x402|l402|lsat)$`)
+	reBase64HeaderCand     = newLazyRegexp(`^[A-Za-z0-9+/_=-]{8,}$`)
+	reTestnetNetwork       = newLazyRegexp(`(?i)(?:sepolia|goerli|holesky|testnet|devnet|mumbai|amoy|fuji)`)
+	reDeceptive402Token    = newLazyRegexp(`(?i)(?:\b(?:gratis|free|trial|complimentary|paid|prepaid|waived|comped|zero|refunded|settled|included|authorized|authorised|allowed|bypass|exempt|sponsored|covered|ok|go|yes)\b|free|gratis|complimentary|ok2fetch|oktofetch|freetrial|nocost|nofee|nocharge|prepaid|already[-_.: ]*paid|fr33|f2ee)`)
+	reX402InjectionProse   = newLazyRegexp(`(?i)\b(?:ignore|disregard|forget|override|system[ \t]+prompt|assistant[ \t]*:|pre-?authori[sz]ed|already[ \t]+settled|fetch_url|bearer[ \t]+token|rm[ \t]+-rf|instructions?)\b`)
+	reZeroValue402Price    = newLazyRegexp(`^[$€£]?\s*0+(?:\.0+)?(?:\b|\s|$)`)
+	reANSICSIorOSCX402     = newLazyRegexp(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?`)
+	reX402DisallowedURLInl = newLazyRegexp(`(?i)\b(?:https?|ftp|javascript|vbscript|data|file|blob):[^\s)]*`)
+	reX402SchemePrefix     = newLazyRegexp(`(?i)^(?:https?|ftp|javascript|vbscript|data|file|blob):`)
+	reX402IdentScheme      = newLazyRegexp(`^[A-Za-z0-9._-]{1,32}$`)
+	reX402IdentNetwork     = newLazyRegexp(`^[A-Za-z0-9:._-]{1,48}$`)
+	reX402IdentPayTo       = newLazyRegexp(`^[A-Za-z0-9:._@-]{1,128}$`)
+	reX402IdentInvoice     = newLazyRegexp(`^[A-Za-z0-9+/=_.:-]{1,512}$`)
+	reX402IdentMacaroon    = newLazyRegexp(`^[A-Za-z0-9+/=_."':-]{1,512}$`)
+	reX402HexContract      = newLazyRegexp(`^0x[A-Za-z0-9]{4,64}$`)
+	reX402SolanaMint       = newLazyRegexp(`^[1-9A-HJ-NP-Za-km-z]{32,44}$`)
+	reX402StandalonePrice  = newLazyRegexp(`^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$`)
+	reX402PriceNumPart     = newLazyRegexp(`^\$?(\d{1,12}(?:\.\d{1,8})?)`)
+	reX402PriceTailCur     = newLazyRegexp(` [A-Z0-9]{2,10}$`)
+	reX402CurCode          = newLazyRegexp(`^[A-Z0-9]{2,10}$`)
+	reX402Digits1to30      = newLazyRegexp(`^\d{1,30}$`)
+	reX402AuthScheme       = newLazyRegexp(`(?i)^(?:x402|l402|lsat)$`)
 
-	reContentSignalProb = regexp.MustCompile(`(?i)content-signal|ai-input\s*=\s*no`)
-	reDNSNotFoundProb   = regexp.MustCompile(`(?i)\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist`)
-	reRobotsProb        = regexp.MustCompile(`(?i)robots\.txt`)
-	reChallengeProb     = regexp.MustCompile(`(?i)challenge|cf-mitigated|turnstile|captcha|verify you are human`)
-	reChallenge403Prob  = regexp.MustCompile(`(?i)cloudflare|bot|forbidden`)
-	reBlockedJobBoards  = regexp.MustCompile(`(?i)(?:^|\.)(?:linkedin\.com|indeed\.com|dice\.com|icims\.com|startup\.jobs|glassdoor\.com|ziprecruiter\.com)$`)
-	rePyPIJSONPath      = regexp.MustCompile(`(?i)/json/?$`)
+	reContentSignalProb = newLazyRegexp(`(?i)content-signal|ai-input\s*=\s*no`)
+	reDNSNotFoundProb   = newLazyRegexp(`(?i)\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist`)
+	reRobotsProb        = newLazyRegexp(`(?i)robots\.txt`)
+	reChallengeProb     = newLazyRegexp(`(?i)challenge|cf-mitigated|turnstile|captcha|verify you are human`)
+	reChallenge403Prob  = newLazyRegexp(`(?i)cloudflare|bot|forbidden`)
+	reBlockedJobBoards  = newLazyRegexp(`(?i)(?:^|\.)(?:linkedin\.com|indeed\.com|dice\.com|icims\.com|startup\.jobs|glassdoor\.com|ziprecruiter\.com)$`)
+	rePyPIJSONPath      = newLazyRegexp(`(?i)/json/?$`)
 
 	knownMainnetUSDCContracts = map[string][]string{
 		"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913":   {"base", "base-mainnet", "eip155:8453"},
@@ -376,7 +375,7 @@ func sanitizeX402PlainField(raw any, maxLen int, strictIdentifier bool) string {
 	return strings.TrimSpace(sliceUTF16Max(withoutURLs, maxLen))
 }
 
-func sanitizeX402Identifier(raw any, re *regexp.Regexp, maxLen int) string {
+func sanitizeX402Identifier(raw any, re *lazyRegexp, maxLen int) string {
 	s := sanitizeX402String(raw, maxLen+8)
 	if s == "" || len(s) > maxLen {
 		return ""

@@ -1,3 +1,5 @@
+//go:build !wasip1
+
 package mcpfed
 
 import (
@@ -291,5 +293,103 @@ func TestPKCEBlobHMACAndValidationHelpers(t *testing.T) {
 		if _, ok, _ := SanitizeSecretHeadersInput(nil, json.RawMessage(badHdr), true); ok {
 			t.Fatalf("expected bad secret header %s to fail", badHdr)
 		}
+	}
+}
+
+func TestVaultCrossImplKnownAnswerVectors(t *testing.T) {
+	// Shared Known-Answer Test (KAT) vectors mirrored byte-for-byte in `hub/test/mcp-federation.test.ts`
+	// (`masterKey = testMasterKey`, `salt = "0123456789abcdef"`, `iv = "fedcba987654"`):
+	const (
+		katV2FiveField  = "v2.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.ThW41skD9EZIY8WR3mTcg46ojnbEPhpj8oty1o3nH-_Wh3oeNwSzpG0TibQHDiLvZlfAjJ3aYrNsS7UB7ctAsw2Xi_kBSyUD06Sx7SYl4JONM0PIFWSL6Th84zYm5CoS0wzn9Q2QdOHKKVXDWAj0kL0t9pzPYJzWmxMd7PIQS2a3SBkyIQQnikvfVVAQlnkNRoEyWCBt7rVClAA836bcBZ_XYeLb5GjtV5bY7Rs_rc-orq-LIB5XglX94A9Xxk50oIRij-YgN1O_zSZScgULalXaoSj4GtU6tr7wRglsRcl83ZlSR41qkvOv0TKg7H3t9Qevj7yLKcT_YlrdnUh_EREFBgKYxn23U0K5biWK-MHe9JkXtGe6WH0C"
+		katV2TwoField   = "v2.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.ThW41skD9EZIY8WR3mTcg46ojnbEPhpj8oty1o3nH-_Wh3oeNwSzpG0TibQHDiLvZlfAjJ3aYrNsS7UZ4cRKsxux269YU0Ye07iu7HVwroqHLAOGRiis7Ssg5zR2py4f_Fj5iFeTfODDP3mVDRj0rOR77obPeYnEilhIoKVZDFaNRAgnDFcukVPlURF1hm4LUIEocz1j6aMOyzkikw68edDbz1BfN8GPHWk"
+		katV1LengthPref = "v1.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.5GO5JdzXAJINsO2v72Vpm5RHB3VmYjKaYz__olQEXSutfgJqLIHNJBtH--1vA001U-pypOEBscqX1UBzKYDRlG4BJh87Dyfl7IQZ-7fa5th3T3sjdaLRybYckqGn5zUjifA84B_qiiT0eQvDq5wb65dBreGsK9G3KptPSys"
+		katV270Legacy   = "v1.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.3xPoth6GY96_i-hybHp46TVh82W5J1XAtNR9M3tGIeeR20k62QZ2z8Jtp576fkjqtJCeCZmYTB0d6OSRsSq8T_UtGLE0DH1KuoE9iTcqhlpJvKl8l_ZF8Yis7mZ5eBAtV8ZhibQnmFZCufTJ51929BpA_qzdqFJvfZvUMg0"
+		katPKCE2        = "pkce2.MDEyMzQ1Njc4OWFiY2RlZg.ZmVkY2JhOTg3NjU0.rIWg0dVMH4e26w-GR4-YcTbPInQjS7GJ9_DidnaKtcflpWRI5VQD1NsOhP4ut8ICUYIsKwFBkn60l4pAoyFNNUFIMwH-aWwUEH9wXhvUUpphInkveed1oaAsaXfVWN6rF83KkdcX6GwFYuM3sDPYO75cHLjs98wEVbTfXIDIF6J30KVc5-_kse72aX5WvNyIXwkceBBe4JOGdpudCPF1cru443o2NatN9-d9Qe6KzGsppm-T029CyFfPaC71UymyLbVY-01b5N6DqSM8Cd4ue2Ep9ZChBXbQGbrG_iEZ7U5mrFD_9C87Nl2zludfFyW4Haac9o-5VBtr9NO0Hjc7AShu0lPjwdZ5SFFyANtMY91d3TQPCRLOl7BlqOgIQvh3eoIgMjHIHdOFEABUONi9-OSXglnDkoai2bA4wn84QLl67lanpa85QkKTx3qNspkJJTAcqew"
+		katBindHMAC     = "y-yn6kpxWI0KrlHLiKia91MfSooumt-wbb79IbRSQ5g"
+	)
+
+	fixedSalt := []byte("0123456789abcdef")
+	fixedIV := []byte("fedcba987654")
+
+	// 1. Native Go PrepareSealVaultEnvelope + HKDF + AES-GCM produces the exact KAT v2 5-field ciphertext
+	prep := PrepareSealVaultEnvelope(SealVaultParams{
+		VaultMasterKey: testMasterKey,
+		UserID:         "gh_1001",
+		RemoteOrigin:   "https://mcp.linear.app",
+		ID:             strPtr("mcp_row_alpha"),
+		Slug:           strPtr("linear-prod"),
+		AuthType:       strPtr("headers"),
+		Payload: OrderedObject{
+			{Key: "kind", Value: "headers"},
+			{Key: "pinnedOrigin", Value: "https://mcp.linear.app"},
+			{Key: "pinnedUrl", Value: "https://mcp.linear.app/mcp"},
+			{Key: "headers", Value: OrderedObject{{Key: "Authorization", Value: "Bearer lin_v2_secret_token"}}},
+		},
+	})
+	if !prep.OK {
+		t.Fatalf("PrepareSealVaultEnvelope failed: %+v", prep)
+	}
+	aesKey, err := hkdf.Key(sha256.New, []byte(prep.CleanKey), fixedSalt, prep.HKDFInfo, 32)
+	if err != nil {
+		t.Fatalf("hkdf.Key: %v", err)
+	}
+	ctBytes, err := aes256GCMSeal(aesKey, fixedIV, []byte(prep.Plaintext), []byte(prep.AAD))
+	if err != nil {
+		t.Fatalf("aes256GCMSeal: %v", err)
+	}
+	goSealedV2 := prep.EnvelopeVersion + "." + encodeBase64URL(fixedSalt) + "." + encodeBase64URL(fixedIV) + "." + encodeBase64URL(ctBytes)
+	if goSealedV2 != katV2FiveField {
+		t.Fatalf("Go fixed-nonce seal mismatch:\n got: %s\nwant: %s", goSealedV2, katV2FiveField)
+	}
+
+	// 2. Native Go UnsealVaultCredentials opens WebCrypto KAT vectors (v2 5-field, v2 2-field, v1, v2.7.0)
+	//    and enforces P6/M8 version-downgrade rejection when SecretVersion=2!
+	u5 := UnsealVaultCredentials(UnsealVaultParams{
+		VaultMasterKey: testMasterKey, UserID: "gh_1001", RemoteOrigin: "https://mcp.linear.app", RemoteURL: "https://mcp.linear.app/mcp",
+		ID: strPtr("mcp_row_alpha"), Slug: strPtr("linear-prod"), AuthType: strPtr("headers"), SecretVersion: intPtr(2), Ciphertext: katV2FiveField,
+	})
+	if !u5.OK || u5.ResealedCiphertext != "" {
+		t.Fatalf("expected katV2FiveField to unseal without reseal: %+v", u5)
+	}
+
+	for _, legacyTC := range []struct {
+		name string
+		ct   string
+	}{
+		{"v2_2field", katV2TwoField},
+		{"v1_len_prefixed", katV1LengthPref},
+		{"v270_legacy", katV270Legacy},
+	} {
+		// Downgrade to legacy ciphertext on a row already at SecretVersion=2 MUST fail closed (P6/M8)!
+		down := UnsealVaultCredentials(UnsealVaultParams{
+			VaultMasterKey: testMasterKey, UserID: "gh_1001", RemoteOrigin: "https://mcp.linear.app",
+			ID: strPtr("mcp_row_alpha"), Slug: strPtr("linear-prod"), AuthType: strPtr("headers"), SecretVersion: intPtr(2), Ciphertext: legacyTC.ct,
+		})
+		if down.OK {
+			t.Fatalf("%s: expected P6/M8 downgrade rejection when SecretVersion=2", legacyTC.name)
+		}
+		// Pre-v2 row (SecretVersion=1) MUST decrypt and auto-reseal to v2 SecretVersion=2!
+		up := UnsealVaultCredentials(UnsealVaultParams{
+			VaultMasterKey: testMasterKey, UserID: "gh_1001", RemoteOrigin: "https://mcp.linear.app",
+			ID: strPtr("mcp_row_alpha"), Slug: strPtr("linear-prod"), AuthType: strPtr("headers"), SecretVersion: intPtr(1), Ciphertext: legacyTC.ct,
+		})
+		if !up.OK || !strings.HasPrefix(up.ResealedCiphertext, "v2.") || up.ResealedSecretVersion == nil || *up.ResealedSecretVersion != 2 {
+			t.Fatalf("%s: expected SecretVersion=1 legacy row to decrypt and auto-reseal, got %+v", legacyTC.name, up)
+		}
+	}
+
+	// 3. PKCE2 & OAuth Bind HMAC KAT verification
+	pkceObj, pkceOK := UnsealPKCEStateBlob(testMasterKey, "gh_1001", "https://mcp.acme.example", katPKCE2)
+	if !pkceOK {
+		t.Fatal("expected UnsealPKCEStateBlob on katPKCE2 to succeed")
+	}
+	if cv, _ := pkceObj.GetString("codeVerifier"); cv != "verifier_1234567890_abcdefghijklmnopqrstuvwxyz" {
+		t.Fatalf("unexpected katPKCE2 codeVerifier: %q", cv)
+	}
+	if gotHMAC := ComputeMCPOAuthBindHMAC(testMasterKey, "gh_1001", "st_1", "csrf_1"); gotHMAC != katBindHMAC {
+		t.Fatalf("ComputeMCPOAuthBindHMAC mismatch: got %q want %q", gotHMAC, katBindHMAC)
+	}
+	if !VerifyMCPOAuthBindHMAC(katBindHMAC, testMasterKey, "gh_1001", "st_1", "csrf_1") {
+		t.Fatal("expected VerifyMCPOAuthBindHMAC on katBindHMAC to succeed")
 	}
 }

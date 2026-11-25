@@ -2,7 +2,6 @@ package extract
 
 import (
 	"net/url"
-	"regexp"
 	"strings"
 )
 
@@ -37,7 +36,7 @@ type LlmsDiscovery struct {
 	RelatedLinks    []LlmsLink `json:"relatedLinks,omitempty"`
 }
 
-var reLlmsItem = regexp.MustCompile(`^[-*]\s+\[([^\]]+)\]\(([^)]+)\)(?:\s*:\s*(.*))?$`)
+var reLlmsItem = newLazyRegexp(`^[-*]\s+\[([^\]]+)\]\(([^)]+)\)(?:\s*:\s*(.*))?$`)
 
 // ParseLlmsTxt parses an `llms.txt` Markdown file, rejecting HTML 200 soft-404 pages masquerading as `/llms.txt`.
 func ParseLlmsTxt(raw, sourceURL string) (*LlmsDocument, bool) {

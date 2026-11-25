@@ -3,7 +3,6 @@ package mcpfed
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 )
 
@@ -12,11 +11,11 @@ const (
 )
 
 var (
-	safeMCPIdentifierRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
-	promptInjMCPIDRe    = regexp.MustCompile(`(?i)(?:^|[_.-])(?:ignore|disregard|override|bypass|exfiltrate|jailbreak|forget)(?:[_.-]|$|[A-Z])|system[_.-]?(?:prompt|instruction|message|override)|developer[_.-]?(?:prompt|instruction|message)|prompt[_.-]?injection`)
-	safeMCPSlugRe       = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
-	doubleUnderscoreRe  = regexp.MustCompile(`__+`)
-	httpTokenHeaderRe   = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,80}$")
+	safeMCPIdentifierRe = newLazyRegexp(`^[A-Za-z0-9_.-]{1,64}$`)
+	promptInjMCPIDRe    = newLazyRegexp(`(?i)(?:^|[_.-])(?:ignore|disregard|override|bypass|exfiltrate|jailbreak|forget)(?:[_.-]|$|[A-Z])|system[_.-]?(?:prompt|instruction|message|override)|developer[_.-]?(?:prompt|instruction|message)|prompt[_.-]?injection`)
+	safeMCPSlugRe       = newLazyRegexp(`^[a-z0-9][a-z0-9_-]{0,47}$`)
+	doubleUnderscoreRe  = newLazyRegexp(`__+`)
+	httpTokenHeaderRe   = newLazyRegexp("^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,80}$")
 )
 
 var forbiddenMCPIdentifiers = map[string]bool{

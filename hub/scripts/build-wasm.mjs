@@ -39,6 +39,19 @@ function newestMtimeMs(dirPath) {
   return maxMs;
 }
 
+function assertZeroStdlibCryptoDeps(depListOutput) {
+  const cryptoPkgs = String(depListOutput)
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((pkg) => pkg === 'crypto' || pkg.startsWith('crypto/'));
+  if (cryptoPkgs.length > 0) {
+    throw new Error(
+      `[build-wasm] Forbidden Go stdlib crypto/ dependency in GOOS=wasip1 GOARCH=wasm ./cmd/edgefetch-wasm ` +
+        `(pulls in Go 1.26 32 MiB fips140/drbg.memory BSS): ${cryptoPkgs.join(', ')}`,
+    );
+  }
+}
+
 export function ensureCoreWasmBuilt() {
   if (process.env.EDGEFETCH_SKIP_WASM_BUILD === '1' && existsSync(outWasmPath)) {
     return outWasmPath;
@@ -69,6 +82,17 @@ export function ensureCoreWasmBuilt() {
   ];
 
   try {
+    const depOut = execFileSync('go', ['list', '-deps', './cmd/edgefetch-wasm'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GOOS: 'wasip1',
+        GOARCH: 'wasm',
+        CGO_ENABLED: '0',
+      },
+    });
+    assertZeroStdlibCryptoDeps(depOut);
     execFileSync('go', buildArgs, {
       cwd: repoRoot,
       stdio: 'inherit',
@@ -81,10 +105,24 @@ export function ensureCoreWasmBuilt() {
     });
     return outWasmPath;
   } catch (nativeErr) {
+    if (String(nativeErr?.message ?? '').includes('Forbidden Go stdlib crypto/')) {
+      throw nativeErr;
+    }
     if (process.platform === 'win32') {
       const wslRepo = repoRoot
         .replace(/\\/g, '/')
         .replace(/^([A-Za-z]):/, (_m, d) => `/mnt/${d.toLowerCase()}`);
+      const depOutWsl = execFileSync(
+        'wsl',
+        [
+          '-e',
+          'bash',
+          '-lc',
+          `export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" && cd "${wslRepo}" && GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go list -deps ./cmd/edgefetch-wasm`,
+        ],
+        { encoding: 'utf8' },
+      );
+      assertZeroStdlibCryptoDeps(depOutWsl);
       execFileSync(
         'wsl',
         [

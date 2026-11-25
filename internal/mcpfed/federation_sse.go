@@ -4,16 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 )
 
 var (
-	mcpQueryTokenSplitRe   = regexp.MustCompile(`[\s<>()"'\[\]{},;]+`)
-	sensitiveQueryParamRe  = regexp.MustCompile(`(?i)^(?:token|access_token|id_token|refresh_token|api[_.-]?key|key|secret|password|passwd|pwd|sig|signature|x-amz-signature|x-goog-signature|code|session|session_id|jwt|auth)$`)
-	scrapeReadToolPrefixRe = regexp.MustCompile(`(?i)^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.-]|$|[A-Z])`)
-	mcpSessionIDHeaderRe   = regexp.MustCompile(`^[\x21-\x7e]{1,256}$`)
+	mcpQueryTokenSplitRe   = newLazyRegexp(`[\s<>()"'\[\]{},;]+`)
+	sensitiveQueryParamRe  = newLazyRegexp(`(?i)^(?:token|access_token|id_token|refresh_token|api[_.-]?key|key|secret|password|passwd|pwd|sig|signature|x-amz-signature|x-goog-signature|code|session|session_id|jwt|auth)$`)
+	scrapeReadToolPrefixRe = newLazyRegexp(`(?i)^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.-]|$|[A-Z])`)
+	mcpSessionIDHeaderRe   = newLazyRegexp(`^[\x21-\x7e]{1,256}$`)
 )
 
 // RPCID represents an optional string or numeric JSON-RPC 2.0 request ID.

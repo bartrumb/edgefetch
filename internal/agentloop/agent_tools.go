@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -136,16 +135,16 @@ var (
 		"__proto__": true, "constructor": true, "prototype": true,
 	}
 
-	reSafeMCPIdentifier       = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
-	reSafeMCPConnectorSlug    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
-	rePromptInjectionMCPID    = regexp.MustCompile(`(?i)(?:^|[_.-])(?:ignore|disregard|override|bypass|exfiltrate|jailbreak|forget)(?:[_.-]|$|[A-Z])|system[_.-]?(?:prompt|instruction|message|override)|developer[_.-]?(?:prompt|instruction|message)|prompt[_.-]?injection`)
-	reSafeRemoteEnumToken     = regexp.MustCompile(`^[A-Za-z0-9_.:/-]{1,32}$`)
-	reANSICSI                 = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
-	reMCPDirectiveInjection   = regexp.MustCompile(`(?i)\b(?:note|instruction|message|directive|reminder)\s+to\s+(?:the\s+)?(?:ai|llm|assistant|model|agent)\b|\bcall\s+query_mcp\s*\(|\bpre-authori[sz]ed\b|\bdo\s+not\s+ask\s+(?:the\s+user\s+)?for\s+confirmation\b|\bwhen\s+summarizing[^.\n]{0,80}\b(?:append|include|output|exfiltrate)\b`)
-	reUntrustedBoundaryTag    = regexp.MustCompile(`(?i)<(\s*/?\s*untrusted_[a-z0-9_-]*)`)
-	reDangerousMarkdownScheme = regexp.MustCompile(`(?i)^(?:javascript|vbscript|data|file|blob)\s*:`)
-	reSafeEnvelopeAttrKey     = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$`)
-	reDescUnsafeChars         = regexp.MustCompile("[`<>]")
+	reSafeMCPIdentifier       = newLazyRegexp(`^[A-Za-z0-9_.-]{1,64}$`)
+	reSafeMCPConnectorSlug    = newLazyRegexp(`^[a-z0-9][a-z0-9_-]{0,47}$`)
+	rePromptInjectionMCPID    = newLazyRegexp(`(?i)(?:^|[_.-])(?:ignore|disregard|override|bypass|exfiltrate|jailbreak|forget)(?:[_.-]|$|[A-Z])|system[_.-]?(?:prompt|instruction|message|override)|developer[_.-]?(?:prompt|instruction|message)|prompt[_.-]?injection`)
+	reSafeRemoteEnumToken     = newLazyRegexp(`^[A-Za-z0-9_.:/-]{1,32}$`)
+	reANSICSI                 = newLazyRegexp(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	reMCPDirectiveInjection   = newLazyRegexp(`(?i)\b(?:note|instruction|message|directive|reminder)\s+to\s+(?:the\s+)?(?:ai|llm|assistant|model|agent)\b|\bcall\s+query_mcp\s*\(|\bpre-authori[sz]ed\b|\bdo\s+not\s+ask\s+(?:the\s+user\s+)?for\s+confirmation\b|\bwhen\s+summarizing[^.\n]{0,80}\b(?:append|include|output|exfiltrate)\b`)
+	reUntrustedBoundaryTag    = newLazyRegexp(`(?i)<(\s*/?\s*untrusted_[a-z0-9_-]*)`)
+	reDangerousMarkdownScheme = newLazyRegexp(`(?i)^(?:javascript|vbscript|data|file|blob)\s*:`)
+	reSafeEnvelopeAttrKey     = newLazyRegexp(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$`)
+	reDescUnsafeChars         = newLazyRegexp("[`<>]")
 )
 
 // DoesMCPServerSelectorMatchRow enforces S7: mcpServers selectors match strictly by exact connector id or slug (case-insensitive).

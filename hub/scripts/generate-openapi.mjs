@@ -23,7 +23,7 @@ try {
       js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);",
     },
     alias: { 'cloudflare:workers': resolve(hubRoot, 'test', 'cloudflare-workers-stub.ts') },
-    loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text' },
+    loader: { '.sql': 'text', '.yaml': 'text', '.yml': 'text', '.wasm': 'binary' },
   });
 
   const mod = await import(pathToFileURL(tmpEntry).href);

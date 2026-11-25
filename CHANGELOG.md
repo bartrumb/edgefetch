@@ -2,6 +2,17 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] - 2026-11-25
+
+### Changed
+- **Go-First Architecture Consolidation (2 Runtimes Down From 4):**
+  - Consolidated all HTML-to-Markdown extraction, CommonMark `S1`–`S5` fence sanitization, `read_artifact` slice paging, Schema.org JSON-LD, framework state hydration, CMS auto-twins, Wikipedia linear cleaning, 56 declarative YAML manifests, ATS `jobs` + `x402`, Shopify/WooCommerce `catalog` diffing, BYO-LLM `/v1/agent` loop, and AES-256-GCM MCP federation/vault into Go (`internal/extract`, `internal/jobs`, `internal/catalog`, `internal/agentloop`, `internal/mcpfed`) compiled to embedded `edgefetch-core.wasm` for Cloudflare Workers.
+  - Promoted Pure-Go `edgefetch --mode=hub` (`internal/hub`, `internal/hub/hubstore`, `internal/hub/hubauth`) to full 17-tool MCP, REST `/v1/*` + `/v2/*`, OAuth 2.1 PKCE `S256`, GitHub OAuth, `/admin`, and Tavily/Firecrawl compatibility parity, switched `Dockerfile.all-in-one` to `alpine:3.24` (`UID 1000` Hub + `UID 65532` Chromium worker, zero Node.js/Deno), and removed `hub/portable/*` (`portable-server.ts` and `deno-server.ts`), cutting `hub/package.json` runtime dependencies down to `jose` and `oauth4webapi` while keeping `go.mod` at `1` external dependency (`github.com/coder/websocket`).
+
+### Security
+- **Post-Consolidation Clean-Room Hardening:**
+  - Enforced dial-time `politeness.RejectNonPublicPeer` (`Proxy: nil`, TLS 1.2+) across BYO-LLM and outbound 3rd-party MCP discovery/federation, pre-comparison per-IP / IPv6 `/64` brute-force lockouts on `/oauth/authorize` and `/oauth/register`, SHA-256 digest `constantTimeEqual`, RFC 6750 `WWW-Authenticate` scope step-up across `search` (`scrape: true`), REST, and MCP JSON-RPC batch requests, and OTLP pre-auth `401` suppression.
+
 ## [2.7.8] - 2026-11-23
 
 ### Added

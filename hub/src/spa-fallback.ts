@@ -162,7 +162,8 @@ async function callCrawl4AiProvider(params: {
     headers.authorization = `Bearer ${params.token.trim()}`;
   }
 
-  const res = await params.fetchFn(`${base}/crawl`, {
+  const fetchFn = params.fetchFn;
+  const res = await fetchFn(`${base}/crawl`, {
     method: 'POST',
     headers,
     body: JSON.stringify({
@@ -254,7 +255,8 @@ async function callFirecrawlProvider(params: {
   }
 
   const endpoint = /\/v[12]$/i.test(base) ? `${base}/scrape` : `${base}/v1/scrape`;
-  const res = await params.fetchFn(endpoint, {
+  const fetchFn = params.fetchFn;
+  const res = await fetchFn(endpoint, {
     method: 'POST',
     headers,
     body: JSON.stringify({

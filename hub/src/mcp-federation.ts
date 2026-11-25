@@ -463,8 +463,9 @@ async function refreshDownstreamOAuthIfNeeded(params: {
   }
 
   let resp: Response;
+  const fetchFn = params.fetchFn;
   try {
-    resp = await params.fetchFn(epCheck.normalizedUrl, {
+    resp = await fetchFn(epCheck.normalizedUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: form.toString(),
@@ -614,8 +615,9 @@ async function sendSingleRemoteJsonRpc(params: {
     }
 
     let resp: Response;
+    const fetchFn = params.fetchFn;
     try {
-      resp = await params.fetchFn(check.normalized, {
+      resp = await fetchFn(check.normalized, {
         method: 'POST',
         headers: new Headers(hdrsRes.headers),
         body: JSON.stringify(params.rpcBody),

@@ -1140,13 +1140,18 @@ test('Hardening & Perf Regressions: redirects, gunzip caps, multi-chunk WS, hibe
       const fullScaleBody = buildEasyPrivacyFixture({ version: '2026112599', hostCount: 45_000 });
       const fullScaleBucket = new NodeFsR2Bucket(join(tmp, 'worker-45k-r2'));
       const t45k = performance.now();
+      const strictWorkerdFetch = async function (this: unknown) {
+        if (this !== undefined && this !== globalThis) {
+          throw new TypeError('Illegal invocation: function called with incorrect `this` reference.');
+        }
+        return new Response(fullScaleBody, {
+          status: 200,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+      } as unknown as typeof fetch;
       const fullScaleOut = await refreshHubTrackerList({
         bucket: fullScaleBucket,
-        fetchFn: (async () =>
-          new Response(fullScaleBody, {
-            status: 200,
-            headers: { 'content-type': 'text/plain; charset=utf-8' },
-          })) as typeof fetch,
+        fetchFn: strictWorkerdFetch,
       });
       const elapsed45k = performance.now() - t45k;
       assert.equal(fullScaleOut.ok, true);

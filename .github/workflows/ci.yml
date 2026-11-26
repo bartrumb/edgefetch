@@ -135,6 +135,11 @@ jobs:
             echo "ERROR: addon/CHANGELOG.md is missing release heading '## [${ha_ver}]' for config.yaml version ${ha_ver}"
             exit 1
           fi
+      - name: Verify release version lockstep (all version markers, server.json agent image, changelogs)
+        working-directory: .
+        # Same lockstep release.yml enforces at tag time, checked on every PR so a bump can't drift before tagging.
+        # Fix drift with: node scripts/release-version.mjs bump <patch|minor|major|X.Y.Z>
+        run: node scripts/release-version.mjs check
 
   docker-multiarch:
     name: Verify Multi-Arch Distroless Builds (amd64 & arm64)

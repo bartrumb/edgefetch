@@ -2285,7 +2285,7 @@ describe('Tier 1 — Area B: Go --mode=hub, --mode=mcp, --mode=agent & Browser R
     }
   });
 
-  test('T1-B5: Go edgefetch.browser.render Child Span [F9/M2]', async () => {
+  test('T1-B5: Go edgefetch.browser.render Child Span [F9/M2]', async (t) => {
     const collector = await startMockOtlpCollector();
     const origin = await startMockOrigin();
     const goServe = await startGoHub({
@@ -2301,14 +2301,26 @@ describe('Tier 1 — Area B: Go --mode=hub, --mode=mcp, --mode=agent & Browser R
 
     try {
       const { traceId, traceparent } = makeTraceIds('01');
+      const renderStartedAt = Date.now();
       const res = await fetch(`${goServe.baseUrl}/v1/scrape`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', traceparent },
         body: JSON.stringify({ url: `${origin.url}/spa`, renderMode: 'always' }),
       });
       const body = await res.json();
-      assert.equal(res.status, 200, `[F9/M2] browser render scrape failed (${res.status}): ${JSON.stringify(body)}`);
-      assert.equal(body.rendered, true, `[F9/M2] expected rendered=true from browser render: ${JSON.stringify(body)}`);
+      // Diagnostics (CI-only slow renders, 3 s -> 30 s on GitHub runners): report the render time and the Go server's
+      // browser launch log lines (browser_started / browser_sandbox_fallback / browser_launch_retry ...) on every run.
+      const serveOut = goServe.getOutput();
+      const browserLog = `${serveOut.stdout}\n${serveOut.stderr}`
+        .split('\n')
+        .filter((line) => /browser|sandbox|chrom|devtools/i.test(line))
+        .slice(-25)
+        .map((line) => line.slice(0, 400))
+        .join('\n');
+      const renderDiag = `render took ${Date.now() - renderStartedAt} ms; Go server browser log:\n${browserLog || '(no browser log lines)'}`;
+      t.diagnostic(renderDiag);
+      assert.equal(res.status, 200, `[F9/M2] browser render scrape failed (${res.status}): ${JSON.stringify(body)}\n${renderDiag}`);
+      assert.equal(body.rendered, true, `[F9/M2] expected rendered=true from browser render: ${JSON.stringify(body)}\n${renderDiag}`);
 
       await collector.waitForSpans((e) => e.some((x) => x.span.traceId === traceId && x.span.name === 'edgefetch.browser.render'), 4500);
       const renderSpan = collector.findByTraceId(traceId).find((e) => e.span.name === 'edgefetch.browser.render');

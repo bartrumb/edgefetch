@@ -515,6 +515,45 @@ func TestStreamableHTTPMCPAll17ToolsGuardsScopesAndRobots(t *testing.T) {
 	if bDisc["result"].(map[string]any)["resultType"] != "complete" {
 		t.Fatalf("unexpected server/discover result: %+v", bDisc)
 	}
+	// The tool list is fixed per build, so no change notifications are promised.
+	if caps, _ := bDisc["result"].(map[string]any)["capabilities"].(map[string]any); caps == nil ||
+		caps["tools"].(map[string]any)["listChanged"] != false {
+		t.Fatalf("server/discover must advertise tools.listChanged=false, got %+v", bDisc["result"])
+	}
+
+	// MCP 2026-07-28 subscriptions/listen: an SSE stream with the acknowledgment (no notification types honored) and
+	// then a graceful "complete" result, both tagged with the subscription ID (the request ID). Not "Method not found".
+	recListen, _ := doJSONReq(t, rte.handler, "POST", "/mcp", map[string]any{
+		"jsonrpc": "2.0", "id": "listen-1", "method": "subscriptions/listen",
+		"params": map[string]any{"notifications": map[string]any{"toolsListChanged": true}},
+	}, map[string]string{"Mcp-Protocol-Version": "2026-07-28", "Accept": "application/json, text/event-stream"}, nil)
+	if recListen.Code != http.StatusOK || !strings.HasPrefix(recListen.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("subscriptions/listen: expected 200 text/event-stream, got %d %q: %s", recListen.Code, recListen.Header().Get("Content-Type"), recListen.Body.String())
+	}
+	var listenMsgs []map[string]any
+	for _, line := range strings.Split(recListen.Body.String(), "\n") {
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(data), &m); err != nil {
+				t.Fatalf("subscriptions/listen: bad SSE data %q: %v", data, err)
+			}
+			listenMsgs = append(listenMsgs, m)
+		}
+	}
+	if len(listenMsgs) != 2 {
+		t.Fatalf("subscriptions/listen: expected ack + final result, got %d messages: %s", len(listenMsgs), recListen.Body.String())
+	}
+	ackParams, _ := listenMsgs[0]["params"].(map[string]any)
+	ackMeta, _ := ackParams["_meta"].(map[string]any)
+	ackNotifs, _ := ackParams["notifications"].(map[string]any)
+	if listenMsgs[0]["method"] != "notifications/subscriptions/acknowledged" || ackMeta["io.modelcontextprotocol/subscriptionId"] != "listen-1" || ackNotifs == nil || len(ackNotifs) != 0 {
+		t.Fatalf("subscriptions/listen: bad acknowledgment %+v", listenMsgs[0])
+	}
+	finRes, _ := listenMsgs[1]["result"].(map[string]any)
+	finMeta, _ := finRes["_meta"].(map[string]any)
+	if listenMsgs[1]["id"] != "listen-1" || finRes["resultType"] != "complete" || finMeta["io.modelcontextprotocol/subscriptionId"] != "listen-1" {
+		t.Fatalf("subscriptions/listen: bad final result %+v", listenMsgs[1])
+	}
 	_, bList := doJSONReq(t, rte.handler, "POST", "/mcp", map[string]any{"jsonrpc": "2.0", "id": 3, "method": "tools/list"}, nil, nil)
 	toolsArr := bList["result"].(map[string]any)["tools"].([]any)
 	if len(toolsArr) != 17 {

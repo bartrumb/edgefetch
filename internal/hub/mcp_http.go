@@ -251,7 +251,42 @@ func (h *RouteHandler) HandleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Mcp-Protocol-Version", effectiveVer)
+	if msg.Method == "subscriptions/listen" {
+		writeMCPSubscriptionListenSSE(w, msg.parsedID(), rep)
+		return
+	}
 	writeJSON(w, httpStatus, rep)
+}
+
+// writeMCPSubscriptionListenSSE answers an MCP 2026-07-28 subscriptions/listen request as an SSE stream carrying
+// notifications/subscriptions/acknowledged (honoring no notification types: the hub's tool list is fixed per build and
+// it advertises listChanged: false) followed by the final "complete" result, i.e. a graceful end of the subscription
+// so the client does not reconnect.
+func writeMCPSubscriptionListenSSE(w http.ResponseWriter, id any, final map[string]any) {
+	ack := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/subscriptions/acknowledged",
+		"params": map[string]any{
+			"_meta":         map[string]any{"io.modelcontextprotocol/subscriptionId": id},
+			"notifications": map[string]any{},
+		},
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	for _, m := range []map[string]any{ack, final} {
+		b, err := json.Marshal(m)
+		if err != nil {
+			return
+		}
+		_, _ = w.Write([]byte("event: message\ndata: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+	}
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
 }
 
 func missingMCPToolScope(msg jsonRPCRequest, p AuthPrincipal) string {
@@ -313,7 +348,7 @@ func (h *RouteHandler) dispatchMCPMessage(
 		return mcpJSONRPCResult(id, map[string]any{
 			"resultType":        "complete",
 			"supportedVersions": supportedMCPProtocolVersions,
-			"capabilities":      map[string]any{"tools": map[string]any{"listChanged": true}},
+			"capabilities":      map[string]any{"tools": map[string]any{"listChanged": false}},
 			"_meta":             map[string]any{"io.modelcontextprotocol/serverInfo": serverInfo},
 			"ttlMs":             mcpServerDiscoveryTTL,
 			"cacheScope":        "private",
@@ -330,12 +365,20 @@ func (h *RouteHandler) dispatchMCPMessage(
 		}
 		return mcpJSONRPCResult(id, map[string]any{
 			"protocolVersion": negVer,
-			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": true}},
+			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"serverInfo":      serverInfo,
 		}), http.StatusOK
 
 	case "ping", "logging/setLevel":
 		return mcpJSONRPCResult(id, addModern(map[string]any{})), http.StatusOK
+
+	case "subscriptions/listen":
+		// No notification types are honored (listChanged: false), so the subscription ends at once with a graceful
+		// "complete" result; the HTTP handler streams it after notifications/subscriptions/acknowledged.
+		return mcpJSONRPCResult(id, map[string]any{
+			"resultType": "complete",
+			"_meta":      map[string]any{"io.modelcontextprotocol/subscriptionId": id},
+		}), http.StatusOK
 
 	case "tools/list":
 		res := addModern(map[string]any{"tools": buildMCPCanonicalToolDefinitions()})

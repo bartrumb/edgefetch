@@ -42,8 +42,10 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          # A skipped deploy must not look like a successful one: v2.8.1's tag run passed green here while the live
+          # Worker stayed on the previous build. Fail loudly so the missing secret is noticed.
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
-            echo "::notice title=Cloudflare Secret Not Set::CLOUDFLARE_API_TOKEN is not configured in environment 'production'; dry-run validation succeeded and live deploy was skipped."
-            exit 0
+            echo "::error title=Cloudflare Secret Not Set::CLOUDFLARE_API_TOKEN is not configured in environment 'production'; dry-run validation passed but NOTHING WAS DEPLOYED. Add the secret or deploy manually with 'npm run deploy' from a clean checkout of this tag."
+            exit 1
           fi
           npm run deploy

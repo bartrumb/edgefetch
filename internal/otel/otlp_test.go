@@ -427,7 +427,7 @@ func TestExporterEnvVariantsTickerBatchDrainAndErrors(t *testing.T) {
 		}
 		return ""
 	}, "", "", nil, safeWriter, 5*time.Millisecond)
-	if stdExp == nil || stdExp.serviceName != "edgefetch-go" || stdExp.serviceVersion != "2.8.1" {
+	if stdExp == nil || stdExp.serviceName != "edgefetch-go" || stdExp.serviceVersion != "2.8.2" {
 		t.Fatalf("unexpected default service/version on stdout exporter: %+v", stdExp)
 	}
 

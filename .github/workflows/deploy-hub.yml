@@ -38,14 +38,39 @@ jobs:
       - run: npm run type-check
       - run: npm run deploy:dry
       - name: Deploy Worker & AgentHubDO to Cloudflare
+        id: deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
+          set -euo pipefail
           # A skipped deploy must not look like a successful one: v2.8.1's tag run passed green here while the live
           # Worker stayed on the previous build. Fail loudly so the missing secret is noticed.
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
             echo "::error title=Cloudflare Secret Not Set::CLOUDFLARE_API_TOKEN is not configured in environment 'production'; dry-run validation passed but NOTHING WAS DEPLOYED. Add the secret or deploy manually with 'npm run deploy' from a clean checkout of this tag."
             exit 1
           fi
-          npm run deploy
+          # Label the Cloudflare Worker Version with the release tag (or main@sha for manual dispatches) and commit.
+          if [ "$REF_TYPE" = "tag" ]; then label="$REF_NAME"; else label="main-${GITHUB_SHA::7}"; fi
+          npm run deploy -- --tag "$label" --message "edgefetch ${label} ${GITHUB_SHA}" 2>&1 | tee deploy.log
+          version_id="$(grep -oE 'Current Version ID: [0-9a-f-]{36}' deploy.log | awk '{print $4}' | tail -1)"
+          url="$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -1)"
+          if [ -z "$version_id" ] || [ -z "$url" ]; then
+            echo "::error title=Deploy output not recognised::Could not read the Version ID / workers.dev URL from wrangler deploy output; treating the deploy as unverified."
+            exit 1
+          fi
+          {
+            echo "version_id=${version_id}"
+            echo "url=${url}"
+            echo "label=${label}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Verify live deployment (version at 100%, tag, live version, health)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION_ID: ${{ steps.deploy.outputs.version_id }}
+          WORKER_URL: ${{ steps.deploy.outputs.url }}
+          LABEL: ${{ steps.deploy.outputs.label }}
+        run: node scripts/verify-deploy.mjs --version-id "$VERSION_ID" --url "$WORKER_URL" --tag "$LABEL"

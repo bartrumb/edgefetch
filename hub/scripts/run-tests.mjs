@@ -73,6 +73,7 @@ const suiteSpecs = [
   ['test/telemetry-openapi-traces.test.ts', 'telemetry-openapi-traces.test.mjs'],
   ['test/wasm-memory-budget.test.ts', 'wasm-memory-budget.test.mjs'],
   ['test/scrape-budget-fidelity.test.ts', 'scrape-budget-fidelity.test.mjs'],
+  ['test/scrape-jsonfilter-cache.test.ts', 'scrape-jsonfilter-cache.test.mjs'],
 ];
 
 try {

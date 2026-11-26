@@ -2,6 +2,14 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.3] - 2026-11-26
+
+### Fixed
+- **Scrape cache ignored `jsonFilter` (L-01):** a `jsonFilter` scrape of a URL that was already cached could return the earlier unfiltered result, either as a cache hit or through `304` revalidation (`+cache:304`, including with `maxAgeMs: 0`). The filter now counts as a non-default cache option, so the plain META D1 lookup and `304` revalidation are skipped, and the trimmed filter is part of the options cache hash, so filtered and unfiltered results, and different filters, never share a cache entry. Requests without `jsonFilter` keep the same cache hash, so no existing cache entry is invalidated.
+
+### Changed
+- CI: publish the versioned add-on image from `main` when a new version lands (#82).
+
 ## [2.8.2] - 2026-11-25
 
 ### Fixed

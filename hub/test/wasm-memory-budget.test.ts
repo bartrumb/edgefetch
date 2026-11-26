@@ -16,16 +16,23 @@ import {
   getWasmReactorStats,
   getWasmRuntimeMemStats,
   isWasmInputBudgetExceededError,
+  isWasmRe2RecompileError,
   MAX_ISOLATE_IN_FLIGHT_BYTES,
   MAX_WASM_INPUT_BYTES,
   resetIsolateBudgetForTests,
   resetWasmReactor,
+  setWasmForcedEvictionForTests,
+  setWasmRe2RecompileFaultForTests,
+  WASM_EVICT_IN_BYTES,
+  WASM_EVICT_OUT_BYTES,
+  WasmRe2RecompileError,
 } from '../src/wasm-bridge';
 import { parseDeclarativeManifest } from '../src/extractors/declarative';
 import { resolveSiteExtractorTwin } from '../src/extractors/registry';
 import { executeJobsCall, resetJobsCacheForTests, resolveAtsPreFetchSpec } from '../src/jobs';
 import { executeCatalogCall } from '../src/catalog';
-import { BATCH_BUSY_MAX_ATTEMPTS, parseSitemapXml, startOrExecuteBatchScrape } from '../src/map-crawl';
+import { BATCH_BUSY_MAX_ATTEMPTS, pathAllowed, parseSitemapXml, startOrExecuteBatchScrape } from '../src/map-crawl';
+import { HtmlDocUnavailableError, parseHtmlDoc } from '../src/extractors/utils';
 import {
   cutMarkdownToSanitizerBudget,
   detectPromptInjection,
@@ -1008,4 +1015,108 @@ test('Step 6: >512K-char mostly-emoji & CJK strings verify TextEncoder.encodeInt
     const roundTrip = callCoreWasm<{ ok: boolean }>('is_safe_twin_url', { url: 'https://example.com/ok' });
     assert.equal(roundTrip.ok, true);
   }
+});
+
+test('Step 7: parseHtmlDoc re-parses once when the reactor is replaced mid-dom_parse and throws instead of returning a silently empty doc', (t) => {
+  t.after(() => setWasmForcedEvictionForTests(null));
+  resetWasmReactor();
+  parseHtmlDoc('<p>warmup</p>');
+  const genBefore = getWasmReactorStats().generation;
+
+  // 1) One eviction right after `dom_parse`: the first handle is dead on arrival, the retry lands on the fresh reactor.
+  setWasmForcedEvictionForTests('dom_parse', 1);
+  const doc = parseHtmlDoc('<div><p class="x">Hello reactor</p><a href="/next">n</a></div>');
+  assert.equal(doc.text('p.x'), 'Hello reactor', 'retried parse must yield a live, queryable doc');
+  assert.equal(doc.attrOf('a', 'href'), '/next');
+  const genAfter = getWasmReactorStats().generation;
+  assert.ok(genAfter > genBefore, 'retry must run on a new reactor generation');
+  assert.equal(getWasmReactorStats().active, true);
+
+  // 2) Evicted during both attempts: explicit typed error, never an empty doc that reads as "no content".
+  setWasmForcedEvictionForTests('dom_parse', 2);
+  assert.throws(
+    () => parseHtmlDoc('<p>never silently empty</p>'),
+    (err: unknown) =>
+      err instanceof HtmlDocUnavailableError &&
+      err.code === 'html_doc_unavailable' &&
+      /reactor replaced during dom_parse/.test(err.message),
+  );
+  setWasmForcedEvictionForTests(null);
+
+  // 3) Empty / non-string input is still the intentional empty doc (not an error), and parsing recovers afterwards.
+  assert.equal(parseHtmlDoc('').select('p').length, 0);
+  assert.equal(parseHtmlDoc(null as unknown as string).text(), '');
+  assert.equal(parseHtmlDoc('<p>back</p>').text('p'), 'back');
+});
+
+test('Step 7b: dom_parse at the full 4 MiB input budget can never trip the 8 MiB I/O eviction (handle stays live)', () => {
+  assert.ok(MAX_WASM_INPUT_BYTES < WASM_EVICT_IN_BYTES, 'input budget must stay below the I/O eviction threshold');
+  assert.ok(MAX_WASM_INPUT_BYTES < WASM_EVICT_OUT_BYTES);
+  resetWasmReactor();
+  parseHtmlDoc('<p>warmup</p>');
+  const gen = getWasmReactorStats().generation;
+
+  // Largest request `callCoreWasm('dom_parse')` accepts: ~4 MiB of ASCII HTML inside the JSON envelope
+  // (unquoted attributes so JSON escaping does not inflate the request past the budget).
+  const row = '<li class=r>item</li>';
+  const body = row.repeat(Math.floor((MAX_WASM_INPUT_BYTES - 4096) / row.length));
+  const html = `<ul id=big>${body}</ul><p id=tail>TAIL_OK</p>`;
+  assert.ok(enc.encode(html).byteLength > MAX_WASM_INPUT_BYTES - 8192);
+  const doc = parseHtmlDoc(html, MAX_WASM_INPUT_BYTES);
+  const stats = getWasmReactorStats();
+  assert.equal(stats.active, true, 'max-budget dom_parse must not evict the reactor');
+  assert.equal(stats.generation, gen, 'max-budget dom_parse must not replace the reactor');
+  assert.ok(doc.select('li.r', 3).length === 3, 'doc handle from a max-budget parse must stay queryable');
+
+  // One byte over budget: rejected before any WASM write, reactor untouched.
+  assert.throws(
+    () => parseHtmlDoc('x'.repeat(MAX_WASM_INPUT_BYTES + 1), MAX_WASM_INPUT_BYTES + 1),
+    (err: unknown) => isWasmInputBudgetExceededError(err),
+  );
+  assert.equal(getWasmReactorStats().generation, gen);
+  assert.equal(doc.select('li.r', 1).length, 1);
+});
+
+test('Step 8: RE2 recompile failure after a reactor swap throws WasmRe2RecompileError and crawl path filters fail closed', (t) => {
+  t.after(() => setWasmRe2RecompileFaultForTests(false));
+  resetWasmReactor();
+
+  // 1) Direct handle: a failed recompile is a typed error, never `false` / `null` ("no match").
+  const re = compileWasmRe2('^/admin/')!;
+  assert.ok(re);
+  assert.equal(re.test('/admin/x'), true);
+  assert.equal(re.exec('/admin/x')?.[0], '/admin/');
+  resetWasmReactor();
+  setWasmRe2RecompileFaultForTests(true);
+  assert.throws(
+    () => re.test('/admin/x'),
+    (err: unknown) => err instanceof WasmRe2RecompileError && isWasmRe2RecompileError(err),
+  );
+  assert.throws(() => re.exec('/admin/x'), (err: unknown) => isWasmRe2RecompileError(err));
+  setWasmRe2RecompileFaultForTests(false);
+  assert.equal(re.test('/admin/x'), true, 'handle must recover once recompiling works again');
+  assert.equal(re.test('/public'), false);
+
+  // 2) Security-relevant caller: map/crawl `excludePaths` (deny list) + `includePaths` (allow list).
+  const excludeUnion = ['^/admin/.*', '.*/private/.*'];
+  const excludeSingle = ['^/secret[0-9]+$'];
+  const includeUnion = ['^/docs/.*', '^/guide/.*'];
+  const u = (p: string) => new URL(`https://example.com${p}`);
+  assert.equal(pathAllowed(u('/admin/panel'), [], excludeUnion, false), false);
+  assert.equal(pathAllowed(u('/docs/a'), [], excludeUnion, false), true);
+  assert.equal(pathAllowed(u('/secret1'), [], excludeSingle, false), false);
+  assert.equal(pathAllowed(u('/docs/a'), includeUnion, [], false), true);
+
+  resetWasmReactor();
+  setWasmRe2RecompileFaultForTests(true);
+  assert.equal(pathAllowed(u('/admin/users'), [], excludeUnion, false), false, 'deny-list error must deny, not allow');
+  assert.equal(pathAllowed(u('/a/private/b'), [], excludeUnion, false), false);
+  assert.equal(pathAllowed(u('/docs/b'), [], excludeUnion, false), false, 'unverifiable exclude list fails closed');
+  assert.equal(pathAllowed(u('/secret22'), [], excludeSingle, false), false);
+  assert.equal(pathAllowed(u('/docs/c'), includeUnion, [], false), false, 'allow-list error must not include');
+  setWasmRe2RecompileFaultForTests(false);
+
+  assert.equal(pathAllowed(u('/docs/d'), [], excludeUnion, false), true);
+  assert.equal(pathAllowed(u('/admin/again'), [], excludeUnion, false), false);
+  assert.equal(pathAllowed(u('/docs/e'), includeUnion, [], false), true);
 });

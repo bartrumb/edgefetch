@@ -1563,18 +1563,28 @@ function getCompiledCrawlPatternListMatcher(patterns: readonly string[]): (subje
   return matcher;
 }
 
-function pathAllowed(
+export function pathAllowed(
   candidateUrl: URL,
   includePaths: string[],
   excludePaths: string[],
   regexOnFullURL: boolean,
 ): boolean {
   const subject = regexOnFullURL ? candidateUrl.toString() : candidateUrl.pathname;
-  if (excludePaths.length > 0 && getCompiledCrawlPatternListMatcher(excludePaths)(subject)) {
+  // Fail closed: a matcher that throws (e.g. `WasmRe2RecompileError` after a reactor swap) must never let a URL past
+  // `excludePaths` (an error is treated as "excluded") nor into `includePaths` (an error is treated as "not included").
+  try {
+    if (excludePaths.length > 0 && getCompiledCrawlPatternListMatcher(excludePaths)(subject)) {
+      return false;
+    }
+  } catch {
     return false;
   }
   if (includePaths.length === 0) return true;
-  return getCompiledCrawlPatternListMatcher(includePaths)(subject);
+  try {
+    return getCompiledCrawlPatternListMatcher(includePaths)(subject);
+  } catch {
+    return false;
+  }
 }
 
 const crawlsUserIdMigratedDbs = new WeakSet<object>();

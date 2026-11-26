@@ -180,6 +180,18 @@ export function resetWasmReactor(): void {
   cachedReactorInitMemBytes = 0;
 }
 
+let forcedEvictionOpForTests: string | null = null;
+let forcedEvictionsForTests = 0;
+
+/**
+ * Test seam: evicts the reactor right after the next `times` `callCoreWasm(op)` calls, simulating an eviction that
+ * lands mid-operation (e.g. between `dom_parse` and the caller reading the new doc's generation). `null` / `0` clears it.
+ */
+export function setWasmForcedEvictionForTests(op: string | null, times = 1): void {
+  forcedEvictionOpForTests = op;
+  forcedEvictionsForTests = op ? Math.max(0, Math.floor(times)) : 0;
+}
+
 function maybeEvictOversizedReactor(
   reactor: CoreReactorExports,
   inBytes: number,
@@ -395,7 +407,14 @@ export function callCoreWasm<T = Record<string, unknown>>(op: string, payload: u
       jsonText = utf8Decoder.decode(new Uint8Array(reactor.memory.buffer, outPtr, outLen));
     }
   } finally {
+    // `dom_parse` skips the total-memory ceiling because evicting right after a parse orphans the new doc handle.
+    // The I/O ceiling cannot fire for it either: the request is capped at `MAX_WASM_INPUT_BYTES` (4 MiB) above and the
+    // reply is a tiny `{docId, rootNodeId}` object, both far below `WASM_EVICT_IN_BYTES` / `WASM_EVICT_OUT_BYTES`.
     maybeEvictOversizedReactor(reactor, inLen, outLen, op === 'dom_parse');
+    if (forcedEvictionsForTests > 0 && forcedEvictionOpForTests === op && cachedReactor === reactor) {
+      forcedEvictionsForTests--;
+      resetWasmReactor();
+    }
   }
   const parsed = JSON.parse(jsonText) as T & { error?: string };
   if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string' && !('ok' in parsed)) {
@@ -689,8 +708,38 @@ export function callCoreWasmRawString(op: string, meta: unknown, rawStr: string)
 
 // ── Fast Integer-Handle RE2 Regex Engine (replaces `re2js`) ─────────────────────────────────────
 
+/**
+ * Thrown by a compiled RE2 handle's `test` / `exec` when the pattern compiled once but could not be recompiled on a
+ * replacement reactor (or after its handle was evicted from the Go ring). Callers MUST NOT read this as "no match":
+ * a deny-list regex that silently returned `false` would turn into an allow. Security predicates fail closed on it.
+ */
+export class WasmRe2RecompileError extends Error {
+  readonly code = 'wasm_re2_recompile_failed' as const;
+
+  constructor(pattern: string) {
+    super(`RE2 pattern could not be recompiled on the current WASM reactor (${pattern.length} bytes)`);
+    this.name = 'WasmRe2RecompileError';
+  }
+}
+
+export function isWasmRe2RecompileError(err: unknown): err is WasmRe2RecompileError {
+  return (
+    err instanceof WasmRe2RecompileError ||
+    (Boolean(err) && typeof err === 'object' && (err as { code?: unknown }).code === 'wasm_re2_recompile_failed')
+  );
+}
+
+let re2RecompileFaultForTests = false;
+
+/** Test seam: forces every RE2 *re*compile (never the initial compile) to fail as if `ef_re2_compile` returned `0`. */
+export function setWasmRe2RecompileFaultForTests(enabled: boolean): void {
+  re2RecompileFaultForTests = enabled;
+}
+
 export interface WasmRe2Compiled {
+  /** Throws `WasmRe2RecompileError` instead of returning `false` when the handle cannot be re-established. */
   test: (subject: string) => boolean;
+  /** Throws `WasmRe2RecompileError` instead of returning `null` when the handle cannot be re-established. */
   exec: (subject: string) => RegExpExecArray | null;
 }
 
@@ -713,10 +762,13 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
 
   let boundReactor: CoreReactorExports | null = initReactor;
 
+  // Re-establishes the handle on `r`; a pattern that compiled once but fails now throws instead of
+  // reporting "no match", so callers can tell a broken matcher apart from a non-matching subject.
   const ensureHandle = (r: CoreReactorExports): number => {
     const len = writeInputBytes(r, patBytes);
-    handle = r.ef_re2_compile(len);
+    handle = re2RecompileFaultForTests ? 0 : r.ef_re2_compile(len);
     boundReactor = handle > 0 ? r : null;
+    if (handle <= 0) throw new WasmRe2RecompileError(re2Pattern);
     return handle;
   };
 
@@ -729,26 +781,28 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
       const subjBytes = utf8Encoder.encode(subject);
       let res: number;
       try {
-        if (r !== boundReactor && ensureHandle(r) <= 0) return false;
+        if (r !== boundReactor) ensureHandle(r);
         const subjLen = writeInputBytes(r, subjBytes);
         res = r.ef_re2_test(handle, subjLen);
         if (res === -1) {
-          if (ensureHandle(r) <= 0) return false;
+          ensureHandle(r);
           const retryLen = writeInputBytes(r, subjBytes);
           res = r.ef_re2_test(handle, retryLen);
         }
       } catch (err) {
-        if (isWasmInputBudgetExceededError(err)) throw err;
+        if (isWasmInputBudgetExceededError(err) || isWasmRe2RecompileError(err)) throw err;
         resetWasmReactor();
         boundReactor = null;
         r = getReactor();
-        if (ensureHandle(r) <= 0) return false;
+        ensureHandle(r);
         const retryLen = writeInputBytes(r, subjBytes);
         res = r.ef_re2_test(handle, retryLen);
         void err;
       } finally {
         maybeEvictOversizedReactor(r, subjBytes.byteLength, 0);
       }
+      // A freshly (re)compiled handle that Go still does not know is a broken matcher, not a non-match.
+      if (res === -1) throw new WasmRe2RecompileError(re2Pattern);
       return res === 1;
     },
     exec(subject: string): RegExpExecArray | null {
@@ -761,20 +815,20 @@ export function compileWasmRe2(re2Pattern: string): WasmRe2Compiled | null {
       let hitText = '';
       try {
         try {
-          if (r !== boundReactor && ensureHandle(r) <= 0) return null;
+          if (r !== boundReactor) ensureHandle(r);
           const subjLen = writeInputBytes(r, subjBytes);
           outLen = r.ef_re2_exec(handle, subjLen) >>> 0;
           if (outLen === 0 && (r !== boundReactor || r.ef_re2_test(handle, 0) === -1)) {
-            if (ensureHandle(r) <= 0) return null;
+            ensureHandle(r);
             const retryLen = writeInputBytes(r, subjBytes);
             outLen = r.ef_re2_exec(handle, retryLen) >>> 0;
           }
         } catch (err) {
-          if (isWasmInputBudgetExceededError(err)) throw err;
+          if (isWasmInputBudgetExceededError(err) || isWasmRe2RecompileError(err)) throw err;
           resetWasmReactor();
           boundReactor = null;
           r = getReactor();
-          if (ensureHandle(r) <= 0) return null;
+          ensureHandle(r);
           const retryLen = writeInputBytes(r, subjBytes);
           outLen = r.ef_re2_exec(handle, retryLen) >>> 0;
           void err;

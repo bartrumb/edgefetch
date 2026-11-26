@@ -3486,6 +3486,11 @@ export async function executeScrapeCall(params: {
             : {}),
         formats: agentFormats,
         onlyMainContent,
+        // A Go node that extracts an over-budget page itself (primary agent path or offload) applies these too and
+        // confirms with `contentScopingApplied`; see `nodeResultSatisfiesRequest`.
+        ...(includeTags.length > 0 ? { includeTags } : {}),
+        ...(excludeTags.length > 0 ? { excludeTags } : {}),
+        ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
         discoverLlms: goDiscoverLlms,
         preferLlmsMarkdown: !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always',
         redactPii,
@@ -5043,9 +5048,20 @@ export async function executeScrapeCall(params: {
   // The Go node's over-budget extractor produces sanitized markdown only: it does not receive or apply
   // `includeTags` / `excludeTags`, and it returns no raw body for html/rawHtml/product/attributes/json.
   // `jsonFilter` is sent with the offload request and applied on the node to JSON record arrays.
-  // Never offload a request that scopes content with include/exclude tags (excluded content would leak into the
-  // markdown); for other edge-only formats, accept the node markdown but say which formats are unavailable.
+  // Tag-scoped requests: node markdown is only acceptable when the node confirms it applied the include/exclude tags
+  // (`contentScopingApplied`); an older node ignores the fields, which would leak excluded content. For other
+  // edge-only formats, accept the node markdown but say which formats are unavailable.
   const nodeOffloadBlockedByScoping = includeTags.length > 0 || excludeTags.length > 0;
+  /**
+   * Whether a node-extracted item (primary agent path or offload) can be returned for this request: it must carry
+   * non-empty in-budget markdown and, for tag-scoped requests, confirm the node applied the tags.
+   */
+  const nodeResultSatisfiesRequest = (nodeItem: Record<string, unknown> | undefined): boolean => {
+    if (!nodeItem || nodeItem.outcome !== 'ok' || nodeItem.markdownOverBudget === true) return false;
+    const md = typeof nodeItem.markdown === 'string' ? nodeItem.markdown : '';
+    if (md.trim().length === 0 || exactUtf8ByteLen(md) > MAX_WASM_INPUT_BYTES) return false;
+    return !nodeOffloadBlockedByScoping || nodeItem.contentScopingApplied === true;
+  };
   const nodeOffloadMissingFormats = [
     ...(['html', 'rawHtml', 'product'] as const).filter((f) => stringFormats.has(f)),
     ...(attributesSpec ? ['attributes'] : []),
@@ -5054,7 +5070,6 @@ export async function executeScrapeCall(params: {
   const nodeOffloadWarnings: string[] = [];
   if (
     rawBodyOverBudget &&
-    !nodeOffloadBlockedByScoping &&
     item.extractedOnNode !== true &&
     !fetchResUsed.via.startsWith('agent') &&
     target !== 'container'
@@ -5085,13 +5100,7 @@ export async function executeScrapeCall(params: {
         // result (e.g. an unformattable >4 MiB sitemap, or origin markdown the node also could not fit) would
         // otherwise discard the raw body and return an empty 200; keeping the raw body lets the edge fallback below
         // cut+sanitize origin markdown or flag `edgeBudgetExceeded` with a warning.
-        const nodeMarkdown = typeof nodeItem?.markdown === 'string' ? nodeItem.markdown : '';
-        if (
-          nodeItem?.outcome === 'ok' &&
-          nodeItem.markdownOverBudget !== true &&
-          nodeMarkdown.trim().length > 0 &&
-          exactUtf8ByteLen(nodeMarkdown) <= MAX_WASM_INPUT_BYTES
-        ) {
+        if (nodeItem && nodeResultSatisfiesRequest(nodeItem)) {
           rawBodyStr = '';
           fetchResUsed = nodeRes;
           item = nodeItem;
@@ -5107,6 +5116,22 @@ export async function executeScrapeCall(params: {
     } catch {
       // Fall through to clean over-budget warning + stored R2 artifact below when no Go node is reachable.
     }
+  }
+
+  // Primary agent path: the first fetch itself went to a Go node, which extracted the over-budget page natively and
+  // omitted the raw body. Apply the same acceptance rules as the offload path above: an empty node result (e.g. an
+  // unformattable sitemap) or tag-scoped markdown the node did not confirm scoping for must not be returned as a
+  // normal success; return the flagged over-budget response instead. (`markdownOverBudget` is handled just below.)
+  if (item.extractedOnNode === true && item.markdownOverBudget !== true && !nodeResultSatisfiesRequest(item)) {
+    const rawToStore = rawBodyStr;
+    rawBodyStr = '';
+    return buildOverBudgetEdgeResponse(rawToStore, { ...item, markdown: '', text: '' }, fetchResUsed.via);
+  }
+  if (item.extractedOnNode === true && nodeOffloadMissingFormats.length > 0 && nodeOffloadWarnings.length === 0) {
+    nodeOffloadWarnings.push(
+      `Document over the 4 MiB edge budget was extracted on a Go node; ${nodeOffloadMissingFormats.join(', ')} ` +
+        'require edge processing of the raw page and are unavailable for this response.',
+    );
   }
 
   const nodeMdStr = typeof item.markdown === 'string' ? item.markdown : '';
@@ -5491,6 +5516,12 @@ export async function executeScrapeCall(params: {
   const rawBase64Requested = stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing;
   if (rawBase64Requested && pdfParserOpts.skipPdfParsing) {
     const rawB64 = encodeBodyToRawBase64(item);
+    // `parsers: []` returns early, so it needs its own artifact reference and omission warning: without them a body
+    // too large to return inline produced `ok: true` with neither `rawBase64` nor any way to fetch the bytes.
+    const skipArt = !isPrivateScrape
+      ? (item.artifact as { blobSha256?: string; contentSha256?: string } | undefined)
+      : undefined;
+    const skipOmitted = rawB64 === undefined && (item.bodyBase64Omitted === true || item.bodyOmitted === true);
     return {
       status: 200,
       via: fetchResUsed.via,
@@ -5503,6 +5534,16 @@ export async function executeScrapeCall(params: {
         status: item.status ?? 200,
         via: fetchResUsed.via,
         ...(rawB64 ? { rawBase64: rawB64 } : {}),
+        ...(skipArt?.contentSha256 ? { contentSha256: skipArt.contentSha256 } : {}),
+        ...(skipArt?.blobSha256 ? { artifactId: skipArt.blobSha256 } : {}),
+        ...(skipOmitted
+          ? {
+              warnings: [
+                'rawBase64 was requested but the body was too large to return inline (batch body budget); ' +
+                  (skipArt?.blobSha256 ? 'fetch the stored artifact via artifactId instead.' : 'no stored artifact is available for this request.'),
+              ],
+            }
+          : {}),
         metadata: {
           contentType: isPdfResponse ? 'application/pdf' : item.contentType,
         },

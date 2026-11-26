@@ -92,6 +92,53 @@ func TestNodeOffloadOverBudgetDocumentsAndNoMarkdownTruncation(t *testing.T) {
 	}
 }
 
+// Over-budget HTML extracted on the node must honour the request's include/exclude tags and confirm it did, so the
+// Hub can accept tag-scoped node markdown without leaking excluded content.
+func TestNodeOffloadAppliesExcludeTagsAndConfirmsScoping(t *testing.T) {
+	const budget = 256 * 1024
+	// The raw HTML is over the inline budget (attribute padding) while the extracted markdown stays well under it.
+	bigHTML := "<!doctype html><html><head><title>Scoped</title></head><body>" +
+		"<div class=\"chrome\" data-blob=\"" + strings.Repeat("x", 300_000) + "\"></div>" +
+		"<main><h1>Kept Heading</h1><p>" + strings.Repeat("Main article words for node extraction. ", 1_000) +
+		"KEPT_MAIN_SENTINEL</p></main><aside class=\"ugc\"><p>EXCLUDED_UGC_SENTINEL</p></aside></body></html>"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("User-agent: *\nAllow: /\n"))
+	})
+	mux.HandleFunc("/scoped.html", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(bigHTML))
+	})
+	c, _ := newTestCrawler(t, mux)
+	onlyMain := false
+	results := c.Run(
+		context.Background(),
+		[]Request{
+			{ID: "scoped", URL: "http://shop.test/scoped.html", Kind: classify.KindScrape, Formats: []string{"markdown"}, OnlyMainContent: &onlyMain, ExcludeTags: []string{"aside"}},
+			{ID: "unscoped", URL: "http://shop.test/scoped.html", Kind: classify.KindScrape, Formats: []string{"markdown"}, OnlyMainContent: &onlyMain},
+		},
+		Options{IncludeBody: true, MaxBytes: 8 << 20, MaxInlineBodyBytes: budget, PauseMs: 1, GapMs: 0},
+	)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	scoped, unscoped := results[0], results[1]
+	if !scoped.ExtractedOnNode || !scoped.ContentScopingApplied {
+		t.Fatalf("expected node extraction with ContentScopingApplied, got extracted=%v applied=%v", scoped.ExtractedOnNode, scoped.ContentScopingApplied)
+	}
+	if strings.Contains(scoped.Markdown, "EXCLUDED_UGC_SENTINEL") || !strings.Contains(scoped.Markdown, "KEPT_MAIN_SENTINEL") {
+		t.Fatalf("excludeTags not applied on node: hasExcluded=%v hasMain=%v",
+			strings.Contains(scoped.Markdown, "EXCLUDED_UGC_SENTINEL"), strings.Contains(scoped.Markdown, "KEPT_MAIN_SENTINEL"))
+	}
+	if !strings.Contains(unscoped.Markdown, "EXCLUDED_UGC_SENTINEL") {
+		t.Fatal("control: without excludeTags (onlyMainContent=false) the aside content should be present")
+	}
+	if unscoped.ContentScopingApplied {
+		t.Fatal("ContentScopingApplied must only be set for tag-scoped requests")
+	}
+}
+
 // BodyBase64 is returned outside `Body`, so it must count toward MaxTotalBytes; otherwise a large binary's base64
 // (4/3 of the raw size) escapes the batch budget and can exceed the Hub's 20 MiB agent reply cap.
 func TestBodyBase64CountsTowardBatchTotalBudget(t *testing.T) {

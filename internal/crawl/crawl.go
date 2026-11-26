@@ -46,23 +46,26 @@ type InteractSpec struct {
 
 // Request describes a single URL to fetch within a batch.
 type Request struct {
-	ID                 string            `json:"id"`
-	URL                string            `json:"url"`
-	Method             string            `json:"method,omitempty"`      // "GET" (default) or "POST" (e.g. Workday CXS JSON search)
-	RequestBody        string            `json:"requestBody,omitempty"` // Optional UTF-8 POST body when Method == "POST"
-	ContentType        string            `json:"contentType,omitempty"` // Optional Content-Type header when Method == "POST"
-	Kind               classify.Kind     `json:"kind"`
-	KindAuto           bool              `json:"kindAuto,omitempty"`
-	Accept             string            `json:"accept,omitempty"`
-	IfNoneMatch        string            `json:"ifNoneMatch,omitempty"`
-	IfModifiedSince    string            `json:"ifModifiedSince,omitempty"`
-	Formats            []string          `json:"formats,omitempty"`
-	OnlyMainContent    *bool             `json:"onlyMainContent,omitempty"`
-	DiscoverLlms       *bool             `json:"discoverLlms,omitempty"`
-	PreferLlmsMarkdown *bool             `json:"preferLlmsMarkdown,omitempty"`
-	RedactPII          bool              `json:"redactPii,omitempty"`
-	Query              string            `json:"query,omitempty"`
-	JSONFilter         string            `json:"jsonFilter,omitempty"` // record filter for over-budget JSON arrays extracted on the node
+	ID                 string        `json:"id"`
+	URL                string        `json:"url"`
+	Method             string        `json:"method,omitempty"`      // "GET" (default) or "POST" (e.g. Workday CXS JSON search)
+	RequestBody        string        `json:"requestBody,omitempty"` // Optional UTF-8 POST body when Method == "POST"
+	ContentType        string        `json:"contentType,omitempty"` // Optional Content-Type header when Method == "POST"
+	Kind               classify.Kind `json:"kind"`
+	KindAuto           bool          `json:"kindAuto,omitempty"`
+	Accept             string        `json:"accept,omitempty"`
+	IfNoneMatch        string        `json:"ifNoneMatch,omitempty"`
+	IfModifiedSince    string        `json:"ifModifiedSince,omitempty"`
+	Formats            []string      `json:"formats,omitempty"`
+	OnlyMainContent    *bool         `json:"onlyMainContent,omitempty"`
+	DiscoverLlms       *bool         `json:"discoverLlms,omitempty"`
+	PreferLlmsMarkdown *bool         `json:"preferLlmsMarkdown,omitempty"`
+	RedactPII          bool          `json:"redactPii,omitempty"`
+	Query              string        `json:"query,omitempty"`
+	JSONFilter         string        `json:"jsonFilter,omitempty"` // record filter for over-budget JSON arrays extracted on the node
+	// IncludeTags / ExcludeTags scope over-budget HTML extracted on the node (same semantics as the Hub's edge path).
+	IncludeTags        []string          `json:"includeTags,omitempty"`
+	ExcludeTags        []string          `json:"excludeTags,omitempty"`
 	Headers            map[string]string `json:"headers,omitempty"`
 	RenderMode         string            `json:"renderMode,omitempty"` // "off" (default), "auto", "always"
 	Mobile             bool              `json:"mobile,omitempty"`
@@ -106,60 +109,64 @@ type ArtifactRef struct {
 
 // Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID                 string                         `json:"id"`
-	URL                string                         `json:"url"`
-	Kind               classify.Kind                  `json:"kind"`
-	Outcome            classify.Outcome               `json:"outcome"`
-	BlockedReason      string                         `json:"blockedReason,omitempty"`
-	Problem            string                         `json:"problem,omitempty"`
-	Status             int                            `json:"status"`
-	ContentType        string                         `json:"contentType,omitempty"`
-	ContentSource      string                         `json:"contentSource,omitempty"`
-	ResponseHeaders    map[string]string              `json:"headers,omitempty"`
-	PaymentHeaders     map[string]string              `json:"paymentHeaders,omitempty"`
-	CfMitigated        string                         `json:"cfMitigated,omitempty"`
-	WAF                *classify.WAFMatch             `json:"waf,omitempty"`
-	ETag               string                         `json:"etag,omitempty"`
-	LastModified       string                         `json:"lastModified,omitempty"`
-	RetryAfter         string                         `json:"retryAfter,omitempty"`
-	RetryAfterMs       int64                          `json:"retryAfterMs,omitempty"`
-	Bytes              int                            `json:"bytes"`
-	Truncated          bool                           `json:"truncated,omitempty"`
-	BodyOmitted        bool                           `json:"bodyOmitted,omitempty"`
-	ExtractedOnNode    bool                           `json:"extractedOnNode,omitempty"`
-	MarkdownOverBudget bool                           `json:"markdownOverBudget,omitempty"`
-	ExtractorID        string                         `json:"extractorId,omitempty"`
-	Records            []map[string]any               `json:"records,omitempty"`
-	Attempts           int                            `json:"attempts"`
-	DurationMs         int64                          `json:"durationMs"`
-	Timing             Timing                         `json:"timing"`
-	Body               string                         `json:"body,omitempty"`
-	BodyEncoding       string                         `json:"bodyEncoding,omitempty"`
-	Artifact           *ArtifactRef                   `json:"artifact,omitempty"`
-	ArtifactError      string                         `json:"artifactError,omitempty"`
-	FinalURL           string                         `json:"finalUrl,omitempty"`
-	Title              string                         `json:"title,omitempty"`
-	Description        string                         `json:"description,omitempty"`
-	Favicon            string                         `json:"favicon,omitempty"`
-	Markdown           string                         `json:"markdown,omitempty"`
-	Text               string                         `json:"text,omitempty"`
-	Links              []string                       `json:"links,omitempty"`
-	Images             []extract.ImageInfo            `json:"images,omitempty"`
-	Branding           *extract.BrandingProfile       `json:"branding,omitempty"`
-	Llms               *extract.LlmsDiscovery         `json:"llms,omitempty"`
-	Rendered           bool                           `json:"rendered,omitempty"`
-	BlockedTrackers    *int                           `json:"blockedTrackers,omitempty"`
-	SessionID          string                         `json:"sessionId,omitempty"`
-	ScreenshotBase64   string                         `json:"screenshotBase64,omitempty"`
-	ActionScreenshots  []string                       `json:"actionScreenshots,omitempty"`
-	ActionScrapes      []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
-	JavascriptReturns  []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
-	ActionResults      []browser.ActionResult         `json:"actionResults,omitempty"`
-	CapturedJSON       []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
-	PDFBase64          string                         `json:"pdfBase64,omitempty"`
-	PDFEngine          string                         `json:"pdfEngine,omitempty"`
-	SHA256             string                         `json:"sha256,omitempty"`
-	BodyBase64         string                         `json:"bodyBase64,omitempty"`
+	ID                 string             `json:"id"`
+	URL                string             `json:"url"`
+	Kind               classify.Kind      `json:"kind"`
+	Outcome            classify.Outcome   `json:"outcome"`
+	BlockedReason      string             `json:"blockedReason,omitempty"`
+	Problem            string             `json:"problem,omitempty"`
+	Status             int                `json:"status"`
+	ContentType        string             `json:"contentType,omitempty"`
+	ContentSource      string             `json:"contentSource,omitempty"`
+	ResponseHeaders    map[string]string  `json:"headers,omitempty"`
+	PaymentHeaders     map[string]string  `json:"paymentHeaders,omitempty"`
+	CfMitigated        string             `json:"cfMitigated,omitempty"`
+	WAF                *classify.WAFMatch `json:"waf,omitempty"`
+	ETag               string             `json:"etag,omitempty"`
+	LastModified       string             `json:"lastModified,omitempty"`
+	RetryAfter         string             `json:"retryAfter,omitempty"`
+	RetryAfterMs       int64              `json:"retryAfterMs,omitempty"`
+	Bytes              int                `json:"bytes"`
+	Truncated          bool               `json:"truncated,omitempty"`
+	BodyOmitted        bool               `json:"bodyOmitted,omitempty"`
+	ExtractedOnNode    bool               `json:"extractedOnNode,omitempty"`
+	MarkdownOverBudget bool               `json:"markdownOverBudget,omitempty"`
+	// ContentScopingApplied confirms the node applied the request's IncludeTags/ExcludeTags to node-extracted
+	// markdown. The Hub only accepts node markdown for a tag-scoped request when this is true, so an older node that
+	// ignores the fields can never leak excluded content.
+	ContentScopingApplied bool                           `json:"contentScopingApplied,omitempty"`
+	ExtractorID           string                         `json:"extractorId,omitempty"`
+	Records               []map[string]any               `json:"records,omitempty"`
+	Attempts              int                            `json:"attempts"`
+	DurationMs            int64                          `json:"durationMs"`
+	Timing                Timing                         `json:"timing"`
+	Body                  string                         `json:"body,omitempty"`
+	BodyEncoding          string                         `json:"bodyEncoding,omitempty"`
+	Artifact              *ArtifactRef                   `json:"artifact,omitempty"`
+	ArtifactError         string                         `json:"artifactError,omitempty"`
+	FinalURL              string                         `json:"finalUrl,omitempty"`
+	Title                 string                         `json:"title,omitempty"`
+	Description           string                         `json:"description,omitempty"`
+	Favicon               string                         `json:"favicon,omitempty"`
+	Markdown              string                         `json:"markdown,omitempty"`
+	Text                  string                         `json:"text,omitempty"`
+	Links                 []string                       `json:"links,omitempty"`
+	Images                []extract.ImageInfo            `json:"images,omitempty"`
+	Branding              *extract.BrandingProfile       `json:"branding,omitempty"`
+	Llms                  *extract.LlmsDiscovery         `json:"llms,omitempty"`
+	Rendered              bool                           `json:"rendered,omitempty"`
+	BlockedTrackers       *int                           `json:"blockedTrackers,omitempty"`
+	SessionID             string                         `json:"sessionId,omitempty"`
+	ScreenshotBase64      string                         `json:"screenshotBase64,omitempty"`
+	ActionScreenshots     []string                       `json:"actionScreenshots,omitempty"`
+	ActionScrapes         []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
+	JavascriptReturns     []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
+	ActionResults         []browser.ActionResult         `json:"actionResults,omitempty"`
+	CapturedJSON          []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
+	PDFBase64             string                         `json:"pdfBase64,omitempty"`
+	PDFEngine             string                         `json:"pdfEngine,omitempty"`
+	SHA256                string                         `json:"sha256,omitempty"`
+	BodyBase64            string                         `json:"bodyBase64,omitempty"`
 	// BodyBase64Omitted is set when BodyBase64 was dropped because it did not fit the batch MaxTotalBytes budget.
 	BodyBase64Omitted bool `json:"bodyBase64Omitted,omitempty"`
 

@@ -805,17 +805,68 @@ test('Step 2c: Go-node offload only accepts real in-budget output and never drop
     return { res, agentCalls };
   };
 
-  // 1) include/exclude tags: the node cannot apply them, so the request must not be offloaded (no excluded-content leak).
+  // 1) include/exclude tags: a node that does not confirm it applied them (older node ignoring the fields) must never
+  //    have its markdown returned (no excluded-content leak); the flagged over-budget response is returned instead.
   const scoped = await runScrape({
     payload: { formats: ['markdown'], excludeTags: ['aside'] },
     body: bigHtml,
     contentType: 'text/html; charset=utf-8',
     nodeItem: { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nEXCLUDED_UGC_SENTINEL' },
   });
-  assert.equal(scoped.agentCalls, 0, 'excludeTags requests must not be offloaded to the Go node');
   assert.equal(scoped.res.status, 200);
   assert.equal(scoped.res.body.edgeBudgetExceeded, true);
   assert.equal(String(scoped.res.body.markdown ?? '').includes('EXCLUDED_UGC_SENTINEL'), false);
+  assert.equal(JSON.stringify(scoped.res.body).includes('EXCLUDED_UGC_SENTINEL'), false, 'no response field may carry excluded content');
+
+  // 1b) A node that confirms `contentScopingApplied` is accepted for the same tag-scoped request.
+  const scopedOk = await runScrape({
+    payload: { formats: ['markdown'], excludeTags: ['aside'] },
+    body: bigHtml,
+    contentType: 'text/html; charset=utf-8',
+    nodeItem: {
+      contentType: 'text/html',
+      extractedOnNode: true,
+      contentScopingApplied: true,
+      bodyOmitted: true,
+      markdown: '# Node\n\nSCOPED_NODE_SENTINEL',
+    },
+  });
+  assert.equal(scopedOk.agentCalls, 1);
+  assert.equal(scopedOk.res.body.extractedOnNode, true);
+  assert.ok(String(scopedOk.res.body.markdown ?? '').includes('SCOPED_NODE_SENTINEL'));
+
+  // 1c) Primary agent path (the first fetch itself is answered by a Go node): an empty node result for an
+  //     unformattable page and unconfirmed tag scoping both return the flagged response, never a silent success.
+  const primary = async (payload: Record<string, unknown>, nodeItem: Record<string, unknown>) =>
+    executeScrapeCall({
+      payload: { url: pageUrl, ...payload },
+      env: { ARTIFACTS: createTempR2Bucket(tempDirs) as unknown as R2Bucket },
+      executeHubFetch: async () => ({
+        status: 200,
+        via: 'agent:home-node',
+        bodyText: JSON.stringify({ results: [{ id: 'scrape-1', url: pageUrl, status: 200, outcome: 'ok', ...nodeItem }] }),
+      }),
+    });
+  const primarySitemap = await primary(
+    { formats: ['markdown'] },
+    { contentType: 'application/xml', extractedOnNode: true, bodyOmitted: true, markdown: '' },
+  );
+  assert.equal(primarySitemap.body.edgeBudgetExceeded, true, 'primary-path empty node result must be flagged');
+  const primaryScoped = await primary(
+    { formats: ['markdown'], excludeTags: ['aside'] },
+    { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nEXCLUDED_UGC_SENTINEL' },
+  );
+  assert.equal(primaryScoped.body.edgeBudgetExceeded, true);
+  assert.equal(JSON.stringify(primaryScoped.body).includes('EXCLUDED_UGC_SENTINEL'), false);
+  const primaryRawHtml = await primary(
+    { formats: ['markdown', 'rawHtml'] },
+    { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nPRIMARY_NODE_SENTINEL' },
+  );
+  assert.ok(String(primaryRawHtml.body.markdown ?? '').includes('PRIMARY_NODE_SENTINEL'));
+  assert.ok(
+    ((primaryRawHtml.body.warnings as string[] | undefined) ?? []).some((w) => w.includes('rawHtml')),
+    'primary-path node extraction must warn that rawHtml is unavailable',
+  );
 
   // 2) Unformattable over-budget body (sitemap): an empty node result must not become a silent empty success.
   const sitemapXml = `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${overBudget('<url><loc>https://offload.example.com/p</loc></url>')}</urlset>`;

@@ -25,6 +25,62 @@ function tempBucket(dirs: string[]): NodeFsR2Bucket {
 
 const overBudget = (unit: string) => unit.repeat(Math.ceil((MAX_WASM_INPUT_BYTES + 512 * 1024) / unit.length));
 
+test('parsers: [] with an omitted body returns a warning and the artifact reference instead of a bare ok', async () => {
+  resetIsolateBudgetForTests();
+  const pdfUrl = 'https://files.example.com/big.pdf';
+  const blobSha = 'a'.repeat(64);
+  const res = await executeScrapeCall({
+    payload: { url: pdfUrl, formats: ['rawBase64'], parsers: [] },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:home-node',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: pdfUrl,
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/pdf',
+            bodyOmitted: true,
+            bodyBase64Omitted: true,
+            artifact: { blobSha256: blobSha, contentSha256: 'b'.repeat(64), contentBytes: 15 * 1024 * 1024 },
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.rawBase64, undefined);
+  assert.equal(res.body.artifactId, blobSha);
+  const warnings = (res.body.warnings as string[] | undefined) ?? [];
+  assert.ok(warnings.some((w) => w.includes('rawBase64') && w.includes('artifactId')), JSON.stringify(warnings));
+});
+
+test('cutMarkdownToSanitizerBudget keeps long single-line documents instead of snapping back to an early line break', () => {
+  // A short first line followed by multi-MiB minified content: the only `\n` is at offset 7.
+  const minified = `# Data\n${'{"k":"v","n":1},'.repeat(400_000)}`;
+  assert.ok(minified.length > MAX_WASM_INPUT_BYTES);
+  const ascii = cutMarkdownToSanitizerBudget(minified);
+  assert.equal(ascii.cut, true);
+  assert.ok(ascii.text.length > 3 * 1024 * 1024, `ASCII cut kept only ${ascii.text.length} chars`);
+
+  // Same with non-ASCII content (encodeInto path), including a surrogate pair at the boundary region.
+  const wide = `# Données\n${'é😀'.repeat(1_200_000)}`;
+  const cutWide = cutMarkdownToSanitizerBudget(wide);
+  assert.equal(cutWide.cut, true);
+  assert.ok(cutWide.text.length > 1024 * 1024, `non-ASCII cut kept only ${cutWide.text.length} chars`);
+  const last = cutWide.text.charCodeAt(cutWide.text.length - 1);
+  assert.equal(last >= 0xd800 && last <= 0xdbff, false, 'cut must not end on a lone high surrogate');
+  assert.ok(new TextEncoder().encode(cutWide.text).byteLength <= MAX_WASM_INPUT_BYTES);
+
+  // A nearby line break is still preferred.
+  const lined = `${'line of prose\n'.repeat(400_000)}`;
+  const cutLined = cutMarkdownToSanitizerBudget(lined);
+  assert.equal(cutLined.text.endsWith('line of prose'), true);
+});
+
 test('finalizeScrapedMarkdown bounds sanitizer growth to the budget and flags it (no silent downstream cuts)', () => {
   // ~3.6 MB of `a < b` prose: under the input budget, but escaping `<` grows the sanitized output past it.
   const doc = `# Growth\n\n${'a < b and c < d\n'.repeat(225_000)}TAIL_SENTINEL\n`;

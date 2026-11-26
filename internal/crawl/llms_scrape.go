@@ -501,6 +501,11 @@ func (c *Crawler) offloadOverBudgetDocumentOnNode(
 	// would accept an empty result as a successful scrape.
 	applyNodeMd := func(md, text string) {
 		res.ExtractedOnNode = true
+		// Tag scoping is honoured: the HTML branch passes IncludeTags/ExcludeTags to the extractor, and the non-HTML
+		// formatters (JSON, feeds, CSV, ...) are unaffected by tags on the edge path too.
+		if len(r.IncludeTags) > 0 || len(r.ExcludeTags) > 0 {
+			res.ContentScopingApplied = true
+		}
 		if r.Query != "" && md != "" {
 			md = extract.RerankPassages(md, r.Query, 24_000)
 			if text != "" {
@@ -549,6 +554,8 @@ func (c *Crawler) offloadOverBudgetDocumentOnNode(
 			IncludeImages:   wantImages,
 			RedactPII:       r.RedactPII,
 			MaxScanChars:    16 << 20,
+			IncludeTags:     r.IncludeTags,
+			ExcludeTags:     r.ExcludeTags,
 		})
 		res.Title = full.Title
 		res.Description = full.Description

@@ -92,6 +92,20 @@ name = "edgefetch-hub"
 workers_dev = true
 preview_urls = false
 
+# Explicit per-env copy of the top-level observability settings. Wrangler marks `observability` inheritable, but
+# stating it here keeps `-e production` deploys from ever depending on that inheritance.
+[env.production.observability]
+enabled = true
+
+[env.production.observability.logs]
+enabled = true
+invocation_logs = true
+head_sampling_rate = 1
+
+[env.production.observability.traces]
+enabled = true
+head_sampling_rate = 1
+
 [env.production.triggers]
 crons = ["0 4 * * *"]
 

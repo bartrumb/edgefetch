@@ -2413,7 +2413,7 @@ async function dispatchRpcMessage(
   deps: McpServerDeps,
   isModern = false,
   userId = 'owner',
-): Promise<{ body: Record<string, unknown>; status?: number } | null> {
+): Promise<{ body: Record<string, unknown>; status?: number; sseLeading?: Array<Record<string, unknown>> } | null> {
   const isNotification = msg.id === undefined;
   const id = msg.id ?? null;
 
@@ -2487,7 +2487,7 @@ async function dispatchRpcMessage(
         body: jsonRpcResult(id, {
           resultType: 'complete',
           supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-          capabilities: { tools: { listChanged: true } },
+          capabilities: { tools: { listChanged: false } },
           _meta: {
             'io.modelcontextprotocol/serverInfo': { name: deps.serverName, version: deps.serverVersion },
           },
@@ -2495,6 +2495,25 @@ async function dispatchRpcMessage(
           ttlMs: 60_000,
           cacheScope: 'private',
         }),
+      };
+    }
+    case 'subscriptions/listen': {
+      // MCP 2026-07-28 change-notification stream. The hub's tool list is fixed per deployed version (it never changes
+      // while a client is connected) and it advertises `listChanged: false`, so it honors no notification types: it
+      // acknowledges with an empty `notifications` set, then ends the subscription gracefully with a `complete` result
+      // (spec "Graceful Closure"), which tells the client not to reconnect. Before this, the method was unknown and
+      // 2026-07-28 clients retried it with backoff on every connect (HTTP 404 bursts).
+      await finishMcpTurn();
+      const subscriptionMeta = { 'io.modelcontextprotocol/subscriptionId': id };
+      return {
+        sseLeading: [
+          {
+            jsonrpc: '2.0',
+            method: 'notifications/subscriptions/acknowledged',
+            params: { _meta: subscriptionMeta, notifications: {} },
+          },
+        ],
+        body: jsonRpcResult(id, { resultType: 'complete', _meta: subscriptionMeta }),
       };
     }
     case 'initialize': {
@@ -2513,7 +2532,7 @@ async function dispatchRpcMessage(
       return {
         body: jsonRpcResult(id, {
           protocolVersion,
-          capabilities: { tools: { listChanged: true } },
+          capabilities: { tools: { listChanged: false } },
           serverInfo: { name: deps.serverName, version: deps.serverVersion },
           instructions: MCP_INSTRUCTIONS,
         }),
@@ -2855,6 +2874,21 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
   const single = await dispatchRpcMessage(msg, auth.scopes, auth.principal, userAgent, resolvedDeps, era.isModern, callerUserId);
   if (!single) {
     return new Response(null, { status: 202, headers: cors });
+  }
+  if (single.sseLeading) {
+    // SSE response stream: the leading notifications (e.g. `notifications/subscriptions/acknowledged`), then the final
+    // JSON-RPC response, which ends the stream.
+    const events = [...single.sseLeading, single.body].map((m) => `event: message\ndata: ${JSON.stringify(m)}\n\n`).join('');
+    return new Response(events, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-accel-buffering': 'no',
+        'mcp-protocol-version': era.negotiatedVersion,
+        ...cors,
+      },
+    });
   }
   return Response.json(single.body, {
     status: single.status ?? 200,

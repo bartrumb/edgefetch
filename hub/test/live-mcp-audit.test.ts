@@ -910,7 +910,7 @@ test('B.5 & B.6: fetch_batch maps 404->not_found vs 410->gone, normalizes SSRF r
   });
 });
 
-test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged + 2.8.6, all 17 tool descriptions are jargon-free, and search inputSchema is deduplicated', async () => {
+test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8.6, subscriptions/listen ends gracefully, all 17 tool descriptions are jargon-free, and search inputSchema is deduplicated', async () => {
   assert.equal(HUB_VERSION, '2.8.6');
   const mcpDeps: McpServerDeps = {
     serverName: 'edgefetch-mcp',
@@ -942,10 +942,52 @@ test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged + 2.8.6, all
       mcpDeps,
     );
     const rpc = (await res.json()) as { result: Record<string, unknown> };
-    assert.deepEqual(rpc.result.capabilities, { tools: { listChanged: true } });
+    // The tool list is fixed per deployed version, so the hub promises no tools/list_changed notifications.
+    assert.deepEqual(rpc.result.capabilities, { tools: { listChanged: false } });
     const instructions = String(rpc.result.instructions ?? '');
     assert.equal(/\b(?:META D1|SEARCH D1|R2|HAOS|edgefetch_fat|Serper waterfall)\b/i.test(instructions), false);
   }
+
+  // MCP 2026-07-28 `subscriptions/listen`: an SSE stream with `notifications/subscriptions/acknowledged` (no notification
+  // types honored) and then a graceful `complete` result, both carrying the subscription ID (the request ID). Before,
+  // this was "Method not found" (HTTP 404) and clients retried it with backoff on every connect.
+  const listenRes = await handleMcpRequest(
+    new Request('https://hub.example.com/mcp', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer owner-secret-token-for-mcp-audit-test-9999',
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+        'mcp-method': 'subscriptions/listen',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'listen-1',
+        method: 'subscriptions/listen',
+        params: {
+          _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' },
+          notifications: { toolsListChanged: true },
+        },
+      }),
+    }),
+    new URL('https://hub.example.com/mcp'),
+    mcpDeps,
+  );
+  assert.equal(listenRes.status, 200);
+  assert.match(listenRes.headers.get('content-type') ?? '', /^text\/event-stream/);
+  assert.equal(listenRes.headers.get('x-accel-buffering'), 'no');
+  const listenMsgs = (await listenRes.text())
+    .split('\n')
+    .filter((line) => line.startsWith('data: '))
+    .map((line) => JSON.parse(line.slice('data: '.length)) as Record<string, any>);
+  assert.equal(listenMsgs.length, 2);
+  assert.equal(listenMsgs[0]!.method, 'notifications/subscriptions/acknowledged');
+  assert.equal(listenMsgs[0]!.params._meta['io.modelcontextprotocol/subscriptionId'], 'listen-1');
+  assert.deepEqual(listenMsgs[0]!.params.notifications, {});
+  assert.equal(listenMsgs[1]!.id, 'listen-1');
+  assert.equal(listenMsgs[1]!.result.resultType, 'complete');
+  assert.equal(listenMsgs[1]!.result._meta['io.modelcontextprotocol/subscriptionId'], 'listen-1');
 
   // Verify all 17 tool descriptions are plain English and free of internal infra jargon
   const tools = buildCanonicalMcpToolSchemas();

@@ -2,6 +2,11 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.4] - 2026-11-26
+
+### Fixed
+- fetch_batch includeBody:false still returns artifactIds; label JSON auto-kind results as json (#84)
+
 ## [2.8.3] - 2026-11-26
 
 ### Fixed

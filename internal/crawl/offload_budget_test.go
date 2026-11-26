@@ -91,3 +91,82 @@ func TestNodeOffloadOverBudgetDocumentsAndNoMarkdownTruncation(t *testing.T) {
 			mdRes.ExtractedOnNode, mdRes.MarkdownOverBudget, len(mdRes.Markdown), len(mdRes.Body))
 	}
 }
+
+// BodyBase64 is returned outside `Body`, so it must count toward MaxTotalBytes; otherwise a large binary's base64
+// (4/3 of the raw size) escapes the batch budget and can exceed the Hub's 20 MiB agent reply cap.
+func TestBodyBase64CountsTowardBatchTotalBudget(t *testing.T) {
+	small := strings.Repeat("s", 64*1024)
+	big := strings.Repeat("b", 900*1024) // ~1.2 MiB of base64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("User-agent: *\nAllow: /\n"))
+	})
+	mux.HandleFunc("/small.bin", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(small))
+	})
+	mux.HandleFunc("/big.bin", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(big))
+	})
+	c, _ := newTestCrawler(t, mux)
+	results := c.Run(
+		context.Background(),
+		[]Request{
+			{ID: "small", URL: "http://shop.test/small.bin", Kind: classify.KindScrape, Formats: []string{"rawBase64"}},
+			{ID: "big", URL: "http://shop.test/big.bin", Kind: classify.KindScrape, Formats: []string{"rawBase64"}},
+		},
+		Options{MaxBytes: 2 << 20, MaxTotalBytes: 1 << 20, PauseMs: 1, GapMs: 0},
+	)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].BodyBase64 == "" || results[0].BodyBase64Omitted {
+		t.Fatalf("small base64 body should fit the 1 MiB budget (len=%d omitted=%v)", len(results[0].BodyBase64), results[0].BodyBase64Omitted)
+	}
+	if results[1].BodyBase64 != "" || !results[1].BodyBase64Omitted {
+		t.Fatalf("~1.2 MiB base64 body must be dropped against a 1 MiB budget (len=%d omitted=%v)", len(results[1].BodyBase64), results[1].BodyBase64Omitted)
+	}
+}
+
+// An over-budget body that no node formatter handles (a `<urlset>` sitemap) must not claim node extraction:
+// otherwise the Hub accepts an empty node result as a successful 200 scrape with no warning.
+func TestNodeOffloadUnformattableBodyDoesNotClaimExtraction(t *testing.T) {
+	const budget = 256 * 1024
+	var sb strings.Builder
+	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`)
+	for i := 0; sb.Len() <= budget+4096; i++ {
+		sb.WriteString("<url><loc>https://shop.test/products/item-")
+		sb.WriteString(strings.Repeat("a", 40))
+		sb.WriteString("</loc><lastmod>2026-11-25</lastmod></url>")
+	}
+	sb.WriteString("</urlset>")
+	sitemap := sb.String()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("User-agent: *\nAllow: /\n"))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(sitemap))
+	})
+	c, _ := newTestCrawler(t, mux)
+	results := c.Run(
+		context.Background(),
+		[]Request{{ID: "sm-1", URL: "http://shop.test/sitemap.xml", Kind: classify.KindScrape, Formats: []string{"markdown"}}},
+		Options{IncludeBody: true, MaxBytes: 8 << 20, MaxInlineBodyBytes: budget, PauseMs: 1, GapMs: 0},
+	)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	res := results[0]
+	if res.ExtractedOnNode {
+		t.Fatalf("unformattable over-budget sitemap must not set ExtractedOnNode (markdownLen=%d)", len(res.Markdown))
+	}
+	if res.Markdown != "" {
+		t.Fatalf("expected no node markdown for an unformattable sitemap, got %d chars", len(res.Markdown))
+	}
+}

@@ -1750,6 +1750,9 @@ export default {
                   includeBody: true,
                   respectRobots: true,
                   ...(boundedMaxBytes !== undefined ? { maxBytes: boundedMaxBytes } : {}),
+                  // `timeoutMs` lives on crawl.Options (Go `crawl.Request` has no such field): on the request it was
+                  // silently dropped by lenient decoders (30 s default) and rejected by the strict server decoder.
+                  ...(boundedTimeoutMs !== undefined ? { timeoutMs: boundedTimeoutMs } : {}),
                 },
                 requests: [
                   {
@@ -1757,7 +1760,6 @@ export default {
                     url: pageUrl,
                     kind,
                     accept,
-                    ...(boundedTimeoutMs !== undefined ? { timeoutMs: boundedTimeoutMs } : {}),
                   },
                 ],
               }),

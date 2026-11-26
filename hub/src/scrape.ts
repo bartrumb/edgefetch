@@ -4870,7 +4870,25 @@ export async function executeScrapeCall(params: {
     !(stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing) &&
     rawBodyStr.length > 0 &&
     exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES;
-  if (rawBodyOverBudget && item.extractedOnNode !== true && !fetchResUsed.via.startsWith('agent') && target !== 'container') {
+  // The Go node's over-budget extractor produces sanitized markdown only: it does not receive or apply
+  // `includeTags` / `excludeTags`, and it returns no raw body for html/rawHtml/product/attributes/json/jsonFilter.
+  // Never offload a request that scopes content with include/exclude tags (excluded content would leak into the
+  // markdown); for other edge-only formats, accept the node markdown but say which formats are unavailable.
+  const nodeOffloadBlockedByScoping = includeTags.length > 0 || excludeTags.length > 0;
+  const nodeOffloadMissingFormats = [
+    ...(['html', 'rawHtml', 'product'] as const).filter((f) => stringFormats.has(f)),
+    ...(attributesSpec ? ['attributes'] : []),
+    ...(jsonSchemaSpec ? ['json'] : []),
+    ...(jsonFilterStr ? ['jsonFilter'] : []),
+  ];
+  const nodeOffloadWarnings: string[] = [];
+  if (
+    rawBodyOverBudget &&
+    !nodeOffloadBlockedByScoping &&
+    item.extractedOnNode !== true &&
+    !fetchResUsed.via.startsWith('agent') &&
+    target !== 'container'
+  ) {
     try {
       const offloadCall = {
         ...fetchCall,
@@ -4891,11 +4909,27 @@ export async function executeScrapeCall(params: {
       if (nodeRes.status === 200) {
         const nodeParsed = JSON.parse(nodeRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const nodeItem = nodeParsed.results?.[0];
-        if (nodeItem?.outcome === 'ok' && (nodeItem.extractedOnNode === true || typeof nodeItem.markdown === 'string')) {
+        // Accept the node result only when it actually produced in-budget markdown. An empty or over-budget node
+        // result (e.g. an unformattable >4 MiB sitemap, or origin markdown the node also could not fit) would
+        // otherwise discard the raw body and return an empty 200; keeping the raw body lets the edge fallback below
+        // cut+sanitize origin markdown or flag `edgeBudgetExceeded` with a warning.
+        const nodeMarkdown = typeof nodeItem?.markdown === 'string' ? nodeItem.markdown : '';
+        if (
+          nodeItem?.outcome === 'ok' &&
+          nodeItem.markdownOverBudget !== true &&
+          nodeMarkdown.trim().length > 0 &&
+          exactUtf8ByteLen(nodeMarkdown) <= MAX_WASM_INPUT_BYTES
+        ) {
           rawBodyStr = '';
           fetchResUsed = nodeRes;
           item = nodeItem;
           finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+          if (nodeOffloadMissingFormats.length > 0) {
+            nodeOffloadWarnings.push(
+              `Document over the 4 MiB edge budget was extracted on a Go node; ${nodeOffloadMissingFormats.join(', ')} ` +
+                'require edge processing of the raw page and are unavailable for this response.',
+            );
+          }
         }
       }
     } catch {
@@ -4924,7 +4958,16 @@ export async function executeScrapeCall(params: {
   );
   const isolateLease = await acquireIsolateByteBudget(estWorkBytes, 200);
   if (!isolateLease) {
-    if (item.extractedOnNode !== true && !fetchResUsed.via.startsWith('agent') && target !== 'container' && rawBodyStr.length >= 1_048_576) {
+    // Same constraint as the over-budget offload: the node markdown ignores include/exclude tags and carries no raw
+    // body, so requests that need those get the retryable 429 below instead of a silently different response.
+    if (
+      !nodeOffloadBlockedByScoping &&
+      nodeOffloadMissingFormats.length === 0 &&
+      item.extractedOnNode !== true &&
+      !fetchResUsed.via.startsWith('agent') &&
+      target !== 'container' &&
+      rawBodyStr.length >= 1_048_576
+    ) {
       try {
         const busyOffloadRes = await executeHubFetch(
           'agent',
@@ -5128,7 +5171,9 @@ export async function executeScrapeCall(params: {
           target,
           JSON.stringify({
             maxSeconds: 45,
-            options: { includeBody: true, respectRobots: true, maxBytes: 16_777_216 },
+            // Bodies over the WASM budget are omitted by the fetcher (the stub rescue then falls back) instead of
+            // being pulled whole into the isolate.
+            options: { includeBody: true, respectRobots: true, maxBytes: 16_777_216, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
             requests: [
               {
                 id: `ats-${stubAts.id}`,
@@ -5369,7 +5414,7 @@ export async function executeScrapeCall(params: {
       target,
       JSON.stringify({
         maxSeconds: 25,
-        options: { includeBody: true, respectRobots: true },
+        options: { includeBody: true, respectRobots: true, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
         requests: [{ id: tag, url: epUrl, kind: 'json', accept: 'application/json' }],
       }),
       site,
@@ -5832,7 +5877,7 @@ export async function executeScrapeCall(params: {
           target,
           JSON.stringify({
             maxSeconds: 30,
-            options: { includeBody: true, respectRobots: true },
+            options: { includeBody: true, respectRobots: true, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
             requests: [{ id: 'alt-md-1', url: altUrl.toString(), kind: 'text', accept: 'text/plain' }],
           }),
           site,
@@ -6226,7 +6271,7 @@ export async function executeScrapeCall(params: {
         target,
         JSON.stringify({
           maxSeconds: 20,
-          options: { includeBody: true, respectRobots: true },
+          options: { includeBody: true, respectRobots: true, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
           requests: [{ id: 'llms-1', url: llmsOriginUrl, kind: 'text', accept: 'text/plain' }],
         }),
         site,
@@ -6360,6 +6405,11 @@ export async function executeScrapeCall(params: {
   const attributesOut =
     attributesSpec && isHtmlBody ? extractHtmlAttributesBySelectors(rawBodyStr, attributesSpec) : undefined;
 
+  // Same precedence as the response's `records` output below: custom-domain Shopify / adapter records first, so
+  // `json` schema fields such as `sku` can be filled from them (they were previously only used for `records`).
+  const recordsForJson = [customShopifyDoc?.records, extracted?.records, nonEmptyUniversalRecords].find(
+    (r): r is NonNullable<typeof r> => Array.isArray(r) && r.length > 0,
+  );
   const docForJson: ExtractedDocument | undefined = jsonSchemaSpec
     ? {
         markdown: rawCleanMarkdown,
@@ -6369,7 +6419,7 @@ export async function executeScrapeCall(params: {
         language: extracted?.language,
         canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
         favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
-        ...(Array.isArray(nonEmptyUniversalRecords) ? { records: nonEmptyUniversalRecords } : {}),
+        ...(recordsForJson ? { records: recordsForJson } : {}),
         links: resolvedLinks as string[],
         images: resolvedImages as ScrapedImage[],
         branding: extracted?.branding ?? {
@@ -6491,7 +6541,12 @@ export async function executeScrapeCall(params: {
   const rawBase64Out = rawBase64Requested ? encodeBodyToRawBase64(item) : undefined;
 
   let jsonExtractionModeOut: 'heuristic' | 'llm' | undefined;
-  const scrapeWarnings: string[] = [...(extracted?.warnings ?? [])];
+  const scrapeWarnings: string[] = [...(extracted?.warnings ?? []), ...nodeOffloadWarnings];
+  if (rawBase64Requested && rawBase64Out === undefined && (item.bodyBase64Omitted === true || item.bodyOmitted === true)) {
+    scrapeWarnings.push(
+      'rawBase64 was requested but the body was too large to return inline (batch body budget); fetch the stored artifact instead.',
+    );
+  }
   if (autoBrowserUnavailable && renderedViaOut === undefined && countTextWords(rawCleanMarkdown) < 50) {
     scrapeWarnings.push(
       'Page appears to require JavaScript rendering, but no connected worker advertises browser-v1. Enable allow_no_sandbox_browser in the Home Assistant add-on configuration or run a Docker worker with --security-opt seccomp=./deploy/seccomp/chromium-sandbox.json.',

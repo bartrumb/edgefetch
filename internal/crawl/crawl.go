@@ -159,6 +159,8 @@ type Result struct {
 	PDFEngine          string                         `json:"pdfEngine,omitempty"`
 	SHA256             string                         `json:"sha256,omitempty"`
 	BodyBase64         string                         `json:"bodyBase64,omitempty"`
+	// BodyBase64Omitted is set when BodyBase64 was dropped because it did not fit the batch MaxTotalBytes budget.
+	BodyBase64Omitted bool `json:"bodyBase64Omitted,omitempty"`
 
 	traceSpanID   string
 	traceStart    time.Time
@@ -684,6 +686,26 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 							res.BodyOmitted = true
 							if res.Problem == "" {
 								res.Problem = fmt.Sprintf("batch total body budget (%d bytes) exceeded", opts.MaxTotalBytes)
+							}
+							break
+						}
+						if retainedBodyBytes.CompareAndSwap(cur, cur+encodedLen) {
+							break
+						}
+					}
+				}
+				// BodyBase64 (rawBase64 / binary requests) is returned outside `Body`, so it must be charged against the
+				// same batch budget: a 16 MiB binary is ~21.3 MiB of base64, over the Hub's 20 MiB agent reply cap.
+				if len(res.BodyBase64) > 0 {
+					encodedLen := int64(len(res.BodyBase64))
+					for {
+						cur := retainedBodyBytes.Load()
+						if cur+encodedLen > int64(opts.MaxTotalBytes) {
+							res.BodyBase64 = ""
+							res.BodyBase64Omitted = true
+							res.Truncated = true
+							if res.Problem == "" {
+								res.Problem = fmt.Sprintf("base64 body exceeds batch total body budget (%d bytes)", opts.MaxTotalBytes)
 							}
 							break
 						}

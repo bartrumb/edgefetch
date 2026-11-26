@@ -736,6 +736,14 @@ export class RequestTracer {
     this.currentSpan = currentSpan;
   }
 
+  /**
+   * True when this tracer is the root view (no span entered) of the same request as `other`. Used so an explicitly
+   * passed root tracer does not shadow the child span that is active in AsyncLocalStorage for that same request.
+   */
+  isRootViewOf(other: RequestTracer): boolean {
+    return this.currentSpan === undefined && this.state === other.state;
+  }
+
   static fromRequest(
     request: Request,
     opts?: { suppress?: boolean; suppressWhenUnsampledHealth?: boolean; authenticated?: boolean },
@@ -1055,7 +1063,15 @@ export class RequestTracer {
 }
 
 export function getActiveRequestTracer(explicit?: RequestTracer | TraceContext): RequestTracer | null {
-  if (explicit instanceof RequestTracer) return explicit;
+  if (explicit instanceof RequestTracer) {
+    // A root tracer handed in explicitly (e.g. bound before `withRouteSpan`) would otherwise win over the span that is
+    // actually active for this request, turning `setActiveSpanAttribute` into a no-op on the root.
+    const activeForSameRequest = requestTracerStorage.getStore();
+    if (activeForSameRequest && activeForSameRequest !== explicit && explicit.isRootViewOf(activeForSameRequest)) {
+      return activeForSameRequest;
+    }
+    return explicit;
+  }
   const fromAls = requestTracerStorage.getStore();
   if (fromAls) return fromAls;
   if (explicit) return RequestTracer.fromContext(explicit);

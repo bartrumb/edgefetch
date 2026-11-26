@@ -2810,6 +2810,12 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 		if ldSku, ok := productLd["sku"].(string); ok {
 			skuSrc = ldSku
 		}
+		// Shopify and many other storefronts publish `sku` only on the (primary) Offer, not on the Product node.
+		if strings.TrimSpace(skuSrc) == "" && primaryOffer != nil {
+			if offerSku, ok := primaryOffer["sku"].(string); ok {
+				skuSrc = offerSku
+			}
+		}
 		cleanSku := SanitizePlainMetadataText(skuSrc, 160)
 
 		rawLdURL := finalURL

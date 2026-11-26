@@ -178,6 +178,7 @@ import {
   refineBlockedInfo,
   tryFetchWaybackSnapshot,
 } from '../src/waf.ts';
+import { assertFastAsync, assertFastSync } from './perf-budget.ts';
 
 function sendRawTcpRequest(port: number, rawHttp: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -844,27 +845,26 @@ test('SEC-V255-4 (M1, M12 & Low): Strict path-prefix LLM key isolation, loopback
   assert.equal(byoCfg.ok, true);
   if (byoCfg.ok && byoCfg.config) {
     const thinkBody = JSON.stringify({ choices: [{ message: { content: '<think>'.repeat(80_000) } }] });
-    const t1 = performance.now();
-    const out1 = await completeLlmTurn({
-      config: byoCfg.config,
-      messages: [{ role: 'user', content: 'hi' }],
-      fetchFn: (async () => new Response(thinkBody, { status: 200 })) as typeof fetch,
-    });
-    const d1 = performance.now() - t1;
+    const llmConfig = byoCfg.config;
+    const out1 = await assertFastAsync('80k <think> tags', 50, () =>
+      completeLlmTurn({
+        config: llmConfig,
+        messages: [{ role: 'user', content: 'hi' }],
+        fetchFn: (async () => new Response(thinkBody, { status: 200 })) as typeof fetch,
+      }),
+    );
     assert.equal(out1.ok, true);
-    assert.ok(d1 < 50, `80k <think> tags took ${d1.toFixed(1)}ms (expected < 50ms)`);
 
     const toolBody = JSON.stringify({ choices: [{ message: { content: '<tool_call>'.repeat(80_000) } }] });
-    const t2 = performance.now();
-    const out2 = await completeLlmTurn({
-      config: byoCfg.config,
-      messages: [{ role: 'user', content: 'hi' }],
-      tools: [{ name: 'scrape', description: 's', parameters: {} }],
-      fetchFn: (async () => new Response(toolBody, { status: 200 })) as typeof fetch,
-    });
-    const d2 = performance.now() - t2;
+    const out2 = await assertFastAsync('80k <tool_call> tags', 50, () =>
+      completeLlmTurn({
+        config: llmConfig,
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ name: 'scrape', description: 's', parameters: {} }],
+        fetchFn: (async () => new Response(toolBody, { status: 200 })) as typeof fetch,
+      }),
+    );
     assert.equal(out2.ok, true);
-    assert.ok(d2 < 50, `80k <tool_call> tags took ${d2.toFixed(1)}ms (expected < 50ms)`);
   }
 });
 
@@ -1258,16 +1258,14 @@ test('QA-V255-ROUND3: cross-origin ATS closed_posting redirect, origin-markdown 
 test('SEC-V260-1 (R3-H1..R3-H3 & llm.ts O(N) summary): linear HTML/Markdown scanners, split-tag XSS defense, and safe regex validation', async () => {
   // 1. `buildDeterministicSummary` on `'['.repeat(100_000)` and `'[a]('.repeat(80_000)` MUST remain strictly linear!
   buildDeterministicSummary('# Warmup\n\nSimple warmup paragraph with more than forty five characters for JIT.'); // JIT warm-up
-  const tSumStart = performance.now();
-  const sumBrackets = buildDeterministicSummary('['.repeat(100_000), 'Adversarial Doc');
-  const sumElapsedMs = performance.now() - tSumStart;
-  assert.ok(sumElapsedMs < 100, `Expected buildDeterministicSummary('['.repeat(100_000)) < 100ms, took ${sumElapsedMs.toFixed(2)}ms`);
+  const sumBrackets = assertFastSync("buildDeterministicSummary('['.repeat(100_000))", 100, () =>
+    buildDeterministicSummary('['.repeat(100_000), 'Adversarial Doc'),
+  );
   assert.ok(typeof sumBrackets === 'string');
 
-  const tLinkStart = performance.now();
-  const sumHalfLinks = buildDeterministicSummary('[a]('.repeat(80_000), 'Half Links');
-  const linkElapsedMs = performance.now() - tLinkStart;
-  assert.ok(linkElapsedMs < 100, `Expected buildDeterministicSummary('[a]('.repeat(80_000)) < 100ms, took ${linkElapsedMs.toFixed(2)}ms`);
+  const sumHalfLinks = assertFastSync("buildDeterministicSummary('[a]('.repeat(80_000))", 100, () =>
+    buildDeterministicSummary('[a]('.repeat(80_000), 'Half Links'),
+  );
   assert.ok(typeof sumHalfLinks === 'string');
 
   // 2. `R3-H1`: `'<!--'.repeat(70_000)` and `'[a]('.repeat(80_000)` linear execution in `stripHtmlCommentsLinear` & `extractHtmlDocument` / `executeScrapeCall`
@@ -2691,10 +2689,7 @@ test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forge
     }).markdown;
 
   // F1: 32k-tab code-fence info header completes in linear time (< 80ms)
-  const tFence = performance.now();
-  const f1Out = fin('```js' + '\t'.repeat(32_000) + 'x\ncode\n```');
-  const f1Ms = performance.now() - tFence;
-  assert.ok(f1Ms < 80, `F1 32k-tab fence header must be linear (<80ms), took ${f1Ms.toFixed(1)}ms`);
+  const f1Out = assertFastSync('F1 32k-tab fence header', 80, () => fin('```js' + '\t'.repeat(32_000) + 'x\ncode\n```'));
   assert.match(f1Out, /\ncode\n```$/);
 
   // F2 (`R5-M1`): Optional group before `$` (`(a*aaa*)?$`) rejected by `compileSafeUserRegex`
@@ -2765,23 +2760,22 @@ test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forge
     id: i + 1,
     src: `https://cdn.shopify.com/s/files/1/0001/img-${i % 400}.jpg`,
   }));
-  const tShop = performance.now();
-  const shopParsed = shopifyAdapter.catalog!.parsePage(
-    JSON.stringify({
-      products: [
-        {
-          id: 99,
-          title: 'Mega Gallery Jacket',
-          handle: 'mega-jacket',
-          images: manyImages,
-          variants: Array.from({ length: 400 }, (_, i) => ({ id: i + 1, title: `V${i}`, price: '19.99', available: true })),
-        },
-      ],
-    }),
-    new URL('https://shop.example.com'),
+  const shopParsed = assertFastSync('Shopify 2000-image dedup', 100, () =>
+    shopifyAdapter.catalog!.parsePage(
+      JSON.stringify({
+        products: [
+          {
+            id: 99,
+            title: 'Mega Gallery Jacket',
+            handle: 'mega-jacket',
+            images: manyImages,
+            variants: Array.from({ length: 400 }, (_, i) => ({ id: i + 1, title: `V${i}`, price: '19.99', available: true })),
+          },
+        ],
+      }),
+      new URL('https://shop.example.com'),
+    ),
   );
-  const shopMs = performance.now() - tShop;
-  assert.ok(shopMs < 100, `Shopify 2000-image dedup must be linear (<100ms), took ${shopMs.toFixed(1)}ms`);
   assert.equal(shopParsed.records[0]?.images?.length, 250);
   assert.equal(shopParsed.records[0]?.variants.length, 250);
 

@@ -2,6 +2,11 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.6] - 2026-11-26
+
+### Fixed
+- serve MCP Streamable HTTP at the site root as well as /mcp (#88)
+
 ## [2.8.5] - 2026-11-26
 
 ### Fixed

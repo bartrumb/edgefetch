@@ -98,6 +98,8 @@ import {
 } from '../src/scrape-advanced.ts';
 import { executeInteractCall, executeScrapeCall } from '../src/scrape.ts';
 import { ensureD1ColumnIfMissing, executeExtractCall } from '../src/search-index.ts';
+import { ensureD1ColumnsIfMissing } from '../src/d1-schema.ts';
+import { USERS_LEGACY_COLUMN_MIGRATIONS } from '../src/github-auth.ts';
 import { isEligibleForExternalSpaFallback } from '../src/spa-fallback.ts';
 import { handleAgentArtifactUpload, resetRecentArtifactUploadsForTests } from '../src/storage.ts';
 import { executeSearchCall, resetSearchProviderPacingForTests } from '../src/web-search.ts';
@@ -2520,6 +2522,65 @@ test('R10-2: PRAGMA table_info guard eliminates duplicate column user_id SQLITE_
   assert.equal(addedSecond, false);
   assert.equal(legacyTracker.alterErrors.length, 0);
   assert.equal(legacyTracker.executedSql.filter((s) => /^\s*ALTER\s+TABLE/i.test(s)).length, 1);
+});
+
+test('R11: users column migrations use one PRAGMA and emit zero duplicate-column D1 error spans on sign-in', async () => {
+  const isAlter = (sql: string) => /^\s*ALTER\s+TABLE/i.test(sql);
+  const isPragma = (sql: string) => /^\s*PRAGMA\s+table_info/i.test(sql);
+
+  // Case A: fully migrated production schema (every legacy column present) -> zero ALTERs, zero error spans.
+  const migrated = new DatabaseSync(':memory:');
+  migrated.exec(`CREATE TABLE users (user_id TEXT PRIMARY KEY, github_login TEXT NOT NULL,
+    promoted_by_owner_id TEXT, session_epoch INTEGER NOT NULL DEFAULT 1, disabled INTEGER NOT NULL DEFAULT 0,
+    admitted_via TEXT, admitted_org TEXT, encrypted_gh_token TEXT, org_verified_at INTEGER);`);
+  const migratedTracker = createSqliteD1Tracker(migrated);
+  const addedA = await ensureD1ColumnsIfMissing({ db: migratedTracker.db, table: 'users', columns: USERS_LEGACY_COLUMN_MIGRATIONS });
+  assert.deepEqual(addedA, []);
+  assert.equal(migratedTracker.executedSql.filter(isAlter).length, 0, 'migrated schema must not run blind ALTERs');
+  assert.equal(migratedTracker.executedSql.filter(isPragma).length, 1, 'one PRAGMA read for all seven columns');
+  assert.equal(migratedTracker.alterErrors.length, 0);
+
+  // Second sign-in on the same isolate: cached, no further D1 round-trips at all.
+  const before = migratedTracker.executedSql.length;
+  assert.deepEqual(await ensureD1ColumnsIfMissing({ db: migratedTracker.db, table: 'users', columns: USERS_LEGACY_COLUMN_MIGRATIONS }), []);
+  assert.equal(migratedTracker.executedSql.length, before);
+
+  // Case B: legacy schema missing three columns -> exactly those three ALTERs, all succeed, columns now exist.
+  const legacy = new DatabaseSync(':memory:');
+  legacy.exec(`CREATE TABLE users (user_id TEXT PRIMARY KEY, github_login TEXT NOT NULL,
+    promoted_by_owner_id TEXT, session_epoch INTEGER NOT NULL DEFAULT 1, disabled INTEGER NOT NULL DEFAULT 0,
+    admitted_via TEXT);`);
+  const legacyTracker = createSqliteD1Tracker(legacy);
+  const addedB = await ensureD1ColumnsIfMissing({ db: legacyTracker.db, table: 'users', columns: USERS_LEGACY_COLUMN_MIGRATIONS });
+  assert.deepEqual(addedB, ['admitted_org', 'encrypted_gh_token', 'org_verified_at']);
+  assert.equal(legacyTracker.executedSql.filter(isAlter).length, 3);
+  assert.equal(legacyTracker.alterErrors.length, 0);
+  const cols = (legacy.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>).map((r) => r.name);
+  for (const { column } of USERS_LEGACY_COLUMN_MIGRATIONS) assert.ok(cols.includes(column), `missing ${column}`);
+
+  // Case C: PRAGMA unreadable -> legacy best-effort fallback attempts every ALTER (never under-migrates).
+  const attempted: string[] = [];
+  const opaqueDb = {
+    prepare: (sql: string) => ({
+      all: async () => {
+        throw new Error('PRAGMA unavailable');
+      },
+      run: async () => {
+        attempted.push(sql);
+        return {};
+      },
+    }),
+  };
+  const addedC = await ensureD1ColumnsIfMissing({ db: opaqueDb, table: 'users', columns: USERS_LEGACY_COLUMN_MIGRATIONS });
+  assert.equal(addedC.length, USERS_LEGACY_COLUMN_MIGRATIONS.length);
+  assert.equal(attempted.filter(isAlter).length, USERS_LEGACY_COLUMN_MIGRATIONS.length);
+
+  // Regression guard: no blind `ALTER TABLE users ADD COLUMN ... .run().catch(...)` left in sign-in/admin paths.
+  const hubDir = process.env.EDGEFETCH_HUB_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  for (const file of ['github-auth.ts', 'admin.ts']) {
+    const src = readFileSync(resolve(hubDir, 'src', file), 'utf8');
+    assert.doesNotMatch(src, /prepare\(\s*['"`]ALTER TABLE[^'"`]*['"`]\s*\)\s*\.run\(\)\s*\.catch/, `${file} has a blind ALTER`);
+  }
 });
 
 test('R10-3: Ashby 1x board deduplication, Greenhouse 505-job pre-filter retention, fast /careers discovery & Workday/Rippling handling', async () => {

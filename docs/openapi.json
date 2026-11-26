@@ -6183,7 +6183,7 @@
           "includeBody": {
             "type": "boolean",
             "default": false,
-            "description": "Set true to include truncated raw body previews per URL."
+            "description": "Set true to include truncated raw body previews per URL. Either way each successful result carries an artifactId for read_artifact."
           },
           "previewBytes": {
             "type": "integer",

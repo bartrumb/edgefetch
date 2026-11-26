@@ -2465,6 +2465,76 @@ test('V2-12: v2.3.0 Handoff Regression Suite (P1-P12 + structured jobs tool)', a
   const mcpBatchParsed = JSON.parse(mcpBatchJson.result.content[0]!.text) as { stageTimingsMs?: { totalHubMs: number } };
   assert.equal(mcpBatchParsed.stageTimingsMs?.totalHubMs, 46);
 
+  // --- fetch_batch `includeBody: false` still stores artifacts (artifactId) and strips inline bodies; JSON on auto-kind is labelled json ---
+  const sha = 'a'.repeat(64);
+  const runBatch = async (includeBody: boolean | undefined) => {
+    let captured: { includeBody?: boolean; hydrateInline?: boolean } = {};
+    const deps: McpServerDeps = {
+      ...mcpBatchDeps,
+      executeFetch: async ({ body, hydrateInline }) => {
+        const parsed = JSON.parse(body) as { options?: { includeBody?: boolean }; requests: Array<{ id: string; url: string; kind: string }> };
+        captured = { includeBody: parsed.options?.includeBody, hydrateInline };
+        return {
+          status: 200,
+          via: 'agent:site-x86',
+          bodyText: JSON.stringify({
+            results: parsed.requests.map((r) => ({
+              id: r.id,
+              url: r.url,
+              finalUrl: r.url,
+              status: 200,
+              outcome: 'ok',
+              kind: r.kind,
+              contentType: 'application/json; charset=utf-8',
+              body: '{"jobs":[]}',
+              artifact: { blobSha256: sha, retention: 'standard' },
+            })),
+          }),
+        };
+      },
+    };
+    const res = await handleMcpRequest(
+      new Request('https://hub.example.com/mcp', {
+        method: 'POST',
+        headers: { authorization: 'Bearer p12-secret-token-0123456789abcdef', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 13,
+          method: 'tools/call',
+          params: {
+            name: 'fetch_batch',
+            arguments: {
+              urls: ['https://api.example.com/posting-api/job-board/acme'],
+              ...(includeBody === undefined ? {} : { includeBody }),
+            },
+          },
+        }),
+      }),
+      new URL('https://hub.example.com/mcp'),
+      deps,
+    );
+    assert.equal(res.status, 200);
+    const json = (await res.json()) as { result: { content: Array<{ text: string }> } };
+    const out = JSON.parse(json.result.content[0]!.text) as { results: Array<Record<string, unknown>> };
+    return { captured, item: out.results[0]! };
+  };
+  for (const includeBody of [false, undefined]) {
+    const { captured, item } = await runBatch(includeBody);
+    assert.equal(captured.includeBody, true, 'node must be asked for bodies so it uploads artifacts');
+    assert.equal(captured.hydrateInline, false, 'hub must not hydrate bodies back from R2 when includeBody is off');
+    assert.equal(item.artifactId, sha);
+    assert.equal('body' in item, false);
+    assert.equal(item.kind, 'json');
+  }
+  {
+    const { captured, item } = await runBatch(true);
+    assert.equal(captured.includeBody, true);
+    assert.equal(captured.hydrateInline, undefined);
+    assert.equal(item.artifactId, sha);
+    assert.equal(item.body, '{"jobs":[]}');
+    assert.equal(item.kind, 'json');
+  }
+
   // --- Section 4: `jobs` tool (`executeJobsCall`) deduplicates, respects `exclude`, and enforces `minBase` (`basis === "base"`) ---
   const jobsSweep = await executeJobsCall({
     payload: {

@@ -49,8 +49,21 @@ jobs:
           "$(go env GOPATH)/bin/staticcheck" ./...
           "$(go env GOPATH)/bin/govulncheck" ./...
 
+      # CPU-budget tests assert wall-clock ceilings calibrated for -race alone (race-on budgets / testRaceSlowdown).
+      # -race with -coverprofile forces covermode=atomic, which made them ~40x slower than plain -race (R9-H3: ~5ms ->
+      # ~200ms, past 500ms on a busy runner), so they run in their own -race step below, uninstrumented for coverage.
+      # Budgets are unchanged and no test is dropped: each runs in exactly one of the two steps.
       - name: Run tests with ThreadSanitizer race detector (-race) & coverage
-        run: go test -v -race -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 15
+        env:
+          CPU_BUDGET_TESTS: '^(TestR9H3Adversarial240KBPerformanceBudget|TestR8RedactEmbeddedURLsLinear1MiBUnder15ms|TestR9RedactEmbeddedURLs90DiverseLeakVectorsAndLinear1MiB|TestRound8H8LinearCPUBudgetsUnder40ms)$'
+        run: go test -v -race -count=1 -skip "$CPU_BUDGET_TESTS" -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 15
+
+      - name: Run CPU-budget tests with -race (no coverage instrumentation)
+        env:
+          CPU_BUDGET_TESTS: '^(TestR9H3Adversarial240KBPerformanceBudget|TestR8RedactEmbeddedURLsLinear1MiBUnder15ms|TestR9RedactEmbeddedURLs90DiverseLeakVectorsAndLinear1MiB|TestRound8H8LinearCPUBudgetsUnder40ms)$'
+        run: |
+          go test -v -race -count=1 -run "$CPU_BUDGET_TESTS" ./internal/mcpfed ./internal/politeness ./internal/extract | tee cpu-budget.log
+          test "$(grep -c '^--- PASS: ' cpu-budget.log)" -eq 4
 
       - name: Run native Go fuzzing smoke suite
         run: |

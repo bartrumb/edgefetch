@@ -24,6 +24,7 @@ import {
 import { handleAdminRoute } from '../src/admin.ts';
 import { handleCompatRoutes } from '../src/compat.ts';
 import hubWorker, { AgentHubDO, CrawlWorkflow, IngestWorkflow } from '../src/index.ts';
+import { MAX_WASM_INPUT_BYTES } from '../src/wasm-bridge';
 import {
   AgentHubEngine,
   DEFAULT_429_NO_HEADER_WAIT_MS,
@@ -12995,4 +12996,78 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
     expectedStaticJson,
     'docs/openapi.json is out of sync with buildOpenApiSpec() — run `npm run openapi:generate` in hub/',
   );
+});
+
+test('POST /v1/catalog caps inline bodies at the WASM input budget and surfaces an omitted page as page_too_large_for_edge', async () => {
+  const callerToken = 'catalog-inline-cap-token';
+  const dispatchedOptions: Array<Record<string, unknown>> = [];
+  let productCalls = 0;
+  const stub = {
+    fetch: async () => new Response('ok', { status: 200 }),
+    listAgents: async () => ({ connected: 1, agents: [{ siteId: 'site-cap', arch: 'amd64', connectedAt: Date.now() }], affinities: [] }),
+    listAffinities: async () => [],
+    listHostHealth: async () => [],
+    recordHostOutcome: async () => undefined,
+    recordHubEvents: async () => undefined,
+    recordMcpCall: async () => undefined,
+    waitForHostWindow: async () => ({ ok: true as const }),
+    hasPendingJob: async () => false,
+    dispatchFetch: async (rawBody: string) => {
+      const parsed = JSON.parse(rawBody) as { options?: Record<string, unknown>; requests?: Array<{ id?: string; url?: string }> };
+      const results = (parsed.requests ?? []).map((r) => {
+        const u = r.url ?? '';
+        if (u.endsWith('/robots.txt')) {
+          return { id: r.id ?? '1', url: u, finalUrl: u, status: 200, outcome: 'ok', contentType: 'text/plain', body: 'User-agent: *\nAllow: /\n' };
+        }
+        if (u.includes('/products.json')) {
+          dispatchedOptions.push(parsed.options ?? {});
+          productCalls++;
+          if (productCalls === 1) {
+            return {
+              id: r.id ?? '1',
+              url: u,
+              finalUrl: u,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/json',
+              body: JSON.stringify({ products: [{ id: 1, title: 'Tea', handle: 'tea', vendor: 'Leaf', product_type: 'Drink', variants: [{ id: 10, sku: 'T1', price: '12.00', available: true }] }] }),
+            };
+          }
+          // What the Go fetcher returns for a page over `options.maxInlineBodyBytes`: no body, `bodyOmitted: true`.
+          return { id: r.id ?? '1', url: u, finalUrl: u, status: 200, outcome: 'ok', contentType: 'application/json', bodyOmitted: true };
+        }
+        return { id: r.id ?? '1', url: u, finalUrl: u, status: 404, outcome: 'ok', contentType: 'text/plain', body: 'not found' };
+      });
+      return { ok: true as const, siteId: 'site-cap', bodyText: JSON.stringify({ results }) };
+    },
+  };
+  const env = {
+    CALLER_TOKEN: callerToken,
+    SAFE_FETCH: async () => new Response('not found', { status: 404 }),
+    SAFE_PUBLIC_FETCH: async () => new Response('not found', { status: 404 }),
+    AGENT_HUB: { idFromName: () => ({ toString: () => 'global' }), get: () => stub },
+  } as unknown as Parameters<typeof hubWorker.fetch>[1];
+  const pending: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (p: Promise<unknown>) => pending.push(p), passThroughOnException() {} } as unknown as ExecutionContext;
+
+  const res = await hubWorker.fetch(
+    new Request('https://hub.example.com/v1/catalog', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${callerToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://inline-cap.example.com', platform: 'shopify', sync: true, maxPages: 5, pauseMs: 0 }),
+    }),
+    env,
+    ctx,
+  );
+  await Promise.allSettled(pending);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as Record<string, unknown>;
+  assert.equal(productCalls, 2, JSON.stringify(body));
+  for (const opts of dispatchedOptions) {
+    assert.equal(opts.maxInlineBodyBytes, MAX_WASM_INPUT_BYTES, 'catalog fetches must cap inline bodies at the WASM input budget');
+  }
+  assert.equal(body.status, 'partial', 'an omitted body must not be parsed as an empty last page');
+  assert.equal(body.reason, 'page_too_large_for_edge');
+  assert.equal(body.truncated, true);
+  assert.equal(body.products, 1);
 });

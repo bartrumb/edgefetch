@@ -16,15 +16,23 @@ import {
   getWasmReactorStats,
   getWasmRuntimeMemStats,
   isWasmInputBudgetExceededError,
+  isWasmRe2RecompileError,
   MAX_ISOLATE_IN_FLIGHT_BYTES,
   MAX_WASM_INPUT_BYTES,
   resetIsolateBudgetForTests,
   resetWasmReactor,
+  setWasmForcedEvictionForTests,
+  setWasmRe2RecompileFaultForTests,
+  WASM_EVICT_IN_BYTES,
+  WASM_EVICT_OUT_BYTES,
+  WasmRe2RecompileError,
 } from '../src/wasm-bridge';
 import { parseDeclarativeManifest } from '../src/extractors/declarative';
 import { resolveSiteExtractorTwin } from '../src/extractors/registry';
 import { executeJobsCall, resetJobsCacheForTests, resolveAtsPreFetchSpec } from '../src/jobs';
-import { parseSitemapXml } from '../src/map-crawl';
+import { executeCatalogCall } from '../src/catalog';
+import { BATCH_BUSY_MAX_ATTEMPTS, pathAllowed, parseSitemapXml, startOrExecuteBatchScrape } from '../src/map-crawl';
+import { HtmlDocUnavailableError, parseHtmlDoc } from '../src/extractors/utils';
 import {
   cutMarkdownToSanitizerBudget,
   detectPromptInjection,
@@ -349,7 +357,11 @@ test('Step 1 & Step 6: Global 4 MiB WASM input budget & memory matrix across all
       baseUrl: over.url,
     });
     assert.equal(fin8MiB.truncated, true, '8MiB finalizeScrapedMarkdown must set truncated: true after cutting at line break');
-    assert.equal(fin8MiB.totalChars, hostile8MiBMd.length);
+    // Pagination totals are sanitized-output chars (what read_artifact serves); the raw input length is sourceChars.
+    assert.equal(fin8MiB.totalChars, fin8MiB.markdown.length);
+    assert.equal(fin8MiB.remainingChars, 0);
+    assert.equal(fin8MiB.sourceTruncated, true);
+    assert.equal(fin8MiB.sourceChars, hostile8MiBMd.length);
     assert.equal(fin8MiB.markdown.includes('<script'), false);
     assert.equal(fin8MiB.markdown.includes('javascript:'), false);
 
@@ -609,6 +621,134 @@ test('Step 3: Per-isolate 12 MiB bytesInFlight semaphore queues brief spikes and
   assert.equal(getIsolateBudgetStats().inFlightBytes, 0);
 });
 
+test('Batch scrape retries isolate_memory_busy siblings (real 12 MiB semaphore) instead of counting them as failed', async () => {
+  resetIsolateBudgetForTests();
+  // Saturate the per-isolate semaphore the way sibling multi-MiB items of one Promise.all chunk do.
+  const held = [
+    await acquireIsolateByteBudget(4 * 1024 * 1024, 200),
+    await acquireIsolateByteBudget(4 * 1024 * 1024, 200),
+    await acquireIsolateByteBudget(4 * 1024 * 1024, 200),
+  ];
+  assert.ok(held.every(Boolean));
+  const page = generateCorpusPayload('html', 2 * 1024 * 1024);
+  const sleeps: number[] = [];
+  let calls = 0;
+  const out = await startOrExecuteBatchScrape({
+    payload: { urls: ['https://busy-a.example.com/p', 'https://busy-b.example.com/p'], sync: true, formats: ['markdown'], target: 'container', ephemeral: true },
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+      // The competing in-flight documents finish while the busy items back off.
+      for (const l of held.splice(0)) l?.release();
+    },
+    executeScrape: async (scArgs) => {
+      calls++;
+      const res = await executeScrapeCall({
+        payload: scArgs as Parameters<typeof executeScrapeCall>[0]['payload'],
+        env: {},
+        executeHubFetch: async () => ({
+          status: 200,
+          via: 'cloudflare',
+          bodyText: JSON.stringify({
+            results: [{ id: 'scrape-1', url: String(scArgs.url), status: 200, outcome: 'ok', contentType: page.contentType, body: page.body, bodyEncoding: 'utf-8' }],
+          }),
+        }),
+      });
+      return { status: res.status, body: res.body, ...(res.retryAfter ? { retryAfter: res.retryAfter } : {}) };
+    },
+  });
+  assert.equal(out.ok, true);
+  if (!out.ok) return;
+  assert.equal(out.job.completed, 2, JSON.stringify(out.job.errors));
+  assert.equal(out.job.failed, 0);
+  assert.equal(out.job.retryable, 0);
+  // The first busy item backs off (freeing the semaphore); a sibling still inside its own 200 ms wait may then win
+  // the slot without ever 429ing, so 1-2 items retry, each exactly once.
+  assert.ok(sleeps.length >= 1 && sleeps.length <= 2, `sleeps=${JSON.stringify(sleeps)}`);
+  assert.equal(calls, 2 + sleeps.length, 'each busy item is retried exactly once after the semaphore frees');
+  // Retry-After: 1 => 1000 ms, plus a per-item stagger (100 ms * chunk index) so siblings do not collide again.
+  assert.ok(sleeps.every((ms) => ms === 1000 || ms === 1100), `sleeps=${JSON.stringify(sleeps)}`);
+  assert.equal(getIsolateBudgetStats().inFlightBytes, 0);
+});
+
+test('Batch scrape: persistent isolate_memory_busy is bounded and surfaced as retryable (with retryAfter), not failed', async () => {
+  const sleeps: number[] = [];
+  const attemptsByUrl = new Map<string, number>();
+  const out = await startOrExecuteBatchScrape({
+    payload: { urls: ['https://stuck.example.com/a', 'https://quota.example.com/b', 'https://ok.example.com/c'], sync: true },
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+    },
+    executeScrape: async (scArgs) => {
+      const u = String(scArgs.url);
+      attemptsByUrl.set(u, (attemptsByUrl.get(u) ?? 0) + 1);
+      if (u.includes('stuck')) {
+        return {
+          status: 429,
+          retryAfter: '1',
+          body: { ok: false, error: 'isolate_memory_busy', retryable: true, status: 429, message: 'busy' },
+        };
+      }
+      if (u.includes('quota')) {
+        return { status: 429, body: { ok: false, error: 'user_quota_exceeded', message: 'Per-user concurrent scrape limit exceeded.' } };
+      }
+      return { status: 200, body: { ok: true, url: u, markdown: '# ok' } };
+    },
+  });
+  assert.equal(out.ok, true);
+  if (!out.ok) return;
+  assert.equal(attemptsByUrl.get('https://stuck.example.com/a'), BATCH_BUSY_MAX_ATTEMPTS);
+  assert.equal(attemptsByUrl.get('https://quota.example.com/b'), 1, 'only isolate_memory_busy is retried in-job');
+  assert.equal(attemptsByUrl.get('https://ok.example.com/c'), 1);
+  assert.equal(sleeps.length, BATCH_BUSY_MAX_ATTEMPTS - 1);
+  assert.ok(sleeps.every((ms) => ms >= 100 && ms <= 2_000 + 8 * 100));
+  assert.equal(out.job.completed, 1);
+  assert.equal(out.job.failed, 1, 'the non-retryable 429 is still a failure');
+  assert.equal(out.job.retryable, 1);
+  const busyErr = out.job.errors.find((e) => e.url === 'https://stuck.example.com/a');
+  assert.deepEqual(busyErr, { url: 'https://stuck.example.com/a', error: 'isolate_memory_busy', status: 429, retryable: true, retryAfter: '1' });
+  const quotaErr = out.job.errors.find((e) => e.url === 'https://quota.example.com/b');
+  assert.equal(quotaErr?.retryable, undefined);
+});
+
+test('Catalog: an omitted (over inline/WASM budget) page body stops visibly instead of reading as an empty last page', async () => {
+  const productsPage = (u: string) =>
+    JSON.stringify({ products: [{ id: 1, title: 'Tea', handle: 'tea', vendor: 'Leaf', product_type: 'Drink', variants: [{ id: 10, sku: 'T1', price: '12.00', available: true }] }] });
+  // Both the raw Go reply shape (`bodyOmitted: true`, no body) and the hub's mapped error shape must be detected.
+  const omittedShapes: Array<(u: string) => unknown> = [
+    (u) => ({ status: 200, body: { results: [{ url: u, status: 200, outcome: 'ok', bodyOmitted: true, contentType: 'application/json' }] } }),
+    (u) => ({ results: [{ url: u, status: 200, outcome: 'ok', bodyBase64Omitted: true }] }),
+    () => ({ status: 200, outcome: 'error', problem: `page body exceeded the ${MAX_WASM_INPUT_BYTES}-byte inline/WASM input budget and was omitted`, bodyOmitted: true, headers: {}, body: '' }),
+  ];
+  for (const [idx, omitted] of omittedShapes.entries()) {
+    let productCalls = 0;
+    const res = await executeCatalogCall({
+      payload: { url: `https://bigcat${idx}.example.com/`, platform: 'shopify', maxPages: 5 },
+      env: {},
+      sleepFn: async () => undefined,
+      executeHubFetch: async (req) => {
+        if (req.url.endsWith('/robots.txt')) {
+          return { status: 200, body: { results: [{ url: req.url, status: 200, outcome: 'ok', body: 'User-agent: *\nAllow: /\n' }] } };
+        }
+        if (req.url.includes('/products.json')) {
+          productCalls++;
+          if (productCalls === 1) {
+            return { status: 200, body: { results: [{ url: req.url, status: 200, outcome: 'ok', body: productsPage(req.url) }] } };
+          }
+          return omitted(req.url);
+        }
+        return { status: 404, body: { results: [{ url: req.url, status: 404, outcome: 'ok', body: '' }] } };
+      },
+    });
+    assert.equal(res.status, 200, `shape ${idx}`);
+    const body = res.body as Record<string, unknown>;
+    assert.equal(productCalls, 2, `shape ${idx}: must stop at the omitted page`);
+    assert.equal(body.status, 'partial', `shape ${idx}: an omitted page must not read as a complete catalog`);
+    assert.equal(body.reason, 'page_too_large_for_edge', `shape ${idx}`);
+    assert.equal(body.truncated, true, `shape ${idx}`);
+    assert.equal(body.ok, false, `shape ${idx}`);
+  }
+});
+
 test('Step 2b: prompt-injection detection sizes WASM calls in UTF-8 bytes (CJK pages under budget never throw)', () => {
   // ~2.9 MB of CJK HTML + ~1.8 MB of CJK markdown: each is under 1M/2M chars but the pair is ~4.7 MB in UTF-8.
   const cjkHtml = `<p>${'日本語のテキスト'.repeat(120_000)}</p>`;
@@ -665,17 +805,68 @@ test('Step 2c: Go-node offload only accepts real in-budget output and never drop
     return { res, agentCalls };
   };
 
-  // 1) include/exclude tags: the node cannot apply them, so the request must not be offloaded (no excluded-content leak).
+  // 1) include/exclude tags: a node that does not confirm it applied them (older node ignoring the fields) must never
+  //    have its markdown returned (no excluded-content leak); the flagged over-budget response is returned instead.
   const scoped = await runScrape({
     payload: { formats: ['markdown'], excludeTags: ['aside'] },
     body: bigHtml,
     contentType: 'text/html; charset=utf-8',
     nodeItem: { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nEXCLUDED_UGC_SENTINEL' },
   });
-  assert.equal(scoped.agentCalls, 0, 'excludeTags requests must not be offloaded to the Go node');
   assert.equal(scoped.res.status, 200);
   assert.equal(scoped.res.body.edgeBudgetExceeded, true);
   assert.equal(String(scoped.res.body.markdown ?? '').includes('EXCLUDED_UGC_SENTINEL'), false);
+  assert.equal(JSON.stringify(scoped.res.body).includes('EXCLUDED_UGC_SENTINEL'), false, 'no response field may carry excluded content');
+
+  // 1b) A node that confirms `contentScopingApplied` is accepted for the same tag-scoped request.
+  const scopedOk = await runScrape({
+    payload: { formats: ['markdown'], excludeTags: ['aside'] },
+    body: bigHtml,
+    contentType: 'text/html; charset=utf-8',
+    nodeItem: {
+      contentType: 'text/html',
+      extractedOnNode: true,
+      contentScopingApplied: true,
+      bodyOmitted: true,
+      markdown: '# Node\n\nSCOPED_NODE_SENTINEL',
+    },
+  });
+  assert.equal(scopedOk.agentCalls, 1);
+  assert.equal(scopedOk.res.body.extractedOnNode, true);
+  assert.ok(String(scopedOk.res.body.markdown ?? '').includes('SCOPED_NODE_SENTINEL'));
+
+  // 1c) Primary agent path (the first fetch itself is answered by a Go node): an empty node result for an
+  //     unformattable page and unconfirmed tag scoping both return the flagged response, never a silent success.
+  const primary = async (payload: Record<string, unknown>, nodeItem: Record<string, unknown>) =>
+    executeScrapeCall({
+      payload: { url: pageUrl, ...payload },
+      env: { ARTIFACTS: createTempR2Bucket(tempDirs) as unknown as R2Bucket },
+      executeHubFetch: async () => ({
+        status: 200,
+        via: 'agent:home-node',
+        bodyText: JSON.stringify({ results: [{ id: 'scrape-1', url: pageUrl, status: 200, outcome: 'ok', ...nodeItem }] }),
+      }),
+    });
+  const primarySitemap = await primary(
+    { formats: ['markdown'] },
+    { contentType: 'application/xml', extractedOnNode: true, bodyOmitted: true, markdown: '' },
+  );
+  assert.equal(primarySitemap.body.edgeBudgetExceeded, true, 'primary-path empty node result must be flagged');
+  const primaryScoped = await primary(
+    { formats: ['markdown'], excludeTags: ['aside'] },
+    { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nEXCLUDED_UGC_SENTINEL' },
+  );
+  assert.equal(primaryScoped.body.edgeBudgetExceeded, true);
+  assert.equal(JSON.stringify(primaryScoped.body).includes('EXCLUDED_UGC_SENTINEL'), false);
+  const primaryRawHtml = await primary(
+    { formats: ['markdown', 'rawHtml'] },
+    { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nPRIMARY_NODE_SENTINEL' },
+  );
+  assert.ok(String(primaryRawHtml.body.markdown ?? '').includes('PRIMARY_NODE_SENTINEL'));
+  assert.ok(
+    ((primaryRawHtml.body.warnings as string[] | undefined) ?? []).some((w) => w.includes('rawHtml')),
+    'primary-path node extraction must warn that rawHtml is unavailable',
+  );
 
   // 2) Unformattable over-budget body (sitemap): an empty node result must not become a silent empty success.
   const sitemapXml = `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${overBudget('<url><loc>https://offload.example.com/p</loc></url>')}</urlset>`;
@@ -879,4 +1070,108 @@ test('Step 6: >512K-char mostly-emoji & CJK strings verify TextEncoder.encodeInt
     const roundTrip = callCoreWasm<{ ok: boolean }>('is_safe_twin_url', { url: 'https://example.com/ok' });
     assert.equal(roundTrip.ok, true);
   }
+});
+
+test('Step 7: parseHtmlDoc re-parses once when the reactor is replaced mid-dom_parse and throws instead of returning a silently empty doc', (t) => {
+  t.after(() => setWasmForcedEvictionForTests(null));
+  resetWasmReactor();
+  parseHtmlDoc('<p>warmup</p>');
+  const genBefore = getWasmReactorStats().generation;
+
+  // 1) One eviction right after `dom_parse`: the first handle is dead on arrival, the retry lands on the fresh reactor.
+  setWasmForcedEvictionForTests('dom_parse', 1);
+  const doc = parseHtmlDoc('<div><p class="x">Hello reactor</p><a href="/next">n</a></div>');
+  assert.equal(doc.text('p.x'), 'Hello reactor', 'retried parse must yield a live, queryable doc');
+  assert.equal(doc.attrOf('a', 'href'), '/next');
+  const genAfter = getWasmReactorStats().generation;
+  assert.ok(genAfter > genBefore, 'retry must run on a new reactor generation');
+  assert.equal(getWasmReactorStats().active, true);
+
+  // 2) Evicted during both attempts: explicit typed error, never an empty doc that reads as "no content".
+  setWasmForcedEvictionForTests('dom_parse', 2);
+  assert.throws(
+    () => parseHtmlDoc('<p>never silently empty</p>'),
+    (err: unknown) =>
+      err instanceof HtmlDocUnavailableError &&
+      err.code === 'html_doc_unavailable' &&
+      /reactor replaced during dom_parse/.test(err.message),
+  );
+  setWasmForcedEvictionForTests(null);
+
+  // 3) Empty / non-string input is still the intentional empty doc (not an error), and parsing recovers afterwards.
+  assert.equal(parseHtmlDoc('').select('p').length, 0);
+  assert.equal(parseHtmlDoc(null as unknown as string).text(), '');
+  assert.equal(parseHtmlDoc('<p>back</p>').text('p'), 'back');
+});
+
+test('Step 7b: dom_parse at the full 4 MiB input budget can never trip the 8 MiB I/O eviction (handle stays live)', () => {
+  assert.ok(MAX_WASM_INPUT_BYTES < WASM_EVICT_IN_BYTES, 'input budget must stay below the I/O eviction threshold');
+  assert.ok(MAX_WASM_INPUT_BYTES < WASM_EVICT_OUT_BYTES);
+  resetWasmReactor();
+  parseHtmlDoc('<p>warmup</p>');
+  const gen = getWasmReactorStats().generation;
+
+  // Largest request `callCoreWasm('dom_parse')` accepts: ~4 MiB of ASCII HTML inside the JSON envelope
+  // (unquoted attributes so JSON escaping does not inflate the request past the budget).
+  const row = '<li class=r>item</li>';
+  const body = row.repeat(Math.floor((MAX_WASM_INPUT_BYTES - 4096) / row.length));
+  const html = `<ul id=big>${body}</ul><p id=tail>TAIL_OK</p>`;
+  assert.ok(enc.encode(html).byteLength > MAX_WASM_INPUT_BYTES - 8192);
+  const doc = parseHtmlDoc(html, MAX_WASM_INPUT_BYTES);
+  const stats = getWasmReactorStats();
+  assert.equal(stats.active, true, 'max-budget dom_parse must not evict the reactor');
+  assert.equal(stats.generation, gen, 'max-budget dom_parse must not replace the reactor');
+  assert.ok(doc.select('li.r', 3).length === 3, 'doc handle from a max-budget parse must stay queryable');
+
+  // One byte over budget: rejected before any WASM write, reactor untouched.
+  assert.throws(
+    () => parseHtmlDoc('x'.repeat(MAX_WASM_INPUT_BYTES + 1), MAX_WASM_INPUT_BYTES + 1),
+    (err: unknown) => isWasmInputBudgetExceededError(err),
+  );
+  assert.equal(getWasmReactorStats().generation, gen);
+  assert.equal(doc.select('li.r', 1).length, 1);
+});
+
+test('Step 8: RE2 recompile failure after a reactor swap throws WasmRe2RecompileError and crawl path filters fail closed', (t) => {
+  t.after(() => setWasmRe2RecompileFaultForTests(false));
+  resetWasmReactor();
+
+  // 1) Direct handle: a failed recompile is a typed error, never `false` / `null` ("no match").
+  const re = compileWasmRe2('^/admin/')!;
+  assert.ok(re);
+  assert.equal(re.test('/admin/x'), true);
+  assert.equal(re.exec('/admin/x')?.[0], '/admin/');
+  resetWasmReactor();
+  setWasmRe2RecompileFaultForTests(true);
+  assert.throws(
+    () => re.test('/admin/x'),
+    (err: unknown) => err instanceof WasmRe2RecompileError && isWasmRe2RecompileError(err),
+  );
+  assert.throws(() => re.exec('/admin/x'), (err: unknown) => isWasmRe2RecompileError(err));
+  setWasmRe2RecompileFaultForTests(false);
+  assert.equal(re.test('/admin/x'), true, 'handle must recover once recompiling works again');
+  assert.equal(re.test('/public'), false);
+
+  // 2) Security-relevant caller: map/crawl `excludePaths` (deny list) + `includePaths` (allow list).
+  const excludeUnion = ['^/admin/.*', '.*/private/.*'];
+  const excludeSingle = ['^/secret[0-9]+$'];
+  const includeUnion = ['^/docs/.*', '^/guide/.*'];
+  const u = (p: string) => new URL(`https://example.com${p}`);
+  assert.equal(pathAllowed(u('/admin/panel'), [], excludeUnion, false), false);
+  assert.equal(pathAllowed(u('/docs/a'), [], excludeUnion, false), true);
+  assert.equal(pathAllowed(u('/secret1'), [], excludeSingle, false), false);
+  assert.equal(pathAllowed(u('/docs/a'), includeUnion, [], false), true);
+
+  resetWasmReactor();
+  setWasmRe2RecompileFaultForTests(true);
+  assert.equal(pathAllowed(u('/admin/users'), [], excludeUnion, false), false, 'deny-list error must deny, not allow');
+  assert.equal(pathAllowed(u('/a/private/b'), [], excludeUnion, false), false);
+  assert.equal(pathAllowed(u('/docs/b'), [], excludeUnion, false), false, 'unverifiable exclude list fails closed');
+  assert.equal(pathAllowed(u('/secret22'), [], excludeSingle, false), false);
+  assert.equal(pathAllowed(u('/docs/c'), includeUnion, [], false), false, 'allow-list error must not include');
+  setWasmRe2RecompileFaultForTests(false);
+
+  assert.equal(pathAllowed(u('/docs/d'), [], excludeUnion, false), true);
+  assert.equal(pathAllowed(u('/admin/again'), [], excludeUnion, false), false);
+  assert.equal(pathAllowed(u('/docs/e'), includeUnion, [], false), true);
 });

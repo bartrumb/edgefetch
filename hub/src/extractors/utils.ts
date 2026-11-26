@@ -138,20 +138,47 @@ export class HtmlDoc extends HtmlNode {
   }
 }
 
+/**
+ * Thrown by `parseHtmlDoc` when non-empty HTML could not be turned into a doc handle on a live WASM reactor
+ * (the reactor was evicted/replaced during the parse twice in a row, or Go returned no handle). Distinct from
+ * the intentionally empty doc returned for empty/non-string input, so callers never mistake it for "no content".
+ */
+export class HtmlDocUnavailableError extends Error {
+  readonly code = 'html_doc_unavailable' as const;
+
+  constructor(reason: string) {
+    super(`parseHtmlDoc could not produce a live DOM handle: ${reason}`);
+    this.name = 'HtmlDocUnavailableError';
+  }
+}
+
+const PARSE_HTML_DOC_MAX_ATTEMPTS = 2;
+
 export function parseHtmlDoc(rawHtml: string, maxChars = 2 * 1024 * 1024): HtmlDoc {
   if (typeof rawHtml !== 'string' || !rawHtml) {
     return new HtmlDoc(0, 0, 0);
   }
   const bounded = maxChars > 0 && rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
-  const res = callCoreWasm<{ docId: number; rootNodeId: number }>('dom_parse', {
-    rawHtml: bounded,
-    maxChars,
-  });
-  const stats = getWasmReactorStats();
-  if (!stats.active || res.docId <= 0) {
-    return new HtmlDoc(0, 0, 0);
+  let reason = 'reactor replaced during dom_parse';
+  // A doc handle only lives in the reactor generation that parsed it. If the reactor is evicted/replaced while
+  // `dom_parse` runs, the handle is dead on arrival: parse once more on the fresh reactor instead of handing back
+  // a silently empty doc, and throw if that also fails.
+  for (let attempt = 0; attempt < PARSE_HTML_DOC_MAX_ATTEMPTS; attempt++) {
+    const res = callCoreWasm<{ docId: number; rootNodeId: number }>('dom_parse', {
+      rawHtml: bounded,
+      maxChars,
+    });
+    if (!res || typeof res.docId !== 'number' || res.docId <= 0) {
+      reason = 'dom_parse returned no document handle';
+      continue;
+    }
+    const stats = getWasmReactorStats();
+    if (stats.active && isWasmReactorGenerationCurrent(stats.generation)) {
+      return new HtmlDoc(res.docId, res.rootNodeId, stats.generation);
+    }
+    reason = 'reactor replaced during dom_parse';
   }
-  return new HtmlDoc(res.docId, res.rootNodeId, stats.generation);
+  throw new HtmlDocUnavailableError(reason);
 }
 
 export const CODE_EXT_FENCE_MAP: Record<string, string> = {

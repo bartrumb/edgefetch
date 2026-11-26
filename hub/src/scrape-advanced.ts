@@ -59,12 +59,7 @@ export function cutMarkdownToSanitizerBudget(
       }
     }
     if (prefixAscii) {
-      let cutPos = candidateChars;
-      const nl = raw.lastIndexOf('\n', cutPos - 1);
-      if (nl > 0) {
-        cutPos = nl;
-      }
-      return { text: raw.slice(0, cutPos), cut: true };
+      return { text: raw.slice(0, snapSanitizerCutToLineBreak(raw, candidateChars)), cut: true };
     }
   }
 
@@ -76,15 +71,23 @@ export function cutMarkdownToSanitizerBudget(
   if (candidateChars === raw.length && encRes.read === raw.length) {
     return { text: raw, cut: false };
   }
-  let cutPos = encRes.read;
+  return { text: raw.slice(0, snapSanitizerCutToLineBreak(raw, encRes.read)), cut: true };
+}
+
+/** Max distance a budget cut may move back to reach a line break (same rule as `escapeMarkdownFallbackLinear`). */
+const MAX_LINE_BREAK_SNAP_CHARS = 262_144;
+
+/**
+ * Moves a budget cut at `cutPos` back to the last `\n` only when that line break is close (within 256 KiB) or in the
+ * second half of the kept prefix. Otherwise (e.g. a short first line followed by multi-MiB minified JSON on one line)
+ * it cuts at `cutPos` on a surrogate-safe boundary, instead of discarding almost the whole document.
+ */
+function snapSanitizerCutToLineBreak(raw: string, cutPos: number): number {
+  if (cutPos <= 0) return 0;
   const nl = raw.lastIndexOf('\n', cutPos - 1);
-  if (nl > 0) {
-    cutPos = nl;
-  } else if (cutPos > 0) {
-    const prev = raw.charCodeAt(cutPos - 1);
-    if (prev >= 0xd800 && prev <= 0xdbff) cutPos--;
-  }
-  return { text: raw.slice(0, cutPos), cut: true };
+  if (nl > 0 && (cutPos - nl <= MAX_LINE_BREAK_SNAP_CHARS || nl >= cutPos >>> 1)) return nl;
+  const prev = raw.charCodeAt(cutPos - 1);
+  return prev >= 0xd800 && prev <= 0xdbff ? cutPos - 1 : cutPos;
 }
 
 /** Invisible / format characters (below U+200B) that the fallback strips: soft hyphen, CGJ, ALM, Mongolian VS. */

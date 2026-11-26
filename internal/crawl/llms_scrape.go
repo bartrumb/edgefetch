@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,8 +21,39 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/jobs"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
+
+// isOpenAPIOrNotebookJSON reports whether raw is a JSON object with a top-level `openapi`, `swagger` or `nbformat`
+// key (the documents the Hub formats as API specs / notebooks instead of record chunks). It streams top-level
+// tokens and skips nested values without building the document.
+func isOpenAPIOrNotebookJSON(raw string) bool {
+	trimmed := strings.TrimLeft(raw, " \t\r\n\ufeff")
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return false
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		key, _ := keyTok.(string)
+		switch key {
+		case "openapi", "swagger", "nbformat":
+			return true
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return false
+		}
+	}
+	return false
+}
 
 const (
 	maxCustomHeaders      = 16
@@ -469,6 +501,11 @@ func (c *Crawler) offloadOverBudgetDocumentOnNode(
 	// would accept an empty result as a successful scrape.
 	applyNodeMd := func(md, text string) {
 		res.ExtractedOnNode = true
+		// Tag scoping is honoured: the HTML branch passes IncludeTags/ExcludeTags to the extractor, and the non-HTML
+		// formatters (JSON, feeds, CSV, ...) are unaffected by tags on the edge path too.
+		if len(r.IncludeTags) > 0 || len(r.ExcludeTags) > 0 {
+			res.ContentScopingApplied = true
+		}
 		if r.Query != "" && md != "" {
 			md = extract.RerankPassages(md, r.Query, 24_000)
 			if text != "" {
@@ -517,6 +554,8 @@ func (c *Crawler) offloadOverBudgetDocumentOnNode(
 			IncludeImages:   wantImages,
 			RedactPII:       r.RedactPII,
 			MaxScanChars:    16 << 20,
+			IncludeTags:     r.IncludeTags,
+			ExcludeTags:     r.ExcludeTags,
 		})
 		res.Title = full.Title
 		res.Description = full.Description
@@ -569,6 +608,40 @@ func (c *Crawler) offloadOverBudgetDocumentOnNode(
 		res.Title = icsDoc.Title
 		applyNodeMd(icsDoc.Markdown, icsDoc.Markdown)
 		return
+	}
+	// `jsonFilter`: same per-record chunker + filter the Hub runs at the edge (`chunkJsonRecords` ->
+	// `jobs_chunk_json_records`), so an over-budget JSON record array honors the filter instead of returning every
+	// record. OpenAPI / notebook documents keep their dedicated formatter (the edge skips record chunking for them).
+	structuredJSON := isOpenAPIOrNotebookJSON(rawStr)
+	if structuredJSON {
+		// The generic JSON formatter only previews documents over its 2 MiB DOM cap (a WASM-memory limit). The node
+		// runs in OS memory, so over-budget OpenAPI specs / notebooks get their dedicated formatters in full.
+		doc := extract.FormatJupyterNotebookToMarkdown(rawStr, baseURL)
+		if doc == nil || strings.TrimSpace(doc.Markdown) == "" {
+			doc = extract.FormatOpenAPISpecToMarkdown(rawStr, baseURL)
+		}
+		if doc != nil && strings.TrimSpace(doc.Markdown) != "" {
+			res.Title = doc.Title
+			res.Description = doc.Description
+			applyNodeMd(doc.Markdown, "")
+			return
+		}
+	}
+	if r.JSONFilter != "" && !structuredJSON {
+		if chunked := jobs.ChunkJSONRecords(jobs.ChunkJSONRecordsParams{
+			RawBody:     rawStr,
+			ContentType: res.ContentType,
+			URL:         baseURL,
+			JSONFilter:  r.JSONFilter,
+		}); chunked != nil {
+			res.Title = chunked.Title
+			md := chunked.Markdown
+			if strings.TrimSpace(md) == "" {
+				md = fmt.Sprintf("No records matched jsonFilter (0 of %d records).", chunked.TotalRecords)
+			}
+			applyNodeMd(md, md)
+			return
+		}
 	}
 	if jsonDoc := extract.TryParseJSONPayloadForScrape(rawStr, baseURL); jsonDoc != nil && strings.TrimSpace(jsonDoc.Markdown) != "" {
 		res.Title = jsonDoc.Title

@@ -32,6 +32,7 @@ import {
   extractUniversalSchemaOrg,
   inspectRawSchemaOrgJsonLdLinear,
   percentEncodeUnsafeRecordUrlChars,
+  sanitizeSchemaHttpsUrl,
   type UniversalSchemaOrgResult,
 } from './extractors/schema-org';
 import {
@@ -325,9 +326,21 @@ export function sanitizeScrapedTimestampField(raw: string | undefined, maxLen = 
 }
 
 export function redactPiiText(text: string): string {
-  if (!text) return text;
-  const { text: bounded } = cutMarkdownToSanitizerBudget(text);
-  return callCoreWasmRawString('redact_pii', null, bounded);
+  return redactPiiTextReportingCut(text).text;
+}
+
+/** `redactPiiText` that also reports whether the input had to be cut to the WASM sanitizer budget first. */
+export function redactPiiTextReportingCut(text: string): { text: string; cut: boolean } {
+  if (!text) return { text, cut: false };
+  const { text: bounded, cut } = cutMarkdownToSanitizerBudget(text);
+  return { text: callCoreWasmRawString('redact_pii', null, bounded), cut };
+}
+
+/** Bounds `s` to the sanitizer budget every downstream WASM text helper enforces, reporting whether it was cut. */
+function boundToSanitizerBudget(s: string): { text: string; cut: boolean } {
+  if (!s) return { text: s, cut: false };
+  const res = cutMarkdownToSanitizerBudget(s);
+  return res.cut ? { text: trimTrailingAsciiWhitespaceLinear(res.text), cut: true } : { text: s, cut: false };
 }
 
 export function extractLargestUrlFromSrcset(srcset: string | undefined): string | undefined {
@@ -1514,6 +1527,60 @@ export function sanitizeRecordUrlsDeep<T>(
   }
 }
 
+const MAX_NODE_SUPPLIED_LINKS = 1_000;
+
+/**
+ * Returns `item` with node-supplied `links` / `favicon` passed through `sanitizeSchemaHttpsUrl` (https-only, public
+ * host, unsafe-char percent-encoding): unsafe / private / non-https entries are dropped, duplicates collapsed.
+ */
+export function sanitizeNodeSuppliedUrls<T extends Record<string, unknown>>(item: T, baseUrl: string): T {
+  const out: Record<string, unknown> = { ...item };
+  if ('links' in item) {
+    const links: string[] = [];
+    if (Array.isArray(item.links)) {
+      const seen = new Set<string>();
+      for (const raw of item.links) {
+        if (links.length >= MAX_NODE_SUPPLIED_LINKS) break;
+        if (typeof raw !== 'string' || !raw || raw.length > 8_192) continue;
+        const safe = sanitizeSchemaHttpsUrl(raw, baseUrl);
+        if (safe && !seen.has(safe)) {
+          seen.add(safe);
+          links.push(safe);
+        }
+      }
+    }
+    out.links = links;
+  }
+  if ('favicon' in item) {
+    const safeFavicon =
+      typeof item.favicon === 'string' && item.favicon && item.favicon.length <= 8_192
+        ? sanitizeSchemaHttpsUrl(item.favicon, baseUrl)
+        : undefined;
+    if (safeFavicon) out.favicon = safeFavicon;
+    else delete out.favicon;
+  }
+  if ('images' in item) {
+    // Node-supplied images get the same URL treatment as links; alt text is kept as plain bounded text.
+    const images: Array<{ url: string; alt?: string }> = [];
+    if (Array.isArray(item.images)) {
+      const seen = new Set<string>();
+      for (const raw of item.images as unknown[]) {
+        if (images.length >= MAX_NODE_SUPPLIED_LINKS) break;
+        const rawUrl = typeof raw === 'string' ? raw : raw && typeof raw === 'object' ? (raw as { url?: unknown }).url : undefined;
+        if (typeof rawUrl !== 'string' || !rawUrl || rawUrl.length > 8_192) continue;
+        const safe = sanitizeSchemaHttpsUrl(rawUrl, baseUrl);
+        if (!safe || seen.has(safe)) continue;
+        seen.add(safe);
+        const rawAlt = raw && typeof raw === 'object' ? (raw as { alt?: unknown }).alt : undefined;
+        const alt = typeof rawAlt === 'string' ? sanitizeScrapedMetadataField(rawAlt, 300) : undefined;
+        images.push(alt ? { url: safe, alt } : { url: safe });
+      }
+    }
+    out.images = images;
+  }
+  return out as T;
+}
+
 export function redactPiiDeep<T>(
   value: T,
   depth = 0,
@@ -1644,6 +1711,10 @@ export function finalizeScrapedMarkdown(
   totalChars?: number;
   nextOffset?: number;
   remainingChars?: number;
+  /** Part of the input was cut to the 4 MiB sanitizer budget (before or after sanitizing) and is not retrievable. */
+  sourceTruncated?: boolean;
+  /** Raw input length in chars when `sourceTruncated` (informational; not a pagination coordinate). */
+  sourceChars?: number;
   frontmatterTitle?: string;
   frontmatterDescription?: string;
 } {
@@ -1653,9 +1724,8 @@ export function finalizeScrapedMarkdown(
     ...(fm.title ? { frontmatterTitle: fm.title } : {}),
     ...(fm.description ? { frontmatterDescription: fm.description } : {}),
   };
-  let md = '';
-  try {
-    const res = callCoreWasmRaw<{ markdown: string }>(
+  const runFinalize = (body: string): string =>
+    callCoreWasmRaw<{ markdown: string }>(
       'finalize_markdown',
       {
         baseUrl: opts.baseUrl ?? '',
@@ -1667,20 +1737,61 @@ export function finalizeScrapedMarkdown(
           allowPdfPageMarkers: Boolean(opts.allowPdfPageMarkers),
         },
       },
-      fm.body,
-    );
-    md = res.markdown ?? '';
+      body,
+    ).markdown ?? '';
+  let md = '';
+  // Sanitizing can grow a document (e.g. every `<` becomes `&lt;`, so a 3.6 MB `a < b` doc becomes 5.4M chars).
+  // Every downstream WASM helper (redactPiiText, stripInvisible, neutralize*, decodeHtmlEntities, the read_artifact
+  // re-sanitizer) silently cuts input at the sanitizer budget, so the output is bounded to that budget HERE and the
+  // cut is reported as truncation (instead of being lost later with no flag).
+  let cutAfterSanitize = false;
+  try {
+    let body = fm.body;
+    md = runFinalize(body);
+    for (let attempt = 0; attempt < 3 && cutMarkdownToSanitizerBudget(md).cut; attempt++) {
+      // Re-sanitize a proportionally shorter prefix of the input so the full sanitizer (not a raw cut) closes fences.
+      const mdBytes = SCRAPE_UTF8_ENCODER.encode(md).byteLength;
+      const bodyBytes = SCRAPE_UTF8_ENCODER.encode(body).byteLength;
+      const targetBytes = Math.floor(bodyBytes * (MAX_SANITIZER_WASM_UTF8_BYTES / mdBytes) * 0.95);
+      const shorter = cutMarkdownToSanitizerBudget(body, Math.max(1, targetBytes)).text;
+      if (!shorter || shorter.length >= body.length) break;
+      body = shorter;
+      md = runFinalize(body);
+      cutAfterSanitize = true;
+    }
+    const bounded = cutMarkdownToSanitizerBudget(md);
+    if (bounded.cut) {
+      md = trimTrailingAsciiWhitespaceLinear(bounded.text);
+      cutAfterSanitize = true;
+    }
   } catch {
-    const escapedFallback = escapeMarkdownFallbackLinear(fm.body);
+    const escapedFull = escapeMarkdownFallbackLinear(fm.body);
+    const escapedBounded = cutMarkdownToSanitizerBudget(escapedFull);
+    const escapedFallback = escapedBounded.text;
+    const overMax = Boolean(opts.maxChars && escapedFallback.length > opts.maxChars);
+    const outMd = overMax ? escapedFallback.slice(0, opts.maxChars) : escapedFallback;
+    const fallbackTruncated = cutBySanitizerBudget || escapedBounded.cut || escapedFallback.length < escapedFull.length || overMax;
     return {
-      markdown: opts.maxChars && escapedFallback.length > opts.maxChars ? escapedFallback.slice(0, opts.maxChars) : escapedFallback,
-      truncated: cutBySanitizerBudget || Boolean(opts.maxChars && escapedFallback.length > opts.maxChars),
-      totalChars: rawMd.length,
+      markdown: outMd,
+      ...(fallbackTruncated
+        ? {
+            truncated: true,
+            totalChars: escapedFallback.length,
+            nextOffset: outMd.length,
+            remainingChars: Math.max(0, escapedFallback.length - outMd.length),
+            ...(cutBySanitizerBudget || escapedBounded.cut ? { sourceTruncated: true, sourceChars: rawMd.length } : {}),
+          }
+        : {}),
       ...fmMeta,
     };
   }
+  const sourceTruncated = cutBySanitizerBudget || cutAfterSanitize;
+  // Pagination coordinates are sanitized-output chars: the same units `read_artifact` (`format: 'markdown'`) serves
+  // from the stored sanitized Markdown. Input that never reached the sanitizer is reported via `sourceTruncated` /
+  // `sourceChars` (raw input chars), never mixed into `totalChars` / `remainingChars` (nothing can fetch it).
+  const sourceMeta = sourceTruncated ? { sourceTruncated: true as const, sourceChars: rawMd.length } : {};
   if (opts.maxChars && md.length > opts.maxChars) {
-    const totalChars = cutBySanitizerBudget ? Math.max(rawMd.length, md.length) : md.length;
+    const totalChars = md.length;
     let cut = opts.maxChars;
     const minCut = Math.floor(opts.maxChars * 0.6);
     const paraBreak = md.lastIndexOf('\n\n', cut);
@@ -1693,15 +1804,16 @@ export function finalizeScrapedMarkdown(
     const nextOffset = rawSliced.length > 0 ? rawSliced.length : cut;
     const remainingChars = Math.max(0, totalChars - nextOffset);
     const sliced = sanitizeMarkdownPageSlice(md, 0, rawSliced, Boolean(opts.allowPdfPageMarkers));
-    return { markdown: sliced, truncated: true, totalChars, nextOffset, remainingChars, ...fmMeta };
+    return { markdown: sliced, truncated: true, totalChars, nextOffset, remainingChars, ...sourceMeta, ...fmMeta };
   }
-  if (cutBySanitizerBudget) {
+  if (sourceTruncated) {
     return {
       markdown: md,
       truncated: true,
-      totalChars: rawMd.length,
+      totalChars: md.length,
       nextOffset: md.length,
-      remainingChars: Math.max(0, rawMd.length - md.length),
+      remainingChars: 0,
+      ...sourceMeta,
       ...fmMeta,
     };
   }
@@ -2207,6 +2319,27 @@ export function formatOpenApiSpecToMarkdown(
 }
 
 const MAX_JSON_SCRAPE_JS_PARSE_CHARS = 2 * 1024 * 1024;
+const LARGE_JSON_SNIFF_CHARS = 64 * 1024;
+
+/**
+ * Bounded sniff (no JS parse) for JSON too large to `JSON.parse` on the edge: reports an OpenAPI / Swagger spec
+ * when a top-level-looking `"openapi"` / `"swagger"` key appears in the head, and a Jupyter notebook when
+ * `"nbformat"` appears in the head or tail (notebooks serialize `cells` first and `nbformat` last) or the URL is
+ * `.ipynb`. The Go formatters re-validate the full document, so a false positive just falls back to the preview.
+ */
+export function sniffLargeStructuredJsonKind(trimmed: string, finalUrl: string): 'openapi' | 'ipynb' | null {
+  if (!trimmed.startsWith('{')) return null;
+  const head = trimmed.slice(0, LARGE_JSON_SNIFF_CHARS);
+  if (/^\{\s*"(?:openapi|swagger)"\s*:\s*"/.test(head) || /[{,]\s*"(?:openapi|swagger)"\s*:\s*"\d/.test(head)) {
+    return 'openapi';
+  }
+  const tail = trimmed.length > LARGE_JSON_SNIFF_CHARS ? trimmed.slice(-LARGE_JSON_SNIFF_CHARS) : '';
+  const nbKey = /[{,]\s*"nbformat"\s*:\s*\d/;
+  if (nbKey.test(head) || nbKey.test(tail) || (/\.ipynb(?:$|[?#])/i.test(finalUrl) && /"cells"\s*:\s*\[/.test(head))) {
+    return 'ipynb';
+  }
+  return null;
+}
 
 export function tryParseJsonPayloadForScrape(
   rawBody: string,
@@ -2217,6 +2350,8 @@ export function tryParseJsonPayloadForScrape(
   markdown: string;
   title?: string;
   description?: string;
+  /** Set when a > 2 MiB OpenAPI spec / notebook was formatted by its dedicated Go formatter without a JS parse. */
+  structuredKind?: 'openapi' | 'ipynb';
 } | null {
   const ctLower = typeof contentType === 'string' ? contentType.toLowerCase() : '';
   const looksJsonCt = ctLower.includes('json');
@@ -2231,6 +2366,35 @@ export function tryParseJsonPayloadForScrape(
       parsed = JSON.parse(trimmed);
     } catch {
       return null;
+    }
+  } else {
+    // Too large for a JS parse: hand OpenAPI specs / notebooks straight to their Go formatters (raw input, within
+    // the 4 MiB WASM input budget enforced upstream) instead of degrading them to the generic JSON preview.
+    const kind = sniffLargeStructuredJsonKind(trimmed, finalUrl);
+    if (kind) {
+      try {
+        const structured = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
+          'format_payload',
+          { kind, url: finalUrl },
+          trimmed,
+        ).doc;
+        if (structured?.markdown) {
+          const title = structured.title;
+          const md =
+            kind === 'ipynb' && title && !structured.markdown.startsWith('# ')
+              ? `# ${title}\n\n${structured.markdown}`
+              : structured.markdown;
+          return {
+            parsed: null,
+            markdown: md,
+            structuredKind: kind,
+            ...(title ? { title } : {}),
+            ...(structured.description ? { description: structured.description } : {}),
+          };
+        }
+      } catch {
+        // Fall through to the generic bounded JSON preview below.
+      }
     }
   }
   const doc = callCoreWasmRaw<{ doc: { title?: string; description?: string; markdown: string } | null }>(
@@ -3322,6 +3486,11 @@ export async function executeScrapeCall(params: {
             : {}),
         formats: agentFormats,
         onlyMainContent,
+        // A Go node that extracts an over-budget page itself (primary agent path or offload) applies these too and
+        // confirms with `contentScopingApplied`; see `nodeResultSatisfiesRequest`.
+        ...(includeTags.length > 0 ? { includeTags } : {}),
+        ...(excludeTags.length > 0 ? { excludeTags } : {}),
+        ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
         discoverLlms: goDiscoverLlms,
         preferLlmsMarkdown: !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always',
         redactPii,
@@ -4819,9 +4988,15 @@ export async function executeScrapeCall(params: {
           contentState: 'active' as const,
           rendered: false,
           truncated: true,
-          totalChars: rawForArtifact.length,
+          // Sanitized-output coordinates (never raw-body chars, which no page read can serve); the raw body that
+          // never reached the sanitizer is reported as `sourceChars`.
+          totalChars: cutSanitized.totalChars ?? cutSanitized.markdown.length,
           nextOffset: cutSanitized.nextOffset ?? cutSanitized.markdown.length,
-          remainingChars: Math.max(0, rawForArtifact.length - (cutSanitized.nextOffset ?? cutSanitized.markdown.length)),
+          remainingChars:
+            cutSanitized.remainingChars ??
+            Math.max(0, (cutSanitized.totalChars ?? cutSanitized.markdown.length) - (cutSanitized.nextOffset ?? cutSanitized.markdown.length)),
+          sourceTruncated: true,
+          sourceChars: rawForArtifact.length,
           ...(overArt?.contentSha256 ? { contentSha256: overArt.contentSha256 } : {}),
           ...(overArt?.blobSha256 ? { artifactId: overArt.blobSha256 } : {}),
           ...(stringFormats.has('markdown') ? { markdown: cutSanitized.markdown } : {}),
@@ -4871,20 +5046,30 @@ export async function executeScrapeCall(params: {
     rawBodyStr.length > 0 &&
     exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES;
   // The Go node's over-budget extractor produces sanitized markdown only: it does not receive or apply
-  // `includeTags` / `excludeTags`, and it returns no raw body for html/rawHtml/product/attributes/json/jsonFilter.
-  // Never offload a request that scopes content with include/exclude tags (excluded content would leak into the
-  // markdown); for other edge-only formats, accept the node markdown but say which formats are unavailable.
+  // `includeTags` / `excludeTags`, and it returns no raw body for html/rawHtml/product/attributes/json.
+  // `jsonFilter` is sent with the offload request and applied on the node to JSON record arrays.
+  // Tag-scoped requests: node markdown is only acceptable when the node confirms it applied the include/exclude tags
+  // (`contentScopingApplied`); an older node ignores the fields, which would leak excluded content. For other
+  // edge-only formats, accept the node markdown but say which formats are unavailable.
   const nodeOffloadBlockedByScoping = includeTags.length > 0 || excludeTags.length > 0;
+  /**
+   * Whether a node-extracted item (primary agent path or offload) can be returned for this request: it must carry
+   * non-empty in-budget markdown and, for tag-scoped requests, confirm the node applied the tags.
+   */
+  const nodeResultSatisfiesRequest = (nodeItem: Record<string, unknown> | undefined): boolean => {
+    if (!nodeItem || nodeItem.outcome !== 'ok' || nodeItem.markdownOverBudget === true) return false;
+    const md = typeof nodeItem.markdown === 'string' ? nodeItem.markdown : '';
+    if (md.trim().length === 0 || exactUtf8ByteLen(md) > MAX_WASM_INPUT_BYTES) return false;
+    return !nodeOffloadBlockedByScoping || nodeItem.contentScopingApplied === true;
+  };
   const nodeOffloadMissingFormats = [
     ...(['html', 'rawHtml', 'product'] as const).filter((f) => stringFormats.has(f)),
     ...(attributesSpec ? ['attributes'] : []),
     ...(jsonSchemaSpec ? ['json'] : []),
-    ...(jsonFilterStr ? ['jsonFilter'] : []),
   ];
   const nodeOffloadWarnings: string[] = [];
   if (
     rawBodyOverBudget &&
-    !nodeOffloadBlockedByScoping &&
     item.extractedOnNode !== true &&
     !fetchResUsed.via.startsWith('agent') &&
     target !== 'container'
@@ -4896,6 +5081,8 @@ export async function executeScrapeCall(params: {
           ...fetchCall.options,
           maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
         },
+        // The node applies `jsonFilter` itself (same Go record chunker as the edge's `chunkJsonRecords`).
+        requests: jsonFilterStr ? fetchCall.requests.map((r) => ({ ...r, jsonFilter: jsonFilterStr })) : fetchCall.requests,
       };
       const nodeRes = await executeHubFetch(
         'agent',
@@ -4913,13 +5100,7 @@ export async function executeScrapeCall(params: {
         // result (e.g. an unformattable >4 MiB sitemap, or origin markdown the node also could not fit) would
         // otherwise discard the raw body and return an empty 200; keeping the raw body lets the edge fallback below
         // cut+sanitize origin markdown or flag `edgeBudgetExceeded` with a warning.
-        const nodeMarkdown = typeof nodeItem?.markdown === 'string' ? nodeItem.markdown : '';
-        if (
-          nodeItem?.outcome === 'ok' &&
-          nodeItem.markdownOverBudget !== true &&
-          nodeMarkdown.trim().length > 0 &&
-          exactUtf8ByteLen(nodeMarkdown) <= MAX_WASM_INPUT_BYTES
-        ) {
+        if (nodeItem && nodeResultSatisfiesRequest(nodeItem)) {
           rawBodyStr = '';
           fetchResUsed = nodeRes;
           item = nodeItem;
@@ -4935,6 +5116,22 @@ export async function executeScrapeCall(params: {
     } catch {
       // Fall through to clean over-budget warning + stored R2 artifact below when no Go node is reachable.
     }
+  }
+
+  // Primary agent path: the first fetch itself went to a Go node, which extracted the over-budget page natively and
+  // omitted the raw body. Apply the same acceptance rules as the offload path above: an empty node result (e.g. an
+  // unformattable sitemap) or tag-scoped markdown the node did not confirm scoping for must not be returned as a
+  // normal success; return the flagged over-budget response instead. (`markdownOverBudget` is handled just below.)
+  if (item.extractedOnNode === true && item.markdownOverBudget !== true && !nodeResultSatisfiesRequest(item)) {
+    const rawToStore = rawBodyStr;
+    rawBodyStr = '';
+    return buildOverBudgetEdgeResponse(rawToStore, { ...item, markdown: '', text: '' }, fetchResUsed.via);
+  }
+  if (item.extractedOnNode === true && nodeOffloadMissingFormats.length > 0 && nodeOffloadWarnings.length === 0) {
+    nodeOffloadWarnings.push(
+      `Document over the 4 MiB edge budget was extracted on a Go node; ${nodeOffloadMissingFormats.join(', ')} ` +
+        'require edge processing of the raw page and are unavailable for this response.',
+    );
   }
 
   const nodeMdStr = typeof item.markdown === 'string' ? item.markdown : '';
@@ -4963,6 +5160,8 @@ export async function executeScrapeCall(params: {
     if (
       !nodeOffloadBlockedByScoping &&
       nodeOffloadMissingFormats.length === 0 &&
+      // An in-budget body is not re-extracted by the node's over-budget path, so `jsonFilter` would not apply.
+      !jsonFilterStr &&
       item.extractedOnNode !== true &&
       !fetchResUsed.via.startsWith('agent') &&
       target !== 'container' &&
@@ -5125,8 +5324,11 @@ export async function executeScrapeCall(params: {
   // Step 1: NEVER slice `rawBodyStr` prior to sanitization! If an origin-markdown document is between
   // `MAX_HTML_SCAN_CHARS` (2 MiB) and `MAX_WASM_INPUT_BYTES` (4 MiB), sanitize the ENTIRE document first
   // and apply `MAX_HTML_SCAN_CHARS` afterwards via fence-safe `finalizeScrapedMarkdown` slicing.
-  const originMdCapTruncated = isOriginMarkdown && rawBodyStr.length > MAX_HTML_SCAN_CHARS;
-  const originMdOriginalChars = originMdCapTruncated ? rawBodyStr.length : 0;
+  // When the over-budget body was extracted on a Go node, `rawBodyStr` is cleared and the node's (unsanitized,
+  // in-budget) Markdown is the origin-markdown body; it must still flow through the edge sanitizer below.
+  const originMarkdownBody =
+    rawBodyStr || (isOriginMarkdown && item.extractedOnNode === true && typeof item.markdown === 'string' ? item.markdown : '');
+  const originMdCapTruncated = isOriginMarkdown && originMarkdownBody.length > MAX_HTML_SCAN_CHARS;
 
   // R2 & R3 (`R3-M3`): Guard against HTTP 200 WAF/CAPTCHA interstitials on BOTH HTML AND `origin-markdown` responses!
   const wafSourceStr = rawBodyStr || (typeof item.markdown === 'string' ? item.markdown : '');
@@ -5314,6 +5516,12 @@ export async function executeScrapeCall(params: {
   const rawBase64Requested = stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing;
   if (rawBase64Requested && pdfParserOpts.skipPdfParsing) {
     const rawB64 = encodeBodyToRawBase64(item);
+    // `parsers: []` returns early, so it needs its own artifact reference and omission warning: without them a body
+    // too large to return inline produced `ok: true` with neither `rawBase64` nor any way to fetch the bytes.
+    const skipArt = !isPrivateScrape
+      ? (item.artifact as { blobSha256?: string; contentSha256?: string } | undefined)
+      : undefined;
+    const skipOmitted = rawB64 === undefined && (item.bodyBase64Omitted === true || item.bodyOmitted === true);
     return {
       status: 200,
       via: fetchResUsed.via,
@@ -5326,6 +5534,16 @@ export async function executeScrapeCall(params: {
         status: item.status ?? 200,
         via: fetchResUsed.via,
         ...(rawB64 ? { rawBase64: rawB64 } : {}),
+        ...(skipArt?.contentSha256 ? { contentSha256: skipArt.contentSha256 } : {}),
+        ...(skipArt?.blobSha256 ? { artifactId: skipArt.blobSha256 } : {}),
+        ...(skipOmitted
+          ? {
+              warnings: [
+                'rawBase64 was requested but the body was too large to return inline (batch body budget); ' +
+                  (skipArt?.blobSha256 ? 'fetch the stored artifact via artifactId instead.' : 'no stored artifact is available for this request.'),
+              ],
+            }
+          : {}),
         metadata: {
           contentType: isPdfResponse ? 'application/pdf' : item.contentType,
         },
@@ -5358,6 +5576,11 @@ export async function executeScrapeCall(params: {
         problem: binaryScrapeProblem,
       },
     };
+  }
+  // Links / favicon produced on a Go node are untrusted input to the Hub: run them through the same https-only,
+  // public-host URL sanitizer the edge applies to extracted URLs before they reach `links` / `favicon` / `json`.
+  if (item.extractedOnNode === true || fetchResUsed.via.startsWith('agent')) {
+    item = sanitizeNodeSuppliedUrls(item, finalUrl);
   }
   let isHtmlBody = Boolean(
     !isOriginMarkdown &&
@@ -5922,12 +6145,13 @@ export async function executeScrapeCall(params: {
       ? tryParseJsonPayloadForScrape(rawBodyStr, item.contentType, finalUrl)
       : null;
   const isNotebookOrOpenApiJson = Boolean(
-    jsonFormatted?.parsed &&
-      typeof jsonFormatted.parsed === 'object' &&
-      !Array.isArray(jsonFormatted.parsed) &&
-      ('openapi' in (jsonFormatted.parsed as Record<string, unknown>) ||
-        'swagger' in (jsonFormatted.parsed as Record<string, unknown>) ||
-        'nbformat' in (jsonFormatted.parsed as Record<string, unknown>)),
+    jsonFormatted?.structuredKind ||
+      (jsonFormatted?.parsed &&
+        typeof jsonFormatted.parsed === 'object' &&
+        !Array.isArray(jsonFormatted.parsed) &&
+        ('openapi' in (jsonFormatted.parsed as Record<string, unknown>) ||
+          'swagger' in (jsonFormatted.parsed as Record<string, unknown>) ||
+          'nbformat' in (jsonFormatted.parsed as Record<string, unknown>))),
   );
   const jsonRecordsFormatted =
     !isOriginMarkdown &&
@@ -5997,7 +6221,7 @@ export async function executeScrapeCall(params: {
       : null;
 
   let markdown = isOriginMarkdown
-    ? rawBodyStr
+    ? originMarkdownBody
     : alternateMarkdownBody ||
       customShopifyDoc?.markdown ||
       cmsTwinDoc?.markdown ||
@@ -6037,7 +6261,7 @@ export async function executeScrapeCall(params: {
     }
   }
   let textOut = isOriginMarkdown
-    ? rawBodyStr
+    ? originMarkdownBody
     : alternateMarkdownBody ||
       customShopifyDoc?.markdown ||
       cmsTwinDoc?.markdown ||
@@ -6088,9 +6312,17 @@ export async function executeScrapeCall(params: {
     }
   }
 
+  const preSanitizeMarkdownChars = markdown.length;
+  let preSanitizeRedactCut = false;
+  // A `text` output cut to the sanitizer budget by a downstream WASM helper must surface as `truncated: true`.
+  let textOutBudgetCut = false;
   if (redactPii) {
-    markdown = redactPiiText(markdown);
-    textOut = redactPiiText(textOut);
+    const mdRedacted = redactPiiTextReportingCut(markdown);
+    markdown = mdRedacted.text;
+    preSanitizeRedactCut = mdRedacted.cut;
+    const textRedacted = redactPiiTextReportingCut(textOut);
+    textOut = textRedacted.text;
+    textOutBudgetCut = textRedacted.cut;
   }
   let fullShaped = finalizeScrapedMarkdown(markdown, {
     isPdf: isPdfResponse,
@@ -6105,7 +6337,22 @@ export async function executeScrapeCall(params: {
       markdown: `# ${fullShaped.frontmatterTitle}\n\n${fullShaped.markdown}`,
     };
   }
-  let rawCleanMarkdown = redactPii ? redactPiiText(fullShaped.markdown) : fullShaped.markdown;
+  const boundedCleanMd = boundToSanitizerBudget(redactPii ? redactPiiText(fullShaped.markdown) : fullShaped.markdown);
+  let rawCleanMarkdown = boundedCleanMd.text;
+  if (boundedCleanMd.cut || preSanitizeRedactCut || fullShaped.truncated) {
+    // Any cut so far (redaction input cut, sanitizer budget, post-redaction growth) is a truncation of the whole
+    // document; totals are in sanitized-output chars, i.e. the stored Markdown artifact `read_artifact` pages over.
+    fullShaped = {
+      ...fullShaped,
+      ...(boundedCleanMd.cut ? { markdown: rawCleanMarkdown } : {}),
+      truncated: true,
+      totalChars: rawCleanMarkdown.length,
+      nextOffset: rawCleanMarkdown.length,
+      remainingChars: 0,
+      sourceTruncated: true,
+      sourceChars: fullShaped.sourceChars ?? preSanitizeMarkdownChars,
+    };
+  }
   const mdAssets = !isHtmlBody && !isPdfResponse ? extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, includeImages) : undefined;
 
   // P1: Short-term / general fallback — when extracted HTML Markdown has < 50 words and `<meta name="description">` / `og:description`
@@ -6217,17 +6464,38 @@ export async function executeScrapeCall(params: {
       : applyQueryFocus(rawCleanMarkdown);
   const effectiveOutMaxChars =
     maxChars ?? (originMdCapTruncated && rawCleanMarkdown.length > MAX_HTML_SCAN_CHARS ? MAX_HTML_SCAN_CHARS : undefined);
-  const shaped =
-    focused.queryFiltered || effectiveOutMaxChars !== undefined
-      ? finalizeScrapedMarkdown(focused.markdown, {
-          isPdf: false,
-          includeImages,
-          maxChars: effectiveOutMaxChars,
-          baseUrl: finalUrl,
-          preserveOriginMarkdown: isOriginMarkdown,
-        })
+  const shaped: ReturnType<typeof finalizeScrapedMarkdown> = focused.queryFiltered
+    ? finalizeScrapedMarkdown(focused.markdown, {
+        isPdf: false,
+        includeImages,
+        maxChars: effectiveOutMaxChars,
+        baseUrl: finalUrl,
+        preserveOriginMarkdown: isOriginMarkdown,
+      })
+    : effectiveOutMaxChars !== undefined
+      ? (() => {
+          // Page the already-sanitized document directly (same fence-safe slicer `read_artifact` uses), so
+          // `nextOffset` / `totalChars` are offsets into exactly the Markdown stored as the `md:` artifact.
+          const page = sliceMarkdownWithOffsetAndMaxChars(rawCleanMarkdown, 0, effectiveOutMaxChars);
+          if (page.truncated) {
+            return {
+              markdown: page.markdown,
+              truncated: true,
+              totalChars: page.totalChars,
+              nextOffset: page.nextOffset ?? page.totalChars,
+              remainingChars: page.remainingChars,
+              ...(fullShaped.sourceTruncated ? { sourceTruncated: true, sourceChars: fullShaped.sourceChars } : {}),
+            };
+          }
+          return { ...fullShaped, markdown: page.markdown };
+        })()
       : fullShaped;
   markdown = shaped.markdown;
+  if (stringFormats.has('text') && !isOriginMarkdown && !hydratedFromJobPostingJsonLd) {
+    const boundedText = boundToSanitizerBudget(textOut);
+    textOut = boundedText.text;
+    textOutBudgetCut = textOutBudgetCut || boundedText.cut;
+  }
   textOut =
     !stringFormats.has('text') || isOriginMarkdown || hydratedFromJobPostingJsonLd
       ? markdown
@@ -6923,15 +7191,18 @@ export async function executeScrapeCall(params: {
             totalRecords: jsonRecordsFormatted.totalRecords,
           }
         : {}),
-    ...(shaped.truncated || originMdCapTruncated
+    ...(shaped.truncated || (textOutBudgetCut && stringFormats.has('text'))
       ? (() => {
-          const effTotal = shaped.totalChars ?? originMdOriginalChars;
+          // One coordinate system: sanitized-output chars (what `read_artifact` serves for `markdownArtifactId`).
+          // Raw input length (e.g. a 2-4 MiB origin-markdown body) is only reported as `sourceChars`.
+          const effTotal = shaped.totalChars ?? markdown.length;
           const effNext = shaped.nextOffset ?? markdown.length;
           return {
             truncated: true,
             totalChars: effTotal,
             nextOffset: effNext,
             remainingChars: shaped.remainingChars ?? Math.max(0, effTotal - effNext),
+            ...(shaped.sourceTruncated ? { sourceTruncated: true, sourceChars: shaped.sourceChars } : {}),
           };
         })()
       : adapterTruncatedOut === true

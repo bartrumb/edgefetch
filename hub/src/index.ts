@@ -150,6 +150,7 @@ import {
   type OtelEnvConfig,
 } from './otel';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
+import { MAX_WASM_INPUT_BYTES } from './wasm-bridge';
 import { readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 import {
   executeIngestPipeline,
@@ -1749,6 +1750,9 @@ export default {
                 options: {
                   includeBody: true,
                   respectRobots: true,
+                  // Go omits bodies over this cap (`bodyOmitted: true`) so a page that cannot fit the WASM evaluator never
+                  // materialises as a multi-MiB JS string; the omission is surfaced below as an explicit error.
+                  maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
                   ...(boundedMaxBytes !== undefined ? { maxBytes: boundedMaxBytes } : {}),
                   // `timeoutMs` lives on crawl.Options (Go `crawl.Request` has no such field): on the request it was
                   // silently dropped by lenient decoders (30 s default) and rejected by the strict server decoder.
@@ -1781,6 +1785,22 @@ export default {
           try {
             const parsedObj = JSON.parse(hubOut.bodyText) as { results?: Array<Record<string, unknown>> };
             const first = parsedObj.results?.[0];
+            if (
+              first &&
+              typeof first.body !== 'string' &&
+              (first.bodyOmitted === true || first.bodyBase64Omitted === true)
+            ) {
+              // An omitted body is NOT an empty page: parsing '' would end pagination early as if the catalog were done.
+              return {
+                status: typeof first.status === 'number' ? first.status : 200,
+                outcome: 'error',
+                problem: `page body exceeded the ${MAX_WASM_INPUT_BYTES}-byte inline/WASM input budget and was omitted`,
+                bodyOmitted: true,
+                ...(typeof first.finalUrl === 'string' ? { finalUrl: first.finalUrl } : {}),
+                headers: {},
+                body: '',
+              };
+            }
             if (first && typeof first.retryAfter === 'string' && first.retryAfter) {
               const existingHdrs =
                 first.headers && typeof first.headers === 'object' && !Array.isArray(first.headers)
@@ -3409,7 +3429,7 @@ export default {
                   source: `batch-scrape:${auth.principal}`,
                   userId: auth.userId,
                 });
-                return { status: res.status, body: res.body };
+                return { status: res.status, body: res.body, ...(res.retryAfter ? { retryAfter: res.retryAfter } : {}) };
               } finally {
                 releaseBatchItemSlot();
               }
@@ -3432,6 +3452,8 @@ export default {
               status: batchOut.job.status,
               total: batchOut.job.total,
               completed: batchOut.job.completed,
+              failed: batchOut.job.failed,
+              retryable: batchOut.job.retryable,
               url: `${url.origin}/v1/batch/scrape/${batchOut.job.id}`,
               ...(payload.sync === true ? { data: batchOut.job.data, errors: batchOut.job.errors } : {}),
             },

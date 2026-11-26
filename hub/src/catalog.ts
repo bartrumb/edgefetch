@@ -117,6 +117,8 @@ export interface NormalizedHubPageResponse {
   body: string;
   finalUrl?: string;
   retryAfterMs?: number;
+  /** The hub/Go fetch dropped the body (over `maxInlineBodyBytes` / inline budget): NOT an empty page. */
+  bodyOmitted?: boolean;
 }
 
 export interface CatalogHubFetchParams {
@@ -710,6 +712,7 @@ function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | nul
     }
     const retryAfterMs = typeof target.retryAfterMs === 'number' && Number.isFinite(target.retryAfterMs) ? target.retryAfterMs : undefined;
     const finalUrl = typeof target.finalUrl === 'string' ? target.finalUrl : undefined;
+    const bodyOmitted = bodyStr === '' && (target.bodyOmitted === true || target.bodyBase64Omitted === true);
     return {
       status,
       ...(outcome ? { outcome } : {}),
@@ -718,6 +721,7 @@ function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | nul
       body: bodyStr,
       ...(finalUrl ? { finalUrl } : {}),
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      ...(bodyOmitted ? { bodyOmitted: true } : {}),
     };
   } catch {
     return null;
@@ -1477,6 +1481,14 @@ export async function executeCatalogCall(params: {
           const pageResp = normalizeHubPageResponse(fetchRace.value);
           if (!pageResp) {
             stopReason = strikes > 0 ? 'rate_limited' : 'empty_response';
+            evalOut = null;
+            break;
+          }
+          if (pageResp.bodyOmitted) {
+            // Body too large for the inline/WASM budget: stop visibly (partial + truncated + reason) instead of
+            // evaluating '' as an empty page, which would read as a natural end of the catalog.
+            stopReason = 'page_too_large_for_edge';
+            truncatedByBudget = true;
             evalOut = null;
             break;
           }

@@ -4,6 +4,7 @@
  */
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
+import { parseExactRetryAfterMs } from './agent-hub';
 import { getActiveCallerAuthContext } from './oauth';
 import { cloudflareOverflowFetch, isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type RequestTracer, type TraceContext } from './otel';
@@ -1562,18 +1563,28 @@ function getCompiledCrawlPatternListMatcher(patterns: readonly string[]): (subje
   return matcher;
 }
 
-function pathAllowed(
+export function pathAllowed(
   candidateUrl: URL,
   includePaths: string[],
   excludePaths: string[],
   regexOnFullURL: boolean,
 ): boolean {
   const subject = regexOnFullURL ? candidateUrl.toString() : candidateUrl.pathname;
-  if (excludePaths.length > 0 && getCompiledCrawlPatternListMatcher(excludePaths)(subject)) {
+  // Fail closed: a matcher that throws (e.g. `WasmRe2RecompileError` after a reactor swap) must never let a URL past
+  // `excludePaths` (an error is treated as "excluded") nor into `includePaths` (an error is treated as "not included").
+  try {
+    if (excludePaths.length > 0 && getCompiledCrawlPatternListMatcher(excludePaths)(subject)) {
+      return false;
+    }
+  } catch {
     return false;
   }
   if (includePaths.length === 0) return true;
-  return getCompiledCrawlPatternListMatcher(includePaths)(subject);
+  try {
+    return getCompiledCrawlPatternListMatcher(includePaths)(subject);
+  } catch {
+    return false;
+  }
 }
 
 const crawlsUserIdMigratedDbs = new WeakSet<object>();
@@ -2690,11 +2701,35 @@ export interface BatchScrapeJobRecord {
   total: number;
   completed: number;
   failed: number;
+  /** Items that were still `isolate_memory_busy` after bounded retries: transient, NOT counted in `failed`. */
+  retryable: number;
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
   data: Array<Record<string, unknown>>;
-  errors: Array<{ url: string; error: string }>;
+  errors: Array<{ url: string; error: string; status?: number; retryable?: boolean; retryAfter?: string }>;
+}
+
+/** Bounded in-job retries for per-isolate byte-semaphore saturation (`executeScrapeCall` HTTP 429 `isolate_memory_busy`). */
+export const BATCH_BUSY_MAX_ATTEMPTS = 3;
+const BATCH_BUSY_MIN_WAIT_MS = 100;
+const BATCH_BUSY_MAX_WAIT_MS = 2_000;
+const BATCH_BUSY_STAGGER_MS = 100;
+/** Retries stop once `job start + window` would be crossed (Workers `waitUntil` grace is ~30 s after the response). */
+export const BATCH_BUSY_RETRY_WINDOW_MS = 25_000;
+
+type BatchScrapeItemResult = { status: number; body: Record<string, unknown>; retryAfter?: string };
+
+export function isRetryableIsolateBusy(out: BatchScrapeItemResult): boolean {
+  return out.status === 429 && out.body?.error === 'isolate_memory_busy' && out.body?.retryable !== false;
+}
+
+function batchBusyRetryAfterValue(out: BatchScrapeItemResult): string | undefined {
+  if (typeof out.retryAfter === 'string' && out.retryAfter.trim()) return out.retryAfter.trim();
+  const fromBody = out.body?.retryAfter;
+  if (typeof fromBody === 'string' && fromBody.trim()) return fromBody.trim();
+  if (typeof fromBody === 'number' && Number.isFinite(fromBody) && fromBody >= 0) return String(Math.ceil(fromBody));
+  return undefined;
 }
 
 const inMemoryBatchJobs = new Map<string, BatchScrapeJobRecord>();
@@ -2706,11 +2741,14 @@ export async function startOrExecuteBatchScrape(params: {
   payload: Record<string, unknown>;
   selfHost?: string;
   userId?: string;
-  executeScrape: (scrapePayload: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeScrape: (scrapePayload: Record<string, unknown>) => Promise<BatchScrapeItemResult>;
   waitUntil?: (p: Promise<unknown>) => void;
   tracer?: RequestTracer | TraceContext;
+  /** Test seam for the `isolate_memory_busy` retry backoff. */
+  sleepFn?: (ms: number) => Promise<void>;
 }): Promise<{ ok: true; status: number; job: BatchScrapeJobRecord } | { ok: false; status: number; error: string; message: string }> {
   const { payload, selfHost, executeScrape, waitUntil } = params;
+  const sleepFn = params.sleepFn ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const activeAuth = getActiveCallerAuthContext();
   const effectiveUserId = sanitizeStorageUserId(params.userId ?? activeAuth?.userId ?? 'owner');
   const isMemberCaller = activeAuth?.role === 'member' || (effectiveUserId !== 'owner' && activeAuth?.role !== 'owner');
@@ -2788,6 +2826,7 @@ export async function startOrExecuteBatchScrape(params: {
     total: validUrls.length,
     completed: 0,
     failed: invalidErrors.length,
+    retryable: 0,
     createdAt: now,
     updatedAt: now,
     expiresAt: now + 24 * 60 * 60_000,
@@ -2830,14 +2869,36 @@ export async function startOrExecuteBatchScrape(params: {
   }
   inMemoryBatchJobs.set(batchId, job);
 
+  const retryDeadlineAt = now + BATCH_BUSY_RETRY_WINDOW_MS;
+  // Items of one `Promise.all` chunk compete for the same per-isolate byte semaphore, so a chunk of multi-MiB pages can
+  // make its own siblings 429 `isolate_memory_busy`. That is transient: retry it a bounded number of times (Retry-After
+  // clamped + per-item stagger so siblings do not collide again), never past the job's retry window or a cancel.
+  // Read through a function: `cancelBatchScrape` flips `job.status` concurrently across the awaits below.
+  const isJobCancelled = (): boolean => job.status === 'cancelled';
+  const scrapeWithBusyRetry = async (u: string, idx: number): Promise<BatchScrapeItemResult> => {
+    let out = await executeScrape({ ...sharedScrapeOpts, url: u });
+    for (let attempt = 1; attempt < BATCH_BUSY_MAX_ATTEMPTS && isRetryableIsolateBusy(out); attempt++) {
+      if (isJobCancelled()) break;
+      const hinted = parseExactRetryAfterMs(batchBusyRetryAfterValue(out), Date.now());
+      const baseWait = hinted !== null ? hinted : 250 * attempt;
+      const waitMs =
+        Math.min(BATCH_BUSY_MAX_WAIT_MS, Math.max(BATCH_BUSY_MIN_WAIT_MS, baseWait)) + idx * BATCH_BUSY_STAGGER_MS;
+      if (Date.now() + waitMs >= retryDeadlineAt) break;
+      await sleepFn(waitMs);
+      if (isJobCancelled()) break;
+      out = await executeScrape({ ...sharedScrapeOpts, url: u });
+    }
+    return out;
+  };
+
   const runBatchCore = async () => {
     for (let i = 0; i < validUrls.length; i += concurrency) {
       if (job.status === 'cancelled') break;
       const chunk = validUrls.slice(i, i + concurrency);
       const results = await Promise.all(
-        chunk.map((u) => {
+        chunk.map((u, idx) => {
           const runOne = async () => {
-            const out = await executeScrape({ ...sharedScrapeOpts, url: u });
+            const out = await scrapeWithBusyRetry(u, idx);
             return { u, out };
           };
           return activeTracer ? activeTracer.run(runOne) : runOne();
@@ -2847,6 +2908,16 @@ export async function startOrExecuteBatchScrape(params: {
         if (out.status === 200) {
           job.completed++;
           job.data.push(out.body);
+        } else if (isRetryableIsolateBusy(out)) {
+          // Still busy after bounded retries: surface as transient/retryable, not a permanent failure.
+          job.retryable++;
+          job.errors.push({
+            url: u,
+            error: String(out.body.error ?? 'isolate_memory_busy'),
+            status: out.status,
+            retryable: true,
+            retryAfter: batchBusyRetryAfterValue(out) ?? '1',
+          });
         } else {
           job.failed++;
           job.errors.push({

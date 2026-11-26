@@ -13,9 +13,11 @@ All notable changes to EdgeFetch are documented in this file. This project adher
 - **Go-node offload of >4 MiB documents (#73, #76):** requests using `includeTags`/`excludeTags` are no longer offloaded (excluded content could leak); node results are accepted only when they contain in-budget markdown (no more silent empty 200s for unformattable bodies such as sitemaps, and over-budget origin markdown is cut and sanitized at the edge); responses warn when `html`/`rawHtml`/`product`/`attributes`/`json`/`jsonFilter` are unavailable for a node-extracted page; the busy-isolate path applies the WAF, prompt-injection and content-state guards.
 - **Extraction (#72, #76):** JSR `<pre>` blocks with copy buttons keep their code; product `sku` falls back to the primary Offer (Shopify), and `json` schema extraction sees custom-domain Shopify / adapter records.
 - **Budgets & plumbing (#76):** base64 bodies count toward the batch body budget (`bodyBase64Omitted` + hub warning instead of exceeding the 20 MiB agent reply cap); secondary fetches (Workday stub, commerce twins, alternate markdown, `llms.txt`) omit bodies over the WASM budget; catalog probe `timeoutMs` is sent where the Go fetcher reads it; an explicit root tracer no longer hides the active child span.
+- **Post-2.8.0 fixes (#66–#70):** multi-MiB ATS boards are streamed and catalog probes are bounded (#70); `fetchFn` is detached from its params object to avoid workerd `Illegal invocation` (#69); the declarative `ExtractHTMLDocumentFull` callback passes `IsFragment=true` (#68); a cold-R2 EasyPrivacy bootstrap with refresh API and pkg.go.dev toolbar-chrome cleanup (#66).
 
 ### Changed
-- CI: shared retrying CPU-budget helper for linear-time regression tests and fixed OTLP span-count races (#75); hub dev dependencies bumped, including TypeScript 7 (#56).
+- Single-pass Go WASM EasyPrivacy validator and fragment `defaultHTMLToMD` (#67).
+- CI: shared retrying CPU-budget helper for linear-time regression tests and fixed OTLP span-count races (#75); the M4 adversarial-HTML check now retries against its unchanged 350 ms budget; hub dev dependencies bumped, including TypeScript 7 (#56).
 
 ## [2.8.0] - 2026-11-25
 

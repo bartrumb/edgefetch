@@ -1268,10 +1268,27 @@ export async function executeExtractCall(params: {
   userId?: string;
   now?: number;
   tracer?: RequestTracer | TraceContext;
+  /**
+   * Optional wall-clock budget for the whole call (used by `search` enrichment). Every node dispatch is capped to the
+   * time remaining, and optional follow-up fetches (HTML retry, Workday stub, browser-auto render, external SPA
+   * fallback) are skipped once too little is left. URLs that miss the budget come back as failed entries. Unset keeps
+   * the standalone `extract` tool's unbounded behaviour.
+   */
+  budgetMs?: number;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runExtract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'extract', selfHost, userId = 'owner', now = Date.now() } = params;
+  const budgetDeadlineAt =
+    typeof params.budgetMs === 'number' && Number.isFinite(params.budgetMs) && params.budgetMs > 0
+      ? Date.now() + params.budgetMs
+      : null;
+  /** `capSecs` clamped to the whole seconds left in the budget (never below 1), or `capSecs` when unbudgeted. */
+  const budgetSecs = (capSecs: number): number =>
+    budgetDeadlineAt === null ? capSecs : Math.max(1, Math.min(capSecs, Math.floor((budgetDeadlineAt - Date.now()) / 1_000)));
+  /** True when unbudgeted, or when at least `minSecs` of the budget remain for an optional follow-up fetch. */
+  const hasBudgetFor = (minSecs: number): boolean =>
+    budgetDeadlineAt === null || budgetDeadlineAt - Date.now() >= minSecs * 1_000;
   if (!Array.isArray(payload.urls) || payload.urls.length === 0 || payload.urls.length > 20) {
     return {
       status: 400,
@@ -1450,7 +1467,7 @@ export async function executeExtractCall(params: {
     const twinByIdx = new Map<number, NonNullable<ReturnType<typeof resolveSiteExtractorTwin>>>();
 
     const call = {
-      maxSeconds: isEphemeral ? 35 : 60,
+      maxSeconds: budgetSecs(isEphemeral ? 35 : 60),
       options: {
         includeBody: true,
         respectRobots: true,
@@ -1554,13 +1571,13 @@ export async function executeExtractCall(params: {
       const r = resMap.get(`ext-${item.idx + 1}`);
       return !r || r.outcome !== 'ok';
     });
-    if (fallbackHtmlItems.length > 0) {
+    if (fallbackHtmlItems.length > 0 && hasBudgetFor(3)) {
       for (const fItem of fallbackHtmlItems) {
         atsByIdx.delete(fItem.idx);
         twinByIdx.delete(fItem.idx);
       }
       const retryCall = {
-        maxSeconds: isEphemeral ? 25 : 45,
+        maxSeconds: budgetSecs(isEphemeral ? 25 : 45),
         options: {
           includeBody: true,
           respectRobots: true,
@@ -1866,12 +1883,12 @@ export async function executeExtractCall(params: {
       const wdStub = rawBodyStr ? detectWorkdayRedirectStub(rawBodyStr, finalUrl) : null;
       if (wdStub) {
         const stubAts = resolveAtsPreFetchSpec(wdStub.redirectUrl);
-        if (stubAts) {
+        if (stubAts && hasBudgetFor(3)) {
           try {
             const stubOut = await executeHubFetch(
               target,
               JSON.stringify({
-                maxSeconds: 25,
+                maxSeconds: budgetSecs(25),
                 options: { includeBody: true, respectRobots: true },
                 requests: [
                   {
@@ -2074,14 +2091,20 @@ export async function executeExtractCall(params: {
           effectiveRenderMode === 'auto' &&
           r.rendered !== true &&
           target !== 'container' &&
-          isThinScriptedPage(rawBodyStr, extracted?.markdown ?? '')
+          isThinScriptedPage(rawBodyStr, extracted?.markdown ?? '') &&
+          hasBudgetFor(6)
         ) {
           try {
             const autoRes = await executeHubFetch(
               'agent',
               JSON.stringify({
-                maxSeconds: 40,
-                options: { includeBody: true, respectRobots: true, maxBytes: 16 * 1024 * 1024, timeoutMs: 35_000 },
+                maxSeconds: budgetSecs(40),
+                options: {
+                  includeBody: true,
+                  respectRobots: true,
+                  maxBytes: 16 * 1024 * 1024,
+                  timeoutMs: Math.max(1_000, Math.min(35_000, (budgetSecs(40) - 1) * 1_000)),
+                },
                 requests: [
                   {
                     id: `ext-auto-${item.idx + 1}`,
@@ -2198,6 +2221,7 @@ export async function executeExtractCall(params: {
         effectiveRenderMode !== 'off' &&
         countExtractWords(md) < 50 &&
         isThinScriptedPage(rawBodyStr, md) &&
+        hasBudgetFor(8) &&
         isEligibleForExternalSpaFallback({
           mode: spaFallbackMode,
           outcome: 'ok',

@@ -1853,7 +1853,7 @@ export default {
               affinities: state.affinities,
             };
           },
-          executeFetch: async ({ target, site, body, principal }) => {
+          executeFetch: async ({ target, site, body, principal, hydrateInline }) => {
             const effectiveUserId = getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
             const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
               inFlightScrapesByUser,
@@ -1873,7 +1873,14 @@ export default {
               };
             }
             try {
-              return await executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`);
+              return await executeHubFetch(
+                target,
+                body,
+                site,
+                `mcp:${principal ?? 'client'}`,
+                undefined,
+                hydrateInline ?? true,
+              );
             } finally {
               releaseScrapeSlot();
             }

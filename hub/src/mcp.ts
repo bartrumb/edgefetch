@@ -181,6 +181,8 @@ export interface McpServerDeps {
     site?: string;
     body: string;
     principal?: string;
+    /** false: store artifacts but don't hydrate bodies back from R2 into the reply (caller set includeBody: false). */
+    hydrateInline?: boolean;
   }) => Promise<McpExecuteFetchResult>;
   readArtifact?: (params: {
     blobSha256: string;
@@ -555,7 +557,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter in milliseconds added to pauseMs.' },
           respectRobots: { type: 'boolean', default: true },
           robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
-          includeBody: { type: 'boolean', default: false, description: 'Set true to include truncated raw body previews per URL.' },
+          includeBody: {
+            type: 'boolean',
+            default: false,
+            description:
+              'Set true to include truncated raw body previews per URL. Either way each successful result carries an artifactId for read_artifact.',
+          },
           previewBytes: {
             type: 'integer',
             minimum: 256,
@@ -1399,6 +1406,15 @@ function buildToolDefinitions(deps: McpServerDeps) {
     .map((t) => ({ ...t, title: t.annotations.title }));
 }
 
+/** Removes inline body fields from a fetch result (for `includeBody: false`), keeping `artifactId` and metadata. */
+export function stripInlineBodyFields(item: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...item };
+  for (const key of ['body', 'bodyEncoding', 'bodyOriginalChars', 'bodyPreviewTruncated', 'bodyBase64', 'rawBody']) {
+    delete copy[key];
+  }
+  return copy;
+}
+
 export function truncateResultBodies(
   parsed: Record<string, unknown>,
   inlineMaxChars = MAX_BODY_PREVIEW_CHARS,
@@ -1468,6 +1484,19 @@ export function truncateResultBodies(
     ) {
       copy.outcome = 'ok';
       delete copy.problem;
+    }
+
+    // An auto-detected `kind: "page"` request that actually returned JSON (e.g. an extensionless ATS API such as
+    // `/posting-api/job-board/<org>`) is reported as `kind: "json"`. Only the response label changes: the request was
+    // fetched as a page on purpose, since guessing `json` up front would turn HTML on api.* hosts into `skip`.
+    if (
+      (autoInferredKind || copy.kindAuto === true) &&
+      copy.kind === 'page' &&
+      copy.outcome === 'ok' &&
+      typeof copy.contentType === 'string' &&
+      /^application\/(?:[a-z0-9.+-]*\+)?json(?:[;\s]|$)/i.test(copy.contentType.trim())
+    ) {
+      copy.kind = 'json';
     }
 
     // Finding #5: Always explain why a response was skipped (e.g. non-HTML content-type on `kind: "page"`).
@@ -1831,10 +1860,14 @@ async function handleToolCallInner(
           ? Math.min(MAX_BODY_PREVIEW_CHARS, Math.max(256, requestedMaxBytes))
           : MAX_BODY_PREVIEW_CHARS;
 
+    // `includeBody: false` means "don't return bodies inline", not "don't keep them": the fetcher (Go node R2 sink and
+    // the hub dispatch artifact policy) only stores an artifact when bodies are requested, so always request them and
+    // instead skip inline R2 hydration and strip the body fields from the response. Results keep `artifactId` for
+    // `read_artifact`, exactly as `fetch_url` does.
     const callPayload = {
       maxSeconds: 60,
       options: {
-        includeBody,
+        includeBody: true,
         respectRobots,
         ...(name === 'fetch_batch' ? { concurrency: 4 } : {}),
         ...(requestedMaxBytes !== undefined && requestedMaxBytes > 8 * 1024 * 1024
@@ -1855,6 +1888,7 @@ async function handleToolCallInner(
         ...(rawSite ? { site: rawSite } : {}),
         body: JSON.stringify(callPayload),
         principal,
+        ...(includeBody ? {} : { hydrateInline: false }),
       });
     } catch (e) {
       return {
@@ -1876,6 +1910,9 @@ async function handleToolCallInner(
     try {
       const parsed = JSON.parse(res.bodyText) as Record<string, unknown>;
       const truncatedObj = truncateResultBodies(parsed, inlineMaxChars, explicitKind === undefined);
+      if (!includeBody && Array.isArray(truncatedObj.results)) {
+        truncatedObj.results = truncatedObj.results.map((item) => (item && typeof item === 'object' ? stripInlineBodyFields(item) : item));
+      }
       if (name === 'fetch_batch' && preBlockedByIndex.size > 0 && Array.isArray(truncatedObj.results)) {
         const fetchedById = new Map<string, Record<string, unknown>>();
         for (const item of truncatedObj.results) {

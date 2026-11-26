@@ -102,7 +102,7 @@ import {
   tryAcquireUserMapSlot,
   type MapRequestPayload,
 } from './map-crawl';
-import { handleMcpRequest } from './mcp';
+import { handleMcpRequest, isMcpRootRequest } from './mcp';
 import {
   executeFederatedMcpQuery,
   tryScrapeViaConnectedMcp,
@@ -1829,7 +1829,7 @@ export default {
       });
       if (oauthRes) return oauthRes;
 
-      if (url.pathname === '/mcp') {
+      if (url.pathname === '/mcp' || isMcpRootRequest(request, url)) {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
           serverVersion: HUB_VERSION,

@@ -12,6 +12,7 @@ All notable changes to EdgeFetch are documented in this file. This project adher
 
 ### Changed
 - Release tooling (#78): `make release-bump BUMP=patch|minor|major` rewrites every version marker and drafts the changelog; `make release-check` runs on every PR. The hub deploy job now fails when `CLOUDFLARE_API_TOKEN` is missing instead of passing after a dry run.
+- Hub deploy verification: the deploy job tags the Cloudflare Worker Version with the release tag and commit, then `hub/scripts/verify-deploy.mjs` fails the job unless the newest deployment serves exactly that version at 100%, it carries the tag, live `/openapi.json` reports the release version, and `/health` is ok.
 - `hub/wrangler.toml` states `[env.production.observability]` explicitly (#79).
 
 ## [2.8.1] - 2026-11-25

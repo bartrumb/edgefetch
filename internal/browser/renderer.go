@@ -4709,6 +4709,16 @@ func isSandboxStartupFailure(err error) bool {
 	return isSandboxStartupFailureText(err.Error())
 }
 
+// isEarlyChromiumExit reports a Chromium process that exited during startup before advertising its DevTools pipe,
+// excluding sandbox failures (those are handled by the sandbox fallback and would fail the same way again) and
+// startup timeouts (whose error text differs).
+func isEarlyChromiumExit(err error) bool {
+	if err == nil || isSandboxStartupFailure(err) {
+		return false
+	}
+	return strings.Contains(err.Error(), "chromium exited before advertising DevTools pipe endpoint")
+}
+
 func linuxSandboxBlockedByHostPolicy() bool {
 	if runtime.GOOS != "linux" {
 		return false
@@ -4955,6 +4965,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		}
 	}
 	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, firstAttemptWait)
+	relaunched := false
 	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil &&
 		(isSandboxStartupFailure(launchErr) || (r.canFallbackToNoSandboxLocked() && strings.Contains(launchErr.Error(), "before advertising DevTools"))) {
 		if !r.canFallbackToNoSandboxLocked() {
@@ -4979,7 +4990,20 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 				slog.String("reason", launchErr.Error()))
 		}
 		useSandbox = false
+		relaunched = true
 		cmd, userDir, conn, launchErr = r.launchAndDialLocked(ctx, proxy.Addr(), false, waitBudget)
+	}
+	// Chromium occasionally dies during startup before opening its DevTools pipe (seen on loaded CI runners, with only
+	// routine stderr such as a DBus warning). Relaunch once, in the SAME sandbox mode (this never weakens the sandbox),
+	// and only for that fast early exit: a startup timeout is not retried, so a hung launch never doubles the wait.
+	if launchErr != nil && !relaunched && ctx.Err() == nil && isEarlyChromiumExit(launchErr) {
+		if r.log != nil {
+			r.log.Warn("browser_launch_retry",
+				slog.String("bin", r.chromeBin),
+				slog.Bool("sandbox", useSandbox),
+				slog.String("reason", launchErr.Error()))
+		}
+		cmd, userDir, conn, launchErr = r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, waitBudget)
 	}
 	if launchErr != nil {
 		_ = proxy.Close()

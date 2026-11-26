@@ -2983,6 +2983,9 @@ export async function executeScrapeCall(params: {
           ? 'off'
           : 'auto';
   const sortedFormatsForCache = [...stringFormats].sort();
+  // `jsonFilter` changes the returned Markdown, so it is part of the cache identity (L-01). Trimmed like
+  // `jsonFilterStr` below; a blank filter is no filter.
+  const jsonFilterForCache = typeof payload.jsonFilter === 'string' ? payload.jsonFilter.trim() : '';
   const locationCacheKey = locationObj
     ? `${typeof locationObj.country === 'string' ? locationObj.country.trim().toUpperCase() : ''}|${locationLanguages.join(',')}`
     : '';
@@ -2998,6 +3001,7 @@ export async function executeScrapeCall(params: {
     waitForMsOpt !== undefined ||
     Boolean(waitSelectorOpt) ||
     !includeImages ||
+    Boolean(jsonFilterForCache) ||
     sortedFormatsForCache.join(',') !== 'markdown';
   const hasNonDefaultCacheOptions = hasNonDefaultCacheOptionsWithoutRedact || Boolean(redactPii);
   const scrapeOptionsHash = await sha256HexString(
@@ -3017,6 +3021,8 @@ export async function executeScrapeCall(params: {
       preferOriginMarkdown,
       redactPii: Boolean(payload.redactPii),
       ...(parsedWikiArticle ? { mwClean: 2 } : {}),
+      // Only present when set, so the hash of every request without `jsonFilter` is unchanged.
+      ...(jsonFilterForCache ? { jsonFilter: jsonFilterForCache } : {}),
     }),
   );
 

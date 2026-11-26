@@ -62,6 +62,7 @@ type Request struct {
 	PreferLlmsMarkdown *bool             `json:"preferLlmsMarkdown,omitempty"`
 	RedactPII          bool              `json:"redactPii,omitempty"`
 	Query              string            `json:"query,omitempty"`
+	JSONFilter         string            `json:"jsonFilter,omitempty"` // record filter for over-budget JSON arrays extracted on the node
 	Headers            map[string]string `json:"headers,omitempty"`
 	RenderMode         string            `json:"renderMode,omitempty"` // "off" (default), "auto", "always"
 	Mobile             bool              `json:"mobile,omitempty"`

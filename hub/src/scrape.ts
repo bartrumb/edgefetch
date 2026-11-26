@@ -1559,6 +1559,25 @@ export function sanitizeNodeSuppliedUrls<T extends Record<string, unknown>>(item
     if (safeFavicon) out.favicon = safeFavicon;
     else delete out.favicon;
   }
+  if ('images' in item) {
+    // Node-supplied images get the same URL treatment as links; alt text is kept as plain bounded text.
+    const images: Array<{ url: string; alt?: string }> = [];
+    if (Array.isArray(item.images)) {
+      const seen = new Set<string>();
+      for (const raw of item.images as unknown[]) {
+        if (images.length >= MAX_NODE_SUPPLIED_LINKS) break;
+        const rawUrl = typeof raw === 'string' ? raw : raw && typeof raw === 'object' ? (raw as { url?: unknown }).url : undefined;
+        if (typeof rawUrl !== 'string' || !rawUrl || rawUrl.length > 8_192) continue;
+        const safe = sanitizeSchemaHttpsUrl(rawUrl, baseUrl);
+        if (!safe || seen.has(safe)) continue;
+        seen.add(safe);
+        const rawAlt = raw && typeof raw === 'object' ? (raw as { alt?: unknown }).alt : undefined;
+        const alt = typeof rawAlt === 'string' ? sanitizeScrapedMetadataField(rawAlt, 300) : undefined;
+        images.push(alt ? { url: safe, alt } : { url: safe });
+      }
+    }
+    out.images = images;
+  }
   return out as T;
 }
 

@@ -72,6 +72,7 @@ const suiteSpecs = [
   ['test/auth-mcp-isolation.test.ts', 'auth-mcp-isolation.test.mjs'],
   ['test/telemetry-openapi-traces.test.ts', 'telemetry-openapi-traces.test.mjs'],
   ['test/wasm-memory-budget.test.ts', 'wasm-memory-budget.test.mjs'],
+  ['test/scrape-budget-fidelity.test.ts', 'scrape-budget-fidelity.test.mjs'],
 ];
 
 try {

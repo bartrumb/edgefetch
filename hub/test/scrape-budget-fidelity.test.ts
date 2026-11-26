@@ -229,6 +229,25 @@ test('sanitizeNodeSuppliedUrls drops unsafe node URLs and keeps safe https ones'
   assert.equal('favicon' in out, false);
   const keep = sanitizeNodeSuppliedUrls({ favicon: '/favicon.png' }, 'https://a.example.com/page');
   assert.equal(keep.favicon, 'https://a.example.com/favicon.png');
+
+  const imgs = sanitizeNodeSuppliedUrls(
+    {
+      images: [
+        { url: '/img/a.png', alt: 'A <b>bold</b> alt' },
+        { url: 'javascript:alert(1)', alt: 'x' },
+        { url: 'http://192.168.1.5/private.png' },
+        'https://cdn.example.com/b.jpg',
+        { url: '/img/a.png' },
+      ],
+    },
+    'https://a.example.com/page',
+  );
+  const imgList = imgs.images as Array<{ url: string; alt?: string }>;
+  assert.deepEqual(
+    imgList.map((i) => i.url),
+    ['https://a.example.com/img/a.png', 'https://cdn.example.com/b.jpg'],
+  );
+  assert.equal((imgList[0]?.alt ?? '').includes('<'), false, 'node image alt text must be plain text');
 });
 
 test('JSON over the 2 MiB JS-parse cap keeps OpenAPI / notebook formatting via the Go formatters', () => {

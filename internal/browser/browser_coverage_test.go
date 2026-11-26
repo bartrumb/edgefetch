@@ -49,7 +49,25 @@ func TestBrowserHelperProcess(t *testing.T) {
 		os.Exit(0)
 	}
 
+	if stateDir := os.Getenv("EDGEFETCH_CHROME_HELPER_STATE_DIR"); stateDir != "" && (mode == "crash_once" || mode == "crash_always") {
+		if f, err := os.OpenFile(filepath.Join(stateDir, "launches"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			_, _ = f.WriteString("x")
+			_ = f.Close()
+		}
+	}
+
 	switch mode {
+	case "crash_always":
+		fmt.Fprintln(os.Stderr, "[1126/193538.490801:ERROR:dbus/object_proxy.cc(572)] Failed to call method: org.freedesktop.DBus.NameHasOwner")
+		os.Exit(1)
+	case "crash_once":
+		marker := filepath.Join(os.Getenv("EDGEFETCH_CHROME_HELPER_STATE_DIR"), "crashed-once")
+		if _, err := os.Stat(marker); err != nil {
+			_ = os.WriteFile(marker, nil, 0o600)
+			fmt.Fprintln(os.Stderr, "[1126/193538.490801:ERROR:dbus/object_proxy.cc(572)] Failed to call method: org.freedesktop.DBus.NameHasOwner")
+			os.Exit(1)
+		}
+		serveFakeDevToolsPipe()
 	case "fatal_sandbox":
 		fmt.Fprintln(os.Stderr, "[0101/000000:FATAL:zygote_host_impl_linux.cc(127)] No usable sandbox!")
 		os.Exit(1)
@@ -76,6 +94,16 @@ func TestBrowserHelperProcess(t *testing.T) {
 			fmt.Fprintln(os.Stderr, "[0101/000000:FATAL:zygote_host_impl_linux.cc(127)] No usable sandbox!")
 			os.Exit(1)
 		}
+		serveFakeDevToolsPipe()
+	default:
+		os.Exit(2)
+	}
+}
+
+// serveFakeDevToolsPipe answers CDP requests on the --remote-debugging-pipe fds (3 in, 4 out) until the parent closes
+// them, then exits 0.
+func serveFakeDevToolsPipe() {
+	{
 		fromParent := os.NewFile(3, "from-parent")
 		toParent := os.NewFile(4, "to-parent")
 		br := bufio.NewReader(fromParent)
@@ -109,8 +137,6 @@ func TestBrowserHelperProcess(t *testing.T) {
 			}
 		}
 		os.Exit(0)
-	default:
-		os.Exit(2)
 	}
 }
 
@@ -122,11 +148,65 @@ func makeChromeHelperWrapper(t *testing.T, mode string) string {
 	}
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "fake-chrome.sh")
-	body := fmt.Sprintf("#!/bin/sh\nexport EDGEFETCH_CHROME_HELPER=%s\nexport GOCOVERDIR=%q\nexec %q -test.run='^TestBrowserHelperProcess$' -- \"$@\"\n", mode, dir, exe)
+	body := fmt.Sprintf("#!/bin/sh\nexport EDGEFETCH_CHROME_HELPER=%s\nexport GOCOVERDIR=%q\nexport EDGEFETCH_CHROME_HELPER_STATE_DIR=%q\nexec %q -test.run='^TestBrowserHelperProcess$' -- \"$@\"\n", mode, dir, dir, exe)
 	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return scriptPath
+}
+
+// helperLaunchCount returns how many times a crash_once / crash_always helper wrapper was started.
+func helperLaunchCount(t *testing.T, wrapperPath string) int {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(wrapperPath), "launches"))
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
+
+func TestEnsureBrowserRelaunchesOnceAfterEarlyChromiumExit(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux-specific --remote-debugging-pipe helper test")
+	}
+
+	// A Chromium that dies once during startup (only routine DBus stderr) is relaunched once, in the same sandbox mode.
+	onceBin := makeChromeHelperWrapper(t, "crash_once")
+	rOnce := NewRenderer(onceBin, nil, "UA", 1, nil)
+	rOnce.allowNoSandbox = true
+	rOnce.sandboxFallback = true // start --no-sandbox, as EDGEFETCH_ALLOW_NO_SANDBOX=1 deployments do after the fallback
+	defer rOnce.Close()
+	if _, err := rOnce.ensureBrowser(context.Background()); err != nil {
+		t.Fatalf("expected the single relaunch after an early Chromium exit to succeed, got %v", err)
+	}
+	if n := helperLaunchCount(t, onceBin); n != 2 {
+		t.Fatalf("expected exactly 2 Chromium launches (crash + relaunch), got %d", n)
+	}
+	if rOnce.sandboxState != "off" {
+		t.Fatalf("relaunch must keep the sandbox mode it started with, got sandboxState=%q", rOnce.sandboxState)
+	}
+
+	// A Chromium that keeps dying is relaunched at most once, then the early-exit error is returned.
+	alwaysBin := makeChromeHelperWrapper(t, "crash_always")
+	rAlways := NewRenderer(alwaysBin, nil, "UA", 1, nil)
+	rAlways.allowNoSandbox = true
+	rAlways.sandboxFallback = true
+	defer rAlways.Close()
+	_, err := rAlways.ensureBrowser(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "chromium exited before advertising DevTools pipe endpoint") {
+		t.Fatalf("expected the early-exit error after the bounded relaunch, got %v", err)
+	}
+	if n := helperLaunchCount(t, alwaysBin); n != 2 {
+		t.Fatalf("expected exactly 2 Chromium launches (bounded to one relaunch), got %d", n)
+	}
+
+	// Sandbox failures and startup timeouts are not early exits.
+	if isEarlyChromiumExit(errors.New("chromium exited before advertising DevTools pipe endpoint: [FATAL:zygote_host_impl_linux.cc(127)] No usable sandbox!")) {
+		t.Fatal("sandbox failures must be left to the sandbox fallback, not retried in the same mode")
+	}
+	if isEarlyChromiumExit(errors.New("timed out waiting for chromium DevTools endpoint")) || isEarlyChromiumExit(nil) {
+		t.Fatal("startup timeouts and nil errors must not trigger a relaunch")
+	}
 }
 
 func TestCDPErrorPathsTimeoutsAndSubscribers(t *testing.T) {

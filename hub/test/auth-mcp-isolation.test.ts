@@ -100,7 +100,7 @@ import {
   unsealVaultCredentials,
   type SqlStorageLike as VaultSqlStorageLike,
 } from '../src/mcp-vault.ts';
-import { handleMcpRequest, type McpServerDeps, truncateResultBodies } from '../src/mcp.ts';
+import { handleMcpRequest, isMcpRootRequest, type McpServerDeps, truncateResultBodies } from '../src/mcp.ts';
 import {
   ADMIN_COOKIE_NAME,
   ADMIN_COOKIE_NAME_DEV,
@@ -2229,6 +2229,36 @@ test('R7-H4, H5, H6 & Multi-User Isolation: Founder ID pinning, live session_epo
     });
     assert.equal(callWithScopeRest.status, 200);
     assert.match(JSON.stringify(await callWithScopeRest.json()), /ALICE_MCP_OK/);
+
+    // MCP at the site root: clients configured with the bare origin (no `/mcp`) send JSON-RPC to `/`. Those calls are
+    // served as `/mcp` (same auth) instead of 401, which made OAuth clients refresh tokens in a loop until rate-limited.
+    const rootToolsList = await dispatch('/', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceMcpCallTok.accessToken}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list' }),
+    });
+    assert.equal(rootToolsList.status, 200);
+    const rootToolsJson = (await rootToolsList.json()) as { id: number; result: { tools: Array<{ name: string }> } };
+    assert.equal(rootToolsJson.id, 7);
+    assert.ok(rootToolsJson.result.tools.some((tool) => tool.name === 'fetch_url'));
+    const rootNoAuth = await dispatch('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tools/list' }),
+    });
+    assert.equal(rootNoAuth.status, 401);
+    assert.ok(
+      (rootNoAuth.headers.get('www-authenticate') ?? '').includes('resource_metadata="https://hub.example.com/.well-known/oauth-protected-resource"'),
+    );
+    const rootUrl = new URL('https://hub.example.com/');
+    assert.equal(isMcpRootRequest(new Request(rootUrl, { method: 'POST', headers: { 'content-type': 'application/json; charset=utf-8' }, body: '{}' }), rootUrl), true);
+    assert.equal(isMcpRootRequest(new Request(rootUrl, { method: 'GET', headers: { accept: 'text/event-stream' } }), rootUrl), true);
+    assert.equal(isMcpRootRequest(new Request(rootUrl, { method: 'DELETE', headers: { 'mcp-session-id': 's1' } }), rootUrl), true);
+    assert.equal(isMcpRootRequest(new Request(rootUrl, { method: 'GET', headers: { accept: 'text/html,*/*' } }), rootUrl), false);
+    assert.equal(isMcpRootRequest(new Request(rootUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'a=1' }), rootUrl), false);
+    assert.equal(isMcpRootRequest(new Request(rootUrl, { method: 'DELETE' }), rootUrl), false);
+    const otherUrl = new URL('https://hub.example.com/v1/scrape');
+    assert.equal(isMcpRootRequest(new Request(otherUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }), otherUrl), false);
 
     // 4. H4: Shared Scrape Cache Isolation — ANY caller header (`Accept-Language`, `X-Tenant-Api-Key`), cookies, or member auth NEVER poisons/reads shared cache!
     const ownerHeaderScrape = await dispatch('/v1/scrape', {

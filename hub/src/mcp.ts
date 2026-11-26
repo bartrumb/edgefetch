@@ -2719,6 +2719,27 @@ function validateRequestEra(
   return { ok: true, isModern, negotiatedVersion: effectiveVersion };
 }
 
+/**
+ * True for an MCP Streamable HTTP request sent to the site root instead of `/mcp`: a JSON POST (JSON-RPC), a GET that
+ * only asks for an SSE stream, or a DELETE that ends an MCP session. Clients configured with the bare origin discover
+ * OAuth via `/.well-known/*` (and the root resource already normalizes to `/mcp`), then send every MCP call to `/`.
+ * Answering those with 401 made clients refresh tokens in a loop until `/oauth/token` rate-limited them, so the hub
+ * serves them as `/mcp`. Browser GETs (HTML) and other root requests are unaffected.
+ */
+export function isMcpRootRequest(request: Request, url: URL): boolean {
+  if (url.pathname !== '/') return false;
+  const method = request.method.toUpperCase();
+  if (method === 'POST') {
+    return /^application\/json(?:\s*;|$)/i.test((request.headers.get('content-type') ?? '').trim());
+  }
+  if (method === 'GET') {
+    const accept = (request.headers.get('accept') ?? '').toLowerCase();
+    return accept.includes('text/event-stream') && !accept.includes('text/html');
+  }
+  if (method === 'DELETE') return request.headers.has('mcp-session-id');
+  return false;
+}
+
 export async function handleMcpRequest(request: Request, url: URL, deps: McpServerDeps): Promise<Response> {
   const origin = url.origin;
   const resolvedDeps: McpServerDeps = deps.selfHost ? deps : { ...deps, selfHost: url.hostname };

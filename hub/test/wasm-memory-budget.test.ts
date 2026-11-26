@@ -357,7 +357,11 @@ test('Step 1 & Step 6: Global 4 MiB WASM input budget & memory matrix across all
       baseUrl: over.url,
     });
     assert.equal(fin8MiB.truncated, true, '8MiB finalizeScrapedMarkdown must set truncated: true after cutting at line break');
-    assert.equal(fin8MiB.totalChars, hostile8MiBMd.length);
+    // Pagination totals are sanitized-output chars (what read_artifact serves); the raw input length is sourceChars.
+    assert.equal(fin8MiB.totalChars, fin8MiB.markdown.length);
+    assert.equal(fin8MiB.remainingChars, 0);
+    assert.equal(fin8MiB.sourceTruncated, true);
+    assert.equal(fin8MiB.sourceChars, hostile8MiBMd.length);
     assert.equal(fin8MiB.markdown.includes('<script'), false);
     assert.equal(fin8MiB.markdown.includes('javascript:'), false);
 

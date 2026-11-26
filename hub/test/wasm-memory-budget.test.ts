@@ -24,7 +24,8 @@ import {
 import { parseDeclarativeManifest } from '../src/extractors/declarative';
 import { resolveSiteExtractorTwin } from '../src/extractors/registry';
 import { executeJobsCall, resetJobsCacheForTests, resolveAtsPreFetchSpec } from '../src/jobs';
-import { parseSitemapXml } from '../src/map-crawl';
+import { executeCatalogCall } from '../src/catalog';
+import { BATCH_BUSY_MAX_ATTEMPTS, parseSitemapXml, startOrExecuteBatchScrape } from '../src/map-crawl';
 import {
   cutMarkdownToSanitizerBudget,
   detectPromptInjection,
@@ -607,6 +608,134 @@ test('Step 3: Per-isolate 12 MiB bytesInFlight semaphore queues brief spikes and
   lease3.release();
   queuedLease.release();
   assert.equal(getIsolateBudgetStats().inFlightBytes, 0);
+});
+
+test('Batch scrape retries isolate_memory_busy siblings (real 12 MiB semaphore) instead of counting them as failed', async () => {
+  resetIsolateBudgetForTests();
+  // Saturate the per-isolate semaphore the way sibling multi-MiB items of one Promise.all chunk do.
+  const held = [
+    await acquireIsolateByteBudget(4 * 1024 * 1024, 200),
+    await acquireIsolateByteBudget(4 * 1024 * 1024, 200),
+    await acquireIsolateByteBudget(4 * 1024 * 1024, 200),
+  ];
+  assert.ok(held.every(Boolean));
+  const page = generateCorpusPayload('html', 2 * 1024 * 1024);
+  const sleeps: number[] = [];
+  let calls = 0;
+  const out = await startOrExecuteBatchScrape({
+    payload: { urls: ['https://busy-a.example.com/p', 'https://busy-b.example.com/p'], sync: true, formats: ['markdown'], target: 'container', ephemeral: true },
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+      // The competing in-flight documents finish while the busy items back off.
+      for (const l of held.splice(0)) l?.release();
+    },
+    executeScrape: async (scArgs) => {
+      calls++;
+      const res = await executeScrapeCall({
+        payload: scArgs as Parameters<typeof executeScrapeCall>[0]['payload'],
+        env: {},
+        executeHubFetch: async () => ({
+          status: 200,
+          via: 'cloudflare',
+          bodyText: JSON.stringify({
+            results: [{ id: 'scrape-1', url: String(scArgs.url), status: 200, outcome: 'ok', contentType: page.contentType, body: page.body, bodyEncoding: 'utf-8' }],
+          }),
+        }),
+      });
+      return { status: res.status, body: res.body, ...(res.retryAfter ? { retryAfter: res.retryAfter } : {}) };
+    },
+  });
+  assert.equal(out.ok, true);
+  if (!out.ok) return;
+  assert.equal(out.job.completed, 2, JSON.stringify(out.job.errors));
+  assert.equal(out.job.failed, 0);
+  assert.equal(out.job.retryable, 0);
+  // The first busy item backs off (freeing the semaphore); a sibling still inside its own 200 ms wait may then win
+  // the slot without ever 429ing, so 1-2 items retry, each exactly once.
+  assert.ok(sleeps.length >= 1 && sleeps.length <= 2, `sleeps=${JSON.stringify(sleeps)}`);
+  assert.equal(calls, 2 + sleeps.length, 'each busy item is retried exactly once after the semaphore frees');
+  // Retry-After: 1 => 1000 ms, plus a per-item stagger (100 ms * chunk index) so siblings do not collide again.
+  assert.ok(sleeps.every((ms) => ms === 1000 || ms === 1100), `sleeps=${JSON.stringify(sleeps)}`);
+  assert.equal(getIsolateBudgetStats().inFlightBytes, 0);
+});
+
+test('Batch scrape: persistent isolate_memory_busy is bounded and surfaced as retryable (with retryAfter), not failed', async () => {
+  const sleeps: number[] = [];
+  const attemptsByUrl = new Map<string, number>();
+  const out = await startOrExecuteBatchScrape({
+    payload: { urls: ['https://stuck.example.com/a', 'https://quota.example.com/b', 'https://ok.example.com/c'], sync: true },
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+    },
+    executeScrape: async (scArgs) => {
+      const u = String(scArgs.url);
+      attemptsByUrl.set(u, (attemptsByUrl.get(u) ?? 0) + 1);
+      if (u.includes('stuck')) {
+        return {
+          status: 429,
+          retryAfter: '1',
+          body: { ok: false, error: 'isolate_memory_busy', retryable: true, status: 429, message: 'busy' },
+        };
+      }
+      if (u.includes('quota')) {
+        return { status: 429, body: { ok: false, error: 'user_quota_exceeded', message: 'Per-user concurrent scrape limit exceeded.' } };
+      }
+      return { status: 200, body: { ok: true, url: u, markdown: '# ok' } };
+    },
+  });
+  assert.equal(out.ok, true);
+  if (!out.ok) return;
+  assert.equal(attemptsByUrl.get('https://stuck.example.com/a'), BATCH_BUSY_MAX_ATTEMPTS);
+  assert.equal(attemptsByUrl.get('https://quota.example.com/b'), 1, 'only isolate_memory_busy is retried in-job');
+  assert.equal(attemptsByUrl.get('https://ok.example.com/c'), 1);
+  assert.equal(sleeps.length, BATCH_BUSY_MAX_ATTEMPTS - 1);
+  assert.ok(sleeps.every((ms) => ms >= 100 && ms <= 2_000 + 8 * 100));
+  assert.equal(out.job.completed, 1);
+  assert.equal(out.job.failed, 1, 'the non-retryable 429 is still a failure');
+  assert.equal(out.job.retryable, 1);
+  const busyErr = out.job.errors.find((e) => e.url === 'https://stuck.example.com/a');
+  assert.deepEqual(busyErr, { url: 'https://stuck.example.com/a', error: 'isolate_memory_busy', status: 429, retryable: true, retryAfter: '1' });
+  const quotaErr = out.job.errors.find((e) => e.url === 'https://quota.example.com/b');
+  assert.equal(quotaErr?.retryable, undefined);
+});
+
+test('Catalog: an omitted (over inline/WASM budget) page body stops visibly instead of reading as an empty last page', async () => {
+  const productsPage = (u: string) =>
+    JSON.stringify({ products: [{ id: 1, title: 'Tea', handle: 'tea', vendor: 'Leaf', product_type: 'Drink', variants: [{ id: 10, sku: 'T1', price: '12.00', available: true }] }] });
+  // Both the raw Go reply shape (`bodyOmitted: true`, no body) and the hub's mapped error shape must be detected.
+  const omittedShapes: Array<(u: string) => unknown> = [
+    (u) => ({ status: 200, body: { results: [{ url: u, status: 200, outcome: 'ok', bodyOmitted: true, contentType: 'application/json' }] } }),
+    (u) => ({ results: [{ url: u, status: 200, outcome: 'ok', bodyBase64Omitted: true }] }),
+    () => ({ status: 200, outcome: 'error', problem: `page body exceeded the ${MAX_WASM_INPUT_BYTES}-byte inline/WASM input budget and was omitted`, bodyOmitted: true, headers: {}, body: '' }),
+  ];
+  for (const [idx, omitted] of omittedShapes.entries()) {
+    let productCalls = 0;
+    const res = await executeCatalogCall({
+      payload: { url: `https://bigcat${idx}.example.com/`, platform: 'shopify', maxPages: 5 },
+      env: {},
+      sleepFn: async () => undefined,
+      executeHubFetch: async (req) => {
+        if (req.url.endsWith('/robots.txt')) {
+          return { status: 200, body: { results: [{ url: req.url, status: 200, outcome: 'ok', body: 'User-agent: *\nAllow: /\n' }] } };
+        }
+        if (req.url.includes('/products.json')) {
+          productCalls++;
+          if (productCalls === 1) {
+            return { status: 200, body: { results: [{ url: req.url, status: 200, outcome: 'ok', body: productsPage(req.url) }] } };
+          }
+          return omitted(req.url);
+        }
+        return { status: 404, body: { results: [{ url: req.url, status: 404, outcome: 'ok', body: '' }] } };
+      },
+    });
+    assert.equal(res.status, 200, `shape ${idx}`);
+    const body = res.body as Record<string, unknown>;
+    assert.equal(productCalls, 2, `shape ${idx}: must stop at the omitted page`);
+    assert.equal(body.status, 'partial', `shape ${idx}: an omitted page must not read as a complete catalog`);
+    assert.equal(body.reason, 'page_too_large_for_edge', `shape ${idx}`);
+    assert.equal(body.truncated, true, `shape ${idx}`);
+    assert.equal(body.ok, false, `shape ${idx}`);
+  }
 });
 
 test('Step 2b: prompt-injection detection sizes WASM calls in UTF-8 bytes (CJK pages under budget never throw)', () => {

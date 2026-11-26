@@ -259,7 +259,7 @@ export async function handleCompatRoutes(params: {
           source: 'compat:firecrawl:batch-scrape',
           ...(activeTracer ? { tracer: activeTracer } : {}),
         });
-        return { status: res.status, body: res.body };
+        return { status: res.status, body: res.body, ...(res.retryAfter ? { retryAfter: res.retryAfter } : {}) };
       },
       ...(waitUntil ? { waitUntil } : {}),
       ...(activeTracer ? { tracer: activeTracer } : {}),

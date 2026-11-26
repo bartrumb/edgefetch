@@ -2,6 +2,21 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.1] - 2026-11-25
+
+### Fixed
+- **Worker memory safety (#71, #73, #74):**
+  - Fresh WASM reactor startup memory cut from 51 MiB to 7.25 MiB by moving vault crypto to host WebCrypto (byte-for-byte compatible with existing sealed secrets, including v1 / v2.7.0 legacy envelopes and downgrade blocking) and lazy-compiling package-level regexes.
+  - Global 4 MiB WASM input budget measured in UTF-8 bytes across all raw/JSON/RE2 entry points, a fail-closed oversized-markdown sanitizer (cut at a line break, then sanitize once; linear TS fallback that escapes `&`, `<` and `>`), and a 12 MiB per-isolate byte semaphore (`429 isolate_memory_busy`).
+  - Reactor eviction only after >8 MiB calls or >64 MiB total linear memory (no rebuild churn on ordinary 2 MB documents), no second retry instance for >8 MiB inputs, and RE2 / DOM handles bound to their reactor instance.
+  - Greenhouse boards fetched in lite mode (`content=false`) in both search and verify modes, with capped per-posting enrichment for pay and snippets.
+- **Go-node offload of >4 MiB documents (#73, #76):** requests using `includeTags`/`excludeTags` are no longer offloaded (excluded content could leak); node results are accepted only when they contain in-budget markdown (no more silent empty 200s for unformattable bodies such as sitemaps, and over-budget origin markdown is cut and sanitized at the edge); responses warn when `html`/`rawHtml`/`product`/`attributes`/`json`/`jsonFilter` are unavailable for a node-extracted page; the busy-isolate path applies the WAF, prompt-injection and content-state guards.
+- **Extraction (#72, #76):** JSR `<pre>` blocks with copy buttons keep their code; product `sku` falls back to the primary Offer (Shopify), and `json` schema extraction sees custom-domain Shopify / adapter records.
+- **Budgets & plumbing (#76):** base64 bodies count toward the batch body budget (`bodyBase64Omitted` + hub warning instead of exceeding the 20 MiB agent reply cap); secondary fetches (Workday stub, commerce twins, alternate markdown, `llms.txt`) omit bodies over the WASM budget; catalog probe `timeoutMs` is sent where the Go fetcher reads it; an explicit root tracer no longer hides the active child span.
+
+### Changed
+- CI: shared retrying CPU-budget helper for linear-time regression tests and fixed OTLP span-count races (#75); hub dev dependencies bumped, including TypeScript 7 (#56).
+
 ## [2.8.0] - 2026-11-25
 
 ### Changed

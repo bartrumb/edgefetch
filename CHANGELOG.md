@@ -2,6 +2,18 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.2] - 2026-11-25
+
+### Fixed
+- **Go-node extraction of >4 MiB pages (#79):** the primary agent path now applies the same acceptance rules as the offload path (non-empty in-budget markdown; flagged response otherwise); nodes apply `includeTags`/`excludeTags` and confirm with `contentScopingApplied`, so tag-scoped large pages succeed on updated nodes and can never leak excluded content from older ones; node-offloaded origin markdown is no longer empty; node `links`/`favicon`/`images` are sanitized; `jsonFilter` is applied on the node; JSON over 2 MiB keeps OpenAPI/notebook formatting.
+- **Scrape fidelity (#79):** sanitizer output that grows past the budget is bounded and flagged (`truncated`, `sourceTruncated`, `sourceChars`); `totalChars`/`nextOffset`/`remainingChars` count the sanitized artifact that `read_artifact` serves; the sanitizer budget cut no longer discards long single-line documents (e.g. minified JSON after a short first line); `parsers: []` returns `artifactId` and a warning when `rawBase64` is too large to inline.
+- **Batch & catalog (#79):** batch scrape retries `429 isolate_memory_busy` (bounded) and reports still-busy items as `retryable` with `retryAfter`; catalog fetches cap inline bodies and stop with `page_too_large_for_edge` instead of silently ending.
+- **WASM bridge (#79):** an RE2 recompile failure after a reactor swap fails closed (crawl include/exclude filtering denies) instead of reporting "no match"; `parseHtmlDoc` retries once after an eviction during parsing, then errors instead of returning an empty document.
+
+### Changed
+- Release tooling (#78): `make release-bump BUMP=patch|minor|major` rewrites every version marker and drafts the changelog; `make release-check` runs on every PR. The hub deploy job now fails when `CLOUDFLARE_API_TOKEN` is missing instead of passing after a dry run.
+- `hub/wrangler.toml` states `[env.production.observability]` explicitly (#79).
+
 ## [2.8.1] - 2026-11-25
 
 ### Fixed

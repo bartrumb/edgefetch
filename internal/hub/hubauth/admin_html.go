@@ -178,7 +178,7 @@ func (m *Manager) HandleAdminTrackerListRefresh(w http.ResponseWriter, r *http.R
 func (m *Manager) CheckHubUpdateStatus(ctx context.Context, agents []FleetAgentVersion) UpdateStatus {
 	curVer := strings.TrimPrefix(strings.TrimSpace(m.cfg.HubVersion), "v")
 	if curVer == "" {
-		curVer = "2.8.1"
+		curVer = "2.8.2"
 	}
 	disRaw := strings.ToLower(strings.TrimSpace(m.getenv("EDGEFETCH_DISABLE_UPDATE_CHECK")))
 	if m.cfg.DisableUpdateCheck || disRaw == "1" || disRaw == "true" || disRaw == "yes" || disRaw == "on" {

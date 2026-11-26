@@ -12,8 +12,18 @@ jobs:
   go:
     name: Go Vet, Staticcheck, Govulncheck, Race Detector & Benchmarks
     runs-on: ubuntu-24.04
+    # Live-Chromium tests use the runner's Google Chrome instead of its Chromium snapshot (/usr/bin/chromium-browser,
+    # first in FindChromeBinary's order). On ubuntu-24.04 that Chromium's sandboxed launch dies ("No usable sandbox!")
+    # after ~4 s and its --no-sandbox start then took ~11 s, pushing renders past their ~30 s deadlines under load.
+    env:
+      EDGEFETCH_CHROME_BIN: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show the browsers available to live-Chromium tests
+        run: |
+          "$EDGEFETCH_CHROME_BIN" --version
+          chromium-browser --version || true
 
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
@@ -88,6 +98,9 @@ jobs:
   hub:
     name: Cloudflare Hub Type-Check & Bundle Dry-Run
     runs-on: ubuntu-24.04
+    # Same as the go job: the e2e Go-serve browser render (T1-B5) uses the runner's Google Chrome, not its Chromium snapshot.
+    env:
+      EDGEFETCH_CHROME_BIN: /usr/bin/google-chrome
     defaults:
       run:
         working-directory: hub

@@ -340,6 +340,7 @@ async function loginViaGitHub(
   dispatch: (path: string, init?: RequestInit) => Promise<Response>,
   code: string,
   returnTo?: string,
+  opts: { iss?: string | null } = {},
 ): Promise<{ status: number; location: string | null; sessionCookie: string | null; body: string; setCookies: string[] }> {
   const startPath = returnTo ? `/admin/auth/github?return_to=${encodeURIComponent(returnTo)}` : '/admin/auth/github';
   const r1 = await dispatch(startPath, { method: 'GET' });
@@ -355,7 +356,10 @@ async function loginViaGitHub(
   const ghStateCookie = cookiePairFromSetCookie(startCookies, '__Host-ef_gh_oauth');
   assert.ok(startCookies.some((c) => c.includes('HttpOnly') && c.includes('SameSite=Lax') && c.includes('Secure')));
 
-  const r2 = await dispatch(`/admin/auth/github/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`, {
+  // Real GitHub appends RFC 9207 `iss=https://github.com/login/oauth` to every callback; `iss: null` omits it.
+  const iss = opts.iss === undefined ? 'https://github.com/login/oauth' : opts.iss;
+  const issParam = iss === null ? '' : `&iss=${encodeURIComponent(iss)}`;
+  const r2 = await dispatch(`/admin/auth/github/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}${issParam}`, {
     method: 'GET',
     headers: { cookie: ghStateCookie },
   });
@@ -535,6 +539,15 @@ test('Pillar 1A: GitHub OAuth PKCE S256 login, SIGNUP_MODE=invite_only, @org mem
       headers: { cookie: '__Host-ef_gh_oauth=tampered' },
     });
     assert.equal(badCb.status, 400);
+
+    // 6b. RFC 9207 `iss`: a callback without `iss` (older GitHub / GHES) still signs in; a foreign issuer fails closed.
+    const noIss = await loginViaGitHub(h.dispatch, 'code_alice', undefined, { iss: null });
+    assert.equal(noIss.status, 302);
+    assert.ok(noIss.sessionCookie);
+    const wrongIss = await loginViaGitHub(h.dispatch, 'code_alice', undefined, { iss: 'https://evil.example.com' });
+    assert.equal(wrongIss.status, 400);
+    assert.equal(wrongIss.sessionCookie, null);
+    assert.match(wrongIss.body, /Invalid OAuth Callback/);
   } finally {
     h.cleanup();
   }

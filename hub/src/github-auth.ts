@@ -48,8 +48,11 @@ const JWT_AUDIENCE = 'urn:edgefetch:admin';
 const GITHUB_LOGIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,38})$/i;
 const GITHUB_NUMERIC_ID_RE = /^[1-9][0-9]{0,19}$/;
 
+// `issuer` must equal the RFC 9207 `iss` value GitHub appends to authorization callbacks (`https://github.com/login/oauth`,
+// since April 2026): oauth4webapi's validateAuthResponse rejects any `iss` that differs from it. Callbacks without `iss`
+// are still accepted.
 const GITHUB_AS: oauth.AuthorizationServer = {
-  issuer: 'https://github.com',
+  issuer: 'https://github.com/login/oauth',
   authorization_endpoint: 'https://github.com/login/oauth/authorize',
   token_endpoint: 'https://github.com/login/oauth/access_token',
 };

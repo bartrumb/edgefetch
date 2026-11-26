@@ -3435,6 +3435,30 @@ test('V2-14: v2.4.1 Next.js App Router RSC Hydration + Ethical Crawl4AI & Firecr
   assert.equal(isEligibleForExternalSpaFallback({ mode: 'off', errorCode: 'fat_agent_required', status: 503 }), false);
 });
 
+test('getActiveRequestTracer: an explicit root tracer does not shadow the active child span of the same request', async () => {
+  const root = RequestTracer.fromRequest(
+    new Request('https://hub.example.com/v1/catalog', {
+      headers: { traceparent: '00-33333333333333333333333333333333-cccccccccccccccc-01' },
+    }),
+  );
+  const otherRoot = RequestTracer.fromRequest(
+    new Request('https://hub.example.com/v1/scrape', {
+      headers: { traceparent: '00-44444444444444444444444444444444-dddddddddddddddd-01' },
+    }),
+  );
+  await root.run(() =>
+    root.withSpan('edgefetch.catalog', async (catalogSpan) => {
+      // Root bound before the route span (as makeCatalogHubFetch does) must resolve to the active child span.
+      assert.equal(getActiveRequestTracer(root)?.spanId, catalogSpan.spanId);
+      // An explicit tracer for a different request is still honoured as-is.
+      assert.equal(getActiveRequestTracer(otherRoot)?.traceId, '44444444444444444444444444444444');
+      // An explicit child tracer is unchanged.
+      const child = getActiveRequestTracer()!;
+      assert.equal(getActiveRequestTracer(child), child);
+    }),
+  );
+});
+
 test('M1-A RequestTracer: ALS concurrency, explicit traceCtx fallback, nested spans, error recording, sanitization, sampling, and injectTraceHeaders', async () => {
   // 1. Concurrent ALS isolation via Promise.all
   const t1 = RequestTracer.fromRequest(

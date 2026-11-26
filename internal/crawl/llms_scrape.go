@@ -463,9 +463,12 @@ func (c *Crawler) offloadOverBudgetDocumentOnNode(
 		baseURL = r.URL
 	}
 	ct := strings.ToLower(res.ContentType)
-	res.ExtractedOnNode = true
 
+	// `ExtractedOnNode` is set only once a formatter actually matched (inside applyNodeMd). An unformattable body
+	// (e.g. a >4 MiB `<urlset>` sitemap, which no node formatter handles) must not claim node extraction, or the Hub
+	// would accept an empty result as a successful scrape.
 	applyNodeMd := func(md, text string) {
+		res.ExtractedOnNode = true
 		if r.Query != "" && md != "" {
 			md = extract.RerankPassages(md, r.Query, 24_000)
 			if text != "" {

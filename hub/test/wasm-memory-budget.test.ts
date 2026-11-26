@@ -621,6 +621,105 @@ test('Step 2b: prompt-injection detection sizes WASM calls in UTF-8 bytes (CJK p
   assert.equal(hit.detected, true, 'injection in the tail of a windowed CJK document must still be detected');
 });
 
+test('Step 2c: Go-node offload only accepts real in-budget output and never drops request scoping silently', async (t) => {
+  const tempDirs: string[] = [];
+  t.after(() => {
+    for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
+  });
+  resetIsolateBudgetForTests();
+  const overBudget = (unit: string) => unit.repeat(Math.ceil((MAX_WASM_INPUT_BYTES + 512 * 1024) / unit.length));
+  const pageUrl = 'https://offload.example.com/page';
+  const bigHtml = `<!doctype html><html><head><title>Big</title></head><body><main>${overBudget('<p>edge paragraph words</p>')}</main><aside class="ugc">EXCLUDED_UGC_SENTINEL</aside></body></html>`;
+
+  const runScrape = async (opts: {
+    payload: Record<string, unknown>;
+    body: string;
+    contentType: string;
+    nodeItem: Record<string, unknown> | null;
+  }) => {
+    let agentCalls = 0;
+    const res = await executeScrapeCall({
+      payload: { url: pageUrl, ...opts.payload },
+      env: { ARTIFACTS: createTempR2Bucket(tempDirs) as unknown as R2Bucket },
+      executeHubFetch: async (targetArg) => {
+        if (targetArg === 'agent') {
+          agentCalls++;
+          if (!opts.nodeItem) return { status: 503, via: 'hub', bodyText: JSON.stringify({ error: 'no_agents_connected' }) };
+          return {
+            status: 200,
+            via: 'agent:home-node',
+            bodyText: JSON.stringify({ results: [{ id: 'scrape-1', url: pageUrl, status: 200, outcome: 'ok', ...opts.nodeItem }] }),
+          };
+        }
+        return {
+          status: 200,
+          via: 'cloudflare',
+          bodyText: JSON.stringify({
+            results: [
+              { id: 'scrape-1', url: pageUrl, status: 200, outcome: 'ok', contentType: opts.contentType, body: opts.body, bodyEncoding: 'utf-8' },
+            ],
+          }),
+        };
+      },
+    });
+    return { res, agentCalls };
+  };
+
+  // 1) include/exclude tags: the node cannot apply them, so the request must not be offloaded (no excluded-content leak).
+  const scoped = await runScrape({
+    payload: { formats: ['markdown'], excludeTags: ['aside'] },
+    body: bigHtml,
+    contentType: 'text/html; charset=utf-8',
+    nodeItem: { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, markdown: '# Node\n\nEXCLUDED_UGC_SENTINEL' },
+  });
+  assert.equal(scoped.agentCalls, 0, 'excludeTags requests must not be offloaded to the Go node');
+  assert.equal(scoped.res.status, 200);
+  assert.equal(scoped.res.body.edgeBudgetExceeded, true);
+  assert.equal(String(scoped.res.body.markdown ?? '').includes('EXCLUDED_UGC_SENTINEL'), false);
+
+  // 2) Unformattable over-budget body (sitemap): an empty node result must not become a silent empty success.
+  const sitemapXml = `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${overBudget('<url><loc>https://offload.example.com/p</loc></url>')}</urlset>`;
+  const sitemap = await runScrape({
+    payload: { formats: ['markdown'] },
+    body: sitemapXml,
+    contentType: 'application/xml',
+    nodeItem: { contentType: 'application/xml', bodyOmitted: true, markdown: '' },
+  });
+  assert.equal(sitemap.agentCalls, 1);
+  assert.equal(sitemap.res.body.edgeBudgetExceeded, true, 'empty node result must fall back to the flagged over-budget response');
+  assert.ok(Array.isArray(sitemap.res.body.warnings) && sitemap.res.body.warnings.length > 0);
+
+  // 3) Edge-only formats: node markdown is accepted, but the response says rawHtml is unavailable.
+  const rawHtmlReq = await runScrape({
+    payload: { formats: ['markdown', 'rawHtml'] },
+    body: bigHtml,
+    contentType: 'text/html; charset=utf-8',
+    nodeItem: { contentType: 'text/html', extractedOnNode: true, bodyOmitted: true, title: 'Big', markdown: '# Big\n\nNODE_MD_SENTINEL' },
+  });
+  assert.equal(rawHtmlReq.agentCalls, 1);
+  assert.equal(rawHtmlReq.res.body.extractedOnNode, true);
+  assert.ok(String(rawHtmlReq.res.body.markdown ?? '').includes('NODE_MD_SENTINEL'));
+  const rawHtmlWarnings = (rawHtmlReq.res.body.warnings as string[] | undefined) ?? [];
+  assert.ok(
+    rawHtmlWarnings.some((w) => w.includes('rawHtml')),
+    `expected a warning naming rawHtml, got ${JSON.stringify(rawHtmlWarnings)}`,
+  );
+
+  // 4) Over-budget origin markdown that the node also cannot fit: keep the raw body so the edge cuts + sanitizes it.
+  const originMd = `# Origin\n\n<script>alert(1)</script>\n${overBudget('Origin markdown prose line.\n')}`;
+  const originRes = await runScrape({
+    payload: { formats: ['markdown'] },
+    body: originMd,
+    contentType: 'text/markdown; charset=utf-8',
+    nodeItem: { contentType: 'text/markdown', extractedOnNode: true, markdownOverBudget: true, bodyOmitted: true, markdown: '' },
+  });
+  assert.equal(originRes.agentCalls, 1);
+  const originOut = String(originRes.res.body.markdown ?? '');
+  assert.ok(originOut.length > 1_000_000, `expected edge cut+sanitized origin markdown, got ${originOut.length} chars`);
+  assert.equal(originRes.res.body.truncated, true);
+  assert.equal(originOut.includes('<script'), false);
+});
+
 test('Step 3b: a timed-out head waiter does not block smaller waiters behind it that already fit', async () => {
   resetIsolateBudgetForTests();
   const MiB = 1024 * 1024;

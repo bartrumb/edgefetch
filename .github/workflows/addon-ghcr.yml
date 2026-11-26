@@ -124,6 +124,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Home Assistant reads addon/config.yaml from the default branch, so it offers `X.Y.Z` as soon as a version bump
+      # merges, but `:X.Y.Z` used to exist only after the `vX.Y.Z` tag ran (users saw `manifest unknown` / 404 in
+      # between). Publish `:X.Y.Z` from the first main build that carries a new version; later main builds leave it
+      # alone, and the tag's `publish-ha-addon-release` job replaces it with the test-gated release build.
+      - name: Add versioned tag if this version is not published yet
+        id: tags
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          BASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -uo pipefail
+          inspect_out="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" 2>&1)"
+          inspect_rc=$?
+          if [ "$inspect_rc" -eq 0 ]; then
+            echo "${IMAGE}:${VERSION} already exists; publishing edge tags only."
+            echo "tags=${BASE_TAGS}" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$inspect_out" | grep -qiE 'not found|manifest unknown|404'; then
+            echo "${IMAGE}:${VERSION} not published yet; adding it so Home Assistant can pull this version now."
+            echo "tags=${BASE_TAGS},${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            # Fail safe: an unrelated registry error must never let a main build overwrite a released image.
+            echo "::warning title=Versioned add-on tag skipped::Could not determine whether ${IMAGE}:${VERSION} exists (${inspect_out}); publishing edge tags only."
+            echo "tags=${BASE_TAGS}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push add-on image (${{ matrix.addon_dir }})
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -134,7 +160,7 @@ jobs:
           build-args: |
             BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             io.hass.version=${{ steps.meta.outputs.version }}
             io.hass.type=addon

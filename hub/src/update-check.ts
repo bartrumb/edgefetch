@@ -54,7 +54,7 @@ export const UPDATE_CHECK_FAILURE_TTL_MS = 5 * 60_000; // 5 minute negative cach
 export const RELEASE_SIGNING_PUBLIC_KEY_SPKI_B64 =
   'MCowBQYDK2VwAyEAv8+ZT9d/404KI0pY1PILOVBzsUvTHWaL0aLghciWy90=';
 
-export const HUB_VERSION: string = typeof hubPkg?.version === 'string' && hubPkg.version.trim() ? hubPkg.version.trim() : '2.8.0';
+export const HUB_VERSION: string = typeof hubPkg?.version === 'string' && hubPkg.version.trim() ? hubPkg.version.trim() : '2.8.1';
 
 const SEMVER_TAG_RE = /^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z._-]+))?$/;
 
@@ -199,7 +199,7 @@ export async function checkHubUpdateStatus(params: {
   nowMs?: number;
   bypassCache?: boolean;
 } = {}): Promise<UpdateCheckStatus> {
-  const curNorm = normalizeSemverVersion(params.currentVersion ?? HUB_VERSION) ?? '2.8.0';
+  const curNorm = normalizeSemverVersion(params.currentVersion ?? HUB_VERSION) ?? '2.8.1';
   const agents = params.agents ?? [];
   const now = params.nowMs ?? Date.now();
 

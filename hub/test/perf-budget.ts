@@ -49,6 +49,26 @@ export function assertFastSync<T>(label: string, baseBudgetMs: number, fn: () =>
   return result;
 }
 
+/**
+ * Like {@link assertFastSync} but the budget is NOT multiplied by `PERF_SCALE`: it only retries (best of up to
+ * `maxRuns` samples) against the exact `budgetMs`. Use it where the budget already has generous headroom over
+ * typical runs and only single-sample noise needs absorbing, so the threshold itself stays unchanged.
+ */
+export function assertFastUnscaledSync<T>(label: string, budgetMs: number, fn: () => T, maxRuns = DEFAULT_MAX_RUNS): T {
+  let best = Infinity;
+  let runs = 0;
+  let result!: T;
+  while (runs < maxRuns) {
+    const t0 = performance.now();
+    result = fn();
+    best = Math.min(best, performance.now() - t0);
+    runs++;
+    if (best < budgetMs) break;
+  }
+  assert.ok(best < budgetMs, `${label}: best of ${runs} run(s) took ${best.toFixed(1)}ms, budget ${budgetMs}ms (unscaled)`);
+  return result;
+}
+
 /** Async variant of {@link assertFastSync}. */
 export async function assertFastAsync<T>(
   label: string,

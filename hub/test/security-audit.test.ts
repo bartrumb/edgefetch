@@ -178,7 +178,7 @@ import {
   refineBlockedInfo,
   tryFetchWaybackSnapshot,
 } from '../src/waf.ts';
-import { assertFastAsync, assertFastSync } from './perf-budget.ts';
+import { assertFastAsync, assertFastSync, assertFastUnscaledSync } from './perf-budget.ts';
 
 function sendRawTcpRequest(port: number, rawHttp: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -504,12 +504,14 @@ test('SEC-AUDIT-4 (H6 & M7): AgentHubEngine enforces dispatched id/url + authori
 test('SEC-AUDIT-5 (M4, M5, M8 & Low): Linear O(N) HTML scanners, safe user regex guard, /v1/agent browser action allowlist, robots blank lines, and IPv6 /64 normalization', async () => {
   // 1. M4: 20,000 unclosed `<noscript>` + 20,000 unclosed `<script>` tags complete in linear O(N) time (< 250ms)!
   const adversarialHtml = `${'<noscript>'.repeat(20_000)}${'<script>'.repeat(20_000)}<main><h1>Fast Linear Parse</h1><p>No quadratic regex backtracking.</p></main>`;
-  const t0 = performance.now();
-  const doc = extractHtmlDocument(adversarialHtml, { baseUrl: 'https://example.com/page' });
-  const state = classifyContentState({ status: 200, rawHtml: adversarialHtml, markdown: doc.markdown });
-  const ssr = recoverSsrHydrationContent('<script id="__NEXT_DATA__">'.repeat(5_000));
-  const elapsedMs = performance.now() - t0;
-  assert.ok(elapsedMs < 350, `M4: adversarial unclosed HTML took ${elapsedMs.toFixed(1)}ms (expected < 350ms)`);
+  // Same 350 ms budget as before (unscaled); best of up to 5 samples absorbs single-sample CI noise (420 ms seen once).
+  const { state, ssr } = assertFastUnscaledSync('M4: adversarial unclosed HTML', 350, () => {
+    const doc = extractHtmlDocument(adversarialHtml, { baseUrl: 'https://example.com/page' });
+    return {
+      state: classifyContentState({ status: 200, rawHtml: adversarialHtml, markdown: doc.markdown }),
+      ssr: recoverSsrHydrationContent('<script id="__NEXT_DATA__">'.repeat(5_000)),
+    };
+  });
   assert.ok(state.state.length > 0);
   assert.equal(ssr, null);
 

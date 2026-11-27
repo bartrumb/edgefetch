@@ -1,0 +1,50 @@
+# Shared Go + TypeScript Declarative Site Adapter: Giant & Liv Bicycles
+id: giant-liv-bikes
+name: Giant & Liv Bicycles Specs & Manuals
+category: commerce-social
+description: "Extracts bike specifications, geometry GFM tables, and owner manual PDF links from Giant and Liv regional HTML pages while respecting Crawl-delay and never hitting /shop*, /comparison*, /account*, or /apiproxy/*."
+domains:
+  - www.giant-bicycles.com
+  - "*.giant-bicycles.com"
+  - giant-bicycles.com
+  - www.liv-cycling.com
+  - "*.liv-cycling.com"
+  - liv-cycling.com
+exampleUrls:
+  - "https://www.giant-bicycles.com/us/defy-advanced-pro-0"
+  - "https://www.liv-cycling.com/us/avail-advanced-pro-0"
+  - "https://www.giant-bicycles.com/us/manuals"
+
+htmlRoutes:
+  - id: giant-liv-bikes
+    mode: giant_liv_html
+    match:
+      exactSegments: false
+      excludeSegmentSuffixes:
+        - .xml
+        - .json
+      anyOf:
+        - exactSegments: false
+          optionalLeadingLocale: true
+          reservedFirstSegment:
+            - shop
+            - comparison
+            - account
+            - apiproxy
+            - int
+            - global
+        - exactSegments: false
+          pathSegments:
+            - param: locale3
+              allowValues:
+                - int
+                - global
+            - param: seg1
+              charset: url_seg
+              minLen: 1
+              maxLen: 160
+              reserved:
+                - shop
+                - comparison
+                - account
+                - apiproxy

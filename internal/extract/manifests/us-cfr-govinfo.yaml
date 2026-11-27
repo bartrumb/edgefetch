@@ -1,0 +1,187 @@
+# Shared Go + TypeScript Declarative Site Adapter: U.S. CFR & GovInfo
+id: us-cfr-govinfo
+name: U.S. CFR & GovInfo
+category: public-records
+description: "Bypasses the empty Angular /app/details/ SPA on govinfo.gov by fetching static /content/pkg/<PKGID>/html/*.htm documents or /wssearch/getContentDetail summary JSON."
+domains:
+  - www.govinfo.gov
+  - govinfo.gov
+exampleUrls:
+  - "https://www.govinfo.gov/app/details/CFR-2023-title16-vol2/CFR-2023-title16-vol2-part1500"
+  - "https://www.govinfo.gov/app/details/CFR-2023-title16-vol2"
+  - "https://www.govinfo.gov/wssearch/getContentDetail?packageId=CFR-2023-title16-vol2"
+
+routes:
+  # Route 1: Granule HTML twin /app/details/<PKGID>/<GRANULE>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - app
+        - details
+        - param: pkgId
+          charset: pkg
+          minLen: 4
+          maxLen: 120
+        - param: granuleId
+          charset: pkg
+          minLen: 4
+          maxLen: 160
+    twin:
+      fetchUrl: "https://www.govinfo.gov/content/pkg/{pkgId}/html/{granuleId}.htm"
+      kind: text
+      accept: text/html
+      maxBytes: 4194304
+    extract:
+      textMode: html_document
+      titleTemplate: "{granuleId} ({pkgId})"
+
+  # Route 2: Package HTML twin /app/details/<PKGID>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - app
+        - details
+        - param: pkgId
+          charset: pkg
+          minLen: 4
+          maxLen: 120
+    twin:
+      fetchUrl: "https://www.govinfo.gov/content/pkg/{pkgId}/html/{pkgId}.htm"
+      kind: text
+      accept: text/html
+      maxBytes: 4194304
+    extract:
+      textMode: html_document
+      titleTemplate: "{pkgId}"
+
+  # Route 3: Bounded wssearch summary JSON endpoint
+  - match:
+      pathEquals:
+        - /wssearch/getContentDetail
+      queryParams:
+        - name: packageId
+          param: pkgId
+          charset: pkg
+          minLen: 4
+          maxLen: 120
+        - name: granuleId
+          param: granuleId
+          charset: pkg
+          optional: true
+          maxLen: 160
+    twin:
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - title
+        - packageId
+      vars:
+        title:
+          paths:
+            - title
+          fallbackTemplate: "{pkgId}"
+          trim: true
+        packageId:
+          paths:
+            - packageId
+          fallbackTemplate: "{pkgId}"
+        collection:
+          paths:
+            - collectionName
+            - collection
+            - collectionCode
+        category:
+          paths:
+            - category
+        dateIssued:
+          paths:
+            - dateIssued
+        lastModified:
+          paths:
+            - lastModified
+          sliceMax: 10
+        authors:
+          paths:
+            - governmentAuthor
+            - metadata.agency
+          join: ", "
+          limit: 10
+        granuleCount:
+          paths:
+            - granuleCount
+          format: int_comma
+        pdfLink:
+          paths:
+            - download.pdfLink
+          requireHttps: true
+        htmlLink:
+          paths:
+            - download.htmlLink
+            - download.htmLink
+          requireHttps: true
+        xmlLink:
+          paths:
+            - download.xmlLink
+          requireHttps: true
+        txtLink:
+          paths:
+            - download.txtLink
+          requireHttps: true
+        zipLink:
+          paths:
+            - download.zipLink
+          requireHttps: true
+        modsLink:
+          paths:
+            - download.modsLink
+          requireHttps: true
+      titleTemplate: "{title}"
+      authorVar: authors
+      publishedTimeVar: dateIssued
+      bullets:
+        - label: Package ID
+          template: "`{packageId}`"
+          whenVar: packageId
+        - label: Collection
+          template: "{collection}"
+          whenVar: collection
+        - label: Category
+          template: "{category}"
+          whenVar: category
+        - label: Date Issued
+          template: "{dateIssued}"
+          whenVar: dateIssued
+        - label: Last Modified
+          template: "{lastModified}"
+          whenVar: lastModified
+        - label: Government Author
+          template: "{authors}"
+          whenVar: authors
+        - label: Granules
+          template: "{granuleCount}"
+          whenVar: granuleCount
+        - label: PDF Download
+          template: "{pdfLink}"
+          whenVar: pdfLink
+        - label: HTML Download
+          template: "{htmlLink}"
+          whenVar: htmlLink
+        - label: XML Download
+          template: "{xmlLink}"
+          whenVar: xmlLink
+        - label: Text Download
+          template: "{txtLink}"
+          whenVar: txtLink
+        - label: ZIP Archive
+          template: "{zipLink}"
+          whenVar: zipLink
+      linksVars:
+        - pdfLink
+        - htmlLink
+        - xmlLink
+        - txtLink
+        - zipLink
+        - modsLink

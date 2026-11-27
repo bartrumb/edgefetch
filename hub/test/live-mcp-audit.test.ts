@@ -1083,6 +1083,7 @@ test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8
     'providers',
     'collectionId',
     'noCache',
+    'visibility',
   ]);
   for (const legacyKey of [
     'max_results',

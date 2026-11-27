@@ -1,0 +1,179 @@
+# Shared Go + TypeScript Declarative Site Adapter: Maven Central
+id: maven-central
+name: Maven Central
+category: developer
+description: "Upgrades central.sonatype.com/artifact/<group>/<artifact>[/<version>] pages to the keyless search.maven.org Solr JSON API with Maven/Gradle coordinates and artifact metadata."
+domains:
+  - central.sonatype.com
+exampleUrls:
+  - "https://central.sonatype.com/artifact/com.fasterxml.jackson.core/jackson-databind"
+  - "https://central.sonatype.com/artifact/com.fasterxml.jackson.core/jackson-databind/2.18.2"
+
+routes:
+  # Route 1: Versioned Maven artifact /artifact/<g>/<a>/<v>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - artifact
+        - param: g
+          charset: pkg
+          minLen: 1
+          maxLen: 160
+        - param: a
+          charset: pkg
+          minLen: 1
+          maxLen: 160
+        - param: v
+          charset: pkg
+          reserved:
+            - versions
+            - overview
+            - dependencies
+            - dependents
+            - jar
+          minLen: 1
+          maxLen: 80
+    twin:
+      fetchUrl: "https://search.maven.org/solrsearch/select?q=g:{g}+AND+a:{a}+AND+v:{v}&core=gav&rows=20&wt=json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      rootPath: response.docs.0
+      requireFields:
+        - id
+        - g
+        - a
+      vars:
+        groupId:
+          paths:
+            - g
+        artifactId:
+          paths:
+            - a
+        ver:
+          paths:
+            - v
+            - latestVersion
+        packaging:
+          paths:
+            - p
+        versionCount:
+          paths:
+            - versionCount
+          format: int_comma
+        published:
+          paths:
+            - timestamp
+          format: epoch_ms_date
+        artifacts:
+          paths:
+            - ec
+          itemWrap: "`"
+          join: ", "
+          limit: 12
+        centralUrl:
+          template: "https://central.sonatype.com/artifact/{groupId}/{artifactId}/{ver}"
+          requireHttps: true
+      titleTemplate: "{groupId}:{artifactId}:{ver} (Maven Central)"
+      publishedTimeVar: published
+      bullets:
+        - label: Maven Coordinate
+          template: "`{groupId}:{artifactId}:{ver}`"
+        - label: Gradle
+          template: "`implementation(\"{groupId}:{artifactId}:{ver}\")`"
+        - label: Packaging
+          template: "{packaging}"
+          whenVar: packaging
+        - label: Published
+          template: "{published}"
+          whenVar: published
+        - label: Versions
+          template: "{versionCount}"
+          whenVar: versionCount
+        - label: Classifiers / Files
+          template: "{artifacts}"
+          whenVar: artifacts
+      linksVars:
+        - centralUrl
+
+  # Route 2: Unversioned Maven artifact /artifact/<g>/<a>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - artifact
+        - param: g
+          charset: pkg
+          minLen: 1
+          maxLen: 160
+        - param: a
+          charset: pkg
+          minLen: 1
+          maxLen: 160
+    twin:
+      fetchUrl: "https://search.maven.org/solrsearch/select?q=g:{g}+AND+a:{a}&rows=20&wt=json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      rootPath: response.docs.0
+      requireFields:
+        - id
+        - g
+        - a
+      vars:
+        groupId:
+          paths:
+            - g
+        artifactId:
+          paths:
+            - a
+        ver:
+          paths:
+            - latestVersion
+            - v
+        packaging:
+          paths:
+            - p
+        versionCount:
+          paths:
+            - versionCount
+          format: int_comma
+        published:
+          paths:
+            - timestamp
+          format: epoch_ms_date
+        artifacts:
+          paths:
+            - ec
+          itemWrap: "`"
+          join: ", "
+          limit: 12
+        centralUrl:
+          template: "https://central.sonatype.com/artifact/{groupId}/{artifactId}"
+          requireHttps: true
+      titleTemplate: "{groupId}:{artifactId}:{ver} (Maven Central)"
+      titleWhenVar: ver
+      titleFallbackTemplate: "{groupId}:{artifactId} (Maven Central)"
+      publishedTimeVar: published
+      bullets:
+        - label: Maven Coordinate
+          template: "`{groupId}:{artifactId}:{ver}`"
+          whenVar: ver
+        - label: Gradle
+          template: "`implementation(\"{groupId}:{artifactId}:{ver}\")`"
+          whenVar: ver
+        - label: Packaging
+          template: "{packaging}"
+          whenVar: packaging
+        - label: Published
+          template: "{published}"
+          whenVar: published
+        - label: Versions
+          template: "{versionCount}"
+          whenVar: versionCount
+        - label: Classifiers / Files
+          template: "{artifacts}"
+          whenVar: artifacts
+      linksVars:
+        - centralUrl

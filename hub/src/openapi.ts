@@ -851,6 +851,13 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
               required: false,
               schema: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
             },
+            {
+              name: 'visibility',
+              in: 'query',
+              required: false,
+              description: 'Index isolation visibility (`"private"` searches the authenticated user private collection).',
+              schema: { type: 'string', enum: ['public', 'private'], default: 'public' },
+            },
           ],
           responses: {
             '200': {
@@ -1539,6 +1546,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             includePaths: crawlProps.includePaths!,
             excludePaths: crawlProps.excludePaths!,
             collectionId: crawlProps.collectionId!,
+            visibility: crawlProps.visibility!,
             sync: {
               type: 'boolean',
               default: false,
@@ -1570,6 +1578,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             query: collectionSearchProps.query!,
             q: { type: 'string', description: 'Alias for `query`.' },
             limit: collectionSearchProps.limit!,
+            visibility: collectionSearchProps.visibility!,
           },
           additionalProperties: false,
         },
@@ -1603,6 +1612,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             maxPages: agentProps.maxPages!,
             threadId: agentProps.threadId!,
             zeroDataRetention: agentProps.zeroDataRetention!,
+            visibility: agentProps.visibility!,
             safe: agentProps.safe!,
             location: agentProps.location!,
             llm: agentProps.llm!,

@@ -1,0 +1,310 @@
+# Shared Go + TypeScript Declarative Site Adapter: Homebrew Formulae & Casks
+id: homebrew-formulae
+name: Homebrew Formulae & Casks
+category: developer
+description: "Upgrades formulae.brew.sh/formula/<id> and /cask/<id> pages to the official Homebrew JSON API with install commands, dependencies, deprecation/disable notices, and 30-day install analytics."
+domains:
+  - formulae.brew.sh
+exampleUrls:
+  - "https://formulae.brew.sh/formula/jq"
+  - "https://formulae.brew.sh/cask/iterm2"
+
+routes:
+  # Route 1: Formula /formula/<id>
+  - match:
+      exactSegments: true
+      excludeSegmentSuffixes:
+        - ".json"
+      pathSegments:
+        - formula
+        - param: id
+          charset: brew_id
+          minLen: 1
+          maxLen: 128
+    twin:
+      fetchUrl: "https://formulae.brew.sh/api/formula/{id}.json"
+      rawPathParams:
+        - id
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - name
+      vars:
+        name:
+          paths:
+            - name
+        fullName:
+          paths:
+            - full_name
+            - name
+        desc:
+          paths:
+            - desc
+          trim: true
+        version:
+          paths:
+            - versions.stable
+            - versions.head
+        license:
+          paths:
+            - license
+        homepage:
+          paths:
+            - homepage
+          requireHttps: true
+        deps:
+          paths:
+            - dependencies
+          itemWrap: "`"
+          join: ", "
+          limit: 20
+        buildDeps:
+          paths:
+            - build_dependencies
+          itemWrap: "`"
+          join: ", "
+          limit: 15
+        caveats:
+          paths:
+            - caveats
+          trim: true
+        installs30d:
+          dynamicKeyPath:
+            base: analytics.install.30d
+            keyVar: id
+          format: int_comma
+        disabledFlag:
+          paths:
+            - disabled
+          format: bool_map
+          trueValue: Disabled
+          falseValue: ""
+        disabledReason:
+          paths:
+            - disable_reason
+        disabledDate:
+          paths:
+            - disable_date
+        deprecatedFlag:
+          paths:
+            - deprecated
+          format: bool_map
+          trueValue: Deprecated
+          falseValue: ""
+        deprecationReason:
+          paths:
+            - deprecation_reason
+        deprecationDate:
+          paths:
+            - deprecation_date
+        replacement:
+          paths:
+            - disable_replacement_formula
+            - disable_replacement_cask
+            - deprecation_replacement_formula
+            - deprecation_replacement_cask
+        disabledSummary:
+          template: "Disabled ({disabledReason}, {disabledDate})"
+          whenVars:
+            - disabledFlag
+            - disabledReason
+            - disabledDate
+          fallbackVar: disabledFlag
+        deprecatedSummary:
+          template: "Deprecated ({deprecationReason}, {deprecationDate})"
+          whenVars:
+            - deprecatedFlag
+            - deprecationReason
+            - deprecationDate
+          fallbackVar: deprecatedFlag
+        statusNotice:
+          template: "{disabledSummary}"
+          whenVars:
+            - disabledSummary
+          fallbackVar: deprecatedSummary
+      titleTemplate: "{fullName} (Homebrew Formula)"
+      descriptionVar: desc
+      blockquoteTemplate: "> **Notice**: {statusNotice}"
+      blockquoteWhenVar: statusNotice
+      introVar: desc
+      bullets:
+        - label: Install
+          template: "`brew install {name}`"
+        - label: Stable Version
+          template: "`{version}`"
+          whenVar: version
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: Replacement
+          template: "`{replacement}`"
+          whenVar: replacement
+        - label: 30d Installs
+          template: "{installs30d}"
+          whenVar: installs30d
+        - label: Homepage
+          template: "{homepage}"
+          whenVar: homepage
+        - label: Dependencies
+          template: "{deps}"
+          whenVar: deps
+        - label: Build Dependencies
+          template: "{buildDeps}"
+          whenVar: buildDeps
+      sections:
+        - heading: Caveats
+          textVar: caveats
+      linksVars:
+        - homepage
+
+  # Route 2: Cask /cask/<id>
+  - match:
+      exactSegments: true
+      excludeSegmentSuffixes:
+        - ".json"
+      pathSegments:
+        - cask
+        - param: id
+          charset: brew_id
+          minLen: 1
+          maxLen: 128
+    twin:
+      fetchUrl: "https://formulae.brew.sh/api/cask/{id}.json"
+      rawPathParams:
+        - id
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - token
+      vars:
+        token:
+          paths:
+            - token
+        displayName:
+          paths:
+            - name.0
+            - full_token
+            - token
+        desc:
+          paths:
+            - desc
+          trim: true
+        version:
+          paths:
+            - version
+        homepage:
+          paths:
+            - homepage
+          requireHttps: true
+        downloadUrl:
+          paths:
+            - url
+          requireHttps: true
+        sha256:
+          paths:
+            - sha256
+        autoUpdates:
+          paths:
+            - auto_updates
+          format: bool_map
+          trueValue: "Yes"
+          falseValue: "No"
+        caveats:
+          paths:
+            - caveats
+          trim: true
+        installs30d:
+          dynamicKeyPath:
+            base: analytics.install.30d
+            keyVar: id
+          format: int_comma
+        disabledFlag:
+          paths:
+            - disabled
+          format: bool_map
+          trueValue: Disabled
+          falseValue: ""
+        disabledReason:
+          paths:
+            - disable_reason
+        disabledDate:
+          paths:
+            - disable_date
+        deprecatedFlag:
+          paths:
+            - deprecated
+          format: bool_map
+          trueValue: Deprecated
+          falseValue: ""
+        deprecationReason:
+          paths:
+            - deprecation_reason
+        deprecationDate:
+          paths:
+            - deprecation_date
+        replacement:
+          paths:
+            - disable_replacement_cask
+            - disable_replacement_formula
+            - deprecation_replacement_cask
+            - deprecation_replacement_formula
+        disabledSummary:
+          template: "Disabled ({disabledReason}, {disabledDate})"
+          whenVars:
+            - disabledFlag
+            - disabledReason
+            - disabledDate
+          fallbackVar: disabledFlag
+        deprecatedSummary:
+          template: "Deprecated ({deprecationReason}, {deprecationDate})"
+          whenVars:
+            - deprecatedFlag
+            - deprecationReason
+            - deprecationDate
+          fallbackVar: deprecatedFlag
+        statusNotice:
+          template: "{disabledSummary}"
+          whenVars:
+            - disabledSummary
+          fallbackVar: deprecatedSummary
+      titleTemplate: "{displayName} (Homebrew Cask)"
+      descriptionVar: desc
+      blockquoteTemplate: "> **Notice**: {statusNotice}"
+      blockquoteWhenVar: statusNotice
+      introVar: desc
+      bullets:
+        - label: Install
+          template: "`brew install --cask {token}`"
+        - label: Token
+          template: "`{token}`"
+        - label: Version
+          template: "`{version}`"
+          whenVar: version
+        - label: Auto Updates
+          template: "{autoUpdates}"
+          whenVar: autoUpdates
+        - label: Replacement
+          template: "`{replacement}`"
+          whenVar: replacement
+        - label: 30d Installs
+          template: "{installs30d}"
+          whenVar: installs30d
+        - label: Homepage
+          template: "{homepage}"
+          whenVar: homepage
+        - label: Download URL
+          template: "{downloadUrl}"
+          whenVar: downloadUrl
+        - label: SHA-256
+          template: "`{sha256}`"
+          whenVar: sha256
+      sections:
+        - heading: Caveats
+          textVar: caveats
+      linksVars:
+        - homepage
+        - downloadUrl

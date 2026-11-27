@@ -21,7 +21,6 @@ var (
 	reTwoslashAnnotationSanGo      = newLazyRegexp(`(?m)^[ \t]*//[ \t]*@(?:noErrors|errors:[ \t]*[\d \t]+|target:[ \t]*\S+|module:[ \t]*\S+|moduleResolution:[ \t]*\S+|lib:[ \t]*\S+|strict(?::[ \t]*\S+)?)[ \t]*\r?\n`)
 	reAdmonitionDirectiveSanGo     = newLazyRegexp(`(?im)^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]{1,200}))?[ \t]*$`)
 	reAdmonitionCloseSanGo         = newLazyRegexp(`(?im)^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:[ \t]+[^\r\n]{0,120})?|raw|v-pre))?[ \t]*$`)
-	reBracketHeadingLinkSanGo      = newLazyRegexp(`(?i)\[\s*<h([1-6])\b[^>"\n]{0,200}>([^<\n]{1,400})</h[1-6]>\s*\]\(([^)\s\n]+)\)`)
 	reHelpfulPromptSanGo           = newLazyRegexp(`(?i)(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes[ \t]*No|Yes[ \t]*/[ \t]*No))?[ \t]*(?:\n|$)`)
 	reOnThisPageTailSanGo          = newLazyRegexp(`(?i)^\n##+[ \t]+On this page[ \t]*(?:\n+(?:[-*][ \t]+\[[^\[\]\n]{1,200}\]\(#[^)\n]{1,200}\)[ \t]*)+)?[ \t]*$`)
 )
@@ -194,7 +193,7 @@ func SanitizeScrapedMeta(s string) string {
 		}
 		sb.WriteByte(c)
 	}
-	res := decodeMarkdownEntitiesPreservingLtGo(sb.String())
+	res := decodeMarkdownProseEntitiesPreservingLinksAndLtGo(sb.String())
 	res = stripInvisibleSmugglingCharsGo(res)
 	res = neutralizeAllUnsafeMarkdownLinksLinearGo(res)
 	res = escapeAllResidualLtInProseLinearGo(res, false)
@@ -2438,24 +2437,71 @@ func collapseAmpEntityChainsGo(s string) string {
 			continue
 		}
 		p := i
-		steps := 0
-		for p < n && s[p] == '&' {
-			if amt := matchAmpEntityPrefixLen(s[p:]); amt > 0 {
-				p += amt
-				steps++
-				continue
+		bestP := -1
+		if amt := matchAmpEntityPrefixLen(s[p:]); amt > 0 {
+			p += amt
+			if p < n && looksLikeEntityBodyAfterAmp(s[p:]) {
+				bestP = p
 			}
-			break
+			for p < n {
+				cont := matchAmpEntityContinuationLen(s[p:])
+				if cont <= 0 {
+					break
+				}
+				p += cont
+				if p < n && looksLikeEntityBodyAfterAmp(s[p:]) {
+					bestP = p
+				}
+			}
 		}
-		if steps > 0 && p < n && looksLikeEntityBodyAfterAmp(s[p:]) {
+		if bestP > 0 {
 			sb.WriteByte('&')
-			i = p
+			i = bestP
 			continue
 		}
 		sb.WriteByte('&')
 		i++
 	}
 	return sb.String()
+}
+
+func matchAmpEntityContinuationLen(s string) int {
+	if len(s) >= 4 && asciiLowerExtractString(s[:4]) == "amp;" {
+		return 4
+	}
+	if len(s) >= 4 && s[0] == '#' {
+		q := 1
+		isHex := false
+		if q < len(s) && (s[q] == 'x' || s[q] == 'X') {
+			isHex = true
+			q++
+		}
+		for q < len(s) && s[q] == '0' {
+			q++
+		}
+		if isHex {
+			if q+2 <= len(s) && s[q] == '2' && s[q+1] == '6' {
+				q += 2
+				if q < len(s) && s[q] == ';' {
+					return q + 1
+				}
+				if q < len(s) && s[q] == '#' {
+					return q
+				}
+			}
+		} else {
+			if q+2 <= len(s) && s[q] == '3' && s[q+1] == '8' {
+				q += 2
+				if q < len(s) && s[q] == ';' {
+					return q + 1
+				}
+				if q < len(s) && s[q] == '#' {
+					return q
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func matchAmpEntityPrefixLen(s string) int {
@@ -3279,6 +3325,35 @@ func decodeMarkdownEntitiesGo(input string) string {
 }
 
 func decodeMarkdownEntitiesRawGo(input string) string {
+	return decodeMarkdownEntitiesRawImplGo(input, false)
+}
+
+func decodeMarkdownEntitiesRawEscapingBracketsGo(input string) string {
+	return decodeMarkdownEntitiesRawImplGo(input, true)
+}
+
+func writeDecodedEntityValueGo(sb *strings.Builder, val string, escapeBrackets bool, trailingBackslashes *int) {
+	if !escapeBrackets {
+		sb.WriteString(val)
+		return
+	}
+	for k := 0; k < len(val); k++ {
+		b := val[k]
+		if b == '[' || b == ']' || b == '\\' {
+			if *trailingBackslashes%2 == 1 {
+				sb.WriteByte('\\')
+			}
+			sb.WriteByte('\\')
+			sb.WriteByte(b)
+			*trailingBackslashes = 0
+		} else {
+			sb.WriteByte(b)
+			*trailingBackslashes = 0
+		}
+	}
+}
+
+func decodeMarkdownEntitiesRawImplGo(input string, escapeDecodedBrackets bool) string {
 	if input == "" || strings.IndexByte(input, '&') < 0 {
 		return input
 	}
@@ -3286,9 +3361,17 @@ func decodeMarkdownEntitiesRawGo(input string) string {
 	sb.Grow(len(input))
 	i := 0
 	n := len(input)
+	trailingBackslashes := 0
 	for i < n {
 		if input[i] != '&' || i+2 >= n {
 			sb.WriteByte(input[i])
+			if escapeDecodedBrackets {
+				if input[i] == '\\' {
+					trailingBackslashes++
+				} else {
+					trailingBackslashes = 0
+				}
+			}
 			i++
 			continue
 		}
@@ -3318,7 +3401,17 @@ func decodeMarkdownEntitiesRawGo(input string) string {
 				}
 				if cp, err := strconv.ParseUint(input[dStart:p], base, 32); err == nil {
 					if cp > 0 && cp <= 0x10FFFF {
-						sb.WriteRune(rune(cp))
+						if escapeDecodedBrackets && (cp == '[' || cp == ']' || cp == '\\') {
+							if trailingBackslashes%2 == 1 {
+								sb.WriteByte('\\')
+							}
+							sb.WriteByte('\\')
+							sb.WriteByte(byte(cp))
+							trailingBackslashes = 0
+						} else {
+							sb.WriteRune(rune(cp))
+							trailingBackslashes = 0
+						}
 					}
 					i = p + 1
 					continue
@@ -3332,24 +3425,33 @@ func decodeMarkdownEntitiesRawGo(input string) string {
 			if p < n && input[p] == ';' {
 				rawName := input[i+1 : p]
 				if mapped, ok := markdownNamedEntities[rawName]; ok {
-					sb.WriteString(mapped)
+					writeDecodedEntityValueGo(&sb, mapped, escapeDecodedBrackets, &trailingBackslashes)
 					i = p + 1
 					continue
 				}
 				if mapped, ok := markdownNamedEntities[asciiLowerExtractString(rawName)]; ok {
-					sb.WriteString(mapped)
+					writeDecodedEntityValueGo(&sb, mapped, escapeDecodedBrackets, &trailingBackslashes)
 					i = p + 1
 					continue
 				}
 			}
 		}
 		sb.WriteByte(input[i])
+		trailingBackslashes = 0
 		i++
 	}
 	return sb.String()
 }
 
 func decodeMarkdownEntitiesPreservingLtGo(prose string) string {
+	return decodeMarkdownEntitiesPreservingLtImplGo(prose, false)
+}
+
+func decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(prose string) string {
+	return decodeMarkdownEntitiesPreservingLtImplGo(prose, true)
+}
+
+func decodeMarkdownEntitiesPreservingLtImplGo(prose string, escapeDecodedBrackets bool) string {
 	if prose == "" || strings.IndexByte(prose, '&') < 0 {
 		return prose
 	}
@@ -3417,11 +3519,258 @@ func decodeMarkdownEntitiesPreservingLtGo(prose string) string {
 		guarded.WriteByte(collapsed[i])
 		i++
 	}
-	decoded := strings.ReplaceAll(decodeMarkdownEntitiesRawGo(guarded.String()), "\x00EFLT\x00", "&lt;")
+	rawOut := decodeMarkdownEntitiesRawImplGo(guarded.String(), escapeDecodedBrackets)
+	decoded := strings.ReplaceAll(rawOut, "\x00EFLT\x00", "&lt;")
 	if strings.Contains(decoded, "\x00EF") {
 		return decoded
 	}
 	return stripInvisibleSmugglingCharsGo(decoded)
+}
+
+func decodeLinkLabelEntitiesPreservingNestedImagesGo(lbl string, isImage bool) string {
+	if lbl == "" || strings.IndexByte(lbl, '&') < 0 {
+		return lbl
+	}
+	if isImage || !strings.Contains(lbl, "![") {
+		return decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(lbl)
+	}
+	subCursors := newMdLineCursorsGo()
+	var sb strings.Builder
+	subLast := 0
+	j := 0
+	for j < len(lbl) {
+		if lbl[j] == '!' && j+1 < len(lbl) && lbl[j+1] == '[' && !isBackslashEscapedAt(lbl, j) {
+			if nested := tryParseMarkdownLinkOrImageAtGo(lbl, j, subCursors, false); nested != nil && nested.isImage {
+				if subLast == 0 && sb.Cap() == 0 {
+					sb.Grow(len(lbl) + 8)
+				}
+				sb.WriteString(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(lbl[subLast:j]))
+				nAlt := decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(nested.rawLabel)
+				nSrc := nested.rawURL
+				if strings.IndexByte(nSrc, '&') >= 0 {
+					nSrc = decodeURIEntitiesLinearGo(nSrc)
+					if isDisallowedMarkdownLinkDestinationGo(nSrc) {
+						nSrc = "#"
+					} else {
+						nSrc = encodeUnsafeHrefCharsGo(nSrc)
+					}
+				}
+				sb.WriteString("![")
+				sb.WriteString(nAlt)
+				sb.WriteString("](")
+				sb.WriteString(nSrc)
+				sb.WriteString(nested.titleSuffix)
+				sb.WriteByte(')')
+				j = nested.end
+				subLast = j
+				continue
+			}
+		}
+		j++
+	}
+	if subLast == 0 {
+		return decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(lbl)
+	}
+	sb.WriteString(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(lbl[subLast:]))
+	return sb.String()
+}
+
+func decodeProseSegmentSanitizingDanglingLinkDestEntitiesGo(seg string) string {
+	if seg == "" || strings.IndexByte(seg, '&') < 0 {
+		return seg
+	}
+	if !strings.Contains(seg, "](") {
+		return decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(seg)
+	}
+	var sb strings.Builder
+	last := 0
+	i := 0
+	n := len(seg)
+	for i < n-1 {
+		rel := strings.Index(seg[i:], "](")
+		if rel < 0 {
+			break
+		}
+		p := i + rel
+		if isBackslashEscapedAt(seg, p) {
+			i = p + 2
+			continue
+		}
+		k := p + 2
+		for k < n && (seg[k] == ' ' || seg[k] == '\t') {
+			k++
+		}
+		if k >= n {
+			break
+		}
+		destStart := k
+		destEnd := k
+		if seg[k] == '<' {
+			gtRel := strings.IndexByte(seg[k+1:minInt(n, k+2049)], '>')
+			if gtRel < 0 {
+				i = p + 2
+				continue
+			}
+			destStart = k + 1
+			destEnd = k + 1 + gtRel
+		} else {
+			lim := minInt(n, k+2048)
+			parenDepth := 0
+			for destEnd < lim {
+				c := seg[destEnd]
+				if c <= 0x20 {
+					break
+				}
+				if c == '(' {
+					parenDepth++
+					if parenDepth > 4 {
+						break
+					}
+				} else if c == ')' {
+					if parenDepth == 0 {
+						break
+					}
+					parenDepth--
+				}
+				destEnd++
+			}
+		}
+		if destEnd > destStart && strings.IndexByte(seg[destStart:destEnd], '&') >= 0 {
+			if last == 0 && sb.Cap() == 0 {
+				sb.Grow(len(seg) + 16)
+			}
+			sb.WriteString(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(seg[last:destStart]))
+			d := decodeURIEntitiesLinearGo(seg[destStart:destEnd])
+			if isDisallowedMarkdownLinkDestinationGo(d) {
+				sb.WriteByte('#')
+			} else {
+				sb.WriteString(encodeUnsafeHrefCharsGo(d))
+			}
+			last = destEnd
+			i = destEnd
+			continue
+		}
+		i = p + 2
+	}
+	if last == 0 {
+		return decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(seg)
+	}
+	sb.WriteString(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(seg[last:]))
+	return sb.String()
+}
+
+func decodeMarkdownProseEntitiesPreservingLinksAndLtGo(prose string) string {
+	if prose == "" || strings.IndexByte(prose, '&') < 0 {
+		return prose
+	}
+	if !strings.Contains(prose, "](") {
+		return decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(prose)
+	}
+	lines := strings.Split(prose, "\n")
+	changed := false
+	for li, line := range lines {
+		if strings.IndexByte(line, '&') < 0 {
+			continue
+		}
+		if strings.IndexByte(line, '[') < 0 || !strings.Contains(line, "](") {
+			dec := decodeProseSegmentSanitizingDanglingLinkDestEntitiesGo(line)
+			if dec != line {
+				lines[li] = dec
+				changed = true
+			}
+			continue
+		}
+		cursors := newMdLineCursorsGo()
+		var out strings.Builder
+		lastCopyIdx := 0
+		i := 0
+		for i < len(line) {
+			ch := line[i]
+			if ch != '`' && ch != '!' && ch != '[' {
+				rel := strings.IndexAny(line[i+1:], "`![")
+				if rel < 0 {
+					break
+				}
+				i += 1 + rel
+				continue
+			}
+			if ch == '`' {
+				if isBackslashEscapedAt(line, i) {
+					i++
+					continue
+				}
+				tEnd, sEnd := scanCodeSpanEndLinearGo(line, i, cursors)
+				if sEnd > 0 {
+					i = sEnd
+				} else {
+					i = tEnd
+				}
+				continue
+			}
+			if (ch == '!' || ch == '[') && !isBackslashEscapedAt(line, i) {
+				if cursors.noCloseBracket || cursors.noCloseParen {
+					break
+				}
+				if tok := tryParseMarkdownLinkOrImageAtGo(line, i, cursors, true); tok != nil {
+					if lastCopyIdx == 0 && out.Cap() == 0 {
+						out.Grow(len(line) + 16)
+					}
+					out.WriteString(decodeProseSegmentSanitizingDanglingLinkDestEntitiesGo(line[lastCopyIdx:i]))
+					if isDisallowedMarkdownLinkDestinationGo(tok.rawURL) {
+						lbl := decodeLinkLabelEntitiesPreservingNestedImagesGo(tok.rawLabel, tok.isImage)
+						out.WriteByte('[')
+						out.WriteString(lbl)
+						out.WriteString("](#)")
+					} else if strings.IndexByte(tok.rawLabel, '&') < 0 && strings.IndexByte(tok.rawURL, '&') < 0 {
+						out.WriteString(line[i:tok.end])
+					} else {
+						dest := tok.rawURL
+						if strings.IndexByte(dest, '&') >= 0 {
+							dest = decodeURIEntitiesLinearGo(dest)
+							if isDisallowedMarkdownLinkDestinationGo(dest) {
+								dest = "#"
+							} else {
+								dest = encodeUnsafeHrefCharsGo(dest)
+							}
+						}
+						lbl := decodeLinkLabelEntitiesPreservingNestedImagesGo(tok.rawLabel, tok.isImage)
+						if tok.isImage {
+							out.WriteString("![")
+						} else {
+							out.WriteByte('[')
+						}
+						out.WriteString(lbl)
+						out.WriteString("](")
+						out.WriteString(dest)
+						out.WriteString(tok.titleSuffix)
+						out.WriteByte(')')
+					}
+					i = tok.end
+					lastCopyIdx = i
+					continue
+				}
+			}
+			i++
+		}
+		if lastCopyIdx > 0 {
+			out.WriteString(decodeProseSegmentSanitizingDanglingLinkDestEntitiesGo(line[lastCopyIdx:]))
+			nextLine := out.String()
+			if nextLine != line {
+				lines[li] = nextLine
+				changed = true
+			}
+		} else {
+			dec := decodeProseSegmentSanitizingDanglingLinkDestEntitiesGo(line)
+			if dec != line {
+				lines[li] = dec
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return prose
+	}
+	return strings.Join(lines, "\n")
 }
 
 func resolveMarkdownRelativeHrefGo(href, baseURL string) string {
@@ -3453,7 +3802,7 @@ func resolveInlineHTMLHrefGo(rawHref, baseURL string, preserveHash bool) string 
 	if trimmedRaw == "" {
 		return ""
 	}
-	trimmed := strings.TrimSpace(decodeMarkdownEntitiesGo(trimmedRaw))
+	trimmed := strings.TrimSpace(decodeMarkdownEntitiesGo(collapseAmpEntityChainsGo(trimmedRaw)))
 	if trimmed == "" ||
 		strings.HasPrefix(trimmed, "#") ||
 		strings.HasPrefix(trimmed, "//") ||
@@ -3500,15 +3849,129 @@ func resolveInlineHTMLHrefGo(rawHref, baseURL string, preserveHash bool) string 
 }
 
 func encodeUnsafeHrefCharsGo(href string) string {
-	if strings.IndexByte(href, ' ') < 0 && strings.IndexByte(href, '<') < 0 &&
-		strings.IndexByte(href, '>') < 0 && strings.IndexByte(href, '`') < 0 {
+	hasUnsafe := false
+	hasParen := false
+	for i := 0; i < len(href); i++ {
+		switch href[i] {
+		case ' ', '\t', '\r', '\n', '<', '>', '`', '[', ']', '\\':
+			hasUnsafe = true
+		case '(', ')':
+			hasUnsafe = true
+			hasParen = true
+		}
+		if hasUnsafe && hasParen {
+			break
+		}
+	}
+	if !hasUnsafe {
 		return href
 	}
-	r := strings.ReplaceAll(href, " ", "%20")
-	r = strings.ReplaceAll(r, "<", "%3C")
-	r = strings.ReplaceAll(r, ">", "%3E")
-	r = strings.ReplaceAll(r, "`", "%60")
-	return r
+	var encodeParen []bool
+	if hasParen {
+		encodeParen = make([]bool, len(href))
+		var openStack [4]int
+		depth := 0
+		for i := 0; i < len(href); i++ {
+			if href[i] == '(' {
+				if depth < 4 {
+					openStack[depth] = i
+					depth++
+				} else {
+					encodeParen[i] = true
+				}
+			} else if href[i] == ')' {
+				if depth > 0 {
+					depth--
+				} else {
+					encodeParen[i] = true
+				}
+			}
+		}
+		for d := 0; d < depth; d++ {
+			encodeParen[openStack[d]] = true
+		}
+	}
+	var sb strings.Builder
+	sb.Grow(len(href) + 12)
+	last := 0
+	for i := 0; i < len(href); i++ {
+		var enc string
+		switch href[i] {
+		case ' ':
+			enc = "%20"
+		case '\t':
+			enc = "%09"
+		case '\r':
+			enc = "%0D"
+		case '\n':
+			enc = "%0A"
+		case '<':
+			enc = "%3C"
+		case '>':
+			enc = "%3E"
+		case '`':
+			enc = "%60"
+		case '[':
+			enc = "%5B"
+		case ']':
+			enc = "%5D"
+		case '\\':
+			enc = "%5C"
+		case '(':
+			if encodeParen != nil && encodeParen[i] {
+				enc = "%28"
+			}
+		case ')':
+			if encodeParen != nil && encodeParen[i] {
+				enc = "%29"
+			}
+		}
+		if enc != "" {
+			sb.WriteString(href[last:i])
+			sb.WriteString(enc)
+			last = i + 1
+		}
+	}
+	if last == 0 {
+		return href
+	}
+	sb.WriteString(href[last:])
+	return sb.String()
+}
+
+func escapeMarkdownLinkLabelGo(label string) string {
+	if !strings.ContainsAny(label, "[]\\&") {
+		return label
+	}
+	if strings.IndexByte(label, '&') >= 0 {
+		label = decodeMarkdownEntitiesPreservingLtGo(label)
+	}
+	if strings.IndexByte(label, '[') < 0 && strings.IndexByte(label, ']') < 0 && strings.IndexByte(label, '\\') < 0 {
+		return label
+	}
+	var sb strings.Builder
+	sb.Grow(len(label) + 8)
+	for i := 0; i < len(label); i++ {
+		switch label[i] {
+		case '\\', '[', ']':
+			sb.WriteByte('\\')
+		}
+		sb.WriteByte(label[i])
+	}
+	return sb.String()
+}
+
+func sanitizeMarkdownImageAltGo(rawAlt string) string {
+	if !strings.ContainsAny(rawAlt, "[]\\&") {
+		return rawAlt
+	}
+	if strings.IndexByte(rawAlt, '&') >= 0 {
+		rawAlt = decodeMarkdownEntitiesPreservingLtGo(rawAlt)
+	}
+	if !strings.ContainsAny(rawAlt, "[]\\") {
+		return rawAlt
+	}
+	return strings.NewReplacer("[", "", "]", "", "\\", "").Replace(rawAlt)
 }
 
 func isValidHttpAutolinkGo(s string) bool {
@@ -4023,6 +4486,18 @@ func findNextValidCloseTagGo(lower, src, closeNeedle string, from int) int {
 }
 
 func stripDangerousHTMLSubtreesGo(s string) string {
+	cur := s
+	for pass := 0; pass < 8 && strings.IndexByte(cur, '<') >= 0 && strings.IndexByte(cur, '>') >= 0; pass++ {
+		next := stripDangerousHTMLSubtreesOnceGo(cur)
+		if next == cur {
+			return cur
+		}
+		cur = next
+	}
+	return cur
+}
+
+func stripDangerousHTMLSubtreesOnceGo(s string) string {
 	var sb strings.Builder
 	noDbl, noSgl := false, false
 	last := 0
@@ -4355,130 +4830,166 @@ func formatInlineCodeSpanGo(txt string) string {
 	return fence + clean + fence
 }
 
+type closeTagSpanGo struct {
+	start int
+	end   int
+}
+
+func findNextExactCloseTagGo(lower, src, closeNeedle string, from int) closeTagSpanGo {
+	pos := from
+	for pos < len(lower) {
+		rel := strings.Index(lower[pos:], closeNeedle)
+		if rel < 0 {
+			return closeTagSpanGo{start: -1, end: -1}
+		}
+		hit := pos + rel
+		after := hit + len(closeNeedle)
+		for after < len(src) && isASCIIWhitespaceByte(src[after]) {
+			after++
+		}
+		if after < len(src) && src[after] == '>' {
+			return closeTagSpanGo{start: hit, end: after + 1}
+		}
+		pos = hit + len(closeNeedle)
+	}
+	return closeTagSpanGo{start: -1, end: -1}
+}
+
 func convertSimpleHTMLTablesInProseGo(s string) string {
-	if !strings.Contains(s, "</") || !strings.Contains(asciiLowerExtractString(s), "<table") {
+	if !strings.Contains(s, "</") {
+		return s
+	}
+	lower := asciiLowerExtractString(s)
+	if !strings.Contains(lower, "<table") {
 		return s
 	}
 	noDbl, noSgl := false, false
 	var sb strings.Builder
 	last := 0
 	pos := 0
+	var nextTableClose closeTagSpanGo
+	seenTableClose := false
 	for pos < len(s) {
 		tag, ok := scanNextHTMLTagQuoteAwareGo(s, pos, &noDbl, &noSgl)
 		if !ok {
 			break
 		}
 		if !tag.isClosing && !tag.selfClosing && tag.tagLower == "table" {
-			searchEnd := minInt(len(s), tag.end+16384)
-			relClose := strings.Index(asciiLowerExtractString(s[tag.end:searchEnd]), "</table")
-			if relClose >= 0 {
-				cStart := tag.end + relClose
-				afterName := cStart + 7
-				for afterName < searchEnd && isASCIIWhitespaceByte(s[afterName]) {
-					afterName++
-				}
-				if afterName < searchEnd && s[afterName] == '>' {
-					cEnd := afterName + 1
-					inner := s[tag.end:cStart]
-					lowInner := asciiLowerExtractString(inner)
-					if !strings.Contains(lowInner, "<table") && !strings.Contains(lowInner, "<pre") {
-						var rows [][]string
-						rNoDbl, rNoSgl := false, false
-						rPos := 0
-						for rPos < len(inner) {
-							rTag, rOk := scanNextHTMLTagQuoteAwareGo(inner, rPos, &rNoDbl, &rNoSgl)
-							if !rOk {
-								break
-							}
-							if !rTag.isClosing && !rTag.selfClosing && rTag.tagLower == "tr" {
-								rCloseRel := strings.Index(asciiLowerExtractString(inner[rTag.end:]), "</tr")
-								if rCloseRel >= 0 {
-									rcStart := rTag.end + rCloseRel
-									rcAfter := rcStart + 4
-									for rcAfter < len(inner) && isASCIIWhitespaceByte(inner[rcAfter]) {
-										rcAfter++
-									}
-									if rcAfter < len(inner) && inner[rcAfter] == '>' {
-										rowInner := inner[rTag.end:rcStart]
-										var cells []string
-										cNoDbl, cNoSgl := false, false
-										cPos := 0
-										for cPos < len(rowInner) {
-											cTag, cOk := scanNextHTMLTagQuoteAwareGo(rowInner, cPos, &cNoDbl, &cNoSgl)
-											if !cOk {
-												break
-											}
-											if !cTag.isClosing && !cTag.selfClosing && (cTag.tagLower == "th" || cTag.tagLower == "td") {
-												cNeedle := "</" + cTag.tagLower
-												cCloseRel := strings.Index(asciiLowerExtractString(rowInner[cTag.end:]), cNeedle)
-												if cCloseRel >= 0 {
-													ccStart := cTag.end + cCloseRel
-													ccAfter := ccStart + len(cNeedle)
-													for ccAfter < len(rowInner) && isASCIIWhitespaceByte(rowInner[ccAfter]) {
-														ccAfter++
-													}
-													if ccAfter < len(rowInner) && rowInner[ccAfter] == '>' {
-														cellTxt := stripTagsInlineLinear(rowInner[cTag.end:ccStart])
-														cellTxt = strings.ReplaceAll(cellTxt, "|", "\\|")
-														cellTxt = strings.Join(strings.Fields(cellTxt), " ")
-														cells = append(cells, cellTxt)
-														cPos = ccAfter + 1
-														continue
-													}
-												}
-											}
-											cPos = cTag.end
-										}
-										if len(cells) > 0 {
-											rows = append(rows, cells)
-										}
-										rPos = rcAfter + 1
-										continue
-									}
-								}
-							}
-							rPos = rTag.end
+			if !seenTableClose || (nextTableClose.start >= 0 && nextTableClose.start < tag.end) {
+				nextTableClose = findNextExactCloseTagGo(lower, s, "</table", tag.end)
+				seenTableClose = true
+			}
+			if nextTableClose.start >= 0 && nextTableClose.end <= tag.end+16384 {
+				cStart := nextTableClose.start
+				cEnd := nextTableClose.end
+				inner := s[tag.end:cStart]
+				lowInner := lower[tag.end:cStart]
+				if !strings.Contains(lowInner, "<table") && !strings.Contains(lowInner, "<pre") {
+					var rows [][]string
+					rNoDbl, rNoSgl := false, false
+					rPos := 0
+					var nextTrClose closeTagSpanGo
+					seenTrClose := false
+					for rPos < len(inner) {
+						rTag, rOk := scanNextHTMLTagQuoteAwareGo(inner, rPos, &rNoDbl, &rNoSgl)
+						if !rOk {
+							break
 						}
-						if len(rows) > 0 && len(rows[0]) > 0 {
-							colCount := len(rows[0])
-							var tsb strings.Builder
-							tsb.WriteString("\n\n| ")
-							for ci := 0; ci < colCount; ci++ {
-								if ci > 0 {
-									tsb.WriteString(" | ")
-								}
-								tsb.WriteString(rows[0][ci])
+						if !rTag.isClosing && !rTag.selfClosing && rTag.tagLower == "tr" {
+							if !seenTrClose || (nextTrClose.start >= 0 && nextTrClose.start < rTag.end) {
+								nextTrClose = findNextExactCloseTagGo(lowInner, inner, "</tr", rTag.end)
+								seenTrClose = true
 							}
-							tsb.WriteString(" |\n| ")
+							if nextTrClose.start >= 0 {
+								rcStart := nextTrClose.start
+								rcEnd := nextTrClose.end
+								rowInner := inner[rTag.end:rcStart]
+								lowRow := lowInner[rTag.end:rcStart]
+								var cells []string
+								cNoDbl, cNoSgl := false, false
+								cPos := 0
+								var nextTdClose, nextThClose closeTagSpanGo
+								seenTdClose, seenThClose := false, false
+								for cPos < len(rowInner) {
+									cTag, cOk := scanNextHTMLTagQuoteAwareGo(rowInner, cPos, &cNoDbl, &cNoSgl)
+									if !cOk {
+										break
+									}
+									if !cTag.isClosing && !cTag.selfClosing && (cTag.tagLower == "th" || cTag.tagLower == "td") {
+										var cHit closeTagSpanGo
+										if cTag.tagLower == "td" {
+											if !seenTdClose || (nextTdClose.start >= 0 && nextTdClose.start < cTag.end) {
+												nextTdClose = findNextExactCloseTagGo(lowRow, rowInner, "</td", cTag.end)
+												seenTdClose = true
+											}
+											cHit = nextTdClose
+										} else {
+											if !seenThClose || (nextThClose.start >= 0 && nextThClose.start < cTag.end) {
+												nextThClose = findNextExactCloseTagGo(lowRow, rowInner, "</th", cTag.end)
+												seenThClose = true
+											}
+											cHit = nextThClose
+										}
+										if cHit.start >= 0 {
+											ccStart := cHit.start
+											cellTxt := stripTagsInlineEscapingBracketEntitiesGo(rowInner[cTag.end:ccStart])
+											cellTxt = strings.ReplaceAll(cellTxt, "|", "\\|")
+											cellTxt = strings.Join(strings.Fields(cellTxt), " ")
+											cells = append(cells, cellTxt)
+											cPos = cHit.end
+											continue
+										}
+									}
+									cPos = cTag.end
+								}
+								if len(cells) > 0 {
+									rows = append(rows, cells)
+								}
+								rPos = rcEnd
+								continue
+							}
+						}
+						rPos = rTag.end
+					}
+					if len(rows) > 0 && len(rows[0]) > 0 {
+						colCount := len(rows[0])
+						var tsb strings.Builder
+						tsb.WriteString("\n\n| ")
+						for ci := 0; ci < colCount; ci++ {
+							if ci > 0 {
+								tsb.WriteString(" | ")
+							}
+							tsb.WriteString(rows[0][ci])
+						}
+						tsb.WriteString(" |\n| ")
+						for ci := 0; ci < colCount; ci++ {
+							if ci > 0 {
+								tsb.WriteString(" | ")
+							}
+							tsb.WriteString("---")
+						}
+						tsb.WriteString(" |")
+						for ri := 1; ri < len(rows); ri++ {
+							tsb.WriteString("\n| ")
 							for ci := 0; ci < colCount; ci++ {
 								if ci > 0 {
 									tsb.WriteString(" | ")
 								}
-								tsb.WriteString("---")
+								if ci < len(rows[ri]) {
+									tsb.WriteString(rows[ri][ci])
+								}
 							}
 							tsb.WriteString(" |")
-							for ri := 1; ri < len(rows); ri++ {
-								tsb.WriteString("\n| ")
-								for ci := 0; ci < colCount; ci++ {
-									if ci > 0 {
-										tsb.WriteString(" | ")
-									}
-									if ci < len(rows[ri]) {
-										tsb.WriteString(rows[ri][ci])
-									}
-								}
-								tsb.WriteString(" |")
-							}
-							tsb.WriteString("\n\n")
-							if last == 0 && sb.Cap() == 0 {
-								sb.Grow(len(s))
-							}
-							sb.WriteString(s[last:tag.start])
-							sb.WriteString(tsb.String())
-							last = cEnd
-							pos = cEnd
-							continue
 						}
+						tsb.WriteString("\n\n")
+						if last == 0 && sb.Cap() == 0 {
+							sb.Grow(len(s))
+						}
+						sb.WriteString(s[last:tag.start])
+						sb.WriteString(tsb.String())
+						last = cEnd
+						pos = cEnd
+						continue
 					}
 				}
 			}
@@ -4492,13 +5003,30 @@ func convertSimpleHTMLTablesInProseGo(s string) string {
 	return s
 }
 
-func convertAnchorInnerWithBadgeImagesSanGo(inner, baseURL string) string {
+func formatAnchorMarkdownWithBadgeImagesSanGo(inner, baseURL, href string) string {
 	lowInner := asciiLowerExtractString(inner)
-	if !strings.Contains(lowInner, "<img") {
-		return stripTagsInlineLinear(inner)
+	stripText := func(seg string) string {
+		if href != "" {
+			return stripTagsInlineLinear(seg)
+		}
+		return stripTagsInlineEscapingBracketEntitiesGo(seg)
 	}
+	if !strings.Contains(lowInner, "<img") {
+		lbl := stripText(inner)
+		if lbl == "" {
+			return ""
+		}
+		if href != "" {
+			return "[" + escapeMarkdownLinkLabelGo(lbl) + "](" + href + ")"
+		}
+		return lbl
+	}
+	type anchorSeg struct {
+		text    string
+		isBadge bool
+	}
+	var parts []anchorSeg
 	noDbl, noSgl := false, false
-	var sb strings.Builder
 	last := 0
 	pos := 0
 	for pos < len(inner) {
@@ -4507,7 +5035,11 @@ func convertAnchorInnerWithBadgeImagesSanGo(inner, baseURL string) string {
 			break
 		}
 		if tag.tagLower == "img" && !tag.isClosing {
-			sb.WriteString(inner[last:tag.start])
+			if tag.start > last {
+				if txt := strings.TrimSpace(stripText(inner[last:tag.start])); txt != "" {
+					parts = append(parts, anchorSeg{text: txt, isBadge: false})
+				}
+			}
 			if !hasInlineEventHandlerAttrGo(tag.attrs) {
 				attrs := parseHTMLTagAttrsGo(tag.attrs)
 				srcCand := attrs["src"]
@@ -4515,47 +5047,300 @@ func convertAnchorInnerWithBadgeImagesSanGo(inner, baseURL string) string {
 					srcCand = attrs["data-src"]
 				}
 				resolvedSrc := resolveSafeMarkdownHrefOrRelativeFullDocGo(srcCand, baseURL, false)
-				alt := strings.NewReplacer("[", "", "]", "").Replace(stripTagsInlineLinear(attrs["alt"]))
+				alt := sanitizeMarkdownImageAltGo(stripTagsInlineLinear(attrs["alt"]))
 				if resolvedSrc != "" && !isTinyOrAvatarImageURLFullDocGo(resolvedSrc, alt) {
-					sb.WriteString(" ![" + alt + "](" + resolvedSrc + ") ")
+					parts = append(parts, anchorSeg{text: "![" + alt + "](" + resolvedSrc + ")", isBadge: true})
 				}
 			}
 			last = tag.end
 		}
 		pos = tag.end
 	}
-	if last > 0 {
-		sb.WriteString(inner[last:])
-		return stripTagsInlineLinear(sb.String())
+	if last < len(inner) {
+		if txt := strings.TrimSpace(stripText(inner[last:])); txt != "" {
+			parts = append(parts, anchorSeg{text: txt, isBadge: false})
+		}
 	}
-	return stripTagsInlineLinear(inner)
+	if len(parts) == 0 {
+		return ""
+	}
+	var out strings.Builder
+	for idx, p := range parts {
+		if idx > 0 {
+			out.WriteByte(' ')
+		}
+		if href != "" && !p.isBadge {
+			out.WriteString(escapeMarkdownLinkLabelGo(p.text))
+		} else {
+			out.WriteString(p.text)
+		}
+	}
+	joined := out.String()
+	if href != "" {
+		return "[" + joined + "](" + href + ")"
+	}
+	return joined
+}
+
+var inlinePairedHTMLTagsGo = map[string]bool{
+	"a": true, "h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
+	"summary": true, "code": true, "kbd": true, "strong": true, "b": true, "em": true, "i": true, "sup": true,
+}
+
+var inlineWrapperStripTagsGo = map[string]bool{
+	"u": true, "sub": true, "details": true, "span": true, "div": true, "p": true, "button": true,
+	"section": true, "article": true, "main": true, "header": true, "footer": true, "nav": true, "aside": true,
+}
+
+func parseBracketHeadingLinkDestGo(s string, from int) (rawHref string, linkEnd int, ok bool) {
+	n := len(s)
+	k := from
+	for k < n && (s[k] == ' ' || s[k] == '\t') {
+		k++
+	}
+	if k >= n {
+		return "", 0, false
+	}
+	if s[k] == '<' {
+		angleLimit := minInt(n, k+2049)
+		gt := -1
+		for p := k + 1; p < angleLimit; p++ {
+			pc := s[p]
+			if pc == '>' {
+				gt = p
+				break
+			}
+			if pc == '<' || pc == '\n' || pc == '\r' {
+				return "", 0, false
+			}
+		}
+		if gt < 0 {
+			return "", 0, false
+		}
+		rawHref = strings.TrimSpace(s[k+1 : gt])
+		k = gt + 1
+	} else {
+		urlStart := k
+		urlLimit := minInt(n, urlStart+2048)
+		parenDepth := 0
+		for k < urlLimit {
+			uc := s[k]
+			if uc == '\\' && k+1 < urlLimit {
+				if s[k+1] == '\n' || s[k+1] == '\r' {
+					return "", 0, false
+				}
+				k += 2
+				continue
+			}
+			if uc == ' ' || uc == '\t' {
+				break
+			}
+			if uc < ' ' {
+				return "", 0, false
+			}
+			if uc == '(' {
+				parenDepth++
+				if parenDepth > 4 {
+					return "", 0, false
+				}
+			} else if uc == ')' {
+				if parenDepth == 0 {
+					break
+				}
+				parenDepth--
+			} else if uc == ']' && k+1 < urlLimit && s[k+1] == '(' {
+				return "", 0, false
+			}
+			k++
+		}
+		if parenDepth != 0 {
+			return "", 0, false
+		}
+		rawHref = s[urlStart:k]
+	}
+	if strings.TrimSpace(rawHref) == "" {
+		return "", 0, false
+	}
+	wsStart := k
+	for k < n && (s[k] == ' ' || s[k] == '\t') {
+		k++
+	}
+	if k < n && k > wsStart && (s[k] == '"' || s[k] == '\'') {
+		qChar := s[k]
+		tLim := minInt(n, k+512)
+		qEnd := -1
+		for p := k + 1; p < tLim; p++ {
+			if s[p] == '\n' || s[p] == '\r' {
+				return "", 0, false
+			}
+			if s[p] == '\\' {
+				p++
+				continue
+			}
+			if s[p] == qChar {
+				qEnd = p
+				break
+			}
+		}
+		if qEnd < 0 {
+			return "", 0, false
+		}
+		k = qEnd + 1
+		for k < n && (s[k] == ' ' || s[k] == '\t') {
+			k++
+		}
+	}
+	if k >= n || s[k] != ')' {
+		return "", 0, false
+	}
+	return rawHref, k + 1, true
+}
+
+func convertBracketHeadingLinksLinearGo(s string, baseURL string) (string, string, bool) {
+	if strings.IndexByte(s, '[') < 0 || !strings.Contains(s, "</") {
+		return s, "", false
+	}
+	lower := asciiLowerExtractString(s)
+	if !strings.Contains(lower, "</h") {
+		return s, lower, true
+	}
+	var sb strings.Builder
+	last := 0
+	pos := 0
+	n := len(s)
+	var nextClose [7]closeTagSpanGo
+	var seenClose [7]bool
+	nextHeadingOpen := 0
+	noDbl, noSgl := false, false
+	for pos < n {
+		rel := strings.IndexByte(s[pos:], '[')
+		if rel < 0 {
+			break
+		}
+		brIdx := pos + rel
+		if isBackslashEscapedAt(s, brIdx) || (brIdx > 0 && s[brIdx-1] == '!' && !isBackslashEscapedAt(s, brIdx-1)) {
+			pos = brIdx + 1
+			continue
+		}
+		p := brIdx + 1
+		nlCount := 0
+		for p < n && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n') {
+			if s[p] == '\n' {
+				nlCount++
+				if nlCount > 1 {
+					break
+				}
+			}
+			p++
+		}
+		if nlCount > 1 || p+4 >= n || s[p] != '<' || (s[p+1] != 'h' && s[p+1] != 'H') ||
+			s[p+2] < '1' || s[p+2] > '6' || !isHTMLTagBoundaryByteGo(s[p+3]) {
+			pos = brIdx + 1
+			continue
+		}
+		tag, ok := scanNextHTMLTagQuoteAwareGo(s, p, &noDbl, &noSgl)
+		if !ok || tag.start != p || tag.isClosing || tag.selfClosing || tag.end-p > 512 {
+			pos = brIdx + 1
+			continue
+		}
+		lvl := int(tag.tagLower[1] - '0')
+		hit := nextClose[lvl]
+		if !seenClose[lvl] || (hit.start >= 0 && hit.start < tag.end) {
+			hit = findNextExactCloseTagGo(lower, s, "</"+tag.tagLower, tag.end)
+			nextClose[lvl] = hit
+			seenClose[lvl] = true
+		}
+		if hit.start < 0 || hit.start-tag.end > 8192 {
+			pos = brIdx + 1
+			continue
+		}
+		if nextHeadingOpen < tag.end {
+			cur := tag.end
+			foundOpen := len(lower)
+			for cur < len(lower) {
+				relH := strings.Index(lower[cur:], "<h")
+				if relH < 0 {
+					break
+				}
+				cand := cur + relH
+				if cand+3 < len(lower) && lower[cand+2] >= '1' && lower[cand+2] <= '6' && isHTMLTagBoundaryByteGo(lower[cand+3]) {
+					foundOpen = cand
+					break
+				}
+				cur = cand + 2
+			}
+			nextHeadingOpen = foundOpen
+		}
+		if nextHeadingOpen < hit.start {
+			pos = brIdx + 1
+			continue
+		}
+		q := hit.end
+		qNL := 0
+		for q < n && (s[q] == ' ' || s[q] == '\t' || s[q] == '\r' || s[q] == '\n') {
+			if s[q] == '\n' {
+				qNL++
+				if qNL > 1 {
+					break
+				}
+			}
+			q++
+		}
+		if qNL > 1 || q+1 >= n || s[q] != ']' || s[q+1] != '(' {
+			pos = brIdx + 1
+			continue
+		}
+		rawHref, linkEnd, destOK := parseBracketHeadingLinkDestGo(s, q+2)
+		if !destOK {
+			pos = brIdx + 1
+			continue
+		}
+		lbl := stripTagsInlineLinear(s[tag.end:hit.start])
+		href := strings.TrimSpace(rawHref)
+		var rep string
+		if lbl == "" {
+			rep = ""
+		} else if isDisallowedMarkdownLinkDestinationGo(href) {
+			rep = escapeMarkdownLinkLabelGo(lbl)
+		} else {
+			if strings.IndexByte(href, '&') >= 0 {
+				href = decodeURIEntitiesLinearGo(href)
+			}
+			if isDisallowedMarkdownLinkDestinationGo(href) {
+				rep = escapeMarkdownLinkLabelGo(lbl)
+			} else {
+				href = encodeUnsafeHrefCharsGo(resolveMarkdownRelativeHrefGo(href, baseURL))
+				rep = "\n\n" + strings.Repeat("#", lvl) + " [" + escapeMarkdownLinkLabelGo(lbl) + "](" + href + ")\n\n"
+			}
+		}
+		if last == 0 && sb.Cap() == 0 {
+			sb.Grow(len(s) + 16)
+		}
+		sb.WriteString(s[last:brIdx])
+		sb.WriteString(rep)
+		last = linkEnd
+		pos = linkEnd
+	}
+	if last > 0 {
+		sb.WriteString(s[last:])
+		return sb.String(), "", false
+	}
+	return s, lower, true
 }
 
 func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]string) string {
-	if strings.IndexByte(s, '[') >= 0 && strings.Contains(asciiLowerExtractString(s), "</h") {
-		s = reBracketHeadingLinkSanGo.ReplaceAllStringFunc(s, func(m string) string {
-			sub := reBracketHeadingLinkSanGo.FindStringSubmatch(m)
-			if len(sub) < 4 {
-				return m
-			}
-			lvl := int(sub[1][0] - '0')
-			lbl := stripTagsInlineLinear(sub[2])
-			href := strings.TrimSpace(sub[3])
-			if lbl == "" || isDisallowedMarkdownLinkDestinationGo(href) {
-				return lbl
-			}
-			return "\n\n" + strings.Repeat("#", lvl) + " [" + lbl + "](" + href + ")\n\n"
-		})
-	}
+	s, lower, hasLower := convertBracketHeadingLinksLinearGo(s, baseURL)
+	sBeforeTable := s
 	s = convertSimpleHTMLTablesInProseGo(s)
-	// 1. Convert paired inline elements (`a`, `h1`..`h6`, `summary`, `code`, `kbd`, `strong`, `b`, `em`, `i`, `sup`)
-	pairedTargets := map[string]bool{
-		"a": true, "h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
-		"summary": true, "code": true, "kbd": true, "strong": true, "b": true, "em": true, "i": true, "sup": true,
+	if s != sBeforeTable {
+		lower = ""
+		hasLower = false
 	}
+	// 1. Convert paired inline elements (`a`, `h1`..`h6`, `summary`, `code`, `kbd`, `strong`, `b`, `em`, `i`, `sup`)
 	if strings.Contains(s, "</") {
 		noDbl, noSgl := false, false
 		var sb strings.Builder
+		var nextClose map[string]closeTagSpanGo
 		last := 0
 		pos := 0
 		for pos < len(s) {
@@ -4563,104 +5348,102 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 			if !ok {
 				break
 			}
-			if !tag.isClosing && !tag.selfClosing && pairedTargets[tag.tagLower] {
-				// Find matching non-nested close tag within 8192 bytes
-				closeNeedle := "</" + tag.tagLower
-				searchEnd := minInt(len(s), tag.end+8192)
-				relClose := strings.Index(asciiLowerExtractString(s[tag.end:searchEnd]), closeNeedle)
-				if relClose >= 0 {
-					cStart := tag.end + relClose
-					afterName := cStart + len(closeNeedle)
-					for afterName < searchEnd && isASCIIWhitespaceByte(s[afterName]) {
-						afterName++
+			if !tag.isClosing && !tag.selfClosing && inlinePairedHTMLTagsGo[tag.tagLower] {
+				if nextClose == nil {
+					if !hasLower {
+						lower = asciiLowerExtractString(s)
+						hasLower = true
 					}
-					if afterName < searchEnd && s[afterName] == '>' {
-						cEnd := afterName + 1
-						inner := s[tag.end:cStart]
-						txt := stripTagsInlineLinear(inner)
-						replacement := ""
-						handled := true
-						switch tag.tagLower {
-						case "a":
-							attrs := parseHTMLTagAttrsGo(tag.attrs)
-							trimmedInner := strings.TrimSpace(inner)
-							if len(trimmedInner) >= 7 && trimmedInner[0] == '<' && (trimmedInner[1] == 'h' || trimmedInner[1] == 'H') && trimmedInner[2] >= '1' && trimmedInner[2] <= '6' {
-								hLvl := int(trimmedInner[2] - '0')
-								hClose := "</h" + string(trimmedInner[2]) + ">"
-								if strings.HasSuffix(asciiLowerExtractString(trimmedInner), hClose) && txt != "" {
-									href := resolveInlineHTMLHrefGo(attrs["href"], baseURL, true)
-									if href != "" {
-										replacement = "\n\n" + strings.Repeat("#", hLvl) + " [" + txt + "](" + href + ")\n\n"
-									} else {
+					nextClose = make(map[string]closeTagSpanGo, 8)
+				}
+				hit, seen := nextClose[tag.tagLower]
+				if !seen || (hit.start >= 0 && hit.start < tag.end) {
+					hit = findNextExactCloseTagGo(lower, s, "</"+tag.tagLower, tag.end)
+					nextClose[tag.tagLower] = hit
+				}
+				if hit.start >= 0 && hit.end <= tag.end+8192 {
+					cStart := hit.start
+					cEnd := hit.end
+					inner := s[tag.end:cStart]
+					replacement := ""
+					handled := true
+					switch tag.tagLower {
+					case "a":
+						attrs := parseHTMLTagAttrsGo(tag.attrs)
+						trimmedInner := strings.TrimSpace(inner)
+						if len(trimmedInner) >= 7 && trimmedInner[0] == '<' && (trimmedInner[1] == 'h' || trimmedInner[1] == 'H') && trimmedInner[2] >= '1' && trimmedInner[2] <= '6' {
+							hLvl := int(trimmedInner[2] - '0')
+							hClose := "</h" + string(trimmedInner[2]) + ">"
+							if strings.HasSuffix(asciiLowerExtractString(trimmedInner), hClose) {
+								href := resolveInlineHTMLHrefGo(attrs["href"], baseURL, true)
+								if href != "" {
+									if txt := stripTagsInlineLinear(inner); txt != "" {
+										replacement = "\n\n" + strings.Repeat("#", hLvl) + " [" + escapeMarkdownLinkLabelGo(txt) + "](" + href + ")\n\n"
+									}
+								} else {
+									if txt := stripTagsInlineEscapingBracketEntitiesGo(inner); txt != "" {
 										replacement = "\n\n" + strings.Repeat("#", hLvl) + " " + txt + "\n\n"
 									}
+								}
+								break
+							}
+						}
+						href := resolveSafeMarkdownHrefOrRelativeFullDocGo(attrs["href"], baseURL, true)
+						replacement = formatAnchorMarkdownWithBadgeImagesSanGo(inner, baseURL, href)
+					case "h1", "h2", "h3", "h4", "h5", "h6":
+						if txt := stripTagsInlineEscapingBracketEntitiesGo(inner); txt != "" {
+							lvl := int(tag.tagLower[1] - '0')
+							replacement = "\n\n" + strings.Repeat("#", lvl) + " " + txt + "\n\n"
+						}
+					case "summary":
+						if txt := stripTagsInlineEscapingBracketEntitiesGo(inner); txt != "" {
+							replacement = "\n\n**" + txt + "**\n\n"
+						}
+					case "code", "kbd":
+						if txt := stripTagsInlineLinear(inner); txt != "" {
+							span := formatInlineCodeSpanGo(txt)
+							if span != "" {
+								idx := len(*inlineCodeStash)
+								*inlineCodeStash = append(*inlineCodeStash, span)
+								replacement = "\x00EFMDINLINE" + strconv.Itoa(idx) + "\x00"
+							}
+						}
+					case "strong", "b":
+						if txt := stripTagsInlineEscapingBracketEntitiesGo(inner); txt != "" {
+							replacement = "**" + txt + "**"
+						}
+					case "em", "i":
+						if txt := stripTagsInlineEscapingBracketEntitiesGo(inner); txt != "" {
+							replacement = "*" + txt + "*"
+						}
+					case "sup":
+						if txt := stripTagsInlineEscapingBracketEntitiesGo(inner); txt != "" {
+							allCitation := true
+							for k := 0; k < len(txt); k++ {
+								c := txt[k]
+								if !((c >= '0' && c <= '9') || c == ',' || c == '-' || c == ' ') {
+									allCitation = false
 									break
 								}
 							}
-							href := resolveSafeMarkdownHrefOrRelativeFullDocGo(attrs["href"], baseURL, true)
-							lbl := convertAnchorInnerWithBadgeImagesSanGo(inner, baseURL)
-							if lbl != "" {
-								if href != "" {
-									replacement = "[" + lbl + "](" + href + ")"
-								} else {
-									replacement = lbl
-								}
+							if allCitation {
+								replacement = " [" + txt + "]"
+							} else {
+								replacement = "^" + txt
 							}
-						case "h1", "h2", "h3", "h4", "h5", "h6":
-							if txt != "" {
-								lvl := int(tag.tagLower[1] - '0')
-								replacement = "\n\n" + strings.Repeat("#", lvl) + " " + txt + "\n\n"
-							}
-						case "summary":
-							if txt != "" {
-								replacement = "\n\n**" + txt + "**\n\n"
-							}
-						case "code", "kbd":
-							if txt != "" {
-								span := formatInlineCodeSpanGo(txt)
-								if span != "" {
-									idx := len(*inlineCodeStash)
-									*inlineCodeStash = append(*inlineCodeStash, span)
-									replacement = "\x00EFMDINLINE" + strconv.Itoa(idx) + "\x00"
-								}
-							}
-						case "strong", "b":
-							if txt != "" {
-								replacement = "**" + txt + "**"
-							}
-						case "em", "i":
-							if txt != "" {
-								replacement = "*" + txt + "*"
-							}
-						case "sup":
-							if txt != "" {
-								allCitation := true
-								for k := 0; k < len(txt); k++ {
-									c := txt[k]
-									if !((c >= '0' && c <= '9') || c == ',' || c == '-' || c == ' ') {
-										allCitation = false
-										break
-									}
-								}
-								if allCitation {
-									replacement = " [" + txt + "]"
-								} else {
-									replacement = "^" + txt
-								}
-							}
-						default:
-							handled = false
 						}
-						if handled {
-							if last == 0 && sb.Cap() == 0 {
-								sb.Grow(len(s))
-							}
-							sb.WriteString(s[last:tag.start])
-							sb.WriteString(replacement)
-							last = cEnd
-							pos = cEnd
-							continue
+					default:
+						handled = false
+					}
+					if handled {
+						if last == 0 && sb.Cap() == 0 {
+							sb.Grow(len(s))
 						}
+						sb.WriteString(s[last:tag.start])
+						sb.WriteString(replacement)
+						last = cEnd
+						pos = cEnd
+						continue
 					}
 				}
 			}
@@ -4673,14 +5456,12 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 	}
 
 	// 2. Convert void/wrapper tags (`br`, `hr`, safe `img`, wrapper containers, PascalCase MDX tags)
-	wrapperStrip := map[string]bool{
-		"u": true, "sub": true, "details": true, "span": true, "div": true, "p": true, "button": true,
-		"section": true, "article": true, "main": true, "header": true, "footer": true, "nav": true, "aside": true,
-	}
 	noDbl, noSgl := false, false
 	var sb2 strings.Builder
 	last2 := 0
 	pos2 := 0
+	lastNewlineScanPos := 0
+	lastNewline := -1
 	for pos2 < len(s) {
 		tag, ok := scanNextHTMLTagQuoteAwareGo(s, pos2, &noDbl, &noSgl)
 		if !ok {
@@ -4689,7 +5470,13 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 		rep := tag.rawTag
 		replaceIt := false
 		if tag.tagLower == "br" {
-			lineStart := strings.LastIndexByte(s[:tag.start], '\n') + 1
+			if tag.start > lastNewlineScanPos {
+				if nlRel := strings.LastIndexByte(s[lastNewlineScanPos:tag.start], '\n'); nlRel >= 0 {
+					lastNewline = lastNewlineScanPos + nlRel
+				}
+				lastNewlineScanPos = tag.start
+			}
+			lineStart := lastNewline + 1
 			p := lineStart
 			for p < len(s) && (s[p] == ' ' || s[p] == '\t') {
 				p++
@@ -4713,7 +5500,7 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 					srcRaw = attrs["data-src"]
 				}
 				resolved := resolveSafeMarkdownHrefOrRelativeFullDocGo(srcRaw, baseURL, false)
-				alt := stripTagsInlineLinear(attrs["alt"])
+				alt := sanitizeMarkdownImageAltGo(stripTagsInlineLinear(attrs["alt"]))
 				if resolved == "" || isTinyOrAvatarImageURLFullDocGo(resolved, alt) {
 					rep = ""
 				} else {
@@ -4731,26 +5518,37 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 				!(tag.start >= 2 && s[tag.start-2] == ']' && s[tag.start-1] == '(') {
 				rep = ""
 				if !tag.isClosing && !tag.selfClosing && tag.attrs != "" && strings.Contains(asciiLowerExtractString(tag.attrs), "title") {
-					ls := strings.LastIndexByte(s[:tag.start], '\n') + 1
-					leRel := strings.IndexByte(s[tag.end:], '\n')
+					ls := 0
+					if tag.start > 0 {
+						scanFrom := tag.start - 65
+						if scanFrom < 0 {
+							scanFrom = 0
+						}
+						if nlRel := strings.LastIndexByte(s[scanFrom:tag.start], '\n'); nlRel >= 0 {
+							ls = scanFrom + nlRel + 1
+						} else if scanFrom > 0 {
+							ls = -1
+						}
+					}
+					leRel := strings.IndexByte(s[tag.end:minInt(len(s), tag.end+66)], '\n')
 					le := len(s)
 					if leRel >= 0 {
 						le = tag.end + leRel
 					}
-					if tag.start-ls <= 64 && le-tag.end <= 64 && isBlankASCIILineGo(s[ls:tag.start]) && isBlankASCIILineGo(s[tag.end:le]) {
+					if ls >= 0 && tag.start-ls <= 64 && le-tag.end <= 64 && isBlankASCIILineGo(s[ls:tag.start]) && isBlankASCIILineGo(s[tag.end:le]) {
 						attrs := parseHTMLTagAttrsGo(tag.attrs)
 						ht := attrs["title"]
 						if ht == "" {
 							ht = attrs["titletext"]
 						}
-						htClean := stripTagsInlineLinear(ht)
+						htClean := stripTagsInlineEscapingBracketEntitiesGo(ht)
 						if htClean != "" {
 							rep = "\n\n**" + htClean + "**\n\n"
 						}
 					}
 				}
 				replaceIt = true
-			} else if wrapperStrip[tag.tagLower] {
+			} else if inlineWrapperStripTagsGo[tag.tagLower] {
 				rep = ""
 				replaceIt = true
 			}
@@ -4970,7 +5768,7 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, isLa
 		(strings.Contains(proseWork, "](") || strings.IndexByte(proseWork, '<') >= 0 || strings.Contains(proseWork, "]:")) {
 		proseWork = sanitizeAndResolveMarkdownProseLinksLinearGo(proseWork, baseURL)
 	}
-	proseWork = decodeMarkdownEntitiesPreservingLtGo(proseWork)
+	proseWork = decodeMarkdownProseEntitiesPreservingLinksAndLtGo(proseWork)
 	if len(inlineCodeStash) > 0 {
 		proseWork = restoreMarkdownInlineCodeStashGo(proseWork, inlineCodeStash)
 	}
@@ -5036,12 +5834,28 @@ func stripInvisibleAndNUL(s string) string {
 // stripTagsInlineLinear strips HTML/XML tags in guaranteed O(N) time (<= 3N byte visits even on adversarial
 // `<"*n` or `<'*n` without closing quotes, while respecting quoted `>` inside valid attributes like `<a href="x>y">`).
 func stripTagsInlineLinear(input string) string {
+	return stripTagsInlineImplGo(input, false)
+}
+
+func stripTagsInlineEscapingBracketEntitiesGo(input string) string {
+	return stripTagsInlineImplGo(input, true)
+}
+
+func stripTagsInlineImplGo(input string, escapeBracketEntities bool) string {
 	if input == "" {
 		return ""
 	}
-	if strings.IndexByte(input, '<') < 0 || strings.IndexByte(input, '>') < 0 {
-		unescaped := stripInvisibleSmugglingCharsGo(html.UnescapeString(input))
+	decodeAndJoin := func(raw string) string {
+		var unescaped string
+		if escapeBracketEntities {
+			unescaped = decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(raw)
+		} else {
+			unescaped = stripInvisibleSmugglingCharsGo(html.UnescapeString(raw))
+		}
 		return strings.Join(strings.Fields(unescaped), " ")
+	}
+	if strings.IndexByte(input, '<') < 0 || strings.IndexByte(input, '>') < 0 {
+		return decodeAndJoin(input)
 	}
 
 	var sb strings.Builder
@@ -5112,6 +5926,5 @@ func stripTagsInlineLinear(input string) string {
 		}
 	}
 
-	unescaped := stripInvisibleSmugglingCharsGo(html.UnescapeString(sb.String()))
-	return strings.Join(strings.Fields(unescaped), " ")
+	return decodeAndJoin(sb.String())
 }

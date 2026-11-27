@@ -1,0 +1,15 @@
+# Shared Go + TypeScript Declarative Site Adapter: SRAM Technical Documentation (Fluid Topics)
+id: sram-docs
+name: "SRAM Technical Documentation (Fluid Topics)"
+category: developer
+description: "Extracts bounded Fluid Topics SSR HTML documentation from docs.sram.com, stripping inline data:image base64 blobs and error chrome while preserving breadcrumbs, model codes, and PDF manual links."
+domains:
+  - docs.sram.com
+exampleUrls:
+  - "https://docs.sram.com/en-US/publications/7E6x3h233022a92169062b0b32331510?models=fc-red-d1"
+
+htmlRoutes:
+  - id: sram-docs
+    match:
+      exactSegments: false
+    mode: sram_docs_html

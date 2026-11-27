@@ -39,6 +39,7 @@ extract:
       fallbackTemplate: "{handle}"
     text:
       paths: [post.record.text]
+      format: plain_text
       trim: true
     desc:
       paths: [post.record.text]

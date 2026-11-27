@@ -239,6 +239,165 @@ func ExtractWooCommerceProductHTML(rawURL, rawHTML, _ string, extractorID string
 	return res
 }
 
+// ExtractWooCommerceCatalogHTML extracts a product list from WooCommerce `/product-category/` or `/shop/` HTML
+// as a fail-open fallback when the Store API is unavailable or disallowed by robots.txt.
+func ExtractWooCommerceCatalogHTML(rawURL, rawHTML, _ string, extractorID string) *PostFetchSiteResult {
+	if extractorID == "" {
+		extractorID = "woocommerce"
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil
+	}
+	if !IsWooCommerceHTMLOrHeaders(rawHTML, nil) {
+		return nil
+	}
+	doc := extract.ParseHTMLDoc(rawHTML, 2*1024*1024)
+	bodyNode := doc.First("body")
+	bodyCls := ""
+	if bodyNode != nil {
+		bodyCls = " " + strings.ToLower(bodyNode.AttrOrEmpty("class")) + " "
+	}
+	lowPath := strings.ToLower(u.Path)
+	isCatalogPage := strings.Contains(bodyCls, " tax-product_cat ") ||
+		strings.Contains(bodyCls, " post-type-archive-product ") ||
+		strings.Contains(lowPath, "/product-category/") ||
+		strings.HasSuffix(strings.TrimRight(lowPath, "/"), "/shop")
+	if !isCatalogPage {
+		return nil
+	}
+
+	cards := doc.Select("ul.products li.product, .wc-block-grid__product, .products .product", 60)
+	if len(cards) == 0 {
+		return nil
+	}
+
+	origin := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+	records := make([]CatalogRecord, 0, len(cards))
+	rows := make([][]string, 0, len(cards))
+	links := make([]string, 0, len(cards))
+	seenURLs := make(map[string]bool)
+
+	for idx, card := range cards {
+		rawTitle := ""
+		for _, sel := range []string{".woocommerce-loop-product__title", ".wc-block-grid__product-title", "h2", "h3", ".product-title"} {
+			if n := card.First(sel); n != nil {
+				if t := strings.TrimSpace(n.Text()); t != "" {
+					rawTitle = t
+					break
+				}
+			}
+		}
+		prodTitle := SanitizeCommerceField(rawTitle, 300)
+		if prodTitle == "" {
+			continue
+		}
+
+		prodHref := ""
+		if a := card.First("a[href]"); a != nil {
+			prodHref = strings.TrimSpace(a.AttrOrEmpty("href"))
+		}
+		prodURL := resolveSafeSameOriginOrPublicHTTPS(prodHref, u)
+		if prodURL == "" {
+			prodURL = u.String()
+		} else if !seenURLs[prodURL] {
+			seenURLs[prodURL] = true
+			links = append(links, prodURL)
+		}
+
+		skuRaw := ""
+		if btn := card.First("[data-product_sku]"); btn != nil {
+			skuRaw = btn.AttrOrEmpty("data-product_sku")
+		}
+		skuPtr := sanitizeCommerceSKU(skuRaw)
+
+		priceText := ""
+		for _, psel := range []string{".price ins .amount", ".price .amount", ".wc-block-grid__product-price .amount", ".price", ".wc-block-grid__product-price"} {
+			if pn := card.First(psel); pn != nil {
+				if pt := strings.TrimSpace(pn.Text()); pt != "" {
+					priceText = pt
+					break
+				}
+			}
+		}
+		price, cur := parseCommercePriceAndCurrency(priceText)
+
+		imgURL := ""
+		if im := card.First("img"); im != nil {
+			cand := strings.TrimSpace(im.AttrOrEmpty("src"))
+			if cand == "" || strings.HasPrefix(strings.ToLower(cand), "data:") {
+				cand = strings.TrimSpace(im.AttrOrEmpty("data-src"))
+			}
+			imgURL = resolveSafeSameOriginOrPublicHTTPS(cand, u)
+		}
+		imgs := []string{}
+		var imgPtr *string
+		if imgURL != "" {
+			imgs = []string{imgURL}
+			imgPtr = &imgURL
+		}
+
+		handle := reNonAlnumSlug.ReplaceAllString(strings.ToLower(prodTitle), "-")
+		handle = strings.Trim(handle, "-")
+		if handle == "" {
+			handle = fmt.Sprintf("item-%d", idx+1)
+		}
+		pid := handle
+		if pidNode := card.First("[data-product_id]"); pidNode != nil {
+			if v := strings.TrimSpace(pidNode.AttrOrEmpty("data-product_id")); v != "" {
+				pid = v
+			}
+		}
+		records = append(records, CatalogRecord{
+			Platform:  "woocommerce",
+			Origin:    origin,
+			ProductID: pid,
+			Handle:    handle,
+			URL:       prodURL,
+			Title:     prodTitle,
+			Tags:      []string{},
+			Images:    &imgs,
+			Options:   []CatalogOption{},
+			Variants: []CatalogVariantRecord{
+				{
+					VariantID: pid,
+					SKU:       skuPtr,
+					Options:   []string{},
+					Price:     price,
+					Currency:  cur,
+					Image:     imgPtr,
+				},
+			},
+		})
+		rows = append(rows, []string{
+			FormatMarkdownLinkCommerce(prodTitle, prodURL),
+			formatCommerceSKUDisplay(skuPtr, false),
+			formatWooMoneyCell(price, cur),
+		})
+	}
+
+	if len(records) == 0 {
+		return nil
+	}
+
+	pageTitle := SanitizeCommerceField(doc.Text("h1.woocommerce-products-header__title"), 300)
+	if pageTitle == "" {
+		pageTitle = SanitizeCommerceField(doc.Text("h1"), 300)
+	}
+	if pageTitle == "" {
+		pageTitle = fmt.Sprintf("%s — WooCommerce Catalog", strings.ToLower(u.Hostname()))
+	}
+
+	tableMD := FormatGFMTable([]string{"Product", "SKU", "Price"}, rows)
+	return &PostFetchSiteResult{
+		ExtractorID: extractorID,
+		Title:       pageTitle,
+		Markdown:    fmt.Sprintf("# %s\n\n%s", pageTitle, tableMD),
+		Links:       links,
+		Records:     records,
+	}
+}
+
 func wooCatalogFirstPage(cfg DeclarativeCatalogConfig, originURLStr, collection string) string {
 	perPage := cfg.PerPage
 	if perPage <= 0 || perPage > 100 {

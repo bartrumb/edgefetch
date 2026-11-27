@@ -1,0 +1,13 @@
+{
+  "adapterId": "cpsc-recalls",
+  "mode": "twin",
+  "inputUrl": "https://www.saferproducts.gov/RestWebServices/Recall?format=json&RecallNumber=24123",
+  "expectedFetchUrl": "https://www.saferproducts.gov/RestWebServices/Recall?format=json&RecallNumber=24123",
+  "mockPayload": "[{\"RecallNumber\":\"24123\",\"Title\":\"Acme Helmet Recall\",\"RecallDate\":\"2024-03-14\",\"Description\":\"Chin strap can fail during impact.\",\"URL\":\"https://www.cpsc.gov/Recalls/2024/Acme-Helmet\",\"Products\":[{\"Name\":\"Bike Helmet\",\"Model\":\"H-1\",\"NumberOfUnits\":\"5,000\",\"Type\":\"Sports\"}],\"Hazards\":[{\"Name\":\"Impact injury hazard\"}],\"Remedies\":[{\"Name\":\"Full refund\"}]}]",
+  "expectTitleIncludes": "Acme Helmet Recall (Recall #24123)",
+  "expectMarkdownIncludes": [
+    "24123",
+    "Impact injury hazard",
+    "Bike Helmet"
+  ]
+}

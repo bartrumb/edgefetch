@@ -1,0 +1,12 @@
+{
+  "adapterId": "sram-docs",
+  "mode": "html",
+  "inputUrl": "https://docs.sram.com/en-US/publications/7E6x3h233022a92169062b0b32331510?models=fc-red-d1",
+  "mockPayload": "<!doctype html><html><body><nav aria-label=\"breadcrumb\"><a href=\"/en-US\">SRAM</a></nav><main><h1 class=\"ft-topic-title\">RED AXS Crankset</h1><div class=\"ft-topic-content\"><p>Torque to 54 Nm.</p><a href=\"/manuals/red-axs.pdf\">Manual PDF</a></div></main></body></html>",
+  "expectMarkdownIncludes": [
+    "RED AXS Crankset",
+    "54 Nm",
+    "fc-red-d1",
+    "https://docs.sram.com/manuals/red-axs.pdf"
+  ]
+}

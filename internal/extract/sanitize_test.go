@@ -1265,3 +1265,202 @@ func TestR11M3InvalidUTF8AndEntityDecodedInvisibleSmuggling(t *testing.T) {
 		}
 	}
 }
+
+func TestM3MultiPassEntitySanitizeMarkdownAndPerf(t *testing.T) {
+	base := "https://docs.sram.com/en-US/publications/7E6x3h"
+	reUnescapedInjected := regexp.MustCompile(`(?:^|[^\\])(?:\[xss\]|\])\s*\(\s*https?://evil\.com`)
+
+	directCases := map[string]string{
+		"dec_bracket_in_label":              `[Manual &#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"backslash_then_entity":             `[Manual \&#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"bsol_then_entity":                  `[Manual &bsol;&#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"double_amp_bracket":                `[Manual &amp;#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"nested_badge_with_entities":        `[![ok &#93;](https://img.shields.io/a.svg?x=1&rpar;2) Docs &#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"heading_link_san":                  `[<h2 id="x">Head ](https://evil.com) &amp;#93;(https://evil.com)</h2>](https://docs.sram.com/a&rpar;&lsqb;xss&rsqb;&lpar;https://evil.com)`,
+		"img_alt_entities":                  `<img src="https://docs.sram.com/a.png" alt="Img &amp;#93;(https://evil.com)">`,
+		"gfm_table_amp_91_93":               `| Brake &amp;#91;xss&amp;#93;(https://evil.com) | Acme |`,
+		"gfm_table_93":                      `| Hub &#93;(https://evil.com) |`,
+		"prose_lsqb_rsqb_lpar_rpar":         `Vend &amp;lsqb;xss&amp;rsqb;&amp;lpar;https://evil.com&amp;rpar;`,
+		"prose_unclosed_open_bracket":       `[Click here &amp;#93;(https://evil.com)`,
+		"bullet_entity_bracket":             `- Item &amp;lsqb;xss&amp;rsqb;(https://evil.com)`,
+		"nested_open_bracket_link":          `[foo [bar &amp;#93;(https://evil.com) [baz](https://docs.sram.com/ok)`,
+		"nested_open_bracket_closed_outer":  `[foo [bar] &amp;#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"multiline_link_entity":             "[Manual\n&#93;(https://evil.com)](https://docs.sram.com/ok)",
+		"multiline_dangling_dest_entity":    "Text ](https://docs.sram.com/a\n&amp;rpar;&amp;lsqb;xss&amp;rsqb;&amp;lpar;https://evil.com)",
+		"heading_link_nested_span_entity":   `[<h2 id="x"><span>Head</span> &amp;#93;(https://evil.com)</h2>](https://docs.sram.com/ok)`,
+		"heading_link_disallowed_js":        `[<h2 id="x"><span>Head</span> &amp;#93;(https://evil.com)</h2>](javascript:alert(1))`,
+		"td_entity_bracket":                 `<table><tr><td>[Click &#93;(https://evil.com)</td></tr></table>`,
+		"anchor_no_href_entity":             `<a>&#91;xss&#93;</a>(https://evil.com)`,
+		"anchor_name_entity":                `<a name="sec">&lsqb;xss&rsqb;(https://evil.com)</a>`,
+		"anchor_js_href_entity":             `<a href="javascript:alert(1)">&lsqb;xss&rsqb;(https://evil.com)</a>`,
+		"anchor_js_href_unclosed_bracket":   `<a href="javascript:alert(1)">[Click &#93;(https://evil.com)</a>`,
+		"anchor_js_href_img_badge_entity":   `<a href="javascript:alert(1)"><img src="https://docs.sram.com/a.png" alt="ok"> [Click &#93;(https://evil.com)</a>`,
+		"triple_amp_93_in_link":             `[Manual &amp;amp;#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		"triple_amp_rsqb_in_link":           `[Manual &amp;amp;rsqb;(https://evil.com)](https://docs.sram.com/ok)`,
+		"triple_amp_lsqb_rsqb_prose":        `Vend &amp;amp;lsqb;xss&amp;amp;rsqb;(https://evil.com)`,
+		"quad_amp_93_in_link":               `[Manual &amp;amp;amp;#93;(https://evil.com)](https://docs.sram.com/ok)`,
+	}
+	for name, md := range directCases {
+		got := SanitizeMarkdown(md, base)
+		if reUnescapedInjected.MatchString(got) {
+			t.Fatalf("[%s] injected evil.com link survived SanitizeMarkdown:\n  in =%q\n  out=%q", name, md, got)
+		}
+		if strings.Contains(strings.ToLower(got), "javascript:") {
+			t.Fatalf("[%s] javascript: survived SanitizeMarkdown:\n  in =%q\n  out=%q", name, md, got)
+		}
+		if got2 := SanitizeMarkdown(got, base); got2 != got {
+			t.Fatalf("[%s] non-idempotent:\n  got1=%q\n  got2=%q", name, got, got2)
+		}
+	}
+
+	if gotSpanH := SanitizeMarkdown(directCases["heading_link_nested_span_entity"], base); !strings.Contains(gotSpanH, `## [Head \](https://evil.com)](https://docs.sram.com/ok)`) {
+		t.Fatalf("expected nested span heading link cleanly formatted, got %q", gotSpanH)
+	}
+	wikiH := `[<h3 title="a>b"><strong>Bold</strong> <code>API</code></h3>](https://en.wikipedia.org/wiki/Foo_(bar))`
+	if gotWikiH := SanitizeMarkdown(wikiH, base); !strings.Contains(gotWikiH, `### [Bold API](https://en.wikipedia.org/wiki/Foo_(bar))`) {
+		t.Fatalf("expected quoted > and Foo_(bar) preserved in bracket heading link, got %q", gotWikiH)
+	}
+	longH2 := "<h2>" + strings.Repeat("x", 10000) + "<h2>Real</h2>"
+	if gotLongH2 := SanitizeMarkdown(longH2, base); !strings.Contains(gotLongH2, "&lt;h2>") || !strings.Contains(gotLongH2, "## Real") {
+		tailStart := len(gotLongH2) - 40
+		if tailStart < 0 {
+			tailStart = 0
+		}
+		t.Fatalf("expected 8192 window preserved for unclosed <h2> before <h2>Real</h2>, got head=%q tail=%q", gotLongH2[:minInt(len(gotLongH2), 40)], gotLongH2[tailStart:])
+	}
+
+	// Idempotence on already-escaped labels with `&` / `&amp;`
+	idempCases := []string{
+		`[Tom & Jerry \](https://evil.com)](https://docs.sram.com/ok)`,
+		`[Tom &amp; Jerry \](https://evil.com)](https://docs.sram.com/ok)`,
+	}
+	for _, md := range idempCases {
+		got1 := SanitizeMarkdown(md, base)
+		got2 := SanitizeMarkdown(got1, base)
+		got3 := SanitizeMarkdown(got2, base)
+		if got1 != got2 || got2 != got3 {
+			t.Fatalf("idempotence failed for %q:\n  1=%q\n  2=%q\n  3=%q", md, got1, got2, got3)
+		}
+	}
+
+	// Literal [1] inside <a name="n1"> is preserved while entity-encoded brackets are escaped.
+	if gotLitAnchor := SanitizeMarkdown(`<a name="n1">[1]</a>`, base); !strings.Contains(gotLitAnchor, "[1]") {
+		t.Fatalf("expected literal [1] preserved on <a name=...>, got %q", gotLitAnchor)
+	}
+
+	// SanitizeScrapedMeta entity label breakout + idempotence on disallowed URL & multi-&amp; chains
+	for _, metaIn := range []string{
+		`[Manual &#93;(https://evil.com)](https://docs.sram.com/ok)`,
+		`[Label &amp;#93;(https://evil.com)](javascript:alert(1))`,
+		`[Manual &amp;amp;amp;#93;(https://evil.com)](https://docs.sram.com/ok)`,
+	} {
+		metaOut1 := SanitizeScrapedMeta(metaIn)
+		if reUnescapedInjected.MatchString(metaOut1) {
+			t.Fatalf("SanitizeScrapedMeta allowed injected link for %q: %q", metaIn, metaOut1)
+		}
+		if strings.Contains(strings.ToLower(metaOut1), "javascript:") {
+			t.Fatalf("SanitizeScrapedMeta allowed javascript: for %q: %q", metaIn, metaOut1)
+		}
+		if metaOut2 := SanitizeScrapedMeta(metaOut1); metaOut2 != metaOut1 {
+			t.Fatalf("SanitizeScrapedMeta non-idempotent for %q:\n  1=%q\n  2=%q", metaIn, metaOut1, metaOut2)
+		}
+	}
+
+	// 50k O(N) performance probes (< 75ms without -race)
+	perfCases := []struct {
+		name  string
+		input string
+	}{
+		{name: "50k_amp_93_label", input: "[" + strings.Repeat("&amp;#93;", 5500) + "](https://docs.sram.com/ok)"},
+		{name: "50k_open_brackets_amp93", input: strings.Repeat("[", 50_000) + "&amp;#93;"},
+		{name: "50k_link_amp_rpar", input: strings.Repeat("[x](https://docs.sram.com/a&amp;rpar;)", 1200)},
+		{name: "50k_bracket_h2_close", input: strings.Repeat(`[<h2 id="x">`, 4200) + "</h2>](https://docs.sram.com/ok)"},
+		{name: "50k_plain_h2_close", input: strings.Repeat(`<h2 id="x">`, 4200) + "</h2>"},
+		{name: "50k_table_close", input: strings.Repeat("<table>", 4200) + "</table>"},
+		{name: "50k_amp_collapse_attack_chain", input: "&" + strings.Repeat("amp;", 12500)},
+		{name: "50k_amp_collapse_attack_rep", input: strings.Repeat("&amp;", 10000)},
+	}
+	budget := 75 * time.Millisecond * time.Duration(extractRaceSlowdown)
+	for _, pc := range perfCases {
+		start := time.Now()
+		_ = SanitizeMarkdown(pc.input, base)
+		if elapsed := time.Since(start); elapsed > budget {
+			t.Fatalf("[50k perf %s] exceeded %v: %v", pc.name, budget, elapsed)
+		}
+	}
+}
+
+func TestM3Iteration7AmpChainAndCommentHardening(t *testing.T) {
+	base := "https://docs.sram.com/en-US/publications/7E6x3h"
+	reUnescapedInjected := regexp.MustCompile(`(?:^|[^\\])(?:\[xss\]|\])\s*\(\s*https?://evil\.com`)
+
+	// 1. 1-pass idempotence under BOTH SanitizeScrapedMeta and SanitizeMarkdown
+	idemCases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "double_amp_space", input: "A &amp;amp; B", want: "A & B"},
+		{name: "triple_amp_space", input: "A &amp;amp;amp; B", want: "A & B"},
+		{name: "amp_num38_space", input: "A &amp;#38; B", want: "A & B"},
+		{name: "double_amp_eof", input: "A &amp;amp;", want: "A &"},
+		{name: "double_amp_foo", input: "&amp;amp;foo", want: "&foo"},
+		{name: "double_amp_T", input: "&amp;amp;T", want: "&T"},
+		{name: "att_single_amp", input: "AT&amp;T", want: "AT&T"},
+		{name: "foo_amp_bar", input: "foo&amp;bar", want: "foo&bar"},
+		{name: "semicolonless_query", input: "&currentTime=45&section=2&region=us", want: "&currentTime=45&section=2&region=us"},
+		{name: "triple_amp_lsqb_rsqb", input: "Vend &amp;amp;lsqb;xss&amp;amp;rsqb;", want: `Vend \[xss\]`},
+	}
+	for _, tc := range idemCases {
+		meta1 := SanitizeScrapedMeta(tc.input)
+		meta2 := SanitizeScrapedMeta(meta1)
+		if meta1 != tc.want || meta2 != meta1 {
+			t.Fatalf("[%s] SanitizeScrapedMeta mismatch/non-idempotent: want=%q got1=%q got2=%q", tc.name, tc.want, meta1, meta2)
+		}
+		md1 := SanitizeMarkdown(tc.input, base)
+		md2 := SanitizeMarkdown(md1, base)
+		if md1 != tc.want || md2 != md1 {
+			t.Fatalf("[%s] SanitizeMarkdown mismatch/non-idempotent: want=%q got1=%q got2=%q", tc.name, tc.want, md1, md2)
+		}
+	}
+
+	// Verify collapseAmpEntityChainsGo directly leaves non-entity chains and query strings untouched
+	for _, untouched := range []string{"AT&amp;T", "foo&amp;bar", "&currentTime=45&section=2&region=us"} {
+		if got := collapseAmpEntityChainsGo(untouched); got != untouched {
+			t.Fatalf("collapseAmpEntityChainsGo(%q) = %q, want unchanged", untouched, got)
+		}
+	}
+	if got := collapseAmpEntityChainsGo("Vend &amp;amp;lsqb;xss&amp;amp;rsqb;"); got != "Vend &lsqb;xss&rsqb;" {
+		t.Fatalf("collapseAmpEntityChainsGo multi-lsqb = %q", got)
+	}
+
+	// Link label with &amp;amp;#93; must escape and remain 1-pass idempotent
+	linkCase := `[Manual &amp;amp;#93;(https://evil.com)](https://docs.sram.com/ok)`
+	linkMeta1 := SanitizeScrapedMeta(linkCase)
+	linkMeta2 := SanitizeScrapedMeta(linkMeta1)
+	if reUnescapedInjected.MatchString(linkMeta1) || linkMeta2 != linkMeta1 {
+		t.Fatalf("SanitizeScrapedMeta failed on %q: got1=%q got2=%q", linkCase, linkMeta1, linkMeta2)
+	}
+	linkMd1 := SanitizeMarkdown(linkCase, base)
+	linkMd2 := SanitizeMarkdown(linkMd1, base)
+	if reUnescapedInjected.MatchString(linkMd1) || linkMd2 != linkMd1 {
+		t.Fatalf("SanitizeMarkdown failed on %q: got1=%q got2=%q", linkCase, linkMd1, linkMd2)
+	}
+
+	// 2. O(N) runtime on 50k amp collapse attack variants
+	budget := 75 * time.Millisecond * time.Duration(extractRaceSlowdown)
+	for _, pc := range []struct {
+		name  string
+		input string
+	}{
+		{name: "50k_amp_collapse_93", input: strings.Repeat("&amp;", 10000) + "#93;"},
+		{name: "50k_amp_collapse_space_B", input: strings.Repeat("&amp;", 10000) + " B"},
+		{name: "50k_amp_chain_space_B", input: "&" + strings.Repeat("amp;", 12500) + " B"},
+	} {
+		start := time.Now()
+		_ = SanitizeMarkdown(pc.input, base)
+		if elapsed := time.Since(start); elapsed > budget {
+			t.Fatalf("[50k perf %s] exceeded %v: %v", pc.name, budget, elapsed)
+		}
+	}
+}

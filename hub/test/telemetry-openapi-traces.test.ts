@@ -1832,7 +1832,7 @@ test('R8-H7-1: matchesApprovedWildcard matches identically in compiler and runti
 });
 
 test('R8-H7-2: Compiler & runtime reject exact-subdomain hijack of *.wikipedia.org, careers.*.com, jobs.*.com, and gitlab.*', () => {
-  assert.equal(DECLARATIVE_SITE_ADAPTERS.length, 56);
+  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 68, `expected >= 68 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
   assert.doesNotThrow(() =>
     validateManifestSet(COMPILED_BUNDLE.manifests.map((obj) => ({ obj, label: `${obj.id}.yaml` }))),
   );

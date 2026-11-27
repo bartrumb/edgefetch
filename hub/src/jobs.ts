@@ -1602,6 +1602,65 @@ export async function executeJobsCall(params: {
         const tried: string[] = [];
         const foundForDom: DiscoveredAtsBoard[] = [];
         let domHitBudgetCap = false;
+        const explicitWdMatch = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(dom);
+        if (explicitWdMatch) {
+          const wdTenant = explicitWdMatch[1]!.toLowerCase();
+          const wdCapTenant = wdTenant.charAt(0).toUpperCase() + wdTenant.slice(1);
+          const wdUpperTenant = wdTenant.toUpperCase();
+          const candidateSites = [
+            ...new Set(['External', wdCapTenant, `${wdCapTenant}ExternalCareerSite`, `${wdUpperTenant}ExternalCareerSite`, wdTenant]),
+          ];
+          for (const siteName of candidateSites) {
+            const wdBoardUrl = `https://${dom}/${siteName}`;
+            tried.push(wdBoardUrl);
+            const r = await executeScrape({
+              url: wdBoardUrl,
+              renderMode: 'off',
+              discoverLlmsTxt: false,
+              preferOriginMarkdown: false,
+              ephemeral: true,
+              atsLiteBoard: true,
+              formats: ['markdown', 'links'],
+              ...(payload.target ? { target: payload.target } : {}),
+              ...(payload.site ? { site: payload.site } : {}),
+            }).catch(() => null);
+            if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
+              domHitBudgetCap = true;
+              break;
+            }
+            if (r && r.status === 200 && r.body?.ok === true) {
+              const jobsArr = Array.isArray(r.body.jobs) ? (r.body.jobs as unknown[]) : [];
+              const links = Array.isArray(r.body.links) ? (r.body.links as string[]) : [];
+              if (jobsArr.length > 0 || links.length > 0) {
+                const entry: DiscoveredAtsBoard = {
+                  domain: dom,
+                  platform: 'workday',
+                  slug: `${wdTenant}/${siteName}`,
+                  boardUrl: wdBoardUrl,
+                  discoveredFrom: `direct-ats-domain:${dom}`,
+                  boardStatus: 'ok',
+                };
+                foundForDom.push(entry);
+                discoveredBoards.push(entry);
+                candidateUrls.add(wdBoardUrl);
+                return;
+              }
+            }
+          }
+          if (foundForDom.length === 0) {
+            const finalStatus: AtsBoardStatus = domHitBudgetCap ? 'budget_exhausted' : 'not_found';
+            discoveredBoards.push({
+              domain: dom,
+              platform: 'workday',
+              slug: wdTenant,
+              boardUrl: '',
+              discoveredFrom: 'none',
+              boardStatus: finalStatus,
+              tried,
+            });
+          }
+          return;
+        }
         const domBrandInfo = extractRegistrableBrandInfo(dom);
         const baseSlug = (domBrandInfo?.sld ?? dom.split('.')[0] ?? '').toLowerCase();
         const canSlugProbe = isValidAtsSlug(baseSlug);
@@ -1817,8 +1876,16 @@ export async function executeJobsCall(params: {
     const scopedQueries = atsGroups.map((grp) => `${grp} ${coreTerms}`.trim());
     if (primaryCompanySlug) {
       const nonCompanyTerms = [searchQueryExpr, wantRemote ? 'remote' : ''].filter(Boolean).join(' ');
+      const explicitWdHostsForCompany = domainsInput.filter((d) => {
+        const m = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(d);
+        return Boolean(m && m[1]!.toLowerCase() === primaryCompanySlug.toLowerCase());
+      });
+      const wdSiteClauses =
+        explicitWdHostsForCompany.length > 0
+          ? explicitWdHostsForCompany.map((h) => `site:${h}`)
+          : [`site:${primaryCompanySlug}.wd5.myworkdayjobs.com`, `site:${primaryCompanySlug}.wd1.myworkdayjobs.com`];
       scopedQueries.push(
-        `(site:jobs.smartrecruiters.com/${primaryCompanySlug} OR site:${primaryCompanySlug}.wd5.myworkdayjobs.com OR site:${primaryCompanySlug}.wd1.myworkdayjobs.com) ${nonCompanyTerms}`.trim(),
+        `(site:jobs.smartrecruiters.com/${primaryCompanySlug} OR ${wdSiteClauses.join(' OR ')}) ${nonCompanyTerms}`.trim(),
       );
     }
 
@@ -1839,6 +1906,8 @@ export async function executeJobsCall(params: {
     }
     for (const dom of domainsInput) {
       preWaveAllowedTokens.add(dom);
+      const explicitWd = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(dom);
+      if (explicitWd?.[1]) preWaveAllowedTokens.add(explicitWd[1].toLowerCase());
       for (const expanded of expandCompanyFilterTokens(dom)) preWaveAllowedTokens.add(expanded);
     }
     for (const db of discoveredBoards) {
@@ -2130,6 +2199,7 @@ export async function executeJobsCall(params: {
 
     const smartRecruitersPostingsToEnrich: StructuredJobRecord[] = [];
     const unverifiedPayUrls = new Set<string>();
+    const verifiedBoardJobUrls = new Set<string>();
     let anyBoardTruncated = false;
     let primaryNextCursor: string | undefined;
 
@@ -2397,32 +2467,74 @@ export async function executeJobsCall(params: {
             continue;
           }
 
-          if (Array.isArray(sc.body.records) && sc.body.extractorId === 'icims') {
-            sourcesUsed.add('ats:icims');
-            resolvedAdapterIds.add('icims');
-            const icimsRecs = sc.body.records as Array<Record<string, unknown>>;
-            const icimsCo = inferCompanyFromAtsUrl(origU);
-            for (const rc of icimsRecs) {
+          if (
+            Array.isArray(sc.body.records) &&
+            (sc.body.extractorId === 'icims' || sc.body.extractorId === 'ukg-paylocity-dover')
+          ) {
+            const extId = sc.body.extractorId;
+            const boardRecs = sc.body.records as Array<Record<string, unknown>>;
+            const boardCoFallback = inferCompanyFromAtsUrl(origU);
+            const isVerifiedBoard = Boolean(
+              discEntry &&
+                discEntry.discoveredFrom &&
+                !discEntry.discoveredFrom.startsWith('slug-probe:') &&
+                !discEntry.discoveredFrom.startsWith('search:'),
+            );
+            if (discEntry) {
+              discEntry.boardStatus = classifyAtsBoardStatus({
+                httpStatus: sc.status,
+                requestedUrl: origU,
+                finalUrl: typeof sc.body.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+                jobCount: boardRecs.length,
+              });
+              if (typeof sc.body.total === 'number') discEntry.total = sc.body.total;
+              discEntry.returned = boardRecs.length;
+              discEntry.truncated = Boolean(sc.body.truncated);
+            }
+            let defaultSource = extId === 'icims' ? 'icims' : 'ukg-paylocity-dover';
+            if (extId === 'ukg-paylocity-dover') {
+              if (/ultipro\.com/i.test(origU)) defaultSource = 'ukg';
+              else if (/paylocity\.com/i.test(origU)) defaultSource = 'paylocity';
+              else if (/dover\.(?:com|io)/i.test(origU)) defaultSource = 'dover';
+            }
+            sourcesUsed.add(`ats:${defaultSource}`);
+            resolvedAdapterIds.add(extId);
+            for (const rc of boardRecs) {
               const rTitle = typeof rc.title === 'string' ? rc.title.trim() : '';
-              const rUrl = typeof rc.url === 'string' ? rc.url.trim() : '';
+              const rUrl =
+                typeof rc.url === 'string' && rc.url.trim()
+                  ? rc.url.trim()
+                  : typeof rc.applyUrl === 'string'
+                    ? rc.applyUrl.trim()
+                    : '';
               if (!rTitle || !rUrl) continue;
+              if (isVerifiedBoard) {
+                verifiedBoardJobUrls.add(rUrl.replace(/\/+$/, '').toLowerCase());
+              }
+              const rApplyUrl = typeof rc.applyUrl === 'string' && rc.applyUrl.trim() ? rc.applyUrl.trim() : rUrl;
               const rLoc =
                 typeof rc.location === 'string'
                   ? rc.location.trim()
                   : Array.isArray(rc.locations) && typeof rc.locations[0] === 'string'
                     ? rc.locations[0].trim()
                     : '';
-              const rSalary = typeof rc.salary === 'string' ? rc.salary : typeof rc.payRaw === 'string' ? rc.payRaw : '';
+              const rComp = typeof rc.company === 'string' && rc.company.trim() ? rc.company.trim() : boardCoFallback;
+              const rDesc = typeof rc.description === 'string' ? rc.description.trim() : '';
+              const payText = [rc.salary, rc.payRaw, rc.compensation, rDesc, rTitle]
+                .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+                .join(' ');
+              const rSource = typeof rc.source === 'string' && rc.source.trim() ? rc.source.trim() : defaultSource;
               collected.push({
                 title: rTitle,
-                company: icimsCo,
+                company: rComp,
                 url: rUrl,
-                applyUrl: rUrl,
-                workplaceType: inferWorkdayWorkplaceType('', rLoc, rTitle),
+                applyUrl: rApplyUrl,
+                workplaceType: inferWorkdayWorkplaceType(rDesc, rLoc, rTitle),
                 locations: rLoc ? [rLoc] : [],
-                pay: rSalary ? parsePayFromText(rSalary) : null,
+                pay: payText ? parsePayFromText(payText) : null,
                 postedAt: typeof rc.postedAt === 'string' ? rc.postedAt : null,
-                source: 'icims',
+                source: rSource,
+                ...(rDesc ? { snippet: rDesc.slice(0, 240) } : {}),
               });
             }
             continue;
@@ -2594,7 +2706,11 @@ export async function executeJobsCall(params: {
       allowedCompanyTokens.add(companyFilter);
       for (const expanded of expandCompanyFilterTokens(companyFilter)) allowedCompanyTokens.add(expanded);
     }
-    for (const dom of domainsInput) allowedCompanyTokens.add(dom);
+    for (const dom of domainsInput) {
+      allowedCompanyTokens.add(dom);
+      const explicitWd = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(dom);
+      if (explicitWd?.[1]) allowedCompanyTokens.add(explicitWd[1].toLowerCase());
+    }
     for (const db of discoveredBoards) {
       const isVerifiedFirstPartyLink =
         Boolean(db.discoveredFrom) &&
@@ -2605,17 +2721,22 @@ export async function executeJobsCall(params: {
         if (rootSlug) allowedCompanyTokens.add(rootSlug);
       }
     }
-    const allowedBoardPrefixes = discoveredBoards
-      .filter(
-        (b) =>
-          Boolean(b.discoveredFrom) &&
-          !b.discoveredFrom.startsWith('slug-probe:') &&
-          !b.discoveredFrom.startsWith('search:') &&
-          b.boardStatus !== 'not_found' &&
-          b.boardStatus !== 'budget_exhausted' &&
-          b.boardUrl,
-      )
-      .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase());
+    const allowedBoardPrefixes = [
+      ...new Set([
+        ...discoveredBoards
+          .filter(
+            (b) =>
+              Boolean(b.discoveredFrom) &&
+              !b.discoveredFrom.startsWith('slug-probe:') &&
+              !b.discoveredFrom.startsWith('search:') &&
+              b.boardStatus !== 'not_found' &&
+              b.boardStatus !== 'budget_exhausted' &&
+              b.boardUrl,
+          )
+          .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase()),
+        ...verifiedBoardJobUrls,
+      ]),
+    ];
 
     const rankOut = callCoreWasm<{
       finalIndices: Array<{ index: number; matchedOn: 'phrase' | 'all_tokens' | 'company_filter'; payUnknown?: boolean }>;

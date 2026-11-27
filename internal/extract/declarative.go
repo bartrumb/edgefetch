@@ -472,6 +472,7 @@ type DeclarativeCodeByPathSpec struct {
 // DeclarativeExtractSpec defines how a JSON, XML, or text twin payload is converted into Markdown and metadata.
 type DeclarativeExtractSpec struct {
 	CommerceMode            string              `json:"commerceMode,omitempty"`
+	JSONMode                string              `json:"jsonMode,omitempty"`
 	IcimsPortal             bool                `json:"icimsPortal,omitempty"`
 	TextMode                string              `json:"textMode,omitempty"`
 	PathParam               string              `json:"pathParam,omitempty"`
@@ -517,6 +518,7 @@ type DeclarativeExtractSpec struct {
 	Sections              []DeclarativeSectionSpec      `json:"sections,omitempty"`
 	LinksVars             []string                      `json:"linksVars,omitempty"`
 	LinkTemplates         []string                      `json:"linkTemplates,omitempty"`
+	RecordFields          map[string]string             `json:"recordFields,omitempty"`
 }
 
 // DeclarativeRouteSpec pairs a URL match specification with its twin fetch and extraction contract.
@@ -761,9 +763,13 @@ var approvedWildcardDomainPatternsGo = map[string]bool{
 	"careers.*.com":       true,
 	"jobs.*.com":          true,
 	"*.myshopify.com":     true,
+	"*.mybigcommerce.com": true,
 	"*.socrata.com":       true,
 	"*.stackexchange.com": true,
 	"*.teamtailor.com":    true,
+	"*.zendesk.com":       true,
+	"*.giant-bicycles.com": true,
+	"*.liv-cycling.com":   true,
 }
 
 var reservedCoreATSDomainsGo = map[string]bool{
@@ -773,17 +779,21 @@ var reservedCoreATSDomainsGo = map[string]bool{
 }
 
 var approvedCrossDomainTwinHostsGo = map[string]map[string]bool{
-	"doi-crossref": {"api.crossref.org": true},
-	"hackernews":   {"hn.algolia.com": true, "hacker-news.firebaseio.com": true},
-	"jazzhr":       {"app.jazz.co": true},
-	"npm-registry": {"registry.npmjs.org": true},
-	"pubmed-pmc":   {"www.ebi.ac.uk": true},
+	"cpsc-recalls":  {"www.saferproducts.gov": true},
+	"doi-crossref":  {"api.crossref.org": true},
+	"hackernews":    {"hn.algolia.com": true, "hacker-news.firebaseio.com": true},
+	"jazzhr":        {"app.jazz.co": true},
+	"maven-central": {"search.maven.org": true},
+	"npm-registry":  {"registry.npmjs.org": true},
+	"osv-ghsa":      {"api.osv.dev": true},
+	"pubmed-pmc":    {"www.ebi.ac.uk": true},
 }
 
 var approvedSAPATSExactExemptionsGo = map[string]bool{
 	"enterprise-ats:jobs.smartrecruiters.com": true,
 	"enterprise-ats:jobs.jobvite.com":         true,
 	"gem-ats:jobs.gem.com":                    true,
+	"ukg-paylocity-dover:jobs.dover.com":      true,
 }
 
 func claimedRegistrableDomainsGo(domains []string) map[string]bool {
@@ -1851,26 +1861,7 @@ func normalizeDeclarativeAccept(kind, rawAccept string) string {
 }
 
 func isSafePublicHostnameGo(h string) bool {
-	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") ||
-		strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".internal") ||
-		strings.HasSuffix(h, ".nip.io") || strings.HasSuffix(h, ".sslip.io") || strings.HasSuffix(h, ".xip.io") ||
-		!strings.Contains(h, ".") || strings.Contains(h, ":") {
-		return false
-	}
-	if net.ParseIP(h) != nil {
-		return false
-	}
-	labels := strings.Split(h, ".")
-	for _, l := range labels {
-		if l == "" {
-			return false
-		}
-	}
-	tld := labels[len(labels)-1]
-	if tld[0] >= '0' && tld[0] <= '9' {
-		return false
-	}
-	return true
+	return IsSafePublicHostname(h)
 }
 
 // IsSafeDeclarativeTwinURL reports whether raw is a safe public HTTPS declarative twin URL.
@@ -2059,21 +2050,20 @@ func applyParamTransformGo(val, transform string) string {
 			return "0"
 		}
 		return stripped
+	case "leading_digits":
+		i := 0
+		for i < len(val) && val[i] >= '0' && val[i] <= '9' {
+			i++
+		}
+		return val[:i]
+	case "strip_dashes":
+		return strings.ReplaceAll(val, "-", "")
 	default:
 		return val
 	}
 }
 
 func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, rawParts []string) (map[string]string, bool) {
-	if len(spec.AnyOf) > 0 {
-		for _, sub := range spec.AnyOf {
-			if params, ok := matchDeclarativeRoute(sub, u, host, rawParts); ok {
-				return params, true
-			}
-		}
-		return nil, false
-	}
-
 	if len(spec.Hosts) > 0 {
 		matchedHost := false
 		for _, hp := range spec.Hosts {
@@ -2093,52 +2083,6 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 	}
 	if spec.SocrataHost && !isLikelySocrataHostGo(host) {
 		return nil, false
-	}
-
-	params := map[string]string{
-		"host":   host,
-		"origin": "https://" + host,
-	}
-	for k, v := range spec.Defaults {
-		params[k] = v
-	}
-
-	if spec.HostSubdomain != nil {
-		suf := strings.ToLower(spec.HostSubdomain.Suffix)
-		if !strings.HasSuffix(host, suf) || len(host) <= len(suf) {
-			return nil, false
-		}
-		sub := host[:len(host)-len(suf)]
-		if spec.HostSubdomain.StripOptional2LetterRegion {
-			if dotIdx := strings.LastIndexByte(sub, '.'); dotIdx > 0 && len(sub)-dotIdx-1 == 2 {
-				sub = sub[:dotIdx]
-			}
-		}
-		if !validateDeclarativeParam(sub, "alnum_dash", nil, spec.HostSubdomain.Reserved, 1, 80) {
-			return nil, false
-		}
-		params[spec.HostSubdomain.Param] = sub
-	}
-
-	if spec.HostMap != nil {
-		normH := host
-		if spec.HostMap.StripWww {
-			normH = strings.TrimPrefix(normH, "www.")
-		}
-		mapped := spec.HostMap.Exact[normH]
-		if mapped == "" && spec.HostMap.SuffixSubdomain != "" {
-			suf := strings.ToLower(spec.HostMap.SuffixSubdomain)
-			if strings.HasSuffix(normH, suf) && len(normH) > len(suf) {
-				sub := normH[:len(normH)-len(suf)]
-				if validateDeclarativeParam(sub, "pkg", nil, nil, 1, 80) {
-					mapped = sub
-				}
-			}
-		}
-		if mapped == "" {
-			return nil, false
-		}
-		params[spec.HostMap.Param] = mapped
 	}
 
 	pathLower := strings.ToLower(u.Path)
@@ -2201,6 +2145,66 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 				}
 			}
 		}
+	}
+
+	if len(spec.AnyOf) > 0 {
+		for _, sub := range spec.AnyOf {
+			if subParams, ok := matchDeclarativeRoute(sub, u, host, activeParts); ok {
+				for k, v := range spec.Defaults {
+					if _, exists := subParams[k]; !exists {
+						subParams[k] = v
+					}
+				}
+				return subParams, true
+			}
+		}
+		return nil, false
+	}
+
+	params := map[string]string{
+		"host":   host,
+		"origin": "https://" + host,
+	}
+	for k, v := range spec.Defaults {
+		params[k] = v
+	}
+
+	if spec.HostSubdomain != nil {
+		suf := strings.ToLower(spec.HostSubdomain.Suffix)
+		if !strings.HasSuffix(host, suf) || len(host) <= len(suf) {
+			return nil, false
+		}
+		sub := host[:len(host)-len(suf)]
+		if spec.HostSubdomain.StripOptional2LetterRegion {
+			if dotIdx := strings.LastIndexByte(sub, '.'); dotIdx > 0 && len(sub)-dotIdx-1 == 2 {
+				sub = sub[:dotIdx]
+			}
+		}
+		if !validateDeclarativeParam(sub, "alnum_dash", nil, spec.HostSubdomain.Reserved, 1, 80) {
+			return nil, false
+		}
+		params[spec.HostSubdomain.Param] = sub
+	}
+
+	if spec.HostMap != nil {
+		normH := host
+		if spec.HostMap.StripWww {
+			normH = strings.TrimPrefix(normH, "www.")
+		}
+		mapped := spec.HostMap.Exact[normH]
+		if mapped == "" && spec.HostMap.SuffixSubdomain != "" {
+			suf := strings.ToLower(spec.HostMap.SuffixSubdomain)
+			if strings.HasSuffix(normH, suf) && len(normH) > len(suf) {
+				sub := normH[:len(normH)-len(suf)]
+				if validateDeclarativeParam(sub, "pkg", nil, nil, 1, 80) {
+					mapped = sub
+				}
+			}
+		}
+		if mapped == "" {
+			return nil, false
+		}
+		params[spec.HostMap.Param] = mapped
 	}
 
 	if spec.AllSegmentsCharset != "" {
@@ -2367,7 +2371,11 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 		if !validateDeclarativeParam(dec, sc.Charset, nil, nil, sc.MinLen, sc.MaxLen) {
 			return nil, false
 		}
-		params[sc.Param] = applyParamTransformGo(dec, sc.Transform)
+		transformed := applyParamTransformGo(dec, sc.Transform)
+		if sc.Transform == "strip_dashes" && !validateDeclarativeParam(transformed, sc.Charset, nil, nil, sc.MinLen, sc.MaxLen) {
+			return nil, false
+		}
+		params[sc.Param] = transformed
 	}
 
 	if spec.ExactSegments != nil && spec.ExactSegments.Count != nil && spec.PathSegments == nil {
@@ -2441,7 +2449,11 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 			if !validateDeclarativeParam(candidate, ps.Charset, ps.AllowValues, ps.Reserved, ps.MinLen, ps.MaxLen) {
 				return nil, false
 			}
-			params[ps.Param] = applyParamTransformGo(candidate, ps.Transform)
+			transformed := applyParamTransformGo(candidate, ps.Transform)
+			if ps.Transform == "strip_dashes" && !validateDeclarativeParam(transformed, ps.Charset, ps.AllowValues, ps.Reserved, ps.MinLen, ps.MaxLen) {
+				return nil, false
+			}
+			params[ps.Param] = transformed
 		}
 	}
 
@@ -2452,12 +2464,21 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 			if len(keys) == 0 && qp.Name != "" {
 				keys = []string{qp.Name}
 			}
-			val := ""
-			for _, k := range keys {
-				if got := q.Get(k); got != "" {
-					val = got
-					break
+			var matchedVals []string
+			for qk, qvals := range q {
+				for _, k := range keys {
+					if strings.EqualFold(qk, k) {
+						matchedVals = append(matchedVals, qvals...)
+						break
+					}
 				}
+			}
+			if len(matchedVals) > 1 {
+				return nil, false
+			}
+			val := ""
+			if len(matchedVals) == 1 {
+				val = matchedVals[0]
 			}
 			if val == "" {
 				if qp.Optional {
@@ -2471,7 +2492,11 @@ func matchDeclarativeRoute(spec DeclarativeMatchSpec, u *url.URL, host string, r
 			if !validateDeclarativeParam(val, qp.Charset, nil, nil, qp.MinLen, qp.MaxLen) {
 				return nil, false
 			}
-			params[qp.Param] = applyParamTransformGo(val, qp.Transform)
+			transformed := applyParamTransformGo(val, qp.Transform)
+			if qp.Transform == "strip_dashes" && !validateDeclarativeParam(transformed, qp.Charset, nil, nil, qp.MinLen, qp.MaxLen) {
+				return nil, false
+			}
+			params[qp.Param] = transformed
 		}
 	}
 
@@ -2539,6 +2564,14 @@ func validateDeclarativeParam(val, charset string, allowValues, reserved []strin
 			}
 		}
 		return true
+	case "cpsc_recall_num":
+		for i := 0; i < len(val); i++ {
+			b := val[i]
+			if !isASCIIAlnum(b) && b != '-' {
+				return false
+			}
+		}
+		return true
 	case "pkg":
 		for i := 0; i < len(val); i++ {
 			b := val[i]
@@ -2598,6 +2631,29 @@ func validateDeclarativeParam(val, charset string, allowValues, reserved []strin
 		return isValidDOIRest(val)
 	case "safe_subpath":
 		return isValidSafeSubpath(val)
+	case "leading_digits_slug":
+		digitEnd := 0
+		for digitEnd < len(val) && val[digitEnd] >= '0' && val[digitEnd] <= '9' {
+			digitEnd++
+		}
+		if digitEnd == 0 || digitEnd > 20 {
+			return false
+		}
+		if digitEnd == len(val) {
+			return true
+		}
+		if val[digitEnd] != '-' || digitEnd+1 >= len(val) {
+			return false
+		}
+		return validateDeclarativeParam(val[digitEnd+1:], "url_seg", nil, nil, 1, 200)
+	case "brew_id":
+		for i := 0; i < len(val); i++ {
+			b := val[i]
+			if !isASCIIAlnum(b) && b != '_' && b != '+' && b != '@' && b != '.' && b != '-' {
+				return false
+			}
+		}
+		return val != "." && val != ".."
 	default:
 		return false
 	}
@@ -2712,6 +2768,23 @@ func encodeURIComponent(s string) string {
 	return sb.String()
 }
 
+func encodePathPcharSegment(s string) string {
+	const hexUpper = "0123456789ABCDEF"
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if isASCIIAlnum(b) || b == '-' || b == '_' || b == '.' || b == '!' || b == '~' || b == '*' || b == '\'' || b == '(' || b == ')' || b == '@' || b == '+' {
+			sb.WriteByte(b)
+		} else {
+			sb.WriteByte('%')
+			sb.WriteByte(hexUpper[b>>4])
+			sb.WriteByte(hexUpper[b&0x0f])
+		}
+	}
+	return sb.String()
+}
+
 func encodeSafeSubpath(val string) string {
 	parts := strings.Split(val, "/")
 	out := make([]string, 0, len(parts))
@@ -2719,13 +2792,216 @@ func encodeSafeSubpath(val string) string {
 		if p == "" || p == "." || p == ".." {
 			continue
 		}
-		out = append(out, encodeURIComponent(p))
+		out = append(out, encodePathPcharSegment(p))
 	}
 	return strings.Join(out, "/")
 }
 
 func isIdentChar(b byte) bool {
 	return isASCIIAlnum(b) || b == '_'
+}
+
+func sanitizeDeclInlineCodeVal(val string) string {
+	return strings.NewReplacer(
+		"`", "'",
+		"\r", " ",
+		"\n", " ",
+		"|", "&#124;",
+	).Replace(val)
+}
+
+func isDeclarativeVarMarkdownFormatted(topVars, itemVars map[string]DeclarativeVarSpec, varName string, depth int) bool {
+	if varName == "" || depth > 4 {
+		return false
+	}
+	spec, ok := itemVars[varName]
+	if !ok {
+		spec, ok = topVars[varName]
+	}
+	if !ok {
+		return false
+	}
+	if spec.Format == "html_to_md" || spec.Format == "se_markdown" {
+		return true
+	}
+	if spec.FallbackVar != "" && isDeclarativeVarMarkdownFormatted(topVars, itemVars, spec.FallbackVar, depth+1) {
+		return true
+	}
+	if strings.HasPrefix(spec.Template, "{") && strings.HasSuffix(spec.Template, "}") && strings.Count(spec.Template, "{") == 1 {
+		inner := spec.Template[1 : len(spec.Template)-1]
+		if isDeclarativeVarMarkdownFormatted(topVars, itemVars, inner, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func escapeDeclMarkdownBrackets(val string) string {
+	clean := neutralizeAllUnsafeMarkdownLinksLinearGo(val)
+	return strings.NewReplacer(
+		"\r", " ",
+		"\n", " ",
+		"](", `\]\(`,
+		"[", `\[`,
+		"]", `\]`,
+	).Replace(clean)
+}
+
+func escapeUnescapedMarkdownBracketsGo(val string) string {
+	clean := neutralizeAllUnsafeMarkdownLinksLinearGo(val)
+	if !strings.ContainsAny(clean, "\r\n[]") {
+		return clean
+	}
+	var sb strings.Builder
+	sb.Grow(len(clean) + 8)
+	n := len(clean)
+	for i := 0; i < n; i++ {
+		c := clean[i]
+		if c == '\r' || c == '\n' {
+			sb.WriteByte(' ')
+			continue
+		}
+		if c == '[' || c == ']' {
+			if !isBackslashEscapedAt(clean, i) {
+				sb.WriteByte('\\')
+			}
+			sb.WriteByte(c)
+			if c == ']' && i+1 < n && clean[i+1] == '(' {
+				sb.WriteString(`\(`)
+				i++
+			}
+			continue
+		}
+		sb.WriteByte(c)
+	}
+	return sb.String()
+}
+
+func escapeDeclMarkdownBlock(val string) string {
+	out := strings.TrimSpace(escapeDeclMarkdownBrackets(val))
+	if strings.HasPrefix(out, "#") {
+		out = `\` + out
+	}
+	return out
+}
+
+func escapeDeclPlainTextPreservingNewlines(val string) string {
+	norm := strings.ReplaceAll(strings.ReplaceAll(val, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(norm, "\n")
+	for i, line := range lines {
+		escaped := neutralizeAllUnsafeMarkdownLinksLinearGo(line)
+		escaped = strings.NewReplacer(
+			"](", `\]\(`,
+			"[", `\[`,
+			"]", `\]`,
+		).Replace(escaped)
+		escaped = strings.ReplaceAll(escaped, "<", "&lt;")
+		trimmedLeft := strings.TrimLeft(escaped, " \t")
+		if strings.HasPrefix(trimmedLeft, "#") {
+			leadingLen := len(escaped) - len(trimmedLeft)
+			escaped = escaped[:leadingLen] + `\` + trimmedLeft
+		}
+		lines[i] = escaped
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func sanitizeDeclLinkURLVal(val string) string {
+	cleaned := strings.NewReplacer("\r", "", "\n", "", "\t", "", " ", "%20").Replace(strings.TrimSpace(val))
+	return PercentEncodeUnsafeRecordURLChars(cleaned)
+}
+
+func expandSafeMarkdownTemplate(tmpl string, lookup func(string) string, isComposedVar func(string) bool) string {
+	var sb strings.Builder
+	sb.Grow(len(tmpl) + 16)
+	n := len(tmpl)
+	i := 0
+	for i < n {
+		if tmpl[i] == '`' {
+			end := strings.IndexByte(tmpl[i+1:], '`')
+			if end >= 0 {
+				inner := tmpl[i+1 : i+1+end]
+				expanded := expandTemplate(inner, func(k string) string {
+					v := lookup(k)
+					if isComposedVar != nil && isComposedVar(k) {
+						return v
+					}
+					return sanitizeDeclInlineCodeVal(v)
+				})
+				sb.WriteByte('`')
+				sb.WriteString(expanded)
+				sb.WriteByte('`')
+				i += end + 2
+				continue
+			}
+		}
+		if tmpl[i] == '[' {
+			mid := -1
+			for j := i + 1; j < n; j++ {
+				if tmpl[j] == '\n' || tmpl[j] == '[' {
+					break
+				}
+				if tmpl[j] == ']' {
+					if j+1 < n && tmpl[j+1] == '(' {
+						mid = j
+					}
+					break
+				}
+			}
+			if mid > i {
+				closeIdx := -1
+				for j := mid + 2; j < n; j++ {
+					if tmpl[j] == '\n' || tmpl[j] == '(' || tmpl[j] == '`' {
+						break
+					}
+					if tmpl[j] == ')' {
+						closeIdx = j
+						break
+					}
+				}
+				if closeIdx > mid+2 {
+					labelTpl := tmpl[i+1 : mid]
+					urlTpl := tmpl[mid+2 : closeIdx]
+					labelVal := strings.TrimSpace(expandSafeMarkdownTemplate(labelTpl, lookup, isComposedVar))
+					urlVal := strings.TrimSpace(expandTemplate(urlTpl, func(k string) string {
+						return sanitizeDeclLinkURLVal(lookup(k))
+					}))
+					if (strings.HasPrefix(urlVal, "https://") || strings.HasPrefix(urlVal, "http://")) &&
+						!strings.ContainsAny(urlVal, "<>\"' \t\r\n") {
+						sb.WriteByte('[')
+						sb.WriteString(labelVal)
+						sb.WriteString("](")
+						sb.WriteString(urlVal)
+						sb.WriteByte(')')
+					} else {
+						sb.WriteString(labelVal)
+					}
+					i = closeIdx + 1
+					continue
+				}
+			}
+		}
+		if tmpl[i] == '{' {
+			j := i + 1
+			for j < n && isIdentChar(tmpl[j]) {
+				j++
+			}
+			if j > i+1 && j < n && tmpl[j] == '}' {
+				k := tmpl[i+1 : j]
+				val := lookup(k)
+				if isComposedVar != nil && isComposedVar(k) {
+					sb.WriteString(val)
+				} else {
+					sb.WriteString(escapeDeclMarkdownBrackets(val))
+				}
+				i = j + 1
+				continue
+			}
+		}
+		sb.WriteByte(tmpl[i])
+		i++
+	}
+	return sb.String()
 }
 
 func expandTemplate(tmpl string, lookup func(string) string) string {
@@ -3028,30 +3304,62 @@ func findAllLinearElementInnersGo(src, tagName string, maxItems int) []string {
 	return out
 }
 
+func hasUnsafeFeedURLCharsGo(u string) bool {
+	for i := 0; i < len(u); i++ {
+		c := u[i]
+		if c <= 0x20 || c == 0x7f || c == '(' || c == ')' || c == '[' || c == ']' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '`' || c == '\\' {
+			return true
+		}
+		if c >= 0x80 {
+			for _, r := range u[i:] {
+				if isIgnorableURIRuneGo(r) {
+					return true
+				}
+			}
+			break
+		}
+	}
+	return false
+}
+
 func isSafePublicHTTPSFeedURL(raw string) bool {
 	s := strings.TrimSpace(raw)
 	if !strings.HasPrefix(s, "https://") || len(s) > 2048 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c <= 0x20 || c == 0x7f || c == '(' || c == ')' || c == '[' || c == ']' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '`' || c == '\\' {
+	if hasUnsafeFeedURLCharsGo(s) {
+		return false
+	}
+	checkParsed := func(target string) bool {
+		u, err := url.Parse(target)
+		if err != nil || u.Scheme != "https" || u.User != nil {
 			return false
 		}
+		if port := u.Port(); port != "" && port != "443" {
+			return false
+		}
+		host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		if !isSafePublicHostnameGo(host) {
+			return false
+		}
+		if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+			return politeness.IsPublicIP(ip)
+		}
+		return true
 	}
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.User != nil {
+	if !checkParsed(s) {
 		return false
 	}
-	if port := u.Port(); port != "" && port != "443" {
-		return false
-	}
-	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
-	if !isSafePublicHostnameGo(host) {
-		return false
-	}
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
-		return politeness.IsPublicIP(ip)
+	if strings.IndexByte(s, '&') >= 0 {
+		decoded := decodeURIEntitiesLinearGo(s)
+		if decoded != s {
+			if !strings.HasPrefix(decoded, "https://") || len(decoded) > 2048 || hasUnsafeFeedURLCharsGo(decoded) {
+				return false
+			}
+			if !checkParsed(decoded) {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -3104,40 +3412,40 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 	}
 
 	if xmlSpec.Mode == "jats_article" {
-		title := extractXMLTagTextGo(clean, "article-title")
+		title := SanitizeScrapedMeta(extractXMLTagTextGo(clean, "article-title"))
 		if title == "" {
 			return nil, false
 		}
-		abs := extractXMLTagTextGo(clean, "abstract")
+		abs := SanitizeScrapedMeta(extractXMLTagTextGo(clean, "abstract"))
 		bodyInner, _, _ := findLinearElementInnerGo(clean, "body", 0)
 		var bodyBlocks []string
 		for _, sec := range findAllLinearElementInnersGo(bodyInner, "sec", 60) {
-			secTitle := extractXMLTagTextGo(sec, "title")
+			secTitle := SanitizeScrapedMeta(extractXMLTagTextGo(sec, "title"))
 			var paras []string
 			for _, p := range findAllLinearElementInnersGo(sec, "p", 100) {
-				pt := stripTagsInlineLinear(p)
+				pt := escapeDeclMarkdownBlock(SanitizeScrapedMeta(stripTagsInlineLinear(p)))
 				if pt != "" {
 					paras = append(paras, pt)
 				}
 			}
 			if len(paras) > 0 && len(bodyBlocks) < 30 {
 				if secTitle != "" {
-					bodyBlocks = append(bodyBlocks, "## "+secTitle+"\n\n"+strings.Join(paras, "\n\n"))
+					bodyBlocks = append(bodyBlocks, "## "+escapeDeclMarkdownBrackets(secTitle)+"\n\n"+strings.Join(paras, "\n\n"))
 				} else {
 					bodyBlocks = append(bodyBlocks, strings.Join(paras, "\n\n"))
 				}
 			}
 		}
-		sections := []string{"# " + title}
-		if pmcid := params["pmcid"]; pmcid != "" {
+		sections := []string{"# " + escapeDeclMarkdownBrackets(title)}
+		if pmcid := sanitizeDeclInlineCodeVal(params["pmcid"]); pmcid != "" {
 			sections = append(sections, "- **PMCID**: `"+pmcid+"`")
 		}
 		if abs != "" {
-			sections = append(sections, "## Abstract\n\n"+abs)
+			sections = append(sections, "## Abstract\n\n"+escapeDeclMarkdownBlock(abs))
 		}
 		sections = append(sections, bodyBlocks...)
 		return &DeclarativeFormattedDoc{
-			Title:    title,
+			Title:    SanitizeScrapedMetadataField(title, 512),
 			Markdown: strings.Join(sections, "\n\n"),
 		}, true
 	}
@@ -3198,7 +3506,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 		}
 		return &DeclarativeFormattedDoc{
 			Title:    title,
-			Markdown: SanitizeScrapedMarkdown("# " + title + "\n\n" + xmlSpec.EmptyText),
+			Markdown: SanitizeScrapedMarkdown("# " + escapeDeclMarkdownBrackets(title) + "\n\n" + xmlSpec.EmptyText),
 		}, true
 	}
 
@@ -3262,18 +3570,18 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 				if mid > 2 && strings.Index(c.Template[mid+4:], "}") == len(c.Template)-(mid+4)-2 {
 					labelVar := c.Template[2:mid]
 					urlVar := c.Template[mid+4 : len(c.Template)-2]
-					lTxt := strings.TrimSpace(rowVars[labelVar])
+					lTxt := escapeDeclMarkdownBrackets(strings.TrimSpace(rowVars[labelVar]))
 					uTxt := strings.TrimSpace(rowVars[urlVar])
 					if isSafePublicHTTPSFeedURL(uTxt) {
-						cell = "[" + lTxt + "](" + uTxt + ")"
+						cell = "[" + lTxt + "](" + sanitizeDeclLinkURLVal(uTxt) + ")"
 					} else {
 						cell = lTxt
 					}
 				} else {
-					cell = strings.TrimSpace(expandTemplate(c.Template, func(k string) string { return rowVars[k] }))
+					cell = strings.TrimSpace(expandSafeMarkdownTemplate(c.Template, func(k string) string { return rowVars[k] }, nil))
 				}
 			} else {
-				cell = strings.TrimSpace(expandTemplate(c.Template, func(k string) string { return rowVars[k] }))
+				cell = strings.TrimSpace(expandSafeMarkdownTemplate(c.Template, func(k string) string { return rowVars[k] }, nil))
 			}
 			if cell == "" {
 				cell = "-"
@@ -3291,7 +3599,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 	}
 	return &DeclarativeFormattedDoc{
 		Title:    title,
-		Markdown: SanitizeScrapedMarkdown("# " + title + "\n\n" + formatDeclarativeGFMTable(headers, rows)),
+		Markdown: SanitizeScrapedMarkdown("# " + escapeDeclMarkdownBrackets(title) + "\n\n" + formatDeclarativeGFMTable(headers, rows)),
 		Links:    links,
 	}, true
 }
@@ -3352,10 +3660,39 @@ func (m *DeclarativeTwinMatch) formatTextTwin(rawBody string) (*DeclarativeForma
 		}
 		return m.formatJSONBytesTwin(jsonBytes, ext)
 	}
+	if ext.TextMode == "html_document" {
+		fallbackTitle := strings.TrimSpace(expandTemplate(ext.TitleTemplate, func(k string) string { return m.params[k] }))
+		cleanRaw := stripInvisibleAndNUL(rawBody)
+		trimmed := strings.TrimLeft(cleanRaw, " \t\r\n")
+		if trimmed == "" || strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") || strings.IndexByte(trimmed, '<') < 0 {
+			return nil, false
+		}
+		extDoc := ExtractHTMLDocumentFull(cleanRaw, FullExtractOptions{
+			BaseURL:         m.origURL,
+			OnlyMainContent: true,
+			IncludeImages:   true,
+		})
+		if strings.TrimSpace(extDoc.Markdown) == "" {
+			return nil, false
+		}
+		title := strings.TrimSpace(extDoc.Title)
+		if title == "" {
+			title = fallbackTitle
+		}
+		return &DeclarativeFormattedDoc{
+			Title:         title,
+			Description:   extDoc.Description,
+			Author:        extDoc.Author,
+			PublishedTime: extDoc.PublishedTime,
+			Markdown:      extDoc.Markdown,
+			Links:         extDoc.Links,
+		}, true
+	}
 	if isLikelyHTMLSoft404(rawBody) {
 		return nil, false
 	}
 	fallbackTitle := strings.TrimSpace(expandTemplate(ext.TitleTemplate, func(k string) string { return m.params[k] }))
+	safeHeadingTitle := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(fallbackTitle))
 	cleanRaw := stripInvisibleAndNUL(rawBody)
 
 	switch ext.TextMode {
@@ -3371,16 +3708,16 @@ func (m *DeclarativeTwinMatch) formatTextTwin(rawBody string) (*DeclarativeForma
 		}
 		return &DeclarativeFormattedDoc{
 			Title:    fallbackTitle,
-			Markdown: fmt.Sprintf("# %s\n\n%s", fallbackTitle, safeDeclarativeFence(cleanRaw, lang)),
+			Markdown: fmt.Sprintf("# %s\n\n%s", safeHeadingTitle, safeDeclarativeFence(cleanRaw, lang)),
 		}, true
 	default:
-		trimmed := strings.TrimSpace(cleanRaw)
+		trimmed := strings.TrimSpace(SanitizeScrapedMarkdown(cleanRaw))
 		if trimmed == "" {
 			return nil, false
 		}
 		md := trimmed
-		if fallbackTitle != "" && !strings.HasPrefix(trimmed, "# ") {
-			md = "# " + fallbackTitle + "\n\n" + trimmed
+		if safeHeadingTitle != "" && !strings.HasPrefix(trimmed, "# ") {
+			md = "# " + safeHeadingTitle + "\n\n" + trimmed
 		}
 		return &DeclarativeFormattedDoc{
 			Title:    fallbackTitle,
@@ -3694,7 +4031,33 @@ func safeCommerceHostLabelGo(origURL string) string {
 	return "store"
 }
 
-func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFormattedDoc, bool) {
+var (
+	externalCommerceModesMu sync.RWMutex
+	externalCommerceModes   = make(map[string]func(rawBytes []byte, origURL string) (*DeclarativeFormattedDoc, bool))
+)
+
+// RegisterExternalCommerceMode registers an external commerce twin formatter (e.g. from internal/catalog)
+// without creating a Go package import cycle.
+func RegisterExternalCommerceMode(mode string, fn func(rawBytes []byte, origURL string) (*DeclarativeFormattedDoc, bool)) {
+	if mode == "" || fn == nil {
+		return
+	}
+	externalCommerceModesMu.Lock()
+	externalCommerceModes[mode] = fn
+	externalCommerceModesMu.Unlock()
+}
+
+func getExternalCommerceMode(mode string) func(rawBytes []byte, origURL string) (*DeclarativeFormattedDoc, bool) {
+	externalCommerceModesMu.RLock()
+	fn := externalCommerceModes[mode]
+	externalCommerceModesMu.RUnlock()
+	return fn
+}
+
+func formatCommerceTwinGo(rawBytes []byte, mode, origURL string, fetchURL ...string) (*DeclarativeFormattedDoc, bool) {
+	if fn := getExternalCommerceMode(mode); fn != nil {
+		return fn(rawBytes, origURL)
+	}
 	parsed, ok := decodeJSONWithNumbers(rawBytes)
 	if !ok || parsed == nil {
 		return nil, false
@@ -3812,6 +4175,17 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 		prods, isArr := obj["products"].([]any)
 		if !isArr {
 			return nil, false
+		}
+		if len(prods) == 0 && len(fetchURL) > 0 {
+			if fTwin := strings.TrimSpace(fetchURL[0]); fTwin != "" && !strings.EqualFold(fTwin, strings.TrimSpace(origURL)) {
+				origPath := ""
+				if ou, errO := url.Parse(strings.TrimSpace(origURL)); errO == nil {
+					origPath = ou.Path
+				}
+				if !strings.HasSuffix(strings.ToLower(origPath), ".json") {
+					return nil, false
+				}
+			}
 		}
 		host := safeCommerceHostLabelGo(origURL)
 		title := fmt.Sprintf("%s — Shopify Catalog Inventory (%d products)", host, len(prods))
@@ -4006,7 +4380,13 @@ func (m *DeclarativeTwinMatch) formatJSONTwin(rawBody string, ext DeclarativeExt
 
 func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext DeclarativeExtractSpec) (*DeclarativeFormattedDoc, bool) {
 	if ext.CommerceMode != "" {
-		return formatCommerceTwinGo(rawBytes, ext.CommerceMode, m.origURL)
+		return formatCommerceTwinGo(rawBytes, ext.CommerceMode, m.origURL, m.FetchURL)
+	}
+	if ext.JSONMode == "nuget_registration" {
+		return formatNuGetRegistrationJSONGo(rawBytes, m.params, m.origURL)
+	}
+	if ext.JSONMode == "paylocity_feed" {
+		return formatPaylocityFeedJSONGo(rawBytes, m.params, m.origURL)
 	}
 	parsed, ok := decodeJSONWithNumbers(rawBytes)
 	if !ok || parsed == nil {
@@ -4149,10 +4529,22 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 	}
 
 	resolved := make(map[string]string, len(ext.Vars))
+	resolvedComposed := make(map[string]bool, len(ext.Vars))
+	resolvedPlainText := make(map[string]bool, len(ext.Vars))
 	visiting := make(map[string]bool)
 
 	var lookup func(string) string
-	var evalVar func(DeclarativeVarSpec, map[string]any, func(string) string) string
+	var isTopComposed func(string) bool
+	var isTopPlainText func(string) bool
+	var evalVar func(DeclarativeVarSpec, map[string]any, func(string) string, func(string) bool, func(string) bool) (string, bool, bool)
+
+	isTopComposed = func(name string) bool {
+		return resolvedComposed[name]
+	}
+
+	isTopPlainText = func(name string) bool {
+		return resolvedPlainText[name]
+	}
 
 	lookup = func(name string) string {
 		if val, done := resolved[name]; done {
@@ -4163,9 +4555,15 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				return ""
 			}
 			visiting[name] = true
-			v := evalVar(spec, rootObj, lookup)
+			v, comp, isPlain := evalVar(spec, rootObj, lookup, isTopComposed, isTopPlainText)
 			delete(visiting, name)
 			resolved[name] = v
+			if comp {
+				resolvedComposed[name] = true
+			}
+			if isPlain {
+				resolvedPlainText[name] = true
+			}
 			return v
 		}
 		return m.params[name]
@@ -4199,8 +4597,10 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		return keys
 	}
 
-	evalVar = func(spec DeclarativeVarSpec, activeObj map[string]any, varLookup func(string) string) string {
+	evalVar = func(spec DeclarativeVarSpec, activeObj map[string]any, varLookup func(string) string, isComposedParent func(string) bool, isPlainTextParent func(string) bool) (string, bool, bool) {
 		var val string
+		composed := false
+		plainText := spec.Format == "plain_text"
 		if spec.Template != "" {
 			allPresent := true
 			for _, w := range spec.WhenVars {
@@ -4217,9 +4617,29 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				}
 			}
 			if allPresent && anyPresent {
-				val = expandTemplate(spec.Template, varLookup)
+				if strings.Contains(spec.Template, "`") || strings.Contains(spec.Template, "](") {
+					val = expandSafeMarkdownTemplate(spec.Template, varLookup, isComposedParent)
+					composed = true
+				} else {
+					val = expandTemplate(spec.Template, varLookup)
+					if strings.HasPrefix(spec.Template, "{") && strings.HasSuffix(spec.Template, "}") && strings.Count(spec.Template, "{") == 1 {
+						innerK := spec.Template[1 : len(spec.Template)-1]
+						if isComposedParent != nil && isComposedParent(innerK) {
+							composed = true
+						}
+						if isPlainTextParent != nil && isPlainTextParent(innerK) {
+							plainText = true
+						}
+					}
+				}
 			} else if spec.FallbackVar != "" {
 				val = varLookup(spec.FallbackVar)
+				if isComposedParent != nil && isComposedParent(spec.FallbackVar) {
+					composed = true
+				}
+				if isPlainTextParent != nil && isPlainTextParent(spec.FallbackVar) {
+					plainText = true
+				}
 			}
 		} else if spec.Format == "bool_map" {
 			truthy := false
@@ -4389,9 +4809,10 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 			spec.Format != "usd_compact" && spec.Format != "usd_per_million_tokens" &&
 			spec.Format != "date_parts" && spec.Format != "array_len" &&
 			spec.Format != "array_len_comma" && spec.Format != "object_keys" &&
-			spec.Format != "epoch_sec_date" && spec.Format != "bytes_human" &&
+			spec.Format != "epoch_sec_date" && spec.Format != "epoch_ms_date" && spec.Format != "bytes_human" &&
 			spec.Format != "inverted_abstract" && spec.Format != "gitlab_blob_html" &&
 			spec.Format != "html_to_md" && spec.Format != "se_markdown" &&
+			spec.Format != "plain_text" &&
 			spec.Format != "fiscal_mmdd" && spec.Format != "pubchem_toc" {
 			val = applyStringFormat(val, spec.Format)
 		}
@@ -4414,7 +4835,10 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		if spec.SliceMax > 0 && val != "" {
 			val = sliceRunesMax(val, spec.SliceMax)
 		}
-		return val
+		if val != "" && (spec.ItemWrap == "`" || strings.Contains(spec.Join, "`")) {
+			composed = true
+		}
+		return val, composed, plainText
 	}
 
 	for _, name := range sortedMapKeys(ext.Vars) {
@@ -4456,7 +4880,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		}
 		return &DeclarativeFormattedDoc{
 			Title:    title,
-			Markdown: fmt.Sprintf("# %s\n\n%s", title, safeDeclarativeFence(plain, lang)),
+			Markdown: fmt.Sprintf("# %s\n\n%s", escapeDeclMarkdownBrackets(title), safeDeclarativeFence(plain, lang)),
 		}, true
 	}
 
@@ -4478,7 +4902,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		if ml.UnlessVar != "" && lookup(ml.UnlessVar) != "" {
 			continue
 		}
-		rendered := strings.TrimSpace(expandTemplate(ml.Template, lookup))
+		rendered := strings.TrimSpace(expandSafeMarkdownTemplate(ml.Template, lookup, isTopComposed))
 		if rendered != "" {
 			if ml.Label != "" {
 				metaParts = append(metaParts, fmt.Sprintf("**%s**: %s", ml.Label, rendered))
@@ -4496,7 +4920,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		if b.UnlessVar != "" && lookup(b.UnlessVar) != "" {
 			continue
 		}
-		rendered := strings.TrimSpace(expandTemplate(b.Template, lookup))
+		rendered := strings.TrimSpace(expandSafeMarkdownTemplate(b.Template, lookup, isTopComposed))
 		if rendered != "" {
 			if b.Label != "" {
 				bulletLines = append(bulletLines, fmt.Sprintf("- **%s**: %s", b.Label, rendered))
@@ -4512,9 +4936,10 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				ordered = ordered[:50]
 			}
 			for _, label := range ordered {
-				href, isStr := linksObj[label].(string)
-				if isStr && strings.HasPrefix(href, "https://") && !strings.ContainsAny(href, " \t\r\n<>") {
-					bulletLines = append(bulletLines, fmt.Sprintf("- **%s**: %s", SanitizeScrapedMeta(label), href))
+				rawHref, isStr := linksObj[label].(string)
+				href := strings.TrimSpace(rawHref)
+				if isStr && isSafePublicHTTPSFeedURL(href) {
+					bulletLines = append(bulletLines, fmt.Sprintf("- **%s**: %s", escapeDeclMarkdownBrackets(SanitizeScrapedMeta(label)), sanitizeDeclLinkURLVal(href)))
 				}
 			}
 		}
@@ -4522,22 +4947,32 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 
 	blockquote := ""
 	if ext.BlockquoteTemplate != "" && (ext.BlockquoteWhenVar == "" || lookup(ext.BlockquoteWhenVar) != "") {
-		blockquote = strings.TrimSpace(expandTemplate(ext.BlockquoteTemplate, lookup))
+		blockquote = strings.TrimSpace(expandSafeMarkdownTemplate(ext.BlockquoteTemplate, lookup, isTopComposed))
 	}
 	footerItalic := ""
 	if ext.FooterItalicTemplate != "" && (ext.FooterItalicWhenVar == "" || lookup(ext.FooterItalicWhenVar) != "") {
-		footerItalic = strings.TrimSpace(expandTemplate(ext.FooterItalicTemplate, lookup))
+		rawFooter := strings.TrimSpace(expandSafeMarkdownTemplate(ext.FooterItalicTemplate, lookup, isTopComposed))
+		footerItalic = strings.NewReplacer("\r", " ", "\n", " ", "*", `\*`).Replace(rawFooter)
 	}
 	intro := ""
 	if ext.IntroVar != "" {
 		intro = strings.TrimSpace(lookup(ext.IntroVar))
+		if intro != "" && !isTopComposed(ext.IntroVar) && !isDeclarativeVarMarkdownFormatted(ext.Vars, nil, ext.IntroVar, 0) {
+			intro = escapeDeclMarkdownBlock(intro)
+		}
 	}
 	bodyText := ""
 	if ext.BodyVar != "" {
 		bodyText = strings.TrimSpace(lookup(ext.BodyVar))
+		if bodyText != "" && !isTopComposed(ext.BodyVar) {
+			if isTopPlainText(ext.BodyVar) {
+				bodyText = escapeDeclPlainTextPreservingNewlines(bodyText)
+			}
+		}
 	}
 
 	var renderedSections []string
+	var collectedRecords []map[string]any
 	for _, sec := range ext.Sections {
 		if sec.WhenVar != "" && lookup(sec.WhenVar) == "" {
 			continue
@@ -4553,17 +4988,20 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 			if tpl == "" {
 				return ""
 			}
-			return SanitizeScrapedMeta(expandTemplate(tpl, func(k string) string {
+			return escapeDeclMarkdownBrackets(SanitizeScrapedMeta(expandTemplate(tpl, func(k string) string {
 				if v, okE := extra[k]; okE {
 					return v
 				}
 				return lookup(k)
-			}))
+			})))
 		}
 
 		if sec.TextVar != "" {
 			txt := strings.TrimSpace(lookup(sec.TextVar))
 			if txt != "" {
+				if !isTopComposed(sec.TextVar) && !isDeclarativeVarMarkdownFormatted(ext.Vars, nil, sec.TextVar, 0) {
+					txt = escapeDeclMarkdownBlock(txt)
+				}
 				h := resolveHeading(nil)
 				if h != "" {
 					renderedSections = append(renderedSections, fmt.Sprintf("## %s\n\n%s", h, txt))
@@ -4603,11 +5041,11 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 					if strings.TrimSpace(cHTML) == "" {
 						continue
 					}
-					cAuth := SanitizeScrapedMeta(jsonScalarToString(getByDotPath(co, tc.AuthorPath)))
+					cAuth := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(jsonScalarToString(getByDotPath(co, tc.AuthorPath))))
 					if cAuth == "" {
 						cAuth = "user"
 					}
-					cTxt := stripTagsInlineLinear(cHTML)
+					cTxt := escapeDeclMarkdownBlock(SanitizeScrapedMeta(stripTagsInlineLinear(cHTML)))
 					if cTxt != "" {
 						indDepth := depth
 						if indDepth > 4 {
@@ -4916,11 +5354,19 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		sliced := rawArr[:lim]
 
 		secItemVarKeys := sortedMapKeys(sec.ItemVars)
-		evalRowMap := func(itemObj map[string]any, idx int) map[string]string {
+		evalRowMap := func(itemObj map[string]any, idx int) (map[string]string, map[string]bool) {
 			itemMap := make(map[string]string, len(sec.ItemVars)+1)
+			itemComposed := make(map[string]bool, len(sec.ItemVars))
 			itemMap["index1"] = strconv.Itoa(idx + 1)
 			rowVisiting := make(map[string]bool, len(sec.ItemVars))
 			var rowLookup func(string) string
+			var isRowComposed func(string) bool
+			isRowComposed = func(k string) bool {
+				if _, isRowVar := itemMap[k]; isRowVar {
+					return itemComposed[k]
+				}
+				return isTopComposed(k)
+			}
 			rowLookup = func(k string) string {
 				if v, has := itemMap[k]; has {
 					return v
@@ -4930,9 +5376,12 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 						return ""
 					}
 					rowVisiting[k] = true
-					v := evalVar(ivSpec, itemObj, rowLookup)
+					v, comp, _ := evalVar(ivSpec, itemObj, rowLookup, isRowComposed, nil)
 					delete(rowVisiting, k)
 					itemMap[k] = v
+					if comp {
+						itemComposed[k] = true
+					}
 					return v
 				}
 				return lookup(k)
@@ -4940,7 +5389,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 			for _, ivName := range secItemVarKeys {
 				_ = rowLookup(ivName)
 			}
-			return itemMap
+			return itemMap, itemComposed
 		}
 
 		if len(sec.Columns) > 0 {
@@ -4950,7 +5399,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 			}
 			var rows [][]string
 			for i, itemObj := range sliced {
-				itemMap := evalRowMap(itemObj, i)
+				itemMap, itemComposed := evalRowMap(itemObj, i)
 				if sec.RequireItemVar != "" && strings.TrimSpace(itemMap[sec.RequireItemVar]) == "" {
 					continue
 				}
@@ -4960,12 +5409,30 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 					}
 					return lookup(k)
 				}
+				isRowComposed := func(k string) bool {
+					if _, has := itemMap[k]; has {
+						return itemComposed[k]
+					}
+					return isTopComposed(k)
+				}
 				for _, lv := range sec.CollectLinkVars {
 					pushLink(itemMap[lv])
 				}
+				if len(sec.RecordFields) > 0 {
+					rec := make(map[string]any, len(sec.RecordFields))
+					for _, rk := range sortedMapKeys(sec.RecordFields) {
+						val := strings.TrimSpace(expandTemplate(sec.RecordFields[rk], rowLookup))
+						if val != "" {
+							rec[rk] = val
+						}
+					}
+					if len(rec) > 0 {
+						collectedRecords = append(collectedRecords, rec)
+					}
+				}
 				row := make([]string, len(sec.Columns))
 				for cIdx, col := range sec.Columns {
-					row[cIdx] = renderTableColumnCell(itemObj, col, rowLookup)
+					row[cIdx] = renderTableColumnCell(itemObj, col, rowLookup, isRowComposed)
 				}
 				rows = append(rows, row)
 			}
@@ -4983,7 +5450,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 
 		if sec.SubsectionsArrayPath != "" {
 			for i, itemObj := range sliced {
-				itemMap := evalRowMap(itemObj, i)
+				itemMap, _ := evalRowMap(itemObj, i)
 				if sec.RequireItemVar != "" && strings.TrimSpace(itemMap[sec.RequireItemVar]) == "" {
 					continue
 				}
@@ -4997,7 +5464,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				if sec.SubsectionAltWhenVar != "" && rowLookup(sec.SubsectionAltWhenVar) != "" && sec.SubsectionAltHeadingTemplate != "" {
 					headTpl = sec.SubsectionAltHeadingTemplate
 				}
-				subH := SanitizeScrapedMeta(expandTemplate(headTpl, rowLookup))
+				subH := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(expandTemplate(headTpl, rowLookup)))
 				if len(sec.SubsectionSubkeys) > 0 {
 					var subLines []string
 					if subH != "" {
@@ -5012,7 +5479,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 							txt = strings.TrimSpace(s)
 						}
 						if txt != "" {
-							subLines = append(subLines, "### "+strings.ReplaceAll(sk, "_", " ")+"\n\n"+sliceRunesMax(txt, 1200))
+							subLines = append(subLines, "### "+strings.ReplaceAll(sk, "_", " ")+"\n\n"+escapeDeclMarkdownBrackets(sliceRunesMax(txt, 1200)))
 						}
 					}
 					if len(subLines) > 1 {
@@ -5021,6 +5488,9 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				} else if sec.SubsectionBodyVar != "" {
 					bodyVal := strings.TrimSpace(rowLookup(sec.SubsectionBodyVar))
 					if bodyVal != "" {
+						if !isDeclarativeVarMarkdownFormatted(ext.Vars, sec.ItemVars, sec.SubsectionBodyVar, 0) {
+							bodyVal = escapeDeclMarkdownBrackets(bodyVal)
+						}
 						if subH != "" {
 							renderedSections = append(renderedSections, fmt.Sprintf("## %s\n\n%s", subH, bodyVal))
 						} else {
@@ -5043,12 +5513,30 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				lines = append(lines, "## "+h)
 			}
 			for i, itemObj := range sliced {
-				itemMap := evalRowMap(itemObj, i)
+				itemMap, itemComposed := evalRowMap(itemObj, i)
 				if sec.RequireItemVar != "" && strings.TrimSpace(itemMap[sec.RequireItemVar]) == "" {
 					continue
 				}
 				for _, lv := range sec.CollectLinkVars {
 					pushLink(itemMap[lv])
+				}
+				if len(sec.RecordFields) > 0 {
+					rowLookup := func(k string) string {
+						if v, has := itemMap[k]; has {
+							return v
+						}
+						return lookup(k)
+					}
+					rec := make(map[string]any, len(sec.RecordFields))
+					for _, rk := range sortedMapKeys(sec.RecordFields) {
+						val := strings.TrimSpace(expandTemplate(sec.RecordFields[rk], rowLookup))
+						if val != "" {
+							rec[rk] = val
+						}
+					}
+					if len(rec) > 0 {
+						collectedRecords = append(collectedRecords, rec)
+					}
 				}
 				depth := 0
 				if sec.IndentField != "" {
@@ -5066,11 +5554,16 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 				if sec.RequireItemVar != "" {
 					itemMap[sec.RequireItemVar] = collapseNewlinesWithIndent(itemMap[sec.RequireItemVar], indent+"  ")
 				}
-				rendered := expandTemplate(sec.ItemTemplate, func(k string) string {
+				rendered := expandSafeMarkdownTemplate(sec.ItemTemplate, func(k string) string {
 					if v, has := itemMap[k]; has {
 						return v
 					}
 					return lookup(k)
+				}, func(k string) bool {
+					if _, has := itemMap[k]; has {
+						return itemComposed[k]
+					}
+					return isTopComposed(k)
 				})
 				lines = append(lines, fmt.Sprintf("%s- %s", indent, rendered))
 			}
@@ -5088,7 +5581,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 	onlyBodyAlreadyTitled := bodyText != "" && strings.HasPrefix(bodyText, "# ") &&
 		len(metaParts) == 0 && blockquote == "" && intro == "" && len(bulletLines) == 0 && len(renderedSections) == 0
 	if !onlyBodyAlreadyTitled {
-		blocks = append(blocks, "# "+title)
+		blocks = append(blocks, "# "+escapeDeclMarkdownBrackets(title))
 	}
 	if len(metaParts) > 0 {
 		joinedMeta := strings.Join(metaParts, " · ")
@@ -5122,10 +5615,24 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		pushLink(expandTemplate(lt, lookup))
 	}
 
+	if len(ext.RecordFields) > 0 && len(collectedRecords) == 0 {
+		rec := make(map[string]any, len(ext.RecordFields))
+		for _, rk := range sortedMapKeys(ext.RecordFields) {
+			val := strings.TrimSpace(expandTemplate(ext.RecordFields[rk], lookup))
+			if val != "" {
+				rec[rk] = val
+			}
+		}
+		if len(rec) > 0 {
+			collectedRecords = append(collectedRecords, rec)
+		}
+	}
+
 	doc := &DeclarativeFormattedDoc{
 		Title:    title,
 		Markdown: strings.Join(blocks, "\n\n"),
 		Links:    links,
+		Records:  collectedRecords,
 	}
 	if ext.DescriptionTemplate != "" {
 		doc.Description = expandTemplate(ext.DescriptionTemplate, lookup)
@@ -5143,14 +5650,18 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 	return doc, true
 }
 
-func renderTableColumnCell(itemObj map[string]any, col DeclarativeTableColumn, lookup func(string) string) string {
+func renderTableColumnCell(itemObj map[string]any, col DeclarativeTableColumn, lookup func(string) string, isComposedVar func(string) bool) string {
 	if col.Template != "" {
-		rendered := stripInvisibleAndNUL(strings.TrimSpace(expandTemplate(col.Template, lookup)))
+		if col.Code {
+			rendered := stripInvisibleAndNUL(strings.TrimSpace(expandTemplate(col.Template, lookup)))
+			if rendered == "" {
+				return "-"
+			}
+			return "`" + sanitizeDeclInlineCodeVal(rendered) + "`"
+		}
+		rendered := stripInvisibleAndNUL(strings.TrimSpace(expandSafeMarkdownTemplate(col.Template, lookup, isComposedVar)))
 		if rendered == "" {
 			return "-"
-		}
-		if col.Code {
-			return "`" + rendered + "`"
 		}
 		return rendered
 	}
@@ -5159,10 +5670,14 @@ func renderTableColumnCell(itemObj map[string]any, col DeclarativeTableColumn, l
 		prices := parseJSONFloatArrayField(itemObj[col.PricesField])
 		parts := make([]string, 0, len(outcomes))
 		for idx, o := range outcomes {
+			safeOutcome := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(o))
+			if safeOutcome == "" {
+				safeOutcome = "-"
+			}
 			if idx < len(prices) && !math.IsNaN(prices[idx]) && !math.IsInf(prices[idx], 0) {
-				parts = append(parts, fmt.Sprintf("%s: %.1f%%", o, prices[idx]*100.0))
+				parts = append(parts, fmt.Sprintf("%s: %.1f%%", safeOutcome, prices[idx]*100.0))
 			} else {
-				parts = append(parts, o)
+				parts = append(parts, safeOutcome)
 			}
 		}
 		if len(parts) == 0 {
@@ -5186,6 +5701,10 @@ func renderTableColumnCell(itemObj map[string]any, col DeclarativeTableColumn, l
 			}
 		case "bytes_human":
 			val = formatBytesHumanGo(raw)
+		case "epoch_ms_date":
+			if f, ok := jsonValueToFloat(raw); ok && f > 0 {
+				val = time.UnixMilli(int64(f)).UTC().Format("2006-01-02")
+			}
 		case "strip_tags":
 			val = stripTagsInlineLinear(jsonScalarToString(raw))
 		default:
@@ -5209,9 +5728,9 @@ func renderTableColumnCell(itemObj map[string]any, col DeclarativeTableColumn, l
 		return "-"
 	}
 	if col.Code {
-		return "`" + val + "`"
+		return "`" + sanitizeDeclInlineCodeVal(val) + "`"
 	}
-	return val
+	return escapeDeclMarkdownBrackets(val)
 }
 
 func parseJSONStringArrayField(raw any, fallback []string) []string {
@@ -5475,7 +5994,15 @@ func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) 
 		}
 		if spec.ItemWrap != "" {
 			for i, k := range keys {
-				keys[i] = spec.ItemWrap + k + spec.ItemWrap
+				cleanK := k
+				if spec.ItemWrap == "`" {
+					cleanK = sanitizeDeclInlineCodeVal(cleanK)
+				}
+				keys[i] = spec.ItemWrap + cleanK + spec.ItemWrap
+			}
+		} else if strings.Contains(spec.Join, "`") {
+			for i, k := range keys {
+				keys[i] = sanitizeDeclInlineCodeVal(k)
 			}
 		}
 		sep := spec.Join
@@ -5486,6 +6013,11 @@ func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) 
 	case "epoch_sec_date":
 		if f, ok := jsonValueToFloat(raw); ok && f > 0 {
 			return time.Unix(int64(f), 0).UTC().Format("2006-01-02")
+		}
+		return ""
+	case "epoch_ms_date":
+		if f, ok := jsonValueToFloat(raw); ok && f > 0 {
+			return time.UnixMilli(int64(f)).UTC().Format("2006-01-02")
 		}
 		return ""
 	case "bytes_human":
@@ -5511,7 +6043,7 @@ func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) 
 		if strings.TrimSpace(doc.Markdown) != "" {
 			return strings.TrimSpace(doc.Markdown)
 		}
-		return stripTagsInlineLinear(s)
+		return stripTagsInlineLinear(stripScriptsStylesNoscriptDeclHTML(s))
 	case "se_markdown":
 		return cleanStackExchangeMarkdownGo(raw)
 	case "fiscal_mmdd":
@@ -5537,7 +6069,7 @@ func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) 
 				if obj, okObj := el.(map[string]any); okObj {
 					var subParts []string
 					for _, sf := range spec.SubFieldsJoin.Fields {
-						if sv, isS := obj[sf].(string); isS && sv != "" {
+						if sv := strings.TrimSpace(jsonScalarToString(obj[sf])); sv != "" {
 							subParts = append(subParts, sv)
 						}
 					}
@@ -5556,7 +6088,13 @@ func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) 
 			}
 			if itemStr != "" {
 				if spec.ItemWrap != "" {
-					itemStr = spec.ItemWrap + itemStr + spec.ItemWrap
+					cleanItem := itemStr
+					if spec.ItemWrap == "`" {
+						cleanItem = sanitizeDeclInlineCodeVal(cleanItem)
+					}
+					itemStr = spec.ItemWrap + cleanItem + spec.ItemWrap
+				} else if strings.Contains(spec.Join, "`") {
+					itemStr = sanitizeDeclInlineCodeVal(itemStr)
 				}
 				items = append(items, itemStr)
 			}
@@ -5876,6 +6414,14 @@ func stripLeadingMarkdownH1Go(md string) string {
 	return trimmed
 }
 
+func demoteLeadingMarkdownH1Go(md string) string {
+	norm := strings.TrimSpace(strings.ReplaceAll(md, "\r\n", "\n"))
+	if strings.HasPrefix(norm, "# ") {
+		return "## " + norm[2:]
+	}
+	return md
+}
+
 func applyStringFormat(s, format string) string {
 	switch format {
 	case "trim":
@@ -5884,6 +6430,8 @@ func applyStringFormat(s, format string) string {
 		return stripTagsInlineLinear(s)
 	case "strip_leading_h1":
 		return stripLeadingMarkdownH1Go(s)
+	case "demote_h1":
+		return demoteLeadingMarkdownH1Go(s)
 	case "jats_abstract":
 		cleaned := stripTagsInlineLinear(s)
 		if len(cleaned) >= 9 && strings.EqualFold(cleaned[:8], "abstract") && (cleaned[8] == ' ' || cleaned[8] == '\t') {
@@ -6103,9 +6651,9 @@ func formatDeclarativeYAMLFrontmatterCard(rawMd, fallbackTitle string) *Declarat
 		trimmed := strings.TrimSpace(norm)
 		md := trimmed
 		if !strings.HasPrefix(trimmed, "# ") {
-			md = "# " + title + "\n\n" + trimmed
+			md = "# " + escapeDeclMarkdownBrackets(SanitizeScrapedMeta(title)) + "\n\n" + trimmed
 		}
-		return &DeclarativeFormattedDoc{Title: title, Markdown: md}
+		return &DeclarativeFormattedDoc{Title: SanitizeScrapedMetadataField(title, 512), Markdown: md}
 	}
 
 	windowEnd := len(norm)
@@ -6121,9 +6669,9 @@ func formatDeclarativeYAMLFrontmatterCard(rawMd, fallbackTitle string) *Declarat
 		trimmed := strings.TrimSpace(norm)
 		md := trimmed
 		if !strings.HasPrefix(trimmed, "# ") {
-			md = "# " + title + "\n\n" + trimmed
+			md = "# " + escapeDeclMarkdownBrackets(SanitizeScrapedMeta(title)) + "\n\n" + trimmed
 		}
-		return &DeclarativeFormattedDoc{Title: title, Markdown: md}
+		return &DeclarativeFormattedDoc{Title: SanitizeScrapedMetadataField(title, 512), Markdown: md}
 	}
 
 	yamlBlock := norm[4 : 4+closeRel]
@@ -6207,7 +6755,7 @@ func formatDeclarativeYAMLFrontmatterCard(rawMd, fallbackTitle string) *Declarat
 	var rows [][]string
 	for _, kv := range kvPairs {
 		if keepKeys[kv.k] {
-			rows = append(rows, []string{"**" + kv.k + "**", kv.v})
+			rows = append(rows, []string{"**" + escapeDeclMarkdownBrackets(kv.k) + "**", escapeDeclMarkdownBrackets(SanitizeScrapedMeta(kv.v))})
 			if len(rows) >= 10 {
 				break
 			}
@@ -6220,7 +6768,7 @@ func formatDeclarativeYAMLFrontmatterCard(rawMd, fallbackTitle string) *Declarat
 
 	var parts []string
 	if !strings.HasPrefix(body, "# ") {
-		parts = append(parts, "# "+title)
+		parts = append(parts, "# "+escapeDeclMarkdownBrackets(SanitizeScrapedMeta(title)))
 	}
 	if tableLines != "" {
 		parts = append(parts, tableLines)
@@ -6236,8 +6784,8 @@ func formatDeclarativeYAMLFrontmatterCard(rawMd, fallbackTitle string) *Declarat
 		}
 	}
 	return &DeclarativeFormattedDoc{
-		Title:       title,
-		Description: desc,
+		Title:       SanitizeScrapedMetadataField(title, 512),
+		Description: SanitizeScrapedMetadataField(desc, 512),
 		Markdown:    strings.TrimSpace(strings.Join(parts, "\n\n")),
 	}
 }

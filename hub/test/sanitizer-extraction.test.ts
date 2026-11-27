@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { assertFastAsync, assertFastSync, PERF_SCALE } from './perf-budget.ts';
+import { assertFastAsync, assertFastSync, assertFastUnscaledAsync, assertFastUnscaledSync, PERF_SCALE } from './perf-budget.ts';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { gzipSync } from 'node:zlib';
@@ -630,66 +630,61 @@ await t.test('M10: RE2JS LRU cache, JS \\s / \\S Unicode whitespace parity, boun
   const excUnion = compileSafeUserRegexUnion(fortyPatterns.slice(20));
   assert.ok(incUnion && excUnion);
 
-  const tBench0 = performance.now();
-  let allowedCount = 0;
-  for (let i = 0; i < urls2000.length; i++) {
-    const u = urls2000[i]!;
-    if (incUnion(u) && !excUnion(u)) {
-      allowedCount++;
+  const allowedCount = assertFastUnscaledSync('M10 40 patterns x 2,000 URLs union matcher', 50 * covMul, () => {
+    let count = 0;
+    for (let i = 0; i < urls2000.length; i++) {
+      const u = urls2000[i]!;
+      if (incUnion(u) && !excUnion(u)) {
+        count++;
+      }
     }
-  }
-  const benchMs = performance.now() - tBench0;
+    return count;
+  });
   assert.equal(allowedCount, 1600);
-  assert.ok(
-    benchMs < 50 * covMul,
-    `M10 40 patterns × 2,000 URLs union matcher must complete in < 50ms, took ${benchMs.toFixed(2)}ms`,
-  );
 
   // Also benchmark `executeMapCall` end-to-end with 20 `includePaths` + 20 `excludePaths` over 2,000 sitemap URLs!
   const sitemapXml =
     '<?xml version="1.0" encoding="UTF-8"?><urlset>' +
     Array.from({ length: 2_000 }, (_, i) => `<url><loc>https://docs.example.com/docs/section-${i % 25}/page-${i}/</loc></url>`).join('') +
     '</urlset>';
-  const tMap0 = performance.now();
-  const mapRes = await executeMapCall({
-    payload: {
-      url: 'https://docs.example.com',
-      sitemap: 'only',
-      limit: 5000,
-      includePaths: fortyPatterns.slice(0, 20),
-      excludePaths: fortyPatterns.slice(20),
-    },
-    executeHubFetch: async (_target, rawReq) => {
-      const parsed = JSON.parse(rawReq) as { requests: Array<{ id: string; url: string }> };
-      return {
-        status: 200,
-        via: 'cloudflare',
-        bodyText: JSON.stringify({
-          results: parsed.requests.map((r) => ({
-            id: r.id,
-            url: r.url,
-            status: r.url.endsWith('/sitemap.xml') ? 200 : 404,
-            outcome: r.url.endsWith('/sitemap.xml') ? 'ok' : 'http_error',
-            contentType: 'application/xml',
-            body: r.url.endsWith('/sitemap.xml') ? sitemapXml : '',
-          })),
-        }),
-      };
-    },
-  });
-  const mapMs = performance.now() - tMap0;
+  const mapRes = await assertFastUnscaledAsync('M10 executeMapCall on 2,000 URLs x 40 patterns', 150 * covMul, () =>
+    executeMapCall({
+      payload: {
+        url: 'https://docs.example.com',
+        sitemap: 'only',
+        limit: 5000,
+        includePaths: fortyPatterns.slice(0, 20),
+        excludePaths: fortyPatterns.slice(20),
+      },
+      executeHubFetch: async (_target, rawReq) => {
+        const parsed = JSON.parse(rawReq) as { requests: Array<{ id: string; url: string }> };
+        return {
+          status: 200,
+          via: 'cloudflare',
+          bodyText: JSON.stringify({
+            results: parsed.requests.map((r) => ({
+              id: r.id,
+              url: r.url,
+              status: r.url.endsWith('/sitemap.xml') ? 200 : 404,
+              outcome: r.url.endsWith('/sitemap.xml') ? 'ok' : 'http_error',
+              contentType: 'application/xml',
+              body: r.url.endsWith('/sitemap.xml') ? sitemapXml : '',
+            })),
+          }),
+        };
+      },
+    }),
+  );
   assert.equal(mapRes.status, 200);
   assert.equal((mapRes.body.links as unknown[]).length, 1600);
-  assert.ok(mapMs < 150 * covMul, `End-to-end executeMapCall on 2,000 URLs × 40 patterns took ${mapMs.toFixed(2)}ms`);
 
   // Verify `matchesSafeCrawlPattern` per-URL memoization on a 2048-char `[ab]*a[ab]{32}` subject (`r6A/re2b.mjs`)
   const long2048 = '/' + 'b'.repeat(2040);
-  const tSingle0 = performance.now();
-  for (let i = 0; i < 2_000; i++) {
-    assert.equal(matchesSafeCrawlPattern(long2048, '[ab]*a[ab]{32}'), false);
-  }
-  const singleMs = performance.now() - tSingle0;
-  assert.ok(singleMs < 50 * covMul, `2,000 calls on 2048-char [ab]*a[ab]{32} must take < 50ms, took ${singleMs.toFixed(2)}ms`);
+  assertFastUnscaledSync('M10 2,000 calls on 2048-char [ab]*a[ab]{32}', 50 * covMul, () => {
+    for (let i = 0; i < 2_000; i++) {
+      assert.equal(matchesSafeCrawlPattern(long2048, '[ab]*a[ab]{32}'), false);
+    }
+  });
 });
 
 await t.test('M11: Prompt-injection guard (Variation Selectors, U+034F, Hangul fillers, code spans/fences) & prose WAF challenge classification', async () => {
@@ -1398,7 +1393,7 @@ test('R7-H9: Declarative adapter linear link sanitization, MediaWiki 2 MiB linea
     twin: { id: 'owner-b', fetchUrl: 'https://api-a.example.com/v2.json', kind: 'json', accept: 'application/json' },
   };
   assert.throws(() => compileValidatedManifestSet([mA, mB]), /Duplicate domain/i);
-  assert.equal(DECLARATIVE_SITE_ADAPTERS.length, 56);
+  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 68, `expected >= 68 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
 });
 
 test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML evasion variants and runs in < 25ms on 2 MiB', () => {
@@ -4482,15 +4477,11 @@ test('Round 9 (H2 & Mediums): Destination <10ms up to 1MiB, Storage v32 clamping
   // 2 MiB linear speed check (< 80 ms)
   const twoMiBProse = 'EdgeFetch processes streaming Markdown and HTML in strictly linear time. '.repeat(28_700);
   detectPromptInjection({ markdown: twoMiBProse }); // warmup
-  let best2MiBMs = Infinity;
-  for (let i = 0; i < 3; i++) {
-    const t0 = performance.now();
+  assertFastUnscaledSync('Round 9 detectPromptInjection(2 MiB)', 80 * covMul, () => {
     const r = detectPromptInjection({ markdown: twoMiBProse });
-    const dt = performance.now() - t0;
     assert.equal(r.detected, false);
-    if (dt < best2MiBMs) best2MiBMs = dt;
-  }
-  assert.ok(best2MiBMs < 80 * covMul, `detectPromptInjection(2 MiB) took ${best2MiBMs.toFixed(1)}ms (expected < 80ms)`);
+    return r;
+  });
 });
 
 test('Round 9 (Item 4): Manifest trailing-dot guard, Commerce untrusted field sanitization, & Jobs precision/recall filter', () => {
@@ -5730,18 +5721,15 @@ test('R11-M1: 20,000 inline backtick code spans with trailing < runs in linear O
   // Warmup JIT once
   sanitizeInlineHtmlInMarkdown('`warmup` <x', 'https://example.com/');
 
-  const t0 = performance.now();
-  const out1 = sanitizeInlineHtmlInMarkdown(lineWithTrailingLt, 'https://example.com/');
-  const elapsedWithLt = performance.now() - t0;
-
-  const t1 = performance.now();
-  const out2 = finalizeScrapedMarkdown(lineWithoutLt, { isPdf: false, includeImages: false }).markdown;
-  const elapsedNoLt = performance.now() - t1;
+  const out1 = assertFastUnscaledSync('R11-M1 20k code spans + trailing <', 50, () =>
+    sanitizeInlineHtmlInMarkdown(lineWithTrailingLt, 'https://example.com/'),
+  );
+  const out2 = assertFastUnscaledSync('R11-M1 20k code spans no <', 50, () =>
+    finalizeScrapedMarkdown(lineWithoutLt, { isPdf: false, includeImages: false }).markdown,
+  );
 
   assert.equal(out1.endsWith('trailing &lt;tag'), true);
   assert.equal(out2.endsWith('trailing plain'), true);
-  assert.ok(elapsedWithLt < 50, `Expected < 50ms for 20,000 code spans + trailing '<', took ${elapsedWithLt.toFixed(2)}ms`);
-  assert.ok(elapsedNoLt < 50, `Expected < 50ms for 20,000 code spans without '<', took ${elapsedNoLt.toFixed(2)}ms`);
 });
 
 test('R11-M2: redactPii scrubs records[] & structured deeply; includeTags/excludeTags/onlyMainContent scope content', async () => {
@@ -6071,5 +6059,149 @@ test('R11-S2: sanitizeMarkdownPageSlice preserves container & non-blank state ac
       assert.equal(out.includes('javascript:'), false, `javascript: survived effFenceDoc(${tag})@${off}: ${out}`);
     }
   }
+});
+
+test('L-04 & R2 #14: product backfill from recordsForJson, relative product.url resolution, and spec-table product + json extraction', async () => {
+  // 1. Custom-domain Shopify HTML page lacking JSON-LD/OG product tags backfills `product` from `recordsForJson[0]`
+  const customShopUrl = 'https://boutique.example.com/products/canvas-pack';
+  const customShopHtml = `<!doctype html><html><head><title>Canvas Pack</title><script>window.Shopify = { shop: "boutique.myshopify.com" };</script></head><body><main><h1>Canvas Pack</h1><p>Durable waxed canvas pack.</p></main></body></html>`;
+  const customShopJson = JSON.stringify({
+    product: {
+      id: 9001,
+      title: 'Canvas Pack',
+      handle: 'canvas-pack',
+      vendor: 'Boutique',
+      body_html: '<p>Durable waxed canvas pack.</p>',
+      images: [{ src: 'https://cdn.example.com/canvas-pack.jpg' }],
+      variants: [{ id: 101, title: 'Default', sku: 'CP-1', price: '149.00', available: true }],
+    },
+  });
+  const customShopRes = await executeScrapeCall({
+    payload: {
+      url: customShopUrl,
+      formats: [
+        'markdown',
+        'product',
+        { type: 'json', schema: { type: 'object', properties: { sku: { type: 'string' }, price: { type: 'number' } } } },
+      ],
+    },
+    env: {},
+    executeHubFetch: async (_t, rawReq) => {
+      const req = (JSON.parse(rawReq) as { requests: Array<{ id: string; url: string }> }).requests[0]!;
+      if (req.url.endsWith('.json')) {
+        return {
+          status: 200,
+          via: 'cloudflare',
+          bodyText: JSON.stringify({
+            results: [{ id: req.id, url: req.url, finalUrl: req.url, status: 200, outcome: 'ok', contentType: 'application/json', body: customShopJson, bodyEncoding: 'utf-8' }],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'cloudflare',
+        bodyText: JSON.stringify({
+          results: [{ id: req.id, url: req.url, finalUrl: req.url, status: 200, outcome: 'ok', contentType: 'text/html', body: customShopHtml, bodyEncoding: 'utf-8' }],
+        }),
+      };
+    },
+  });
+  assert.equal(customShopRes.status, 200);
+  const customProd = customShopRes.body.product as Record<string, unknown>;
+  assert.ok(customProd);
+  assert.equal(customProd.sku, 'CP-1');
+  assert.equal(customProd.price, 149);
+  assert.equal(customProd.brand, 'Boutique');
+  assert.equal(customProd.availability, 'InStock');
+  assert.equal((customShopRes.body.json as Record<string, unknown>).sku, 'CP-1');
+
+  // 2. Twin path (*.myshopify.com/products/...) populates `product` from `formatted.records[0]`
+  const twinUrl = 'https://boutique.myshopify.com/products/canvas-pack';
+  const twinRes = await executeScrapeCall({
+    payload: { url: twinUrl, formats: ['product'] },
+    env: {},
+    executeHubFetch: async (_t, rawReq) => {
+      const req = (JSON.parse(rawReq) as { requests: Array<{ id: string; url: string }> }).requests[0]!;
+      return {
+        status: 200,
+        via: 'cloudflare',
+        bodyText: JSON.stringify({
+          results: [{ id: req.id, url: req.url, finalUrl: req.url, status: 200, outcome: 'ok', contentType: 'application/json', body: customShopJson, bodyEncoding: 'utf-8' }],
+        }),
+      };
+    },
+  });
+  assert.equal(twinRes.status, 200);
+  const twinProd = twinRes.body.product as Record<string, unknown>;
+  assert.ok(twinProd);
+  assert.equal(twinProd.sku, 'CP-1');
+  assert.equal(twinProd.brand, 'Boutique');
+
+  // 3. Non-product record (e.g. GitHub repo / HN) must NOT synthesize `product`
+  const nonProduct = scrapeModule.backfillProductFromRecord(
+    null,
+    { title: 'edgefetch repo', url: 'https://github.com/bartrumb/edgefetch', stars: 100, author: 'bartrumb' },
+    { finalUrl: 'https://github.com/bartrumb/edgefetch' },
+  );
+  assert.equal(nonProduct, null);
+
+  // 4. books.toscrape.com-style HTML populates both `product` and `json`
+  const bookUrl = 'https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html';
+  const bookHtml = `<!doctype html><html><body><article class="product_page"><h1>A Light in the Attic</h1><p class="price_color">£51.77</p><p class="instock availability">In stock (22 available)</p><table class="table"><tr><th>UPC</th><td>a897fe39b1053632</td></tr><tr><th>Product Type</th><td>Books</td></tr><tr><th>Availability</th><td>In stock (22 available)</td></tr></table></article></body></html>`;
+  const bookRes = await executeScrapeCall({
+    payload: {
+      url: bookUrl,
+      formats: ['product', { type: 'json', schema: { type: 'object', properties: { price: { type: 'number' }, currency: { type: 'string' }, upc: { type: 'string' }, inStock: { type: 'boolean' } } } }],
+    },
+    env: {},
+    executeHubFetch: async (_t, rawReq) => {
+      const req = (JSON.parse(rawReq) as { requests: Array<{ id: string; url: string }> }).requests[0]!;
+      return {
+        status: 200,
+        via: 'cloudflare',
+        bodyText: JSON.stringify({
+          results: [{ id: req.id, url: req.url, finalUrl: req.url, status: 200, outcome: 'ok', contentType: 'text/html', body: bookHtml, bodyEncoding: 'utf-8' }],
+        }),
+      };
+    },
+  });
+  assert.equal(bookRes.status, 200);
+  const bookProd = bookRes.body.product as Record<string, unknown>;
+  assert.equal(bookProd.price, 51.77);
+  assert.equal(bookProd.currency, 'GBP');
+  assert.equal(bookProd.gtin, 'a897fe39b1053632');
+  const bookJson = bookRes.body.json as Record<string, unknown>;
+  assert.equal(bookJson.price, 51.77);
+  assert.equal(bookJson.currency, 'GBP');
+  assert.equal(bookJson.upc, 'a897fe39b1053632');
+  assert.equal(bookJson.inStock, true);
+
+  // 5. JSON-LD product with relative URL resolves against finalUrl
+  const relProdRes = await executeScrapeCall({
+    payload: { url: 'https://shop.example.com/cat/index.html', formats: ['product'] },
+    env: {},
+    executeHubFetch: async (_t, rawReq) => {
+      const req = (JSON.parse(rawReq) as { requests: Array<{ id: string; url: string }> }).requests[0]!;
+      return {
+        status: 200,
+        via: 'cloudflare',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: req.id,
+              url: req.url,
+              finalUrl: req.url,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html',
+              body: `<!doctype html><html><head><script type="application/ld+json">{"@type":"Product","name":"Hat","url":"/products/hat?v=2","offers":{"price":"29.00","priceCurrency":"USD"}}</script></head><body><h1>Hat</h1></body></html>`,
+              bodyEncoding: 'utf-8',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal((relProdRes.body.product as Record<string, unknown>).url, 'https://shop.example.com/products/hat?v=2');
 });
 }

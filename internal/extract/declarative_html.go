@@ -22,6 +22,7 @@ type DeclarativePostFetchResult struct {
 	PublishedTime string           `json:"publishedTime,omitempty"`
 	Markdown      string           `json:"markdown"`
 	Links         []string         `json:"links,omitempty"`
+	ReplaceLinks  bool             `json:"-"`
 	Records       []map[string]any `json:"records,omitempty"`
 	Total         *int             `json:"total,omitempty"`
 	Returned      *int             `json:"returned,omitempty"`
@@ -61,7 +62,7 @@ var (
 	reIcimsLeadDigitsDeclHTML   = newLazyRegexp(`^\d+\s*-\s*`)
 	reIcimsJobTitlePrefDeclHTML = newLazyRegexp(`(?i)^(?:Job\s+Title|Title)\s*`)
 	reIcimsSpanDateDeclHTML     = newLazyRegexp(`^\d{1,2}/\d{1,2}/\d{4}\b`)
-	reIcimsExplicitZeroDeclHTML = newLazyRegexp(`(?i)\b(?:no\s+results\s+found|sorry,\s+no\s+jobs|currently\s+no\s+open\s+positions|there\s+are\s+currently\s+no\s+open|0\s+results\s+available)\b`)
+	reIcimsExplicitZeroDeclHTML = newLazyRegexp(`(?i)\b(?:no\s+results\s+found|sorry,\s+no\s+jobs|currently\s+no\s+open\s+positions|there\s+are\s+currently\s+no\s+open|no\s+jobs\s+match(?:\s+your\s+search\s+criteria)?|no\s+open\s+(?:jobs|positions|roles)|0\s+results\s+available)\b`)
 	reIcimsPageOfDeclHTML       = newLazyRegexp(`(?i)\bPage\s+(\d+)\s+of\s+(\d+)\b`)
 	reIcimsCareerSuffixDeclHTML = newLazyRegexp(`(?i)\s*Career\s+Listings\s*$`)
 	reIcimsIframeShellDeclHTML  = newLazyRegexp(`(?i)\bicims_content_iframe\b`)
@@ -423,14 +424,25 @@ func extractBalancedDivAtDeclHTML(htmlSrc string, openTagIndex int) (string, boo
 }
 
 func stripScriptsAndStylesDeclHTML(rawHTML string) string {
-	dropTags := map[string]bool{
+	return stripHTMLDropTagsDeclHTML(rawHTML, map[string]bool{
 		"script": true,
 		"style":  true,
 		"svg":    true,
 		"iframe": true,
 		"object": true,
 		"embed":  true,
-	}
+	})
+}
+
+func stripScriptsStylesNoscriptDeclHTML(rawHTML string) string {
+	return stripHTMLDropTagsDeclHTML(rawHTML, map[string]bool{
+		"script":   true,
+		"style":    true,
+		"noscript": true,
+	})
+}
+
+func stripHTMLDropTagsDeclHTML(rawHTML string, dropTags map[string]bool) string {
 	src := rawHTML
 	if len(src) > 2*1024*1024 {
 		src = src[:2*1024*1024]
@@ -1067,22 +1079,30 @@ func runMarkdownCleanPresetDeclHTML(preset string, ctx *htmlExtractContextDeclHT
 			}
 			if rawLine == fullTrim {
 				if secMatch := reIETFSectionDeclHTML.FindStringSubmatch(fullTrim); len(secMatch) == 3 {
+					safeSecTitle := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(secMatch[2]))
 					depth := strings.Count(secMatch[1], ".") + 2
 					if depth > 4 {
 						depth = 4
 					}
-					cleanedLines = append(cleanedLines, fmt.Sprintf("\n%s %s. %s\n", strings.Repeat("#", depth), secMatch[1], secMatch[2]))
+					cleanedLines = append(cleanedLines, fmt.Sprintf("\n%s %s. %s\n", strings.Repeat("#", depth), secMatch[1], safeSecTitle))
 					continue
 				}
 			}
-			cleanedLines = append(cleanedLines, rawLine)
+			safeLine := escapeUnescapedMarkdownBracketsGo(rawLine)
+			safeLine = escapeDangerousRawHTMLInLineDeclGo(safeLine)
+			trimmedSafe := strings.TrimLeft(safeLine, " \t")
+			if strings.HasPrefix(trimmedSafe, "#") {
+				leadingLen := len(safeLine) - len(trimmedSafe)
+				safeLine = safeLine[:leadingLen] + `\` + trimmedSafe
+			}
+			cleanedLines = append(cleanedLines, safeLine)
 		}
 
 		md := strings.TrimSpace(reMWExcessBlankDeclHTML.ReplaceAllString(strings.Join(cleanedLines, "\n"), "\n\n"))
 		rawTitle, _ := findElementInnerLinearDeclHTML(ctx.rawHTML, "title", nil, 0)
 		title := SanitizeScrapedMeta(stripTagsInlineLinear(rawTitle))
 		if title != "" && !strings.HasPrefix(md, "# ") {
-			md = "# " + title + "\n\n" + md
+			md = "# " + escapeDeclMarkdownBrackets(title) + "\n\n" + md
 		}
 		return &DeclarativePostFetchResult{
 			ExtractorID: extractorID,
@@ -1164,9 +1184,10 @@ func runGistExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extractorID strin
 		if name == "" {
 			continue
 		}
+		safeName := escapeDeclMarkdownBrackets(name)
 		if mdArticleHTML := box.HTML("article.markdown-body"); mdArticleHTML != "" {
 			md, _ := ctx.htmlToMD(mdArticleHTML, ctx.baseURL)
-			files = append(files, "## "+name+"\n\n"+strings.TrimSpace(md))
+			files = append(files, "## "+safeName+"\n\n"+strings.TrimSpace(md))
 			continue
 		}
 		tds := box.Select("td.blob-code-inner", 2000)
@@ -1176,7 +1197,7 @@ func runGistExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extractorID strin
 				codeLines[i] = td.Text()
 			}
 			lang, _ := detectDeclarativeFenceLang(name)
-			files = append(files, "## "+name+"\n\n"+safeDeclarativeFence(strings.Join(codeLines, "\n"), lang))
+			files = append(files, "## "+safeName+"\n\n"+safeDeclarativeFence(strings.Join(codeLines, "\n"), lang))
 		}
 	}
 	if len(files) == 0 {
@@ -1189,9 +1210,9 @@ func runGistExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extractorID strin
 	if title == "" {
 		title = "GitHub Gist"
 	}
-	sections := []string{"# " + title}
+	sections := []string{"# " + escapeDeclMarkdownBrackets(title)}
 	if desc != "" && desc != title {
-		sections = append(sections, desc)
+		sections = append(sections, escapeDeclMarkdownBlock(desc))
 	}
 	sections = append(sections, strings.Join(files, "\n\n"))
 	return &DeclarativePostFetchResult{
@@ -1252,7 +1273,7 @@ func runStackExchangeExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extracto
 		for _, cm := range findAllElementInnersLinearDeclHTML(block, "span", func(a string) bool {
 			return attrHasTokenLinearDeclHTML(a, "class", "comment-copy")
 		}, 6) {
-			txt := stripTagsInlineLinear(cm)
+			txt := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(stripTagsInlineLinear(cm)))
 			if txt != "" && len(out) < 6 {
 				out = append(out, "> - *Comment*: "+txt)
 			}
@@ -1267,13 +1288,14 @@ func runStackExchangeExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extracto
 		}, 0)
 		qScore = stripTagsInlineLinear(vcInner)
 	}
+	qScore = escapeDeclMarkdownBrackets(SanitizeScrapedMeta(qScore))
 
 	var tags []string
 	seenTag := make(map[string]bool)
 	for _, inner := range findAllElementInnersLinearDeclHTML(qInner, "a", func(a string) bool {
 		return attrHasTokenLinearDeclHTML(a, "class", "post-tag")
 	}, 16) {
-		t := stripTagsInlineLinear(inner)
+		t := sanitizeDeclInlineCodeVal(SanitizeScrapedMeta(stripTagsInlineLinear(inner)))
 		if t != "" && !seenTag[t] {
 			seenTag[t] = true
 			tags = append(tags, "`"+t+"`")
@@ -1288,7 +1310,7 @@ func runStackExchangeExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extracto
 		return nil
 	}
 
-	sections := []string{"# " + title}
+	sections := []string{"# " + escapeDeclMarkdownBrackets(title)}
 	var qMeta []string
 	if qScore != "" {
 		qMeta = append(qMeta, "**Votes**: "+qScore)
@@ -1389,7 +1411,7 @@ func runRedditShredditExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extract
 		return nil
 	}
 	author := SanitizeScrapedMeta(stdhtml.UnescapeString(shPost.AttrOrEmpty("author")))
-	score := strings.TrimSpace(shPost.AttrOrEmpty("score"))
+	score := SanitizeScrapedMeta(stdhtml.UnescapeString(shPost.AttrOrEmpty("score")))
 	sub := SanitizeScrapedMeta(stdhtml.UnescapeString(shPost.AttrOrEmpty("subreddit-prefixed-name")))
 	bodyHTML := shPost.HTML()
 	bodyMD := ""
@@ -1398,19 +1420,19 @@ func runRedditShredditExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extract
 		bodyMD = strings.TrimSpace(md)
 	}
 
-	sections := []string{"# " + pTitle}
+	sections := []string{"# " + escapeDeclMarkdownBrackets(pTitle)}
 	var meta []string
 	if sub != "" {
-		meta = append(meta, sub)
+		meta = append(meta, escapeDeclMarkdownBrackets(sub))
 	}
 	if author != "" {
-		meta = append(meta, "u/"+author)
+		meta = append(meta, "u/"+escapeDeclMarkdownBrackets(author))
 	}
 	if score != "" {
-		meta = append(meta, score+" upvotes")
+		meta = append(meta, escapeDeclMarkdownBrackets(score)+" upvotes")
 	}
 	if len(meta) > 0 {
-		sections = append(sections, "*"+strings.Join(meta, " · ")+"*")
+		sections = append(sections, "*"+strings.ReplaceAll(strings.Join(meta, " · "), "*", `\*`)+"*")
 	}
 	if bodyMD != "" {
 		sections = append(sections, bodyMD)
@@ -1422,7 +1444,7 @@ func runRedditShredditExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extract
 		if cAuthor == "" {
 			cAuthor = "user"
 		}
-		cScore := strings.TrimSpace(cm.AttrOrEmpty("score"))
+		cScore := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(stdhtml.UnescapeString(cm.AttrOrEmpty("score"))))
 		cDepth, _ := strconv.Atoi(strings.TrimSpace(cm.AttrOrEmpty("depth")))
 		if cDepth < 0 {
 			cDepth = 0
@@ -1439,7 +1461,7 @@ func runRedditShredditExtractorDeclHTML(ctx *htmlExtractContextDeclHTML, extract
 				if cScore != "" {
 					scorePart = " (" + cScore + ")"
 				}
-				comments = append(comments, fmt.Sprintf("%s- **u/%s**%s: %s", strings.Repeat("  ", cDepth), cAuthor, scorePart, cMd))
+				comments = append(comments, fmt.Sprintf("%s- **u/%s**%s: %s", strings.Repeat("  ", cDepth), escapeDeclMarkdownBrackets(cAuthor), scorePart, cMd))
 			}
 		}
 	}
@@ -1595,19 +1617,20 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 		}
 		canonicalJobURL := stripQueryParamDeclHTML(u, "in_iframe")
 
-		bullets := []string{"- **Company**: " + company}
+		bullets := []string{"- **Company**: " + escapeDeclMarkdownBrackets(company)}
 		if len(locations) > 0 {
-			bullets = append(bullets, "- **Location**: "+strings.Join(locations, "; "))
+			bullets = append(bullets, "- **Location**: "+escapeDeclMarkdownBrackets(strings.Join(locations, "; ")))
 		}
 		if empType != "" {
-			bullets = append(bullets, "- **Employment Type**: "+empType)
+			bullets = append(bullets, "- **Employment Type**: "+escapeDeclMarkdownBrackets(empType))
 		}
 		if posted != "" {
-			bullets = append(bullets, "- **Posted**: "+posted)
+			bullets = append(bullets, "- **Posted**: "+escapeDeclMarkdownBrackets(posted))
 		}
 
 		fullTitle := title + " @ " + company
-		blocks := []string{"# " + fullTitle, strings.Join(bullets, "\n")}
+		headingLine := "# " + escapeDeclMarkdownBrackets(title) + " @ " + escapeDeclMarkdownBrackets(company)
+		blocks := []string{headingLine, strings.Join(bullets, "\n")}
 		if bodyMD != "" {
 			blocks = append(blocks, bodyMD)
 		}
@@ -1765,12 +1788,17 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 			return nil
 		}
 		emptyTitle := hostSlug + " — iCIMS Career Portal"
+		matchedEmpty := strings.TrimSpace(reIcimsExplicitZeroDeclHTML.FindString(doc.Text()))
+		emptyBody := "No open positions currently listed (0 open roles)."
+		if matchedEmpty != "" && !strings.Contains(strings.ToLower(matchedEmpty), "0 open roles") {
+			emptyBody = matchedEmpty + " (0 open roles)."
+		}
 		zero := 0
 		notTrunc := false
 		return &DeclarativePostFetchResult{
 			ExtractorID: extractorID,
 			Title:       emptyTitle,
-			Markdown:    "# " + emptyTitle + "\n\nNo open positions currently listed (0 open roles).",
+			Markdown:    "# " + escapeDeclMarkdownBrackets(emptyTitle) + "\n\n" + emptyBody,
 			Links:       []string{},
 			Records:     []map[string]any{},
 			Total:       &zero,
@@ -1822,10 +1850,10 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 			pay = "-"
 		}
 		rows[i] = []string{
-			fmt.Sprintf("[%s](%s)", j.title, j.url),
-			"`" + j.id + "`",
-			loc,
-			pay,
+			fmt.Sprintf("[%s](%s)", escapeDeclMarkdownBrackets(j.title), PercentEncodeUnsafeRecordURLChars(j.url)),
+			"`" + strings.ReplaceAll(j.id, "`", "'") + "`",
+			escapeDeclMarkdownBrackets(loc),
+			escapeDeclMarkdownBrackets(pay),
 		}
 	}
 
@@ -1884,7 +1912,7 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 	res := &DeclarativePostFetchResult{
 		ExtractorID: extractorID,
 		Title:       title,
-		Markdown:    "# " + title + "\n\n" + formatDeclarativeGFMTable([]string{"Role", "Job ID", "Location", "Salary"}, rows) + truncFooter,
+		Markdown:    "# " + escapeDeclMarkdownBrackets(title) + "\n\n" + formatDeclarativeGFMTable([]string{"Role", "Job ID", "Location", "Salary"}, rows) + truncFooter,
 		Links:       links,
 		Records:     records,
 		Returned:    &retCount,
@@ -1949,7 +1977,11 @@ func sanitizeCommerceFieldDeclHTML(raw any, maxLen int) string {
 	esc.Grow(len(s) + 8)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		prevEsc := i > 0 && s[i-1] == '\\'
+		bs := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			bs++
+		}
+		prevEsc := bs%2 == 1
 		if !prevEsc {
 			switch c {
 			case '[', ']', '*', '_', '~', '`', '#':
@@ -3319,6 +3351,24 @@ func runDomRouteDeclHTML(
 	visiting := make(map[string]bool)
 	bodyLinksByVar := make(map[string][]string)
 
+	var isHTMLVarMarkdownFormattedDeclHTML func(map[string]DeclarativeHTMLVarSpec, string, int) bool
+	isHTMLVarMarkdownFormattedDeclHTML = func(vars map[string]DeclarativeHTMLVarSpec, varName string, depth int) bool {
+		if varName == "" || depth > 4 {
+			return false
+		}
+		spec, ok := vars[varName]
+		if !ok {
+			return false
+		}
+		if len(spec.CSSHTMLToMd) > 0 {
+			return true
+		}
+		if spec.FallbackVar != "" && isHTMLVarMarkdownFormattedDeclHTML(vars, spec.FallbackVar, depth+1) {
+			return true
+		}
+		return false
+	}
+
 	var lookup func(string) string
 	var evalHTMLVar func(string, DeclarativeHTMLVarSpec) string
 
@@ -3601,6 +3651,96 @@ func runDomRouteDeclHTML(
 	}
 	title = SanitizeScrapedMeta(title)
 
+	sanitizeDomInlineCodeVal := func(val string) string {
+		r := strings.NewReplacer(
+			"`", "'",
+			"\r", " ",
+			"\n", " ",
+			"|", "&#124;",
+		)
+		return r.Replace(val)
+	}
+	sanitizeDomTextVal := func(val string) string {
+		clean := neutralizeAllUnsafeMarkdownLinksLinearGo(val)
+		r := strings.NewReplacer(
+			"\r", " ",
+			"\n", " ",
+			"](", `\]\(`,
+			"[", `\[`,
+			"]", `\]`,
+		)
+		return r.Replace(clean)
+	}
+	sanitizeDomLinkURLVal := func(val string) string {
+		cleaned := strings.NewReplacer("\r", "", "\n", "", "\t", "", " ", "%20").Replace(strings.TrimSpace(val))
+		return PercentEncodeUnsafeRecordURLChars(cleaned)
+	}
+	expandDomPlainSegment := func(seg string) string {
+		var sb strings.Builder
+		pos := 0
+		for pos < len(seg) {
+			openIdx := strings.IndexByte(seg[pos:], '{')
+			if openIdx < 0 {
+				sb.WriteString(seg[pos:])
+				break
+			}
+			absOpen := pos + openIdx
+			closeIdx := strings.IndexByte(seg[absOpen+1:], '}')
+			if closeIdx < 0 {
+				sb.WriteString(seg[pos:])
+				break
+			}
+			absClose := absOpen + 1 + closeIdx
+			sb.WriteString(seg[pos:absOpen])
+			name := seg[absOpen+1 : absClose]
+			val := lookup(name)
+			if absOpen >= 2 && seg[absOpen-2:absOpen] == "](" && absClose+1 < len(seg) && seg[absClose+1] == ')' {
+				sb.WriteString(sanitizeDomLinkURLVal(val))
+			} else {
+				sb.WriteString(sanitizeDomTextVal(val))
+			}
+			pos = absClose + 1
+		}
+		return strings.NewReplacer("\r", " ", "\n", " ").Replace(sb.String())
+	}
+	expandDomBulletTemplate := func(tmpl string) string {
+		if !strings.Contains(tmpl, "`") {
+			return strings.TrimSpace(expandDomPlainSegment(tmpl))
+		}
+		var sb strings.Builder
+		n := len(tmpl)
+		i := 0
+		for i < n {
+			if tmpl[i] == '`' {
+				end := strings.IndexByte(tmpl[i+1:], '`')
+				if end >= 0 {
+					inner := tmpl[i+1 : i+1+end]
+					expanded := expandTemplate(inner, func(name string) string {
+						return sanitizeDomInlineCodeVal(lookup(name))
+					})
+					sb.WriteByte('`')
+					sb.WriteString(sanitizeDomInlineCodeVal(expanded))
+					sb.WriteByte('`')
+					i += end + 2
+					continue
+				}
+			}
+			nextTick := strings.IndexByte(tmpl[i:], '`')
+			segEnd := n
+			if nextTick >= 0 {
+				segEnd = i + nextTick
+			}
+			if segEnd > i {
+				sb.WriteString(expandDomPlainSegment(tmpl[i:segEnd]))
+				i = segEnd
+			} else {
+				sb.WriteByte(tmpl[i])
+				i++
+			}
+		}
+		return strings.TrimSpace(sb.String())
+	}
+
 	var bulletLines []string
 	for _, b := range hr.Bullets {
 		if b.WhenVar != "" && lookup(b.WhenVar) == "" {
@@ -3609,7 +3749,7 @@ func runDomRouteDeclHTML(
 		if b.UnlessVar != "" && lookup(b.UnlessVar) != "" {
 			continue
 		}
-		rendered := strings.TrimSpace(expandTemplate(b.Template, lookup))
+		rendered := expandDomBulletTemplate(b.Template)
 		if rendered != "" {
 			if b.Label != "" {
 				bulletLines = append(bulletLines, fmt.Sprintf("- **%s**: %s", b.Label, rendered))
@@ -3639,29 +3779,36 @@ func runDomRouteDeclHTML(
 	}
 	bodyStartsH1 := strings.HasPrefix(bodyVal, "# ")
 
+	h1Line := ""
+	if title != "" {
+		h1Line = "# " + escapeDeclMarkdownBrackets(title)
+	}
 	if hr.BlockquoteTemplate != "" && (hr.BlockquoteWhenVar == "" || lookup(hr.BlockquoteWhenVar) != "") {
-		bq := strings.TrimSpace(expandTemplate(hr.BlockquoteTemplate, lookup))
+		bq := strings.TrimSpace(expandDomBulletTemplate(hr.BlockquoteTemplate))
 		if bodyStartsH1 && bq != "" {
 			blocks = append(blocks, bq)
 		} else {
-			if title != "" {
-				blocks = append(blocks, "# "+title)
+			if h1Line != "" {
+				blocks = append(blocks, h1Line)
 			}
 			if bq != "" {
 				blocks = append(blocks, bq)
 			}
 		}
-	} else if title != "" {
-		blocks = append(blocks, "# "+title)
+	} else if h1Line != "" {
+		blocks = append(blocks, h1Line)
 	}
 
 	if hr.MetaItalicTemplate != "" && (hr.MetaItalicWhenVar == "" || lookup(hr.MetaItalicWhenVar) != "") {
-		if mi := strings.TrimSpace(expandTemplate(hr.MetaItalicTemplate, lookup)); mi != "" {
+		if mi := strings.ReplaceAll(strings.TrimSpace(expandDomBulletTemplate(hr.MetaItalicTemplate)), "*", `\*`); mi != "" {
 			blocks = append(blocks, "*"+mi+"*")
 		}
 	}
 	if hr.IntroVar != "" {
 		if iv := strings.TrimSpace(lookup(hr.IntroVar)); iv != "" {
+			if !isHTMLVarMarkdownFormattedDeclHTML(hr.Vars, hr.IntroVar, 0) {
+				iv = escapeDeclMarkdownBlock(iv)
+			}
 			blocks = append(blocks, iv)
 		}
 	}
@@ -3677,6 +3824,9 @@ func runDomRouteDeclHTML(
 	}
 	for _, sec := range hr.Sections {
 		if txt := strings.TrimSpace(lookup(sec.TextVar)); txt != "" {
+			if !isHTMLVarMarkdownFormattedDeclHTML(hr.Vars, sec.TextVar, 0) {
+				txt = escapeDeclMarkdownBlock(txt)
+			}
 			blocks = append(blocks, "## "+sec.Heading+"\n\n"+txt)
 		}
 	}
@@ -3693,7 +3843,7 @@ func runDomRouteDeclHTML(
 		}
 	}
 
-	if len(blocks) == 0 || (len(blocks) == 1 && title != "" && blocks[0] == "# "+title) {
+	if len(blocks) == 0 || (len(blocks) == 1 && h1Line != "" && blocks[0] == h1Line) {
 		return nil
 	}
 
@@ -3786,6 +3936,11 @@ func runEmbeddedJSONRouteDeclHTML(
 		PublishedTime: formatted.PublishedTime,
 		Markdown:      formatted.Markdown,
 		Links:         formatted.Links,
+		Records:       formatted.Records,
+		Total:         formatted.Total,
+		Returned:      formatted.Returned,
+		Truncated:     formatted.Truncated,
+		NextCursor:    formatted.NextCursor,
 	}
 }
 
@@ -3818,6 +3973,29 @@ func sanitizePostFetchResultDeclHTML(out *DeclarativePostFetchResult) *Declarati
 		}
 	}
 	return out
+}
+
+var (
+	externalHTMLModesMu sync.RWMutex
+	externalHTMLModes   = make(map[string]func(rawHTML, baseURL, currentMD, extractorID string) *DeclarativePostFetchResult)
+)
+
+// RegisterExternalHTMLMode registers an external HTML extractor mode (e.g. from internal/catalog)
+// without creating a Go package import cycle.
+func RegisterExternalHTMLMode(mode string, fn func(rawHTML, baseURL, currentMD, extractorID string) *DeclarativePostFetchResult) {
+	if mode == "" || fn == nil {
+		return
+	}
+	externalHTMLModesMu.Lock()
+	externalHTMLModes[mode] = fn
+	externalHTMLModesMu.Unlock()
+}
+
+func getExternalHTMLMode(mode string) func(rawHTML, baseURL, currentMD, extractorID string) *DeclarativePostFetchResult {
+	externalHTMLModesMu.RLock()
+	fn := externalHTMLModes[mode]
+	externalHTMLModesMu.RUnlock()
+	return fn
 }
 
 func executeDeclarativeHTMLRouteDeclHTML(
@@ -3868,12 +4046,32 @@ func executeDeclarativeHTMLRouteDeclHTML(
 		out = runStackExchangeExtractorDeclHTML(ctx, extractorID)
 	case "reddit_shreddit":
 		out = runRedditShredditExtractorDeclHTML(ctx, extractorID)
+	case "xenforo_html":
+		out = runXenForoExtractorDeclHTML(ctx, extractorID)
+	case "sram_docs_html":
+		out = runSramDocsExtractorDeclHTML(ctx, extractorID)
+	case "bosch_help_html":
+		out = runBoschHelpExtractorDeclHTML(ctx, extractorID)
+	case "ukg_pro_html":
+		out = runUkgProHTMLExtractorDeclHTML(ctx, extractorID)
+	case "paylocity_html":
+		out = runPaylocityHTMLExtractorDeclHTML(ctx, extractorID)
+	case "dover_html":
+		out = runDoverHTMLExtractorDeclHTML(ctx, extractorID)
+	case "sitecore_jss_html":
+		out = runSitecoreJSSHTMLExtractorDeclHTML(ctx, extractorID)
+	case "giant_liv_html":
+		out = runGiantLivHTMLExtractorDeclHTML(ctx, extractorID)
 	case "embedded_json":
 		out = runEmbeddedJSONRouteDeclHTML(hr, ctx, params, extractorID)
 	case "dom":
 		out = runDomRouteDeclHTML(hr, ctx, params, extractorID)
 	default:
-		return nil
+		if extFn := getExternalHTMLMode(hr.Mode); extFn != nil {
+			out = extFn(ctx.rawHTML, ctx.baseURL, ctx.currentMD, extractorID)
+		} else {
+			return nil
+		}
 	}
 
 	return sanitizePostFetchResultDeclHTML(out)

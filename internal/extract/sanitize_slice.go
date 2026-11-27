@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -91,6 +92,7 @@ var (
 
 var disallowedHostSuffixesSliceGo = []string{
 	".localhost",
+	".localhost.localdomain",
 	".local",
 	".internal",
 	".arpa",
@@ -110,6 +112,7 @@ var disallowedHostSuffixesSliceGo = []string{
 
 var disallowedExactHostsSliceGo = map[string]bool{
 	"localhost":                  true,
+	"localhost.localdomain":      true,
 	"nip.io":                     true,
 	"sslip.io":                   true,
 	"xip.io":                     true,
@@ -2388,7 +2391,16 @@ func isSafePublicHostnameSliceGo(rawHost string) bool {
 			return false
 		}
 	}
+	if net.ParseIP(host) != nil || IsPublicOrPrivateSuffix(host) {
+		return false
+	}
 	return true
+}
+
+// IsSafePublicHostname validates that rawHost is a safe public DNS hostname (rejecting localhost,
+// .localhost.localdomain, local/internal/DNS-rebinding suffixes, IP literals, and bare public suffixes).
+func IsSafePublicHostname(rawHost string) bool {
+	return isSafePublicHostnameSliceGo(rawHost)
 }
 
 func normalizePublicProductImageURLSliceGo(raw string, baseURL string) string {
@@ -2633,17 +2645,8 @@ func parsePriceValueSliceGo(rawPrice any) (any, bool) {
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if trimmed != "" {
-			var sb strings.Builder
-			for i := 0; i < len(trimmed); i++ {
-				if (trimmed[i] >= '0' && trimmed[i] <= '9') || trimmed[i] == '.' {
-					sb.WriteByte(trimmed[i])
-				}
-			}
-			numStr := sb.String()
-			if numStr != "" {
-				if f, err := strconv.ParseFloat(numStr, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f != 0 {
-					return f, true
-				}
+			if f, ok := parseNumericPriceSpanSliceGo(trimmed); ok && !math.IsNaN(f) && !math.IsInf(f, 0) && f != 0 {
+				return f, true
 			}
 			return trimmed, true
 		}
@@ -2655,17 +2658,14 @@ func parseVariantPriceValueSliceGo(rawPrice any) (any, bool) {
 	if rawPrice == nil {
 		return nil, false
 	}
-	strVal := fmt.Sprint(rawPrice)
-	var sb strings.Builder
-	for i := 0; i < len(strVal); i++ {
-		if (strVal[i] >= '0' && strVal[i] <= '9') || strVal[i] == '.' {
-			sb.WriteByte(strVal[i])
+	if fv, ok := rawPrice.(float64); ok {
+		if !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+			return fv, true
 		}
 	}
-	if numStr := sb.String(); numStr != "" {
-		if f, err := strconv.ParseFloat(numStr, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f != 0 {
-			return f, true
-		}
+	strVal := strings.TrimSpace(fmt.Sprint(rawPrice))
+	if f, ok := parseNumericPriceSpanSliceGo(strVal); ok && !math.IsNaN(f) && !math.IsInf(f, 0) && f != 0 {
+		return f, true
 	}
 	return rawPrice, true
 }
@@ -2761,10 +2761,15 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 		availability := ""
 		if primaryOffer != nil {
 			if c, ok := primaryOffer["priceCurrency"].(string); ok {
-				currency = c
+				currency = strings.TrimSpace(c)
 			}
 			if a, ok := primaryOffer["availability"].(string); ok {
-				availability = reSchemaOrgPrefixSliceGo.ReplaceAllString(a, "")
+				availability = normalizeAvailabilitySliceGo(a)
+			}
+		}
+		if currency == "" {
+			if rawPriceStr, ok := rawPrice.(string); ok {
+				currency = inferPriceCurrencySliceGo(rawPriceStr)
 			}
 		}
 
@@ -2819,8 +2824,14 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 		cleanSku := SanitizePlainMetadataText(skuSrc, 160)
 
 		rawLdURL := finalURL
-		if ldURL, ok := productLd["url"].(string); ok && !IsDisallowedMarkdownLinkDestination(ldURL) {
-			rawLdURL = ldURL
+		if ldURL, ok := productLd["url"].(string); ok {
+			rawLdURL = resolveStructuredProductURLSliceGo(ldURL, finalURL)
+		} else if ldURLMap, ok := productLd["url"].(map[string]any); ok {
+			if idStr, okID := ldURLMap["@id"].(string); okID {
+				rawLdURL = resolveStructuredProductURLSliceGo(idStr, finalURL)
+			} else if urlStr, okU := ldURLMap["url"].(string); okU {
+				rawLdURL = resolveStructuredProductURLSliceGo(urlStr, finalURL)
+			}
 		}
 
 		out := map[string]any{
@@ -2838,10 +2849,18 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 		if cleanSku != "" {
 			out["sku"] = cleanSku
 		}
-		if g13, ok := productLd["gtin13"].(string); ok {
-			out["gtin"] = g13
-		} else if g, ok := productLd["gtin"].(string); ok {
-			out["gtin"] = g
+		if mpnStr, ok := productLd["mpn"].(string); ok && strings.TrimSpace(mpnStr) != "" {
+			if cleanMpn := SanitizePlainMetadataText(mpnStr, 160); cleanMpn != "" {
+				out["mpn"] = cleanMpn
+			}
+		}
+		for _, gtinKey := range []string{"gtin13", "gtin14", "gtin12", "gtin8", "gtin"} {
+			if gv, ok := productLd[gtinKey].(string); ok && strings.TrimSpace(gv) != "" {
+				if cleanG := SanitizePlainMetadataText(gv, 64); cleanG != "" {
+					out["gtin"] = cleanG
+					break
+				}
+			}
 		}
 		if hasPrice {
 			out["price"] = price
@@ -2887,7 +2906,9 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 					vm["currency"] = vc
 				}
 				if va, ok := o["availability"].(string); ok && va != "" {
-					vm["availability"] = reSchemaOrgPrefixSliceGo.ReplaceAllString(va, "")
+					if normVA := normalizeAvailabilitySliceGo(va); normVA != "" {
+						vm["availability"] = normVA
+					}
 				}
 				variants = append(variants, vm)
 			}
@@ -2896,12 +2917,21 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 		return out
 	}
 
+	// Fallback to scoped HTML Schema.org Microdata (`itemscope` + `itemtype*="schema.org/Product"`).
+	if microProd := extractMicrodataProductSliceGo(rawBody, finalURL, fallbackTitle, fallbackDescription); microProd != nil {
+		return microProd
+	}
+
 	// Fallback to OpenGraph `product:price:amount` / meta tags.
 	ogPrice := matchMetaContentSliceGo(rawBody, []string{"product:price:amount", "og:price:amount", "price"})
 	ogCurrency := matchMetaContentSliceGo(rawBody, []string{"product:price:currency", "og:price:currency", "priceCurrency"})
+	if ogCurrency == "" && ogPrice != "" {
+		ogCurrency = inferPriceCurrencySliceGo(ogPrice)
+	}
 	ogBrand := SanitizePlainMetadataText(matchMetaContentSliceGo(rawBody, []string{"product:brand", "og:brand", "brand"}), 240)
-	ogAvail := matchMetaContentSliceGo(rawBody, []string{"product:availability", "og:availability", "availability"})
+	ogAvail := normalizeAvailabilitySliceGo(matchMetaContentSliceGo(rawBody, []string{"product:availability", "og:availability", "availability"}))
 	ogImage := normalizePublicProductImageURLSliceGo(matchMetaContentSliceGo(rawBody, []string{"og:image"}), finalURL)
+	ogURL := resolveStructuredProductURLSliceGo(matchMetaContentSliceGo(rawBody, []string{"og:url"}), finalURL)
 
 	if ogPrice != "" || ogBrand != "" || ogAvail != "" {
 		ogTitleSrc := matchMetaContentSliceGo(rawBody, []string{"og:title"})
@@ -2911,7 +2941,7 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 		cleanOgTitle := SanitizePlainMetadataText(ogTitleSrc, 400)
 		cleanOgDesc := SanitizePlainMetadataText(fallbackDescription, 1200)
 		out := map[string]any{
-			"url": finalURL,
+			"url": ogURL,
 		}
 		if cleanOgTitle != "" {
 			out["title"] = cleanOgTitle
@@ -2937,6 +2967,13 @@ func ExtractStructuredProduct(rawBody, finalURL, fallbackTitle, fallbackDescript
 			out["images"] = []string{ogImage}
 		}
 		return out
+	}
+
+	// Fallback to guarded 2-column HTML spec-table / <dl> / semantic product pages (`books.toscrape.com`,
+	// `bikeschematics.com`, `bafang-e.com`). Runs before the minimal barcode/H1 fallback so pages with spec tables
+	// retain price/sku/specs.
+	if specProd := extractSpecTableProductSliceGo(rawBody, finalURL, fallbackTitle, fallbackDescription, jsonLdList); specProd != nil {
+		return specProd
 	}
 
 	// Fallback for barcode / consumer packaged goods & microdata pages (e.g. Open Food Facts `/product/<gtin>`).

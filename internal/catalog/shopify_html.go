@@ -11,8 +11,14 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
 )
 
+// ShopifyFeedFormatOptions configures FormatShopifyProductsFeedTwin.
+type ShopifyFeedFormatOptions struct {
+	TwinURL  string `json:"twinUrl,omitempty"`
+	Currency string `json:"currency,omitempty"`
+}
+
 // FormatShopifyProductsFeedTwin formats a `/products.json` or `/collections/<h>/products.json` feed page.
-func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
+func FormatShopifyProductsFeedTwin(rawBody, origURL string, opts ...ShopifyFeedFormatOptions) *TwinFormattedDoc {
 	data, ok := parseJSONObjectCommerce(rawBody)
 	if !ok {
 		return nil
@@ -21,11 +27,21 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 	if !isArr {
 		return nil
 	}
+	var fmtOpt ShopifyFeedFormatOptions
+	if len(opts) > 0 {
+		fmtOpt = opts[0]
+	}
 	u, err := url.Parse(strings.TrimSpace(origURL))
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil
 	}
-	q := u.Query()
+	queryURL := u
+	if strings.TrimSpace(fmtOpt.TwinURL) != "" {
+		if tu, errT := url.Parse(strings.TrimSpace(fmtOpt.TwinURL)); errT == nil && tu.Scheme != "" && tu.Host != "" {
+			queryURL = tu
+		}
+	}
+	q := queryURL.Query()
 	page := 1
 	if p, errP := strconv.Atoi(q.Get("page")); errP == nil && p > 1 {
 		page = p
@@ -40,20 +56,32 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 	}
 
 	origin := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+	var normOpts *ShopifyNormalizeOptions
+	if strings.TrimSpace(fmtOpt.Currency) != "" {
+		normOpts = &ShopifyNormalizeOptions{Currency: fmtOpt.Currency}
+	}
 	records := make([]CatalogRecord, 0, len(rawProducts))
 	for _, rpAny := range rawProducts {
 		if rp, okM := rpAny.(map[string]any); okM {
-			if norm := NormalizeShopifyProductRecord(rp, origin, nil); norm != nil {
+			if norm := NormalizeShopifyProductRecord(rp, origin, normOpts); norm != nil {
 				records = append(records, *norm)
 			}
 		}
+	}
+
+	if tTwin := strings.TrimSpace(fmtOpt.TwinURL); tTwin != "" &&
+		!strings.EqualFold(tTwin, strings.TrimSpace(origURL)) &&
+		!strings.HasSuffix(strings.ToLower(u.Path), ".json") &&
+		len(records) == 0 {
+		// Fail open cleanly to origin collection HTML when a pre-fetch collection twin returns products: [].
+		return nil
 	}
 
 	returned := len(records)
 	hasMore := returned > 0 && returned >= limit
 	nextURL := ""
 	if hasMore {
-		nextU := *u
+		nextU := *queryURL
 		nq := nextU.Query()
 		nq.Set("page", strconv.Itoa(page+1))
 		if !nq.Has("limit") {
@@ -65,11 +93,15 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 
 	host := strings.ToLower(u.Hostname())
 	scopeLabel := host
-	rawPath := u.EscapedPath()
+	rawPath := queryURL.EscapedPath()
 	if rawPath == "" {
-		rawPath = u.Path
+		rawPath = queryURL.Path
 	}
 	if colMatch := reShopifyCollectionURL.FindStringSubmatch(rawPath); len(colMatch) == 2 {
+		if decCol, okDec := SafeDecodeURIComponent(colMatch[1]); okDec && decCol != "" {
+			scopeLabel = fmt.Sprintf("%s (%s)", host, decCol)
+		}
+	} else if colMatch := reShopifyColPath.FindStringSubmatch(u.EscapedPath()); len(colMatch) == 2 {
 		if decCol, okDec := SafeDecodeURIComponent(colMatch[1]); okDec && decCol != "" {
 			scopeLabel = fmt.Sprintf("%s (%s)", host, decCol)
 		}
@@ -82,7 +114,7 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 
 	moreLine := "- **Has More Pages**: No"
 	if hasMore {
-		moreLine = fmt.Sprintf("- **Has More Pages**: Yes ([Page %d](%s))", page+1, nextURL)
+		moreLine = "- **Has More Pages**: Yes (" + FormatMarkdownLinkCommerce(fmt.Sprintf("Page %d", page+1), nextURL) + ")"
 	}
 	summaryBullets := strings.Join([]string{
 		"- **Store Origin**: " + origin,
@@ -102,7 +134,13 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 		var minP, maxP *float64
 		availCount := 0
 		anyKnownAvail := false
+		var skuSamples []string
+		seenSKU := make(map[string]bool)
 		for _, v := range r.Variants {
+			if v.SKU != nil && *v.SKU != "" && !seenSKU[*v.SKU] && len(skuSamples) < 3 {
+				seenSKU[*v.SKU] = true
+				skuSamples = append(skuSamples, formatCommerceSKUDisplay(v.SKU, false))
+			}
 			if v.Price != nil {
 				pv := *v.Price
 				if minP == nil || pv < *minP {
@@ -121,16 +159,20 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 				}
 			}
 		}
+		skuCell := "-"
+		if len(skuSamples) > 0 {
+			skuCell = strings.Join(skuSamples, ", ")
+		}
 		priceCell := "-"
 		if minP != nil && maxP != nil {
+			var c0 *string
+			if len(r.Variants) > 0 {
+				c0 = r.Variants[0].Currency
+			}
 			if *minP == *maxP {
-				var c0 *string
-				if len(r.Variants) > 0 {
-					c0 = r.Variants[0].Currency
-				}
 				priceCell = formatMoneyDisplay(minP, c0)
 			} else {
-				priceCell = formatMoneyDisplay(minP, nil) + "–" + formatMoneyDisplay(maxP, nil)
+				priceCell = formatMoneyDisplay(minP, c0) + "–" + formatMoneyDisplay(maxP, c0)
 			}
 		}
 		availCell := fmt.Sprintf("%d variants", len(r.Variants))
@@ -154,9 +196,10 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 			typeCell = *r.ProductType
 		}
 		rows = append(rows, []string{
-			fmt.Sprintf("[%s](%s)", r.Title, r.URL),
+			FormatMarkdownLinkCommerce(r.Title, r.URL),
 			vendorCell,
 			typeCell,
+			skuCell,
 			strconv.Itoa(len(r.Variants)),
 			priceCell,
 			availCell,
@@ -166,7 +209,7 @@ func FormatShopifyProductsFeedTwin(rawBody, origURL string) *TwinFormattedDoc {
 
 	tableSection := "No products returned on this page."
 	if len(rows) > 0 {
-		tableSection = FormatGFMTable([]string{"Product", "Vendor", "Type", "Variants", "Price", "Stock", "Updated"}, rows)
+		tableSection = FormatGFMTable([]string{"Product", "Vendor", "Type", "SKU", "Variants", "Price", "Stock", "Updated"}, rows)
 	}
 	return &TwinFormattedDoc{
 		Title:    title,

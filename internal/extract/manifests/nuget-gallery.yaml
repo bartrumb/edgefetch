@@ -1,0 +1,56 @@
+# Shared Go + TypeScript Declarative Site Adapter: NuGet Gallery
+id: nuget-gallery
+name: NuGet Gallery
+category: developer
+description: "Upgrades nuget.org/packages/<id>[/<version>] pages to the official api.nuget.org v3 registration JSON API (supporting both inlined catalogEntry pages and un-inlined CatalogPage stubs)."
+domains:
+  - www.nuget.org
+  - nuget.org
+exampleUrls:
+  - "https://www.nuget.org/packages/Newtonsoft.Json"
+  - "https://www.nuget.org/packages/Newtonsoft.Json/13.0.3"
+
+routes:
+  # Route 1: Versioned NuGet package /packages/<pkgId>/<ver>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - packages
+        - param: pkgId
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+          transform: lower
+        - param: ver
+          charset: url_seg
+          reserved:
+            - ReportAbuse
+            - ContactOwners
+            - versions
+          minLen: 1
+          maxLen: 64
+    twin:
+      fetchUrl: "https://api.nuget.org/v3/registration5-gz-semver2/{pkgId}/index.json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      jsonMode: nuget_registration
+
+  # Route 2: Latest NuGet package /packages/<pkgId>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - packages
+        - param: pkgId
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+          transform: lower
+    twin:
+      fetchUrl: "https://api.nuget.org/v3/registration5-gz-semver2/{pkgId}/index.json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      jsonMode: nuget_registration

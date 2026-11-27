@@ -6,7 +6,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { parseExactRetryAfterMs } from './agent-hub';
 import { getActiveCallerAuthContext } from './oauth';
-import { cloudflareOverflowFetch, isSafePublicHostname } from './overflow';
+import { cloudflareOverflowFetch, isSafePublicHostname, validatePublicHttpsTargetUrl } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type RequestTracer, type TraceContext } from './otel';
 import { getRegistrableDomain, hasPrivateSharedHostingSuffix, isPublicOrPrivateSuffix } from './psl';
 import {
@@ -46,13 +46,16 @@ import {
   ensureD1ColumnIfMissing,
   INTERNAL_COLLECTION_ID_RE,
   resolveUserCollectionId,
+  sanitizeExtractedTitle,
 } from './search-index';
 import {
+  isPrivateRequestPayload,
   r2DerivedKey,
   r2PrivateDerivedKey,
   readVerifiedArtifactFromR2,
   sanitizeStorageUserId,
   type ArtifactRetention,
+  type ArtifactVisibility,
   type OptionalStorageBindings,
 } from './storage';
 import { getCachedWikipediaSitemapUrls, isWikipediaHost, setCachedWikipediaSitemapUrls } from './wikipedia';
@@ -166,7 +169,7 @@ function matchesHostScope(candidateHost: string, rootHost: string, allowSubdomai
 }
 
 /** Extracts `Sitemap:` URLs declared inside a `/robots.txt` file. */
-export function extractRobotsSitemaps(robotsText: string, origin: string): string[] {
+export function extractRobotsSitemaps(robotsText: string, origin: string, selfHost?: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const rawLine of robotsText.split(/\r?\n/)) {
@@ -175,9 +178,10 @@ export function extractRobotsSitemaps(robotsText: string, origin: string): strin
     if (!m?.[1]) continue;
     try {
       const u = new URL(m[1], origin);
-      if (u.protocol === 'https:' && !seen.has(u.toString())) {
-        seen.add(u.toString());
-        out.push(u.toString());
+      const check = validatePublicHttpsTargetUrl(u.toString(), selfHost);
+      if (check.ok && !seen.has(check.normalized)) {
+        seen.add(check.normalized);
+        out.push(check.normalized);
         if (out.length >= 10) break;
       }
     } catch {
@@ -218,7 +222,7 @@ function unwrapXmlCdataLinear(raw: string): string {
 }
 
 /** Parses XML `<sitemapindex>` and `<urlset>` `<loc>` entries in guaranteed linear O(N) time (`R3-H1`). */
-export function parseSitemapXml(xmlText: string): { isIndex: boolean; locs: string[] } {
+export function parseSitemapXml(xmlText: string, selfHost?: string): { isIndex: boolean; locs: string[] } {
   const bounded = xmlText.length > 4 * 1024 * 1024 ? xmlText.slice(0, 4 * 1024 * 1024) : xmlText;
   const isIndex = /<\s*sitemapindex\b/i.test(bounded.slice(0, 4_096));
   const locs: string[] = [];
@@ -267,18 +271,14 @@ export function parseSitemapXml(xmlText: string): { isIndex: boolean; locs: stri
       .replace(/&amp;/g, '&')
       .trim();
     if (!raw || seen.has(raw)) continue;
-    try {
-      const u = new URL(raw);
-      if (u.protocol === 'https:') {
-        u.hash = '';
-        const clean = u.toString();
-        if (!seen.has(clean)) {
-          seen.add(clean);
-          locs.push(clean);
-        }
+    const check = validatePublicHttpsTargetUrl(raw, selfHost);
+    if (check.ok) {
+      check.url.hash = '';
+      const clean = check.url.toString();
+      if (!seen.has(clean)) {
+        seen.add(clean);
+        locs.push(clean);
       }
-    } catch {
-      // ignore invalid URL
     }
   }
   return { isIndex, locs };
@@ -293,9 +293,44 @@ async function decodeXmlOrGzipBody(bodyStr: string, bodyEncoding?: string, urlHi
     const bytes = new Uint8Array(binStr.length);
     for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
     if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+      const cap = 4 << 20; // MAX_WASM_INPUT_BYTES
       const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-      const ab = await new Response(stream).arrayBuffer();
-      return new TextDecoder('utf-8', { fatal: false }).decode(ab.slice(0, 4 << 20));
+      const reader = stream.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || value.byteLength === 0) continue;
+          const remaining = cap - total;
+          if (remaining <= 0) {
+            await reader.cancel('sitemap gzip cap exceeded').catch(() => undefined);
+            break;
+          }
+          if (value.byteLength >= remaining) {
+            chunks.push(value.byteLength === remaining ? value : value.subarray(0, remaining));
+            total += remaining;
+            await reader.cancel('sitemap gzip cap exceeded').catch(() => undefined);
+            break;
+          }
+          chunks.push(value);
+          total += value.byteLength;
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore
+        }
+      }
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        out.set(c, off);
+        off += c.byteLength;
+      }
+      return new TextDecoder('utf-8', { fatal: false }).decode(out);
     }
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
   } catch {
@@ -527,9 +562,10 @@ export async function executeMapCall(params: {
     return SHARED_MULTI_TENANT_REDIRECT_HOSTS.some((d) => lh === d || lh.endsWith(`.${d}`));
   };
   const homeItem = byId.get('home');
-  const redirectProbeItem = [homeItem, byId.get('sitemap'), byId.get('llms')].find(
-    (it) => it?.outcome === 'ok' && typeof it.finalUrl === 'string' && it.finalUrl.trim().length > 0,
-  );
+  const redirectProbeItem =
+    homeItem?.outcome === 'ok' && typeof homeItem.finalUrl === 'string' && homeItem.finalUrl.trim().length > 0
+      ? homeItem
+      : undefined;
   let redirectedRootUrl: URL | null = null;
   if (redirectProbeItem && typeof redirectProbeItem.finalUrl === 'string') {
     const redirCheck = validatePublicHttpsUrl(redirectProbeItem.finalUrl, selfHost);
@@ -541,10 +577,7 @@ export async function executeMapCall(params: {
       !isPublicOrPrivateSuffix(destHost) &&
       !isSharedMultiTenantHost(destHost)
     ) {
-      redirectedRootUrl =
-        redirectProbeItem === homeItem
-          ? redirCheck.url
-          : new URL(trimmedSubpath || '/', redirCheck.url.origin);
+      redirectedRootUrl = redirCheck.url;
     }
   }
   // Developer tools on `.sh`/`.io`/`.ai`/`.dev`/`.app` often rebrand canonical URLs in `/sitemap.xml` & `/llms.txt` to
@@ -597,12 +630,13 @@ export async function executeMapCall(params: {
         allowSubdomains,
         redirectedHostIsPrivateShared,
       ));
-  const resolveVerifiedSeedUrl = (item: Record<string, unknown> | undefined, fallbackUrlStr: string): URL => {
+  const resolveVerifiedSeedUrl = (item: Record<string, unknown> | undefined, fallbackUrlStr: string): URL | null => {
     if (item && item.outcome === 'ok' && typeof item.finalUrl === 'string' && item.finalUrl.trim()) {
       const chk = validatePublicHttpsUrl(item.finalUrl, selfHost);
-      if (chk.ok && matchesEffectiveHostScope(chk.url.hostname, true)) {
-        return chk.url;
+      if (!chk.ok || !matchesEffectiveHostScope(chk.url.hostname, true)) {
+        return null;
       }
+      return chk.url;
     }
     return new URL(fallbackUrlStr);
   };
@@ -642,7 +676,7 @@ export async function executeMapCall(params: {
   ): string | null => {
     try {
       const u = new URL(rawCandidate, baseOriginOverride ?? origin);
-      if (u.protocol !== 'https:' || (u.port && u.port !== '443')) return null;
+      if (u.protocol !== 'https:' || (u.port && u.port !== '443') || u.username || u.password) return null;
       const isSameBrandComTwin = matchesSameBrandComFromRoot(u.hostname, sourceItemHost, includeSubdomains);
       if (!isSameBrandComTwin && !matchesEffectiveHostScope(u.hostname, includeSubdomains)) return null;
       if (
@@ -722,16 +756,18 @@ export async function executeMapCall(params: {
     const homeSeen = new Set<string>();
     if (homeItem.outcome === 'ok' && typeof homeItem.body === 'string') {
       const verifiedHomeUrl = resolveVerifiedSeedUrl(homeItem, rootUrl.toString());
-      const homeBaseStr = verifiedHomeUrl.toString();
-      const anchorTitles = extractAnchorTitlesFromHtml(homeItem.body, homeBaseStr);
-      const ext = extractHtmlDocument(homeItem.body, { baseUrl: homeBaseStr, onlyMainContent: false });
-      const homeLinks =
-        ext.links.length > 0
-          ? ext.links
-          : extractMarkdownLinksAndImages(homeItem.body, homeBaseStr, false).links;
-      for (const l of homeLinks) {
-        const key = addUrl(l, 'homepage', anchorTitles.get(l), undefined, homeBaseStr, verifiedHomeUrl.hostname);
-        if (key) homeSeen.add(key);
+      if (verifiedHomeUrl) {
+        const homeBaseStr = verifiedHomeUrl.toString();
+        const anchorTitles = extractAnchorTitlesFromHtml(homeItem.body, homeBaseStr);
+        const ext = extractHtmlDocument(homeItem.body, { baseUrl: homeBaseStr, onlyMainContent: false });
+        const homeLinks =
+          ext.links.length > 0
+            ? ext.links
+            : extractMarkdownLinksAndImages(homeItem.body, homeBaseStr, false).links;
+        for (const l of homeLinks) {
+          const key = addUrl(l, 'homepage', anchorTitles.get(l), undefined, homeBaseStr, verifiedHomeUrl.hostname);
+          if (key) homeSeen.add(key);
+        }
       }
     }
     sourcesReport.push({
@@ -752,13 +788,15 @@ export async function executeMapCall(params: {
     const llmsSeen = new Set<string>();
     if (llmsItem.outcome === 'ok' && typeof llmsItem.body === 'string') {
       const verifiedLlmsUrl = resolveVerifiedSeedUrl(llmsItem, llmsTargetUrl);
-      const effectiveLlmsUrl = verifiedLlmsUrl.toString();
-      const llmsDoc = parseLlmsTxt(llmsItem.body, effectiveLlmsUrl, { recordCompanionCache: false });
-      if (llmsDoc) {
-        for (const l of llmsDoc.links) {
-          const noteSummary = [l.section, l.notes].filter(Boolean).join(' — ');
-          const key = addUrl(l.url, srcLabel, l.title, noteSummary || undefined, effectiveLlmsUrl, verifiedLlmsUrl.hostname);
-          if (key) llmsSeen.add(key);
+      if (verifiedLlmsUrl) {
+        const effectiveLlmsUrl = verifiedLlmsUrl.toString();
+        const llmsDoc = parseLlmsTxt(llmsItem.body, effectiveLlmsUrl, { recordCompanionCache: false });
+        if (llmsDoc) {
+          for (const l of llmsDoc.links) {
+            const noteSummary = [l.section, l.notes].filter(Boolean).join(' — ');
+            const key = addUrl(l.url, srcLabel, l.title, noteSummary || undefined, effectiveLlmsUrl, verifiedLlmsUrl.hostname);
+            if (key) llmsSeen.add(key);
+          }
         }
       }
     }
@@ -778,11 +816,12 @@ export async function executeMapCall(params: {
       let sitemapsFound = 0;
       if (robotsItem.outcome === 'ok' && typeof robotsItem.body === 'string') {
         const verifiedRobotsUrl = resolveVerifiedSeedUrl(robotsItem, `${origin}/robots.txt`);
-        for (const sm of extractRobotsSitemaps(robotsItem.body, verifiedRobotsUrl.origin)) {
-          let isSameBrandRobotsSm = false;
-          try {
-            const smHost = new URL(sm).hostname;
-            isSameBrandRobotsSm = matchesSameBrandComFromRoot(smHost, verifiedRobotsUrl.hostname, true);
+        if (verifiedRobotsUrl) {
+          for (const sm of extractRobotsSitemaps(robotsItem.body, verifiedRobotsUrl.origin, selfHost)) {
+            const smCheck = validatePublicHttpsTargetUrl(sm, selfHost);
+            if (!smCheck.ok) continue;
+            const smHost = smCheck.url.hostname;
+            const isSameBrandRobotsSm = matchesSameBrandComFromRoot(smHost, verifiedRobotsUrl.hostname, true);
             if (
               !isSameBrandRobotsSm &&
               !matchesSingleScopedHost(
@@ -794,18 +833,16 @@ export async function executeMapCall(params: {
             ) {
               continue;
             }
-          } catch {
-            continue;
-          }
-          sitemapsFound++;
-          if (
-            !isSameBrandRobotsSm &&
-            sm !== `${origin}/sitemap.xml` &&
-            sm !== `${origin}/sitemap-index.xml` &&
-            sm !== `${verifiedRobotsUrl.origin}/sitemap.xml` &&
-            sm !== `${verifiedRobotsUrl.origin}/sitemap-index.xml`
-          ) {
-            childSitemaps.add(sm);
+            sitemapsFound++;
+            if (
+              !isSameBrandRobotsSm &&
+              smCheck.normalized !== `${origin}/sitemap.xml` &&
+              smCheck.normalized !== `${origin}/sitemap-index.xml` &&
+              smCheck.normalized !== `${verifiedRobotsUrl.origin}/sitemap.xml` &&
+              smCheck.normalized !== `${verifiedRobotsUrl.origin}/sitemap-index.xml`
+            ) {
+              childSitemaps.add(smCheck.normalized);
+            }
           }
         }
       }
@@ -837,21 +874,55 @@ export async function executeMapCall(params: {
         if (wikiSmItem) {
           let found = 0;
           if (wikiSmItem.outcome === 'ok' && typeof wikiSmItem.body === 'string') {
-            const xml = await decodeXmlOrGzipBody(wikiSmItem.body, wikiSmItem.bodyEncoding as string | undefined, wikiAllowedSitemapUrl);
-            const parsedSm = parseSitemapXml(xml);
-            if (parsedSm.isIndex) {
-              for (const loc of parsedSm.locs) {
-                childSitemaps.add(loc);
-                found++;
+            const verifiedWikiSmUrl = resolveVerifiedSeedUrl(wikiSmItem, wikiAllowedSitemapUrl);
+            if (verifiedWikiSmUrl) {
+              const xml = await decodeXmlOrGzipBody(
+                wikiSmItem.body,
+                wikiSmItem.bodyEncoding as string | undefined,
+                verifiedWikiSmUrl.toString(),
+              );
+              const parsedSm = parseSitemapXml(xml, selfHost);
+              if (parsedSm.isIndex) {
+                for (const loc of parsedSm.locs) {
+                  let resolvedChild: URL;
+                  try {
+                    resolvedChild = new URL(loc, verifiedWikiSmUrl.origin);
+                  } catch {
+                    continue;
+                  }
+                  const childCheck = validatePublicHttpsTargetUrl(resolvedChild.toString(), selfHost);
+                  if (
+                    !childCheck.ok ||
+                    !matchesSingleScopedHost(
+                      childCheck.url.hostname,
+                      verifiedWikiSmUrl.hostname,
+                      true,
+                      hasPrivateSharedHostingSuffix(verifiedWikiSmUrl.hostname),
+                    )
+                  ) {
+                    continue;
+                  }
+                  childSitemaps.add(childCheck.normalized);
+                  found++;
+                }
+              } else {
+                const wikiSeen = new Set<string>();
+                for (const loc of parsedSm.locs) {
+                  const key = addUrl(
+                    loc,
+                    'sitemap',
+                    undefined,
+                    undefined,
+                    verifiedWikiSmUrl.origin,
+                    verifiedWikiSmUrl.hostname,
+                  );
+                  if (key) wikiSeen.add(key);
+                }
+                found = wikiSeen.size;
+                if (wikiSeen.size > 0) {
+                  setCachedWikipediaSitemapUrls(rootHost, [...wikiSeen]);
+                }
               }
-            } else {
-              setCachedWikipediaSitemapUrls(rootHost, parsedSm.locs);
-              const wikiSeen = new Set<string>();
-              for (const loc of parsedSm.locs) {
-                const key = addUrl(loc, 'sitemap', undefined, undefined, origin, rootHost);
-                if (key) wikiSeen.add(key);
-              }
-              found = wikiSeen.size;
             }
           }
           sourcesReport.push({
@@ -874,15 +945,22 @@ export async function executeMapCall(params: {
       let found = 0;
       if (smItem.outcome === 'ok' && typeof smItem.body === 'string') {
         const verifiedSmUrl = resolveVerifiedSeedUrl(smItem, smUrl);
-        const xml = await decodeXmlOrGzipBody(smItem.body, smItem.bodyEncoding as string | undefined, verifiedSmUrl.toString());
-        const parsedSm = parseSitemapXml(xml);
-        if (parsedSm.isIndex) {
-          for (const loc of parsedSm.locs) {
-            try {
-              const locHost = new URL(loc, verifiedSmUrl.origin).hostname;
+        if (verifiedSmUrl) {
+          const xml = await decodeXmlOrGzipBody(smItem.body, smItem.bodyEncoding as string | undefined, verifiedSmUrl.toString());
+          const parsedSm = parseSitemapXml(xml, selfHost);
+          if (parsedSm.isIndex) {
+            for (const loc of parsedSm.locs) {
+              let resolvedChild: URL;
+              try {
+                resolvedChild = new URL(loc, verifiedSmUrl.origin);
+              } catch {
+                continue;
+              }
+              const childCheck = validatePublicHttpsTargetUrl(resolvedChild.toString(), selfHost);
               if (
+                !childCheck.ok ||
                 !matchesSingleScopedHost(
-                  locHost,
+                  childCheck.url.hostname,
                   verifiedSmUrl.hostname,
                   true,
                   hasPrivateSharedHostingSuffix(verifiedSmUrl.hostname),
@@ -890,19 +968,17 @@ export async function executeMapCall(params: {
               ) {
                 continue;
               }
-            } catch {
-              continue;
+              childSitemaps.add(childCheck.normalized);
+              found++;
             }
-            childSitemaps.add(new URL(loc, verifiedSmUrl.origin).toString());
-            found++;
+          } else {
+            const smSeen = new Set<string>();
+            for (const loc of parsedSm.locs) {
+              const key = addUrl(loc, 'sitemap', undefined, undefined, verifiedSmUrl.origin, verifiedSmUrl.hostname);
+              if (key) smSeen.add(key);
+            }
+            found = smSeen.size;
           }
-        } else {
-          const smSeen = new Set<string>();
-          for (const loc of parsedSm.locs) {
-            const key = addUrl(loc, 'sitemap', undefined, undefined, verifiedSmUrl.origin, verifiedSmUrl.hostname);
-            if (key) smSeen.add(key);
-          }
-          found = smSeen.size;
         }
       }
       sourcesReport.push({
@@ -949,11 +1025,8 @@ export async function executeMapCall(params: {
 
     const toFetchSitemaps = [...childSitemaps]
       .filter((u) => {
-        try {
-          return matchesEffectiveHostScope(new URL(u).hostname, true);
-        } catch {
-          return false;
-        }
+        const chk = validatePublicHttpsTargetUrl(u, selfHost);
+        return chk.ok && matchesEffectiveHostScope(chk.url.hostname, true);
       })
       .map((u, idx) => ({ url: u, score: scoreChildSitemap(u), seq: extractSitemapSeq(u), idx }))
       .filter((x) => Boolean(searchFilter) || discovered.size < limit || x.score > 0)
@@ -996,23 +1069,27 @@ export async function executeMapCall(params: {
           let found = 0;
           if (sr.outcome === 'ok' && typeof sr.body === 'string' && srUrl) {
             const verifiedChildSmUrl = resolveVerifiedSeedUrl(sr, srUrl);
-            const xml = await decodeXmlOrGzipBody(sr.body, sr.bodyEncoding as string | undefined, verifiedChildSmUrl.toString());
-            const p = parseSitemapXml(xml);
-            if (!p.isIndex) {
-              const csmSeen = new Set<string>();
-              for (const loc of p.locs) {
-                if (isWikiRootHost && wikiCollectedChildLocs.length < 5_000) wikiCollectedChildLocs.push(loc);
-                const key = addUrl(
-                  loc,
-                  'sitemap',
-                  undefined,
-                  undefined,
-                  verifiedChildSmUrl.origin,
-                  verifiedChildSmUrl.hostname,
-                );
-                if (key) csmSeen.add(key);
+            if (verifiedChildSmUrl) {
+              const xml = await decodeXmlOrGzipBody(sr.body, sr.bodyEncoding as string | undefined, verifiedChildSmUrl.toString());
+              const p = parseSitemapXml(xml, selfHost);
+              if (!p.isIndex) {
+                const csmSeen = new Set<string>();
+                for (const loc of p.locs) {
+                  const key = addUrl(
+                    loc,
+                    'sitemap',
+                    undefined,
+                    undefined,
+                    verifiedChildSmUrl.origin,
+                    verifiedChildSmUrl.hostname,
+                  );
+                  if (key) {
+                    csmSeen.add(key);
+                    if (isWikiRootHost && wikiCollectedChildLocs.length < 5_000) wikiCollectedChildLocs.push(key);
+                  }
+                }
+                found = csmSeen.size;
               }
-              found = csmSeen.size;
             }
           }
           if (srUrl) {
@@ -1399,6 +1476,7 @@ export async function deliverSignedWebhook(params: {
 
 export interface CrawlJobOptions {
   userId?: string;
+  visibility?: ArtifactVisibility;
   limit: number;
   maxDepth: number;
   allowSubdomains: boolean;
@@ -1751,8 +1829,10 @@ export async function createCrawlJob(params: {
       ? Math.min(30_000, Math.round(payload.delay * 1_000))
       : undefined;
 
+  const isPrivateCrawl = isPrivateRequestPayload(payload, effectiveUserId);
   const options: CrawlJobOptions = {
     userId: effectiveUserId,
+    visibility: isPrivateCrawl ? 'private' : 'public',
     limit: typeof payload.limit === 'number' && Number.isFinite(payload.limit) ? Math.min(200, Math.max(1, Math.floor(payload.limit))) : 25,
     maxDepth: Math.min(8, Math.max(0, Math.floor(rawMaxDepth))),
     allowSubdomains: Boolean(payload.allowSubdomains),
@@ -1789,6 +1869,17 @@ export async function createCrawlJob(params: {
     .run();
 
   return { ok: true, crawlId, rootUrl: urlCheck.url.toString(), options };
+}
+
+function toDisplayCollectionId(rawStoredCollectionId: string | undefined, effectiveUserId: string): string | undefined {
+  if (!rawStoredCollectionId || !rawStoredCollectionId.startsWith('private:')) {
+    return rawStoredCollectionId;
+  }
+  const pm = /^private:([A-Za-z0-9_-]{1,64}):([A-Za-z0-9_.:-]{1,64})$/.exec(rawStoredCollectionId);
+  if (pm && pm[1] === effectiveUserId && pm[2]) {
+    return pm[2];
+  }
+  return rawStoredCollectionId;
 }
 
 export async function executeCrawlJob(params: {
@@ -1828,7 +1919,7 @@ export async function executeCrawlJob(params: {
   const effectiveUserId = sanitizeStorageUserId(
     params.userId ?? options.userId ?? initialRow?.user_id ?? getActiveCallerAuthContext()?.userId ?? 'owner',
   );
-  const isPrivateCrawl = effectiveUserId !== 'owner';
+  const isPrivateCrawl = effectiveUserId !== 'owner' || options.visibility === 'private';
   if (isPrivateCrawl) {
     await ensurePrivateCrawlPagesTable(metaDb);
   }
@@ -1978,11 +2069,14 @@ export async function executeCrawlJob(params: {
               ? itemLinks
               : (mdAssets?.links ?? []);
 
-          const resolvedPageTitle =
+          const rawResolvedPageTitle =
             ext?.title ||
             fm.title ||
             mdAssets?.title ||
             (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined);
+          const resolvedPageTitle = rawResolvedPageTitle
+            ? sanitizeExtractedTitle(rawResolvedPageTitle, itemUrl, false)
+            : undefined;
 
           if (itemUrl) {
             await ensurePrivateCrawlPagesTable(metaDb);
@@ -2185,7 +2279,13 @@ export async function executeCrawlJob(params: {
         defaultSecret: env.WEBHOOK_SECRET,
         event: 'crawl.completed',
         crawlId,
-        data: { rootUrl, discoveredCount: visited.size, fetchedCount, failedCount, collectionId: options.collectionId },
+        data: {
+          rootUrl,
+          discoveredCount: visited.size,
+          fetchedCount,
+          failedCount,
+          collectionId: toDisplayCollectionId(options.collectionId, effectiveUserId),
+        },
         selfHost,
         ...(webhookFetchFn ? { fetchFn: webhookFetchFn } : {}),
         ...(activeTracer ? { tracer: activeTracer } : {}),
@@ -2264,7 +2364,7 @@ export async function getCrawlJobStatus(params: {
       ? Math.floor(parsedOpts.limit)
       : 25;
 
-  const isPrivateCrawl = effectiveUserId !== 'owner';
+  const isPrivateCrawl = effectiveUserId !== 'owner' || parsedOpts.visibility === 'private';
   await ensurePrivateCrawlPagesTable(metaDb);
 
   // Reconcile live fetch counts from `fetches` AND `private_crawl_pages` so `fetchedCount`, `status`, and `data`
@@ -2556,13 +2656,17 @@ export async function getCrawlJobStatus(params: {
     }
   }
 
+  const rawStoredCollectionId = typeof parsedOpts.collectionId === 'string' ? parsedOpts.collectionId : undefined;
+  const displayCollectionId = toDisplayCollectionId(rawStoredCollectionId, effectiveUserId);
+
   return {
     ok: true,
     crawl: {
       id: row.id,
       rootUrl: row.root_url,
       status: effectiveStatus,
-      collectionId: parsedOpts.collectionId,
+      ...(isPrivateCrawl ? { visibility: 'private' as const } : {}),
+      collectionId: displayCollectionId,
       discoveredCount: effectiveDiscovered,
       fetchedCount: effectiveFetched,
       failedCount: effectiveFailed,
@@ -2578,7 +2682,11 @@ export async function getCrawlJobStatus(params: {
   };
 }
 
-export async function cancelCrawlJob(crawlId: string, metaDb?: D1Database, userId?: string): Promise<{ ok: boolean; status: number }> {
+export async function cancelCrawlJob(
+  crawlId: string,
+  metaDb?: D1Database,
+  userId?: string,
+): Promise<{ ok: boolean; status: number; visibility?: 'private' }> {
   if (!metaDb) return { ok: false, status: 503 };
   await ensureCrawlsUserIdColumn(metaDb);
   const effectiveUserId = sanitizeStorageUserId(userId ?? getActiveCallerAuthContext()?.userId ?? 'owner');
@@ -2591,14 +2699,27 @@ export async function cancelCrawlJob(crawlId: string, metaDb?: D1Database, userI
     )
     .bind(now, now, crawlId, effectiveUserId)
     .run();
-  if ((res.meta?.changes ?? 0) === 0) {
-    const exists = await metaDb
-      .prepare('SELECT status FROM crawls WHERE id = ? AND user_id = ? LIMIT 1')
-      .bind(crawlId, effectiveUserId)
-      .first<{ status: string }>();
-    if (!exists) return { ok: false, status: 404 };
+  const row = await metaDb
+    .prepare('SELECT status, options_json FROM crawls WHERE id = ? AND user_id = ? LIMIT 1')
+    .bind(crawlId, effectiveUserId)
+    .first<{ status: string; options_json?: string }>();
+  if ((res.meta?.changes ?? 0) === 0 && !row) {
+    return { ok: false, status: 404 };
   }
-  return { ok: true, status: 200 };
+  let isPrivateCrawl = effectiveUserId !== 'owner';
+  if (!isPrivateCrawl && typeof row?.options_json === 'string') {
+    try {
+      const parsedOpts = JSON.parse(row.options_json) as Record<string, unknown>;
+      if (parsedOpts?.visibility === 'private') isPrivateCrawl = true;
+    } catch {
+      // ignore malformed options_json
+    }
+  }
+  return {
+    ok: true,
+    status: 200,
+    ...(isPrivateCrawl ? { visibility: 'private' as const } : {}),
+  };
 }
 
 export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, CrawlWorkflowParams> {
@@ -2697,6 +2818,7 @@ export function previewCrawlParams(payload: Record<string, unknown>, selfHost?: 
 export interface BatchScrapeJobRecord {
   id: string;
   userId?: string;
+  visibility: 'public' | 'private';
   status: 'scraping' | 'completed' | 'cancelled' | 'failed';
   total: number;
   completed: number;
@@ -2819,9 +2941,11 @@ export async function startOrExecuteBatchScrape(params: {
       ? Math.min(8, Math.max(1, Math.floor(maxConcurrency)))
       : 4;
 
+  const isPrivateBatch = isPrivateRequestPayload(payload, effectiveUserId);
   const job: BatchScrapeJobRecord = {
     id: batchId,
     userId: effectiveUserId,
+    visibility: isPrivateBatch ? 'private' : 'public',
     status: 'scraping',
     total: validUrls.length,
     completed: 0,

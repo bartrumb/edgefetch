@@ -1883,6 +1883,20 @@
               "maximum": 50,
               "default": 10
             }
+          },
+          {
+            "name": "visibility",
+            "in": "query",
+            "required": false,
+            "description": "Index isolation visibility (`\"private\"` searches the authenticated user private collection).",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "public",
+                "private"
+              ],
+              "default": "public"
+            }
           }
         ],
         "responses": {
@@ -4370,6 +4384,15 @@
             "default": true,
             "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
           },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Cache and storage visibility (\"private\" disables shared artifact persistence and isolates responses to the authenticated user)."
+          },
           "site": {
             "type": "string",
             "description": "Optional browser-capable worker site ID."
@@ -4507,6 +4530,15 @@
             "type": "boolean",
             "default": false,
             "description": "Set true to bypass cached search results and fetch fresh results."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Cache and search isolation mode (\"private\" isolates search and collection results to the authenticated user)."
           }
         },
         "required": [
@@ -4987,6 +5019,15 @@
             "type": "string",
             "description": "Optional collection ID to index crawled pages into for search_collection."
           },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Cache and storage visibility (\"private\" isolates crawled pages and indexed collections to the authenticated user)."
+          },
           "sync": {
             "type": "boolean",
             "default": false,
@@ -5046,6 +5087,15 @@
             "maximum": 50,
             "default": 10,
             "description": "Maximum matching chunks to return (1..50)."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Index isolation visibility (\"private\" searches the authenticated user private collection)."
           }
         },
         "additionalProperties": false
@@ -5142,6 +5192,15 @@
             "type": "boolean",
             "default": false,
             "description": "When true, skips persisting run history or cached artifacts."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Run and storage visibility (\"private\" isolates run state, memory, and tool scrapes to the authenticated user)."
           },
           "safe": {
             "type": "boolean",
@@ -6710,6 +6769,15 @@
             "type": "string",
             "description": "Optional collection ID to index crawled pages into for search_collection."
           },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Cache and storage visibility (\"private\" isolates crawled pages and indexed collections to the authenticated user)."
+          },
           "offset": {
             "type": "integer",
             "minimum": 0,
@@ -6802,6 +6870,15 @@
             "type": "boolean",
             "default": false,
             "description": "Set true to bypass cached search results and fetch fresh results."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Cache and search isolation mode (\"private\" isolates search and collection results to the authenticated user)."
           }
         },
         "required": [
@@ -6829,6 +6906,15 @@
             "maximum": 50,
             "default": 10,
             "description": "Maximum matching chunks to return (1..50)."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Index isolation visibility (\"private\" searches the authenticated user private collection)."
           }
         },
         "required": [
@@ -6944,6 +7030,15 @@
             "type": "boolean",
             "default": true,
             "description": "Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only)."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Cache and storage visibility (\"private\" disables shared artifact persistence and isolates responses to the authenticated user)."
           },
           "site": {
             "type": "string",
@@ -7354,6 +7449,15 @@
             "type": "boolean",
             "default": false,
             "description": "When true, skips persisting run history or cached artifacts."
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ],
+            "default": "public",
+            "description": "Run and storage visibility (\"private\" isolates run state, memory, and tool scrapes to the authenticated user)."
           },
           "safe": {
             "type": "boolean",

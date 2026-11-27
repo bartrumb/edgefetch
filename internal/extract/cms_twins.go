@@ -220,7 +220,7 @@ func FormatWordPressRestPostJSON(rawJSON, baseURL string, htmlToMD func(frag, ba
 
 	md := bodyMD
 	if title != "" && !strings.HasPrefix(bodyMD, "# ") {
-		md = "# " + title + "\n\n" + bodyMD
+		md = "# " + escapeDeclMarkdownBrackets(title) + "\n\n" + bodyMD
 	}
 
 	wpHasUnicodeTag := HasRawOrEncodedUnicodeTag(rawJSON) ||

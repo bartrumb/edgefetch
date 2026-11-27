@@ -12,7 +12,7 @@ import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
 import { getActiveCallerAuthContext } from './oauth';
 import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
 import { ensureD1ColumnIfMissing } from './search-index';
-import { sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
+import { isPrivateRequestPayload, sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
 import {
   acquireIsolateByteBudget,
   callCoreWasm,
@@ -43,6 +43,7 @@ export interface CatalogUcpMetadata {
 
 export interface CatalogStatusSummary {
   ok: boolean;
+  visibility?: 'private';
   catalogId: string;
   status: CatalogRunStatus;
   platform: string;
@@ -70,6 +71,7 @@ export interface CatalogStatusSummary {
 
 export interface CatalogRecordsResult {
   ok: boolean;
+  visibility?: 'private';
   catalogId: string;
   status: CatalogRunStatus;
   platform: string;
@@ -107,6 +109,12 @@ export interface CatalogCallPayload {
   query?: unknown;
   target?: unknown;
   site?: unknown;
+  visibility?: unknown;
+  headers?: unknown;
+  cookies?: unknown;
+  useConnectedMcp?: unknown;
+  preferMcp?: unknown;
+  auth?: unknown;
 }
 
 export interface NormalizedHubPageResponse {
@@ -612,6 +620,7 @@ async function findPreviousCompleteCatalogRun(
   origin: string,
   collection: string,
   excludeCatalogId: string,
+  isPrivateCatalog: boolean,
 ): Promise<{ productsCount: number; hashes: SnapshotHashBundle | null } | null> {
   const db = getMetaD1(env);
   if (db) {
@@ -621,7 +630,7 @@ async function findPreviousCompleteCatalogRun(
         .prepare(
           `SELECT catalog_id, user_id, products_count, hashes_json, summary_json FROM catalog_runs
            WHERE user_id = ? AND origin = ? AND collection = ? AND status = 'complete' AND catalog_id != ?
-           ORDER BY created_at DESC LIMIT 10`,
+           ORDER BY created_at DESC LIMIT 50`,
         )
         .bind(userId, origin, collection, excludeCatalogId)
         .all<{ catalog_id: string; user_id?: string; products_count: number; hashes_json: string | null; summary_json: string }>();
@@ -630,6 +639,7 @@ async function findPreviousCompleteCatalogRun(
         const parsedEntry = parseStoredCatalogSummary(row.summary_json);
         if (parsedEntry && parsedEntry.ownerUserId !== userId) continue;
         if (!parsedEntry && userId !== 'owner') continue;
+        if (Boolean(parsedEntry?.summary.visibility === 'private') !== isPrivateCatalog) continue;
         if (parsedEntry?.summary.warning === 'shrink') continue;
         let hashes: SnapshotHashBundle | null = null;
         if (row.hashes_json) {
@@ -648,6 +658,7 @@ async function findPreviousCompleteCatalogRun(
   for (const item of [...MEMORY_CATALOG_RUNS.values()].reverse()) {
     if (
       item.userId === userId &&
+      Boolean(item.summary.visibility === 'private') === isPrivateCatalog &&
       item.summary.catalogId !== excludeCatalogId &&
       item.summary.origin === origin &&
       (item.summary.collection ?? '') === collection &&
@@ -898,7 +909,11 @@ export async function getCatalogStatus(params: {
   const notFound = { status: 404, body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` } };
 
   const mem = MEMORY_CATALOG_RUNS.get(catalogId);
-  if (mem) return mem.userId !== ownerKey ? notFound : { status: 200, body: { ...mem.summary } };
+  if (mem) {
+    if (mem.userId !== ownerKey) return notFound;
+    const isPriv = ownerKey !== 'owner' || mem.summary.visibility === 'private';
+    return { status: 200, body: { ...mem.summary, ...(isPriv ? { visibility: 'private' as const } : {}) } };
+  }
 
   const db = getMetaD1(params.env);
   if (db) {
@@ -907,7 +922,10 @@ export async function getCatalogStatus(params: {
       const row = await db.prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`).bind(catalogId).first<{ user_id?: string; summary_json: string }>();
       if (row?.summary_json && (!row.user_id || row.user_id === ownerKey)) {
         const parsed = parseStoredCatalogSummary(row.summary_json);
-        if (parsed && parsed.ownerUserId === ownerKey) return { status: 200, body: { ...parsed.summary } };
+        if (parsed && parsed.ownerUserId === ownerKey) {
+          const isPriv = ownerKey !== 'owner' || parsed.summary.visibility === 'private';
+          return { status: 200, body: { ...parsed.summary, ...(isPriv ? { visibility: 'private' as const } : {}) } };
+        }
       }
     } catch {
       // ignore
@@ -1189,8 +1207,10 @@ export async function getCatalogRecords(params: {
     }
   }
 
+  const isPriv = ownerKey !== 'owner' || summary.visibility === 'private';
   const result: CatalogRecordsResult = {
     ok: true,
+    ...(isPriv ? { visibility: 'private' as const } : {}),
     catalogId,
     status: summary.status,
     platform: summary.platform,
@@ -1316,6 +1336,7 @@ export async function executeCatalogCall(params: {
   }
 
   const { ownerKey, concurrencyBucketKey, isOwner } = resolveCatalogTenantKey({ userId: params.userId, principal: params.principal });
+  const isPrivateCatalog = isPrivateRequestPayload(payload, ownerKey);
   const activeForPrincipal = ACTIVE_CATALOG_BY_PRINCIPAL.get(concurrencyBucketKey) ?? 0;
   const nonOwnerPoolFull = !isOwner && activeCatalogNonOwnerGlobal >= MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL;
   if (activeCatalogGlobal >= MAX_CONCURRENT_CATALOG_GLOBAL || nonOwnerPoolFull || activeForPrincipal >= MAX_CONCURRENT_CATALOG_PER_PRINCIPAL) {
@@ -1361,6 +1382,7 @@ export async function executeCatalogCall(params: {
     userId: ownerKey,
     summary: {
       ok: true,
+      ...(isPrivateCatalog ? { visibility: 'private' as const } : {}),
       catalogId,
       status: 'running',
       platform: activeSpec.platform,
@@ -1705,7 +1727,7 @@ export async function executeCatalogCall(params: {
       ]);
       const detectedCurrency = resolvedCurr ?? '';
 
-      const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, plan.origin, collection, catalogId);
+      const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, plan.origin, collection, catalogId, isPrivateCatalog);
       const r2 = getArtifactsR2(env);
       const wantNdjson = Boolean(r2 && rawFinalRecords.length > 0);
       type FinalizeOut = {
@@ -1763,7 +1785,8 @@ export async function executeCatalogCall(params: {
 
       let artifactId: string | undefined;
       let hashesArtifactId: string | undefined;
-      const r2Prefix = ownerKey !== 'owner' && ownerKey !== 'anonymous' ? `private/${sanitizeStorageUserId(ownerKey)}/catalog` : 'catalog';
+      const isCatalogArtifactPrivate = isPrivateCatalog || (ownerKey !== 'owner' && ownerKey !== 'anonymous');
+      const r2Prefix = isCatalogArtifactPrivate ? `private/${sanitizeStorageUserId(ownerKey)}/catalog` : 'catalog';
       if (r2 && finalized.records.length > 0) {
         const key = `${r2Prefix}/${catalogId}.ndjson`;
         await r2

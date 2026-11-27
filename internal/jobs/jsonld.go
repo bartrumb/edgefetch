@@ -16,7 +16,6 @@ const maxJobPIChars = 1_572_864
 var (
 	reJobPostingToken    = newLazyRegexp(`(?i)JobPosting`)
 	reTelecommuteToken   = newLazyRegexp(`(?i)TELECOMMUTE`)
-	reSafeHTTPApplyURL   = newLazyRegexp(`(?i)^https?://[^\s<>()"` + "`" + `]+$`)
 	reBoilerplateHeading = newLazyRegexp(`(?i)^(?:equal\s+(?:employment\s+)?opportunity|eeo\s+statement|accommodations?|reasonable\s+accommodation|ai\s+in\s+hiring|applicant\s+privacy|privacy\s+notice|ccpa|fair\s+chance)`)
 	reBoilerplateEEO1    = newLazyRegexp(`\bequal\s+(?:employment\s+)?opportunity\s+employer\b|\bproud\s+to\s+be\s+an?\s+equal\s+opportunity\b`)
 	reBoilerplateEEO2    = newLazyRegexp(`\bwithout\s+regard\s+to\s+race,\s*color,\s*religion\b|\bnational\s+origin,\s*(?:sex|gender|age|disability)\b`)
@@ -565,10 +564,7 @@ func ExtractJobPostingJSONLD(rawHTML, baseURL, fallbackProse string) *Structured
 	if u, ok := jp["url"].(string); ok {
 		rawJpURL = strings.TrimSpace(StripInvisibleJobChars(u))
 	}
-	applyURL := baseURL
-	if len(rawJpURL) <= 2048 && reSafeHTTPApplyURL.MatchString(rawJpURL) {
-		applyURL = rawJpURL
-	}
+	applyURL := sanitizeATSHttpsURL(rawJpURL, baseURL)
 
 	if finalPay != nil && finalPay.Raw != "" {
 		copied := *finalPay
@@ -614,31 +610,47 @@ func equalOptFloat(a, b *float64) bool {
 func FormatJobPostingHeaderMarkdown(jp StructuredJobPosting) string {
 	var bullets []string
 	if jp.HiringOrganization != "" {
-		bullets = append(bullets, "- **Company**: "+jp.HiringOrganization)
+		if cleanOrg := sanitizeATSMarkdownText(jp.HiringOrganization, 256); cleanOrg != "" {
+			bullets = append(bullets, "- **Company**: "+cleanOrg)
+		}
 	}
 	if len(jp.JobLocation) > 0 {
-		bullets = append(bullets, "- **Location**: "+strings.Join(jp.JobLocation, "; "))
+		cleanLocs := make([]string, 0, len(jp.JobLocation))
+		for _, loc := range jp.JobLocation {
+			if cl := sanitizeATSMarkdownText(loc, 180); cl != "" {
+				cleanLocs = append(cleanLocs, cl)
+			}
+		}
+		if len(cleanLocs) > 0 {
+			bullets = append(bullets, "- **Location**: "+strings.Join(cleanLocs, "; "))
+		}
 	}
 	if jp.WorkplaceType != "" && jp.WorkplaceType != WorkplaceUnknown {
 		bullets = append(bullets, "- **Workplace**: "+string(jp.WorkplaceType))
 	}
 	if jp.Pay != nil {
 		if formatted := FormatNormalizedPay(jp.Pay); formatted != "" {
-			bullets = append(bullets, "- **Compensation**: "+formatted)
+			bullets = append(bullets, "- **Compensation**: "+strings.NewReplacer("[", "\\[", "]", "\\]").Replace(formatted))
 		}
 	}
 	if jp.EmploymentType != "" {
-		bullets = append(bullets, "- **Employment Type**: "+jp.EmploymentType)
+		if cleanEmp := sanitizeATSMarkdownText(jp.EmploymentType, 80); cleanEmp != "" {
+			bullets = append(bullets, "- **Employment Type**: "+cleanEmp)
+		}
 	}
 	if jp.DatePosted != "" {
-		dp := jp.DatePosted
+		dp := sanitizeATSMarkdownText(jp.DatePosted, 64)
 		if len(dp) > 10 {
 			dp = dp[:10]
 		}
-		bullets = append(bullets, "- **Posted**: "+dp)
+		if dp != "" {
+			bullets = append(bullets, "- **Posted**: "+dp)
+		}
 	}
 	if jp.ApplyURL != "" {
-		bullets = append(bullets, "- **Apply URL**: "+jp.ApplyURL)
+		if safeURL := sanitizeATSHttpsURL(jp.ApplyURL, ""); safeURL != "" {
+			bullets = append(bullets, "- **Apply URL**: "+safeURL)
+		}
 	}
 	return strings.Join(bullets, "\n")
 }

@@ -1,0 +1,15 @@
+# Shared Go + TypeScript Declarative Site Adapter: Bosch eBike Systems Help Center
+id: bosch-ebike-help
+name: "Bosch eBike Systems Help Center"
+category: developer
+description: "Extracts bounded SSR HTML help articles from help.bosch-ebike.com (strictly respecting robots.txt /api/* disallow), stripping data:image base64 blobs and dodo-service-include__error chrome while preserving Suspense slots, breadcrumbs, model codes, and PDF links."
+domains:
+  - help.bosch-ebike.com
+exampleUrls:
+  - "https://help.bosch-ebike.com/us/help-center/ebw-error-codes?models=bdu37yy"
+
+htmlRoutes:
+  - id: bosch-ebike-help
+    match:
+      exactSegments: false
+    mode: bosch_help_html

@@ -69,6 +69,27 @@ export function assertFastUnscaledSync<T>(label: string, budgetMs: number, fn: (
   return result;
 }
 
+/** Async variant of {@link assertFastUnscaledSync}: `budgetMs` is used as-is, without `PERF_SCALE`. */
+export async function assertFastUnscaledAsync<T>(
+  label: string,
+  budgetMs: number,
+  fn: () => Promise<T>,
+  maxRuns = DEFAULT_MAX_RUNS,
+): Promise<T> {
+  let best = Infinity;
+  let runs = 0;
+  let result!: T;
+  while (runs < maxRuns) {
+    const t0 = performance.now();
+    result = await fn();
+    best = Math.min(best, performance.now() - t0);
+    runs++;
+    if (best < budgetMs) break;
+  }
+  assert.ok(best < budgetMs, `${label}: best of ${runs} run(s) took ${best.toFixed(1)}ms, budget ${budgetMs}ms (unscaled)`);
+  return result;
+}
+
 /** Async variant of {@link assertFastSync}. */
 export async function assertFastAsync<T>(
   label: string,

@@ -304,7 +304,9 @@ try {
             ? `---\npretty_name: ${sd.str.slice(0, 80)}\nlicense: mit\ntags:\n  - nlp\n---\n# Card Title\n\n${sd.str}`
             : ext.textMode === 'git_patch'
               ? `From 0123456789abcdef Mon Sep 17 00:00:00 2001\nSubject: [PATCH] ${sd.str.slice(0, 120)}\n---\n a.txt | 1 +\n---\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n+${sd.str.slice(0, 200)}\n`
-              : `# Markdown Twin\n\n${sd.str}\n`,
+              : ext.textMode === 'html_document'
+                ? `<!doctype html><html><head><title>Twin Doc ${sd.str.slice(0, 60)}</title></head><body><main><h1>Document Heading</h1><p>${sd.str}</p><a href="${sd.url}">Reference</a><a href="${sd.badUrl}">Bad</a></main></body></html>`
+                : `# Markdown Twin\n\n${sd.str}\n`,
       }));
     }
 
@@ -365,6 +367,46 @@ try {
               prices: { price: '1999', currency_code: 'USD', currency_minor_unit: 2 },
               variants: [{ id: 1, title: 'Default', price: '19.99', available: true }],
               images: [{ src: sd.url }],
+            },
+          ],
+        }),
+      }));
+    }
+
+    if (ext.jsonMode === 'nuget_registration') {
+      return seeds.map((sd) => ({
+        name: `${labelPrefix}:${sd.suffix}`,
+        body: JSON.stringify({
+          count: 1,
+          items: [
+            {
+              '@id': sd.url,
+              '@type': 'catalog:CatalogPage',
+              count: 2,
+              lower: '1.0.0',
+              upper: '2.0.0',
+              items: [
+                {
+                  catalogEntry: {
+                    id: 'Newtonsoft.Json',
+                    version: '2.0.0',
+                    description: sd.str,
+                    authors: `Author ${sd.str.slice(0, 60)}`,
+                    licenseExpression: 'MIT',
+                    projectUrl: sd.url,
+                    licenseUrl: sd.badUrl,
+                    published: '2026-01-15T00:00:00Z',
+                    listed: true,
+                    tags: ['json', sd.str.slice(0, 40)],
+                    dependencyGroups: [
+                      {
+                        targetFramework: 'net8.0',
+                        dependencies: [{ id: 'System.Text.Json', range: '[8.0.0, )' }],
+                      },
+                    ],
+                  },
+                },
+              ],
             },
           ],
         }),

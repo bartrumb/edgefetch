@@ -24,6 +24,7 @@ var (
 	reShopifyAvailTrue     = newLazyRegexp(`(?i)InStock|PreOrder|BackOrder|OnlineOnly`)
 	reShopifyAvailFalse    = newLazyRegexp(`(?i)OutOfStock|SoldOut|Discontinued`)
 	reShopifyPreorder      = newLazyRegexp(`(?i)PreOrder|BackOrder`)
+	reCatalogLocaleSeg     = newLazyRegexp(`(?i)^[a-z]{2}(?:-[a-z]{2})?$`)
 )
 
 // IsShopifyHTMLOrHeaders detects Shopify storefronts from HTTP response headers or HTML markers.
@@ -139,6 +140,53 @@ func ResolveCustomDomainShopifyProductTwinURL(productURL string) *ShopifyProduct
 		JSONURL: origin + "/products/" + enc + ".json",
 		JSURL:   origin + "/products/" + enc + ".js",
 		Handle:  handle,
+	}
+}
+
+// ShopifyCollectionTwinURL holds the resolved `/collections/<handle>/products.json?limit=50` twin URL.
+type ShopifyCollectionTwinURL struct {
+	JSONURL string `json:"jsonUrl"`
+	Handle  string `json:"handle"`
+}
+
+// ResolveCustomDomainShopifyCollectionTwinURL resolves `/collections/<handle>` URLs (with optional leading locale)
+// to `/collections/<handle>/products.json?limit=50`, rejecting product sub-routes (`/collections/<col>/products/<prod>`).
+func ResolveCustomDomainShopifyCollectionTwinURL(pageURL string) *ShopifyCollectionTwinURL {
+	host, rawPath, ok := parseHTTPSHostAndRawPath(pageURL)
+	if !ok {
+		return nil
+	}
+	var nonEmpty []string
+	for _, seg := range strings.Split(rawPath, "/") {
+		if seg != "" {
+			nonEmpty = append(nonEmpty, seg)
+		}
+	}
+	if len(nonEmpty) > 0 && reCatalogLocaleSeg.MatchString(nonEmpty[0]) {
+		nonEmpty = nonEmpty[1:]
+	}
+	// Match /collections/<handle> or /collections/<handle>/products (without product handle).
+	if len(nonEmpty) < 2 || len(nonEmpty) > 3 || !strings.EqualFold(nonEmpty[0], "collections") {
+		return nil
+	}
+	if len(nonEmpty) == 3 && !strings.EqualFold(nonEmpty[2], "products") {
+		return nil
+	}
+	rawSeg, okDec := SafeDecodeURIComponent(nonEmpty[1])
+	if !okDec || rawSeg == "" {
+		return nil
+	}
+	if strings.HasSuffix(strings.ToLower(rawSeg), ".json") || strings.HasSuffix(strings.ToLower(rawSeg), ".js") {
+		return nil
+	}
+	if !reShopifyHandleSafe.MatchString(rawSeg) {
+		return nil
+	}
+	origin := "https://" + host
+	enc := EncodeURIComponent(rawSeg)
+	return &ShopifyCollectionTwinURL{
+		JSONURL: origin + "/collections/" + enc + "/products.json?limit=50",
+		Handle:  rawSeg,
 	}
 }
 

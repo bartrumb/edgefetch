@@ -8,8 +8,8 @@
  *  - `fetches` never stores URL query strings or bodies (linking to `pages.id`).
  */
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import { deriveMarkdownDocument, SCRAPE_PIPELINE_VERSION } from './scrape';
-import { COLLECTION_ID_RE, D1FtsSearchIndex } from './search-index';
+import { deriveMarkdownDocument, sanitizeInlineHtmlInMarkdown, SCRAPE_PIPELINE_VERSION } from './scrape';
+import { D1FtsSearchIndex, INTERNAL_COLLECTION_ID_RE, sanitizeExtractedTitle } from './search-index';
 import { classifyContentState } from './waf';
 import {
   MAX_ARTIFACT_CONTENT_BYTES,
@@ -40,6 +40,7 @@ export interface ManifestResultItem {
   timing?: {
     ttfbMs?: number;
   };
+  contentSha256?: string;
   artifact?: {
     blobSha256: string;
     contentSha256: string;
@@ -69,6 +70,11 @@ function bytesToHex(buf: ArrayBuffer | Uint8Array): string {
 
 export async function sha256HexString(input: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return bytesToHex(digest);
+}
+
+export async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bytes as unknown as BufferSource);
   return bytesToHex(digest);
 }
 
@@ -129,13 +135,47 @@ export async function writeJobManifestToR2(params: {
       };
     }
 
+    const status = typeof r.status === 'number' ? Math.floor(r.status) : 0;
+    const outcome = typeof r.outcome === 'string' ? r.outcome : 'error';
+    let resolvedContentSha256: string | undefined = cleanArtifact?.contentSha256;
+    if (!resolvedContentSha256 && isValidSha256Hex(r.contentSha256)) {
+      resolvedContentSha256 = r.contentSha256;
+    }
+    if (!resolvedContentSha256 && outcome === 'ok' && status !== 304 && r.truncated !== true) {
+      if (typeof r.body === 'string' && r.body.length > 0) {
+        if (r.bodyEncoding === 'base64') {
+          try {
+            const bin = atob(r.body);
+            const bytes = new Uint8Array(bin.length);
+            for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
+            resolvedContentSha256 = await sha256HexBytes(bytes);
+          } catch {
+            // Ignore malformed base64
+          }
+        } else {
+          resolvedContentSha256 = await sha256HexString(r.body);
+        }
+      } else if (typeof r.bodyBase64 === 'string' && r.bodyBase64.length > 0) {
+        try {
+          const bin = atob(r.bodyBase64);
+          const bytes = new Uint8Array(bin.length);
+          for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
+          resolvedContentSha256 = await sha256HexBytes(bytes);
+        } catch {
+          // Ignore malformed base64
+        }
+      } else if (typeof r.body === 'string' && r.body.length === 0 && r.bodyOmitted !== true && status >= 200 && status < 300) {
+        resolvedContentSha256 = await sha256HexString('');
+      }
+    }
+
     const tm = r.timing as { ttfbMs?: unknown } | undefined;
     cleanItems.push({
       id: rawId,
       url,
       ...(typeof r.kind === 'string' ? { kind: r.kind } : {}),
-      status: typeof r.status === 'number' ? Math.floor(r.status) : 0,
-      outcome: typeof r.outcome === 'string' ? r.outcome : 'error',
+      status,
+      outcome,
       ...(typeof r.problem === 'string' && r.problem ? { problem: r.problem.slice(0, 500) } : {}),
       ...(typeof r.contentType === 'string' && r.contentType ? { contentType: r.contentType.slice(0, 160) } : {}),
       ...(typeof r.etag === 'string' && r.etag ? { etag: r.etag.slice(0, 200) } : {}),
@@ -143,6 +183,7 @@ export async function writeJobManifestToR2(params: {
       attempts: typeof r.attempts === 'number' ? Math.max(0, Math.floor(r.attempts)) : 1,
       durationMs: typeof r.durationMs === 'number' ? Math.max(0, Math.floor(r.durationMs)) : 0,
       ...(typeof tm?.ttfbMs === 'number' ? { timing: { ttfbMs: Math.max(0, Math.floor(tm.ttfbMs)) } } : {}),
+      ...(resolvedContentSha256 ? { contentSha256: resolvedContentSha256 } : {}),
       ...(cleanArtifact ? { artifact: cleanArtifact } : {}),
     });
   }
@@ -156,7 +197,7 @@ export async function writeJobManifestToR2(params: {
     via: params.via,
     ...(params.siteId ? { siteId: params.siteId } : {}),
     ...(params.crawlId ? { crawlId: params.crawlId } : {}),
-    ...(params.collectionId && COLLECTION_ID_RE.test(params.collectionId) ? { collectionId: params.collectionId } : {}),
+    ...(params.collectionId && INTERNAL_COLLECTION_ID_RE.test(params.collectionId) ? { collectionId: params.collectionId } : {}),
     fetchedAt: params.now ?? Date.now(),
     results: cleanItems,
   };
@@ -203,8 +244,17 @@ export async function trackManifestChunkInMetaD1(
 
     const pageId = `pg_${(await sha256HexString(item.url)).slice(0, 32)}`;
     const fetchId = `ft_${(await sha256HexString(`${manifest.jobId}:${item.id}`)).slice(0, 32)}`;
-    const contentSha = item.artifact?.contentSha256 ?? null;
+    const artifactContentSha = item.artifact?.contentSha256 ?? null;
+    const contentSha =
+      artifactContentSha ?? (isValidSha256Hex(item.contentSha256) ? item.contentSha256 : null);
     const blobSha = item.artifact?.blobSha256 ?? null;
+    const isOkNon304 = (item.outcome ?? 'error') === 'ok' && (item.status ?? 0) !== 304;
+    const invalidateMismatchOnNoArtifact =
+      artifactContentSha === null &&
+      isOkNon304 &&
+      (manifest.via === 'container' || Boolean(item.etag) || Boolean(item.lastModified))
+        ? 1
+        : 0;
 
     if (item.artifact) {
       const r2Key = r2ArtifactKey(item.artifact.retention, item.artifact.blobSha256);
@@ -242,15 +292,46 @@ export async function trackManifestChunkInMetaD1(
              latest_fetch_id = excluded.latest_fetch_id,
              latest_status = excluded.latest_status,
              latest_outcome = excluded.latest_outcome,
-             etag = COALESCE(excluded.etag, pages.etag),
-             last_modified = COALESCE(excluded.last_modified, pages.last_modified),
+             etag = CASE
+               WHEN excluded.latest_content_sha256 IS NOT NULL THEN
+                 CASE
+                   WHEN pages.latest_content_sha256 IS excluded.latest_content_sha256 THEN COALESCE(excluded.etag, pages.etag)
+                   ELSE excluded.etag
+                 END
+               WHEN excluded.latest_status = 304 THEN COALESCE(excluded.etag, pages.etag)
+               WHEN ? = 1 THEN
+                 CASE
+                   WHEN ? IS NOT NULL AND pages.latest_content_sha256 IS ? THEN COALESCE(excluded.etag, pages.etag)
+                   ELSE NULL
+                 END
+               ELSE pages.etag
+             END,
+             last_modified = CASE
+               WHEN excluded.latest_content_sha256 IS NOT NULL THEN
+                 CASE
+                   WHEN pages.latest_content_sha256 IS excluded.latest_content_sha256 THEN COALESCE(excluded.last_modified, pages.last_modified)
+                   ELSE excluded.last_modified
+                 END
+               WHEN excluded.latest_status = 304 THEN COALESCE(excluded.last_modified, pages.last_modified)
+               WHEN ? = 1 THEN
+                 CASE
+                   WHEN ? IS NOT NULL AND pages.latest_content_sha256 IS ? THEN COALESCE(excluded.last_modified, pages.last_modified)
+                   ELSE NULL
+                 END
+               ELSE pages.last_modified
+             END,
              last_fetched_at = MAX(COALESCE(pages.last_fetched_at, 0), excluded.last_fetched_at),
              last_changed_at = CASE
                WHEN excluded.latest_content_sha256 IS NOT NULL AND pages.latest_content_sha256 IS NOT excluded.latest_content_sha256
                  THEN excluded.last_changed_at
                ELSE pages.last_changed_at
              END,
-             latest_content_sha256 = COALESCE(excluded.latest_content_sha256, pages.latest_content_sha256)`,
+             latest_content_sha256 = CASE
+               WHEN excluded.latest_content_sha256 IS NOT NULL THEN excluded.latest_content_sha256
+               WHEN excluded.latest_status = 304 THEN pages.latest_content_sha256
+               WHEN ? = 1 AND (? IS NULL OR pages.latest_content_sha256 IS NOT ?) THEN NULL
+               ELSE pages.latest_content_sha256
+             END`,
         )
         .bind(
           pageId,
@@ -259,12 +340,21 @@ export async function trackManifestChunkInMetaD1(
           fetchId,
           item.status ?? 0,
           item.outcome ?? 'error',
-          contentSha,
+          artifactContentSha,
           item.etag ?? null,
           item.lastModified ?? null,
           now,
           now,
-          contentSha ? now : null,
+          artifactContentSha ? now : null,
+          invalidateMismatchOnNoArtifact,
+          contentSha,
+          contentSha,
+          invalidateMismatchOnNoArtifact,
+          contentSha,
+          contentSha,
+          invalidateMismatchOnNoArtifact,
+          contentSha,
+          contentSha,
         ),
     );
 
@@ -718,7 +808,7 @@ export async function executeIngestPipeline(
   let derivedCount = 0;
   let indexedCount = 0;
   let capacityStoppedCount = 0;
-  const activeCollection = summary.collectionId && COLLECTION_ID_RE.test(summary.collectionId) ? summary.collectionId : undefined;
+  const activeCollection = summary.collectionId && INTERNAL_COLLECTION_ID_RE.test(summary.collectionId) ? summary.collectionId : undefined;
   const shouldIndexSearch = Boolean(env.SEARCH && activeCollection);
 
   const pagesByContentSha = new Map<string, Array<{ pageId: string; url: string; contentSha256: string; fetchedAt: number }>>();
@@ -800,13 +890,18 @@ export async function executeIngestPipeline(
                   const stateCheck = classifyContentState({ status: 200, title: deriveRes.title ?? '', markdown: mdText });
                   if (stateCheck.state !== 'soft_404' && stateCheck.state !== 'login_wall') {
                     for (const pg of pagesForSha) {
+                      const safeMdText = sanitizeInlineHtmlInMarkdown(mdText, pg.url).trim();
+                      if (!safeMdText) continue;
+                      const safeDeriveTitle = deriveRes.title
+                        ? (sanitizeExtractedTitle(deriveRes.title, pg.url, false) ?? '')
+                        : '';
                       const idxRes = await searchIndex.replacePageChunks({
                         collectionId: activeCollection!,
                         documentId: deriveRes.documentId,
                         pageId: pg.pageId,
                         url: pg.url,
-                        title: deriveRes.title ?? '',
-                        markdown: mdText,
+                        title: safeDeriveTitle,
+                        markdown: safeMdText,
                         fetchedAt: pg.fetchedAt,
                       });
                       if (idxRes.status === 'indexed') {

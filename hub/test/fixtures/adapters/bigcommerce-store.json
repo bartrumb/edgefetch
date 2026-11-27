@@ -1,0 +1,11 @@
+{
+  "adapterId": "bigcommerce-store",
+  "mode": "html",
+  "inputUrl": "https://demo.mybigcommerce.com/gravel-frameset/",
+  "mockPayload": "<!doctype html><html><head><script src=\"https://cdn11.bigcommerce.com/s-demo/stencil.js\"></script><script>window.BCData = {\"product_attributes\":{\"sku\":\"BC-FRAME-1\",\"instock\":true,\"price\":{\"without_tax\":{\"value\":899.5,\"currency\":\"USD\"}}}};</script></head><body><h1 class=\"productView-title\">Gravel Frameset</h1><dl class=\"productView-info\"><dt class=\"productView-info-name\">Weight:</dt><dd class=\"productView-info-value\">1,450 g</dd></dl></body></html>",
+  "expectMarkdownIncludes": [
+    "Gravel Frameset",
+    "BC-FRAME-1",
+    "1,450 g"
+  ]
+}

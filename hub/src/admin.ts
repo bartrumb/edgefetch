@@ -2065,11 +2065,18 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { grantId?: string } = {};
         if (capped.text.trim()) {
+          let parsed: unknown;
           try {
-            body = JSON.parse(capped.text) as { grantId?: string };
+            parsed = JSON.parse(capped.text);
           } catch {
-            body = {};
+            parsed = {};
           }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as { grantId?: string };
         }
         if (!body.grantId || typeof body.grantId !== 'string') {
           span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
@@ -2095,7 +2102,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       if (!capped.ok) return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
       let body: { remoteUrl?: unknown; confirmedAuthOrigin?: unknown } = {};
       try {
-        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown; confirmedAuthOrigin?: unknown };
+        const parsed = JSON.parse(capped.text || '{}') as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return adminJson({ ok: false, error: 'bad_json' }, 400);
+        }
+        body = parsed as { remoteUrl?: unknown; confirmedAuthOrigin?: unknown };
       } catch {
         return adminJson({ error: 'invalid_json' }, 400);
       }
@@ -2121,7 +2132,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: Record<string, unknown> = {};
         try {
-          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as Record<string, unknown>;
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
@@ -2181,7 +2196,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: Record<string, unknown> = {};
         try {
-          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as Record<string, unknown>;
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
@@ -2296,7 +2315,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: Record<string, unknown> = {};
         try {
-          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as Record<string, unknown>;
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
@@ -2428,7 +2451,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: { slug?: unknown } = {};
         try {
-          body = JSON.parse(capped.text || '{}') as { slug?: unknown };
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as { slug?: unknown };
         } catch {
           return adminJson({ error: 'invalid_json' }, 400);
         }
@@ -2545,7 +2572,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { userId?: string; role?: string; disabled?: boolean } = {};
         try {
-          body = JSON.parse(capped.text || '{}') as typeof body;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as typeof body;
         } catch {
           body = {};
         }
@@ -2671,7 +2704,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { userId?: string } = {};
         try {
-          body = JSON.parse(capped.text || '{}') as typeof body;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as typeof body;
         } catch {
           body = {};
         }
@@ -2758,11 +2797,18 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { siteId?: string } = {};
         if (capped.text.trim()) {
+          let parsed: unknown;
           try {
-            body = JSON.parse(capped.text) as { siteId?: string };
+            parsed = JSON.parse(capped.text);
           } catch {
-            body = {};
+            parsed = {};
           }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as { siteId?: string };
         }
         await deps.clearAffinities(body.siteId);
         span.setAttributes({
@@ -2790,7 +2836,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { enabled?: unknown } = {};
         try {
-          body = JSON.parse(capped.text) as { enabled?: unknown };
+          const parsed = JSON.parse(capped.text) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as { enabled?: unknown };
         } catch {
           span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
           span.setStatus(false, 'invalid_json');
@@ -2858,13 +2910,20 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           includeBody?: boolean;
         } = {};
         if (capped.text.trim()) {
+          let parsed: unknown;
           try {
-            body = JSON.parse(capped.text) as typeof body;
+            parsed = JSON.parse(capped.text);
           } catch {
             span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
             span.setStatus(false, 'invalid_json');
             return adminJson({ error: 'invalid_json' }, 400);
           }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as typeof body;
         }
         if (!body.url || typeof body.url !== 'string') {
           span.setAttributes({ 'admin.outcome': 'missing_url', 'http.response.status_code': 400 });

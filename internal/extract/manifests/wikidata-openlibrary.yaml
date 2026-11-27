@@ -1,0 +1,298 @@
+# Shared Go + TypeScript Declarative Site Adapter: Wikidata & Open Library
+id: wikidata-openlibrary
+name: Wikidata & Open Library
+category: research-health
+description: "Upgrades wikidata.org/wiki/Q* to Special:EntityData/Q*.json (handling labels.en, labels.mul, and sitelinks.enwiki fallbacks) and openlibrary.org/isbn/* to /isbn/*.json (never calling disallowed /api/*)."
+domains:
+  - www.wikidata.org
+  - wikidata.org
+  - openlibrary.org
+  - www.openlibrary.org
+exampleUrls:
+  - "https://www.wikidata.org/wiki/Q42"
+  - "https://openlibrary.org/isbn/9780140328721"
+
+routes:
+  # Route 1: Wikidata Entity /wiki/Q<id>
+  - match:
+      hosts:
+        - www.wikidata.org
+        - wikidata.org
+      exactSegments: true
+      pathPrefix: "/wiki/Q"
+      pathSegments:
+        - wiki
+        - param: qidNum
+          stripPrefix: "Q"
+          charset: digits
+          minLen: 1
+          maxLen: 15
+    twin:
+      fetchUrl: "https://www.wikidata.org/wiki/Special:EntityData/Q{qidNum}.json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - entities
+      vars:
+        qid:
+          template: "Q{qidNum}"
+        labelEn:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: labels.en.value
+          trim: true
+        labelMul:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: labels.mul.value
+          trim: true
+        labelEnwiki:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: sitelinks.enwiki.title
+          trim: true
+        labelMulOrEnwiki:
+          template: "{labelMul}"
+          whenVars:
+            - labelMul
+          fallbackVar: labelEnwiki
+        label:
+          template: "{labelEn}"
+          whenVars:
+            - labelEn
+          fallbackVar: labelMulOrEnwiki
+        descEn:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: descriptions.en.value
+          trim: true
+        descMul:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: descriptions.mul.value
+          trim: true
+        desc:
+          template: "{descEn}"
+          whenVars:
+            - descEn
+          fallbackVar: descMul
+        aliasesEn:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: aliases.en
+          subField: value
+          join: ", "
+          limit: 10
+        aliasesMul:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: aliases.mul
+          subField: value
+          join: ", "
+          limit: 10
+        aliases:
+          template: "{aliasesEn}"
+          whenVars:
+            - aliasesEn
+          fallbackVar: aliasesMul
+        modified:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: modified
+          sliceMax: 10
+        claimProps:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims
+          format: object_keys
+          limit: 25
+          itemWrap: "`"
+          join: ", "
+        enwikiSlug:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: sitelinks.enwiki.title
+          replaceAll:
+            from: " "
+            to: "_"
+        enwikiUrl:
+          template: "https://en.wikipedia.org/wiki/{enwikiSlug}"
+          whenVars:
+            - enwikiSlug
+          requireHttps: true
+        wikidataUrl:
+          template: "https://www.wikidata.org/wiki/{qid}"
+          requireHttps: true
+      requireVars:
+        - label
+      titleTemplate: "{label} ({qid})"
+      descriptionVar: desc
+      publishedTimeVar: modified
+      introVar: desc
+      bullets:
+        - label: Wikidata ID
+          template: "`{qid}`"
+        - label: Also Known As
+          template: "{aliases}"
+          whenVar: aliases
+        - label: Modified
+          template: "{modified}"
+          whenVar: modified
+        - label: Claim Properties
+          template: "{claimProps}"
+          whenVar: claimProps
+        - label: English Wikipedia
+          template: "{enwikiUrl}"
+          whenVar: enwikiUrl
+        - label: Wikidata URL
+          template: "{wikidataUrl}"
+          whenVar: wikidataUrl
+      linksVars:
+        - wikidataUrl
+        - enwikiUrl
+
+  # Route 2: Open Library ISBN /isbn/<isbn> (never /api/*)
+  - match:
+      hosts:
+        - openlibrary.org
+        - www.openlibrary.org
+      exactSegments: true
+      pathSegments:
+        - isbn
+        - param: isbn
+          stripSuffix: ".json"
+          charset: alnum_dash
+          minLen: 10
+          maxLen: 17
+    twin:
+      fetchUrl: "https://openlibrary.org/isbn/{isbn}.json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - title
+      vars:
+        title:
+          paths:
+            - title
+          trim: true
+        subtitle:
+          paths:
+            - subtitle
+          trim: true
+        isbn13:
+          paths:
+            - isbn_13
+          itemWrap: "`"
+          join: ", "
+        isbn10:
+          paths:
+            - isbn_10
+          itemWrap: "`"
+          join: ", "
+        publishers:
+          paths:
+            - publishers
+          join: ", "
+          limit: 8
+        publishDate:
+          paths:
+            - publish_date
+          trim: true
+        pages:
+          paths:
+            - number_of_pages
+          format: int_comma
+        contributions:
+          paths:
+            - contributions
+          join: ", "
+          limit: 8
+        authors:
+          paths:
+            - authors
+          subField: key
+          join: ", "
+          limit: 8
+        works:
+          paths:
+            - works
+          subField: key
+          join: ", "
+          limit: 5
+        olKey:
+          paths:
+            - key
+        olUrl:
+          template: "https://openlibrary.org{olKey}"
+          whenVars:
+            - olKey
+          requireHttps: true
+        desc:
+          paths:
+            - description.value
+            - description
+            - first_sentence.value
+            - first_sentence
+          trim: true
+        descShort:
+          paths:
+            - description.value
+            - description
+            - first_sentence.value
+            - first_sentence
+          trim: true
+          sliceMax: 260
+      titleTemplate: "{title}"
+      descriptionVar: descShort
+      authorVar: contributions
+      publishedTimeVar: publishDate
+      bullets:
+        - label: Subtitle
+          template: "{subtitle}"
+          whenVar: subtitle
+        - label: ISBN-13
+          template: "{isbn13}"
+          whenVar: isbn13
+        - label: ISBN-10
+          template: "{isbn10}"
+          whenVar: isbn10
+        - label: Publishers
+          template: "{publishers}"
+          whenVar: publishers
+        - label: Published
+          template: "{publishDate}"
+          whenVar: publishDate
+        - label: Pages
+          template: "{pages}"
+          whenVar: pages
+        - label: Contributors
+          template: "{contributions}"
+          whenVar: contributions
+        - label: Author Keys
+          template: "{authors}"
+          whenVar: authors
+        - label: Work Keys
+          template: "{works}"
+          whenVar: works
+        - label: Open Library URL
+          template: "{olUrl}"
+          whenVar: olUrl
+      sections:
+        - heading: Description
+          textVar: desc
+      linksVars:
+        - olUrl

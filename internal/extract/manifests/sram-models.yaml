@@ -1,0 +1,64 @@
+# Shared Go + TypeScript Declarative Site Adapter: SRAM Component Model Pages
+id: sram-models
+name: SRAM Component Models (www.sram.com)
+category: commerce-social
+description: "Extracts structured Product JSON-LD and technical component specification tables from www.sram.com/*/sram/models/* pages."
+domains:
+  - www.sram.com
+  - sram.com
+exampleUrls:
+  - "https://www.sram.com/en/sram/models/rd-xx-e-b1"
+
+htmlRoutes:
+  - id: sram-models
+    mode: dom
+    match:
+      optionalLeadingLocale: true
+      exactSegments: false
+      pathSegments:
+        - sram
+        - models
+        - param: modelSlug
+          charset: url_seg
+          minLen: 1
+          maxLen: 140
+    jsonLdTypes:
+      - Product
+    vars:
+      title:
+        jsonLdPaths:
+          - name
+        cssText:
+          - .product-detail h1
+          - h1
+          - title
+        trim: true
+      sku:
+        jsonLdPaths:
+          - sku
+        trim: true
+      brand:
+        jsonLdPaths:
+          - brand.name
+          - brand
+        trim: true
+      body:
+        cssHtmlToMd:
+          - main.product-detail
+          - .product-detail
+          - main
+        format: strip_leading_h1
+        trim: true
+    requireVars:
+      - title
+      - body
+    titleTemplate: "{title}"
+    bullets:
+      - label: Brand
+        template: "{brand}"
+        whenVar: brand
+      - label: SKU
+        template: "`{sku}`"
+        whenVar: sku
+    bodyVar: body
+    preserveBodyLinksFromVar: body

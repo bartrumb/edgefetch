@@ -7,6 +7,7 @@
  * Pure-CPU classification delegates to Go (`internal/classify/content_state.go`) via `edgefetch-core.wasm`.
  */
 
+import { validatePublicHttpsTargetUrl } from './overflow';
 import { callCoreWasm, callCoreWasmRaw } from './wasm-bridge';
 
 export {
@@ -156,6 +157,7 @@ export async function tryFetchWaybackSnapshot(params: {
   target: 'auto' | 'agent' | 'container';
   site?: string;
   source: string;
+  artifactRetention?: 'transient' | 'stored' | 'off';
   executeHubFetch: (
     target: 'auto' | 'agent' | 'container',
     body: string,
@@ -183,6 +185,16 @@ export async function tryFetchWaybackSnapshot(params: {
     const cdxParsed = JSON.parse(cdxRes.bodyText) as { results?: Array<Record<string, unknown>> };
     const cdxItem = cdxParsed.results?.[0];
     if (cdxItem?.outcome !== 'ok' || typeof cdxItem.body !== 'string') return null;
+    const rawCdxFinal =
+      typeof cdxItem?.finalUrl === 'string' && cdxItem.finalUrl.trim()
+        ? cdxItem.finalUrl.trim()
+        : '';
+    if (rawCdxFinal) {
+      const checkedCdx = validatePublicHttpsTargetUrl(rawCdxFinal);
+      if (!checkedCdx.ok) return null;
+      const cdxHost = checkedCdx.url.hostname.toLowerCase().replace(/\.$/, '');
+      if (cdxHost !== 'archive.org' && cdxHost !== 'web.archive.org') return null;
+    }
 
     const avail = JSON.parse(cdxItem.body) as {
       archived_snapshots?: {
@@ -193,8 +205,10 @@ export async function tryFetchWaybackSnapshot(params: {
     if (!closest?.available || typeof closest.url !== 'string' || !closest.timestamp) return null;
     if (closest.status && closest.status !== '200') return null;
 
-    const snapParsed = new URL(closest.url.replace(/^http:\/\//i, 'https://'));
-    if (snapParsed.hostname.toLowerCase() !== 'web.archive.org') return null;
+    const checkedClosest = validatePublicHttpsTargetUrl(closest.url.replace(/^http:\/\//i, 'https://'));
+    if (!checkedClosest.ok) return null;
+    const snapParsed = checkedClosest.url;
+    if (snapParsed.hostname.toLowerCase().replace(/\.$/, '') !== 'web.archive.org') return null;
     snapParsed.pathname = snapParsed.pathname.replace(/^\/web\/(\d{14})(?:[a-z_]*)\//, '/web/$1id_/');
     const cleanSnapUrl = snapParsed.toString();
 
@@ -207,12 +221,24 @@ export async function tryFetchWaybackSnapshot(params: {
       }),
       params.site,
       `${params.source}:wayback-snap`,
-      'transient',
+      params.artifactRetention ?? 'transient',
       true,
     );
     if (snapRes.status !== 200) return null;
     const snapReply = JSON.parse(snapRes.bodyText) as { results?: Array<Record<string, unknown>> };
     const snapItem = snapReply.results?.[0];
+    const rawSnapFinal =
+      typeof snapItem?.finalUrl === 'string' && snapItem.finalUrl.trim()
+        ? snapItem.finalUrl.trim()
+        : typeof snapItem?.url === 'string' && snapItem.url.trim()
+          ? snapItem.url.trim()
+          : '';
+    if (rawSnapFinal) {
+      const checkedFinal = validatePublicHttpsTargetUrl(rawSnapFinal);
+      if (!checkedFinal.ok) return null;
+      const finalHost = checkedFinal.url.hostname.toLowerCase().replace(/\.$/, '');
+      if (finalHost !== 'web.archive.org' && finalHost !== 'archive.org') return null;
+    }
     const snapBody = typeof snapItem?.body === 'string' && snapItem.bodyEncoding !== 'base64' ? snapItem.body : '';
     if (snapItem?.outcome !== 'ok' || !snapBody.trim()) return null;
 

@@ -1,0 +1,21 @@
+# Shared Go + TypeScript Declarative Site Adapter: XenForo 2 Forum Threads
+id: xenforo-thread
+name: "XenForo 2 Forum Threads"
+category: commerce-social
+description: "Extracts structured forum posts, authors, timestamps, and clean quote blocks from XenForo 2 thread HTML (article.message--post) while stripping signatures and sidebar chrome."
+domains:
+  - forums.electricbikereview.com
+  - mtbr.com
+  - www.mtbr.com
+  - endless-sphere.com
+universalEngine: true
+exampleUrls:
+  - https://forums.electricbikereview.com/threads/example-thread.12345/
+  - https://www.mtbr.com/threads/example-thread.67890/
+  - https://endless-sphere.com/sphere/threads/example-thread.54321/
+
+htmlRoutes:
+  - id: xenforo-thread
+    match:
+      pathContainsSegment: threads
+    mode: xenforo_html

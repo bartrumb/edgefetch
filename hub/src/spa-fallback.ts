@@ -13,7 +13,7 @@
  *     `tryExternalSpaFallback` fetches and enforces `/robots.txt` first before calling Crawl4AI or Firecrawl.
  */
 
-import { fetchOverflowRobots, isRobotsAllowed } from './overflow';
+import { fetchOverflowRobots, isRobotsAllowed, resolveValidatedFinalUrl } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle, type RequestTracer, type TraceContext } from './otel';
 import { classifyWafAndChallenge, type ContentState, type WafClassification } from './waf';
 
@@ -151,6 +151,7 @@ async function callCrawl4AiProvider(params: {
   token?: string;
   waitSelector?: string;
   noCache?: boolean;
+  selfHost?: string;
   fetchFn: typeof fetch;
 }): Promise<SpaFallbackSuccess | null> {
   const base = params.baseUrl.trim().replace(/\/+$/, '');
@@ -214,7 +215,13 @@ async function callCrawl4AiProvider(params: {
   if (!markdown) return null;
 
   const meta = first.metadata && typeof first.metadata === 'object' ? (first.metadata as Record<string, unknown>) : {};
-  const finalUrl = typeof first.redirected_url === 'string' && first.redirected_url ? first.redirected_url : typeof first.url === 'string' && first.url ? first.url : params.url;
+  const rawFinalUrl =
+    typeof first.redirected_url === 'string' && first.redirected_url
+      ? first.redirected_url
+      : typeof first.url === 'string' && first.url
+        ? first.url
+        : params.url;
+  const finalUrl = resolveValidatedFinalUrl(rawFinalUrl, params.url, params.selfHost);
   const linksObj = first.links && typeof first.links === 'object' ? (first.links as { internal?: Array<{ href?: string }>; external?: Array<{ href?: string }> }) : undefined;
   const links = linksObj
     ? [...(linksObj.internal ?? []), ...(linksObj.external ?? [])]
@@ -243,6 +250,7 @@ async function callFirecrawlProvider(params: {
   onlyMainContent?: boolean;
   waitForMs?: number;
   noCache?: boolean;
+  selfHost?: string;
   fetchFn: typeof fetch;
 }): Promise<SpaFallbackSuccess | null> {
   const base = (params.baseUrl?.trim() || 'https://api.firecrawl.dev').replace(/\/+$/, '');
@@ -284,12 +292,13 @@ async function callFirecrawlProvider(params: {
     return null;
   }
 
-  const finalUrl =
+  const rawFinalUrl =
     typeof meta.sourceURL === 'string' && meta.sourceURL
       ? meta.sourceURL
       : typeof meta.url === 'string' && meta.url
         ? meta.url
         : params.url;
+  const finalUrl = resolveValidatedFinalUrl(rawFinalUrl, params.url, params.selfHost);
   const links = Array.isArray(data.links) ? data.links.filter((l): l is string => typeof l === 'string' && l.startsWith('https://')) : undefined;
 
   return {
@@ -315,6 +324,7 @@ export async function tryExternalSpaFallback(params: {
   waitForMs?: number;
   waitSelector?: string;
   noCache?: boolean;
+  selfHost?: string;
   tracer?: RequestTracer | TraceContext;
 }): Promise<SpaFallbackSuccess | null> {
   const mode = params.mode ?? 'auto';
@@ -331,7 +341,7 @@ export async function tryExternalSpaFallback(params: {
     const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.7 (bot@edgefetch.dev)';
 
     if (!params.robotsAlreadyVerified) {
-      const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, robotsFetchFn);
+      const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, robotsFetchFn, params.selfHost);
       span?.setAttribute('edgefetch.spa_fallback.robots_allowed', allowed);
       if (!allowed) {
         span?.setAttribute('edgefetch.spa_fallback.succeeded', false);
@@ -348,6 +358,7 @@ export async function tryExternalSpaFallback(params: {
             token: params.env.CRAWL4AI_API_TOKEN,
             waitSelector: params.waitSelector,
             noCache: params.noCache,
+            ...(params.selfHost ? { selfHost: params.selfHost } : {}),
             fetchFn,
           });
           if (out && out.markdown.trim().length > 0) {
@@ -365,6 +376,7 @@ export async function tryExternalSpaFallback(params: {
             onlyMainContent: params.onlyMainContent,
             waitForMs: params.waitForMs,
             noCache: params.noCache,
+            ...(params.selfHost ? { selfHost: params.selfHost } : {}),
             fetchFn,
           });
           if (out && out.markdown.trim().length > 0) {

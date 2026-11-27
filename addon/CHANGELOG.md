@@ -2,6 +2,11 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.10] - 2026-11-26
+
+### Changed
+- **`search` keeps each result's real URL:** result URLs were canonicalized without their trailing slash, which is a good dedupe key, but it was also the URL that search returned and fetched. Docs sites redirect `/page` to `/page/`, and the node waits a full same-host politeness pause before following it, so each such page cost 4.4-7.8 s against a ~20 ms first byte and enrichment kept hitting its 15 s budget. Results now return, and enrichment now fetches, the provider's own URL (with its slash). Fusion still dedupes on the slashless key (#97).
+
 ## [2.8.9] - 2026-11-26
 
 ### Changed

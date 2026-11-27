@@ -1764,6 +1764,24 @@ func (n *HTMLNode) Tag() string {
 	return n.tag
 }
 
+// NodeKey returns a comparable identity key for the underlying DOM node, or nil if n is nil.
+// Multiple HTMLNode wrappers returned by separate Select/First calls for the same DOM element
+// share the same NodeKey.
+func (n *HTMLNode) NodeKey() any {
+	if n == nil || n.node == nil {
+		return nil
+	}
+	return n.node
+}
+
+// SameNode reports whether n and other wrap the same underlying DOM node.
+func (n *HTMLNode) SameNode(other *HTMLNode) bool {
+	if n == nil || other == nil || n.node == nil || other.node == nil {
+		return false
+	}
+	return n.node == other.node
+}
+
 // Select returns up to limit matching descendant HTMLNodes in DOM document order (capped at 5,000).
 func (n *HTMLNode) Select(selector string, limit int) []*HTMLNode {
 	if n == nil || n.node == nil || limit <= 0 || n.budget == nil || n.budget.remaining <= 0 {
@@ -2004,6 +2022,20 @@ func (n *HTMLNode) TableRows(subSelector ...string) [][]string {
 	})
 
 	return rows
+}
+
+// IsDescendantOf reports whether n is a strict descendant of ancestor within the same parsed DOM.
+func (n *HTMLNode) IsDescendantOf(ancestor *HTMLNode) bool {
+	if n == nil || n.node == nil || ancestor == nil || ancestor.node == nil || n.node == ancestor.node {
+		return false
+	}
+	target := ancestor.node
+	for cur := n.node.parent; cur != nil; cur = cur.parent {
+		if cur == target {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseHTMLDoc parses rawHTML (capped at maxChars, defaulting to 2 MiB with a 4 MiB hard ceiling) into a linear-time queryable HTMLDoc.

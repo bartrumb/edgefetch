@@ -1,0 +1,315 @@
+# Shared Go + TypeScript Declarative Site Adapter: Zendesk Help Center
+id: zendesk-hc
+name: Zendesk Help Center
+category: developer
+description: "Upgrades *.zendesk.com Help Center article, section, and category pages to the official Help Center v2 JSON API with breadcrumbs, updated timestamps, and Markdown conversion."
+domains:
+  - "*.zendesk.com"
+exampleUrls:
+  - "https://support.zendesk.com/hc/en-us/articles/4408886858138-What-is-Zendesk"
+  - "https://support.zendesk.com/hc/en-us/sections/4408886858138"
+  - "https://support.zendesk.com/hc/en-us/categories/4408886858138"
+
+routes:
+  # Route 1: Help Center article /hc/<locale>/articles/<id>[-<slug>]
+  - match:
+      exactSegments: false
+      pathSegments:
+        - hc
+        - param: locale
+          charset: alnum_dash
+          minLen: 2
+          maxLen: 16
+          transform: lower
+        - articles
+        - param: articleId
+          charset: leading_digits_slug
+          minLen: 1
+          maxLen: 160
+          transform: leading_digits
+    twin:
+      fetchUrl: "https://{host}/api/v2/help_center/{locale}/articles/{articleId}.json?include=sections,categories"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      rejectIfFieldTruthy: article.draft
+      requireFields:
+        - article.title
+        - article.body
+      vars:
+        title:
+          paths:
+            - article.title
+          format: strip_tags
+          trim: true
+        updatedAt:
+          paths:
+            - article.updated_at
+            - article.edited_at
+        htmlUrl:
+          paths:
+            - article.html_url
+          requireHttps: true
+        sectionName:
+          paths:
+            - sections.0.name
+          format: strip_tags
+          trim: true
+        sectionUrl:
+          paths:
+            - sections.0.html_url
+          requireHttps: true
+        categoryName:
+          paths:
+            - categories.0.name
+          format: strip_tags
+          trim: true
+        categoryUrl:
+          paths:
+            - categories.0.html_url
+          requireHttps: true
+        catAndSec:
+          template: "{categoryName} › {sectionName}"
+          whenVars:
+            - categoryName
+            - sectionName
+          fallbackVar: sectionName
+        breadcrumbs:
+          template: "{catAndSec}"
+          whenVars:
+            - catAndSec
+          fallbackVar: categoryName
+        labels:
+          paths:
+            - article.label_names
+          itemWrap: "`"
+          join: ", "
+          limit: 12
+        bodyMd:
+          paths:
+            - article.body
+          format: html_to_md
+          trim: true
+      requireVars:
+        - title
+        - bodyMd
+      titleTemplate: "{title}"
+      publishedTimeVar: updatedAt
+      bullets:
+        - label: Breadcrumbs
+          template: "{breadcrumbs}"
+          whenVar: breadcrumbs
+        - label: Updated
+          template: "{updatedAt}"
+          whenVar: updatedAt
+        - label: Labels
+          template: "{labels}"
+          whenVar: labels
+        - label: Canonical URL
+          template: "{htmlUrl}"
+          whenVar: htmlUrl
+      bodyVar: bodyMd
+      linksVars:
+        - htmlUrl
+        - sectionUrl
+        - categoryUrl
+
+  # Route 2: Help Center section /hc/<locale>/sections/<id>[-<slug>]
+  - match:
+      exactSegments: false
+      pathSegments:
+        - hc
+        - param: locale
+          charset: alnum_dash
+          minLen: 2
+          maxLen: 16
+          transform: lower
+        - sections
+        - param: sectionId
+          charset: leading_digits_slug
+          minLen: 1
+          maxLen: 160
+          transform: leading_digits
+    twin:
+      fetchUrl: "https://{host}/api/v2/help_center/{locale}/sections/{sectionId}/articles.json?per_page=50&include=sections,categories"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - articles
+        - sections
+      vars:
+        sectionTitle:
+          paths:
+            - sections.0.name
+          format: strip_tags
+          trim: true
+          fallbackTemplate: "Help Center Section #{sectionId}"
+        categoryName:
+          paths:
+            - categories.0.name
+          format: strip_tags
+          trim: true
+        sectionUrl:
+          paths:
+            - sections.0.html_url
+          requireHttps: true
+        categoryUrl:
+          paths:
+            - categories.0.html_url
+          requireHttps: true
+        articleCount:
+          paths:
+            - articles
+          format: array_len_comma
+      titleTemplate: "{sectionTitle}"
+      bullets:
+        - label: Category
+          template: "{categoryName}"
+          whenVar: categoryName
+        - label: Articles
+          template: "{articleCount}"
+          whenVar: articleCount
+      sections:
+        - heading: Articles
+          arrayPath: articles
+          limit: 50
+          emptyText: No published articles found in this section.
+          requireItemVar: artTitle
+          collectLinkVars:
+            - artUrl
+          itemVars:
+            artTitle:
+              paths:
+                - title
+              format: strip_tags
+              trim: true
+            artUrl:
+              paths:
+                - html_url
+              requireHttps: true
+            artLabels:
+              paths:
+                - label_names
+              join: ", "
+              limit: 8
+            artUpdated:
+              paths:
+                - updated_at
+              sliceMax: 10
+          recordFields:
+            title: "{artTitle}"
+            url: "{artUrl}"
+            updatedAt: "{artUpdated}"
+            labels: "{artLabels}"
+          columns:
+            - header: Article
+              template: "[{artTitle}]({artUrl})"
+            - header: Updated
+              paths:
+                - updated_at
+              sliceMax: 10
+            - header: Labels
+              template: "{artLabels}"
+      linksVars:
+        - sectionUrl
+        - categoryUrl
+
+  # Route 3: Help Center category /hc/<locale>/categories/<id>[-<slug>]
+  - match:
+      exactSegments: false
+      pathSegments:
+        - hc
+        - param: locale
+          charset: alnum_dash
+          minLen: 2
+          maxLen: 16
+          transform: lower
+        - categories
+        - param: categoryId
+          charset: leading_digits_slug
+          minLen: 1
+          maxLen: 160
+          transform: leading_digits
+    twin:
+      fetchUrl: "https://{host}/api/v2/help_center/{locale}/categories/{categoryId}/sections.json?per_page=50&include=categories"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - sections
+        - categories
+      vars:
+        categoryTitle:
+          paths:
+            - categories.0.name
+          format: strip_tags
+          trim: true
+          fallbackTemplate: "Help Center Category #{categoryId}"
+        categoryDesc:
+          paths:
+            - categories.0.description
+          format: strip_tags
+          trim: true
+        categoryUrl:
+          paths:
+            - categories.0.html_url
+          requireHttps: true
+        sectionCount:
+          paths:
+            - sections
+          format: array_len_comma
+      titleTemplate: "{categoryTitle}"
+      descriptionVar: categoryDesc
+      introVar: categoryDesc
+      bullets:
+        - label: Sections
+          template: "{sectionCount}"
+          whenVar: sectionCount
+      sections:
+        - heading: Sections
+          arrayPath: sections
+          limit: 50
+          emptyText: No sections found in this category.
+          requireItemVar: secName
+          collectLinkVars:
+            - secUrl
+          itemVars:
+            secName:
+              paths:
+                - name
+              format: strip_tags
+              trim: true
+            secUrl:
+              paths:
+                - html_url
+              requireHttps: true
+            secDesc:
+              paths:
+                - description
+              format: strip_tags
+              trim: true
+              sliceMax: 160
+            secUpdated:
+              paths:
+                - updated_at
+              sliceMax: 10
+          recordFields:
+            title: "{secName}"
+            url: "{secUrl}"
+            description: "{secDesc}"
+            updatedAt: "{secUpdated}"
+          columns:
+            - header: Section
+              template: "[{secName}]({secUrl})"
+            - header: Description
+              template: "{secDesc}"
+            - header: Updated
+              paths:
+                - updated_at
+              sliceMax: 10
+      linksVars:
+        - categoryUrl

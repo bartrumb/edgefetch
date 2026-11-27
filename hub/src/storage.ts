@@ -125,27 +125,61 @@ export interface NormalizeVisibilityOptions {
   userId?: string;
 }
 
-function hasAnyCallerHeader(headers: unknown): boolean {
-  if (!headers || typeof headers !== 'object') return false;
-  if (typeof (headers as Headers).forEach === 'function') {
-    let found = false;
-    (headers as Headers).forEach((v) => {
-      if (typeof v === 'string' && v.trim().length > 0) found = true;
-    });
-    return found;
-  }
-  if (Array.isArray(headers)) {
-    return headers.length > 0;
-  }
-  for (const [, v] of Object.entries(headers as Record<string, unknown>)) {
-    if (v !== undefined && v !== null && String(v).trim().length > 0) {
-      return true;
-    }
-  }
-  return false;
+const CALLER_HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const UNSAFE_CALLER_HEADER_VALUE_RE = /[\x00-\x08\x0a-\x1f\x7f]|[^\x00-\xff]/;
+
+function toCallerHeaderScalar(v: unknown): string | null {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return null;
 }
 
-function hasAnyCallerCookies(cookies: unknown): boolean {
+export function normalizeCallerHeadersRecord(headers: unknown): Record<string, string> {
+  if (!headers || typeof headers !== 'object') return {};
+  const out: Record<string, string> = {};
+  const lowerToKey = new Map<string, string>();
+  const setHeader = (rawKey: unknown, rawVal: unknown) => {
+    const keyScalar = toCallerHeaderScalar(rawKey);
+    const valScalar = toCallerHeaderScalar(rawVal);
+    if (keyScalar === null || valScalar === null) return;
+    const key = keyScalar.trim();
+    const val = valScalar.trim();
+    if (!key || !val) return;
+    const lower = key.toLowerCase();
+    if (lower === '__proto__' || !CALLER_HEADER_NAME_RE.test(key) || UNSAFE_CALLER_HEADER_VALUE_RE.test(val)) {
+      return;
+    }
+    const prevKey = lowerToKey.get(lower);
+    if (prevKey !== undefined && prevKey !== key) {
+      delete out[prevKey];
+    }
+    lowerToKey.set(lower, key);
+    out[key] = val;
+  };
+  if (Array.isArray(headers)) {
+    for (const entry of headers) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      setHeader(entry[0], entry[1]);
+    }
+    return out;
+  }
+  if (typeof (headers as Headers).forEach === 'function' && typeof (headers as Headers).get === 'function') {
+    (headers as Headers).forEach((v, k) => {
+      setHeader(k, v);
+    });
+    return out;
+  }
+  for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+    setHeader(k, v);
+  }
+  return out;
+}
+
+export function hasAnyCallerHeader(headers: unknown): boolean {
+  return Object.keys(normalizeCallerHeadersRecord(headers)).length > 0;
+}
+
+export function hasAnyCallerCookies(cookies: unknown): boolean {
   if (cookies === undefined || cookies === null) return false;
   if (typeof cookies === 'string') return cookies.trim().length > 0;
   if (Array.isArray(cookies)) return cookies.length > 0;
@@ -180,6 +214,23 @@ export function normalizeVisibility(
     return 'public';
   }
   return 'public';
+}
+
+export function isPrivateRequestPayload(payload: unknown, userId?: string): boolean {
+  const obj =
+    payload && typeof payload === 'object' && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
+  if (
+    normalizeVisibility(obj.visibility, obj.headers, {
+      cookies: obj.cookies,
+      preferMcp: obj.useConnectedMcp === true || obj.preferMcp === true,
+      hasAuthContext: Boolean(obj.auth),
+      userId,
+    }) === 'private'
+  ) {
+    return true;
+  }
+  const effectiveUser = userId ?? getActiveCallerAuthContext()?.userId;
+  return Boolean(effectiveUser && sanitizeStorageUserId(effectiveUser) !== 'owner');
 }
 
 export function r2PrivateArtifactKey(userId: string, retention: ArtifactRetention, blobSha256: string): string {
@@ -901,10 +952,14 @@ export async function hydrateReplyBodiesFromR2(
   bucket: R2Bucket,
   budgetBytes = INLINE_HYDRATION_BUDGET_BYTES,
   maxPerItemBytes?: number,
+  allowAbovePerItemCapIds?: ReadonlySet<string>,
 ): Promise<string> {
   let parsed: {
     results?: Array<{
+      id?: string;
+      kind?: string;
       body?: string;
+      bodyBase64?: string;
       bodyEncoding?: 'utf-8' | 'base64';
       bodyOmitted?: boolean;
       extractedOnNode?: boolean;
@@ -924,7 +979,12 @@ export async function hydrateReplyBodiesFromR2(
   } catch {
     return replyText;
   }
-  if (!Array.isArray(parsed.results) || !parsed.results.some((r) => r?.artifact?.blobSha256 && r.body === undefined)) {
+  if (
+    !Array.isArray(parsed.results) ||
+    !parsed.results.some(
+      (r) => r?.artifact?.blobSha256 && r.body === undefined && !(typeof r.bodyBase64 === 'string' && r.bodyBase64.length > 0),
+    )
+  ) {
     return replyText;
   }
 
@@ -938,13 +998,19 @@ export async function hydrateReplyBodiesFromR2(
   const hydNow = Date.now();
   for (const r of parsed.results) {
     const art = r?.artifact;
-    if (!art?.blobSha256 || typeof r.body === 'string') continue;
+    if (!art?.blobSha256 || typeof r.body === 'string' || (typeof r.bodyBase64 === 'string' && r.bodyBase64.length > 0)) {
+      continue;
+    }
+    const skipPerItemCap =
+      r.kind === 'binary' || (typeof r.id === 'string' && Boolean(allowAbovePerItemCapIds?.has(r.id)));
     if (
-      r.extractedOnNode === true ||
-      (maxPerItemBytes !== undefined &&
+      (!skipPerItemCap && r.extractedOnNode === true) ||
+      (!skipPerItemCap &&
+        maxPerItemBytes !== undefined &&
         maxPerItemBytes > 0 &&
         typeof art.contentBytes === 'number' &&
-        art.contentBytes > maxPerItemBytes)
+        art.contentBytes > maxPerItemBytes) ||
+      (typeof art.contentBytes === 'number' && art.contentBytes > budgetBytes)
     ) {
       r.bodyOmitted = true;
       continue;
@@ -977,6 +1043,7 @@ export async function hydrateReplyBodiesFromR2(
     }
     r.body = encoded.body;
     r.bodyEncoding = encoded.bodyEncoding;
+    delete r.bodyOmitted;
     usedInlineBytes += encoded.body.length;
   }
 
@@ -1490,18 +1557,26 @@ export async function handleArtifactGetRequest(params: {
   deriveMarkdownFromRaw?: (bytes: Uint8Array) => string | null;
 }): Promise<Response> {
   const { request, url, blobSha256, bucket, metaDb, userId, pipelineVersion, deriveMarkdownFromRaw } = params;
+  const rawVis = url.searchParams.get('visibility');
+  const visibility: ArtifactVisibility | undefined = rawVis === 'private' ? 'private' : rawVis === 'public' ? 'public' : undefined;
+  const isPrivateCaller = Boolean((userId && sanitizeStorageUserId(userId) !== 'owner') || visibility === 'private');
+  const cacheControl = isPrivateCaller ? 'private, no-store' : 'no-store';
   if (!bucket) {
-    return Response.json({ error: 'artifacts_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
+    return Response.json(
+      { error: 'artifacts_not_configured', ...(isPrivateCaller ? { visibility: 'private' as const } : {}) },
+      { status: 503, headers: { 'cache-control': cacheControl } },
+    );
   }
   const cleanParamId = blobSha256.startsWith('md:') ? blobSha256.slice(3) : blobSha256;
   if (!isValidSha256Hex(cleanParamId)) {
-    return Response.json({ error: 'invalid_blob_sha256' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+    return Response.json(
+      { error: 'invalid_blob_sha256', ...(isPrivateCaller ? { visibility: 'private' as const } : {}) },
+      { status: 400, headers: { 'cache-control': cacheControl } },
+    );
   }
 
   const rawRet = url.searchParams.get('retention');
   const retention: ArtifactRetention | undefined = rawRet === 'stored' ? 'stored' : rawRet === 'transient' ? 'transient' : undefined;
-  const rawVis = url.searchParams.get('visibility');
-  const visibility: ArtifactVisibility | undefined = rawVis === 'private' ? 'private' : rawVis === 'public' ? 'public' : undefined;
   const contentFormat: 'raw' | 'markdown' | undefined =
     url.searchParams.get('content') === 'markdown' || url.searchParams.get('format') === 'markdown' ? 'markdown' : undefined;
   const offset = url.searchParams.has('offset') ? Number(url.searchParams.get('offset')) : 0;
@@ -1522,22 +1597,32 @@ export async function handleArtifactGetRequest(params: {
   });
   if (!out.ok) {
     return Response.json(
-      { ok: false, status: out.status, via: 'hub', error: out.error, ...(out.message ? { message: out.message } : {}) },
-      { status: out.status, headers: { 'cache-control': 'no-store' } },
+      {
+        ok: false,
+        ...(isPrivateCaller ? { visibility: 'private' as const } : {}),
+        status: out.status,
+        via: 'hub',
+        error: out.error,
+        ...(out.message ? { message: out.message } : {}),
+      },
+      { status: out.status, headers: { 'cache-control': cacheControl } },
     );
   }
 
   const wantsJson =
     url.searchParams.get('format') === 'json' || (request.headers.get('accept') ?? '').toLowerCase().includes('application/json');
   if (wantsJson) {
-    return Response.json(out.page, { status: 200, headers: { 'cache-control': 'no-store' } });
+    return Response.json(
+      { ...out.page, ...(isPrivateCaller ? { visibility: 'private' as const } : {}) },
+      { status: 200, headers: { 'cache-control': cacheControl } },
+    );
   }
 
   return new Response(out.page.content, {
     status: 200,
     headers: {
       'content-type': 'text/plain; charset=utf-8',
-      'cache-control': 'no-store',
+      'cache-control': cacheControl,
       'x-content-type-options': 'nosniff',
       'content-security-policy': 'sandbox',
       'content-disposition': `attachment; filename="${blobSha256.slice(0, 16)}.txt"`,

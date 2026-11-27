@@ -132,7 +132,7 @@ func extractAshbyLocations(job map[string]any) []string {
 	seen := make(map[string]bool)
 	out := make([]string, 0, 4)
 	pushLoc := func(raw string) {
-		clean := strings.TrimSpace(raw)
+		clean := SanitizeJobFieldPlain(raw, 180)
 		if clean == "" {
 			return
 		}

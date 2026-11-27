@@ -32,36 +32,37 @@ type FullExtractOptions struct {
 // ExtractedDocumentFull holds the full-fidelity Markdown, metadata, links, images, branding,
 // structured JSON-LD entities, and pagination state extracted from an HTML document.
 type ExtractedDocumentFull struct {
-	Title                string           `json:"title,omitempty"`
-	Description          string           `json:"description,omitempty"`
-	Author               string           `json:"author,omitempty"`
-	PublishedTime        string           `json:"publishedTime,omitempty"`
-	ModifiedTime         string           `json:"modifiedTime,omitempty"`
-	SiteName             string           `json:"siteName,omitempty"`
-	WordCount            int              `json:"wordCount,omitempty"`
-	Language             string           `json:"language,omitempty"`
-	Favicon              string           `json:"favicon,omitempty"`
-	OGImage              string           `json:"ogImage,omitempty"`
-	CanonicalURL         string           `json:"canonicalUrl,omitempty"`
-	MarkdownAlternateURL string           `json:"markdownAlternateUrl,omitempty"`
-	RobotsMeta           string           `json:"robotsMeta,omitempty"`
-	ExtractorID          string           `json:"extractorId,omitempty"`
-	Records              []map[string]any `json:"records,omitempty"`
-	Total                *int             `json:"total,omitempty"`
-	Returned             *int             `json:"returned,omitempty"`
-	NextCursor           string           `json:"nextCursor,omitempty"`
-	InertiaHydrated      bool             `json:"inertiaHydrated,omitempty"`
-	Markdown             string           `json:"markdown"`
-	RawSanitizedMarkdown string           `json:"rawSanitizedMarkdown,omitempty"`
-	Text                 string           `json:"text,omitempty"`
-	Links                []string         `json:"links"`
-	Images               []ImageInfo      `json:"images"`
-	Branding             BrandingProfile  `json:"branding"`
-	StructuredData       []map[string]any `json:"structuredData,omitempty"`
-	TotalChars           int              `json:"totalChars"`
-	ReturnedChars        int              `json:"returnedChars"`
-	Truncated            bool             `json:"truncated,omitempty"`
-	NextOffset           *int             `json:"nextOffset,omitempty"`
+	Title                    string           `json:"title,omitempty"`
+	Description              string           `json:"description,omitempty"`
+	Author                   string           `json:"author,omitempty"`
+	PublishedTime            string           `json:"publishedTime,omitempty"`
+	ModifiedTime             string           `json:"modifiedTime,omitempty"`
+	SiteName                 string           `json:"siteName,omitempty"`
+	WordCount                int              `json:"wordCount,omitempty"`
+	Language                 string           `json:"language,omitempty"`
+	Favicon                  string           `json:"favicon,omitempty"`
+	OGImage                  string           `json:"ogImage,omitempty"`
+	CanonicalURL             string           `json:"canonicalUrl,omitempty"`
+	MarkdownAlternateURL     string           `json:"markdownAlternateUrl,omitempty"`
+	RobotsMeta               string           `json:"robotsMeta,omitempty"`
+	ExtractorID              string           `json:"extractorId,omitempty"`
+	Records                  []map[string]any `json:"records,omitempty"`
+	PreferRecordAvailability bool             `json:"preferRecordAvailability,omitempty"`
+	Total                    *int             `json:"total,omitempty"`
+	Returned                 *int             `json:"returned,omitempty"`
+	NextCursor               string           `json:"nextCursor,omitempty"`
+	InertiaHydrated          bool             `json:"inertiaHydrated,omitempty"`
+	Markdown                 string           `json:"markdown"`
+	RawSanitizedMarkdown     string           `json:"rawSanitizedMarkdown,omitempty"`
+	Text                     string           `json:"text,omitempty"`
+	Links                    []string         `json:"links"`
+	Images                   []ImageInfo      `json:"images"`
+	Branding                 BrandingProfile  `json:"branding"`
+	StructuredData           []map[string]any `json:"structuredData,omitempty"`
+	TotalChars               int              `json:"totalChars"`
+	ReturnedChars            int              `json:"returnedChars"`
+	Truncated                bool             `json:"truncated,omitempty"`
+	NextOffset               *int             `json:"nextOffset,omitempty"`
 }
 
 var (
@@ -145,6 +146,7 @@ var (
 		"flickity-cloned":                       true,
 		"glide__slide--clone":                   true,
 		"owl-cloned":                            true,
+		"dodo-service-include__error":           true,
 	}
 
 	nonContentRolesFullDocGo = map[string]bool{
@@ -452,13 +454,17 @@ func scanHTMLTagsLinearFullDocGo(rawHTML string, onTag func(scannedTagFullDocGo)
 		maxChars = maxHTMLScanCharsFullDocGo
 	}
 	src := truncateUTF8SafeFullDocGo(rawHTML, maxChars)
+	lastGt := strings.LastIndexByte(src, '>')
+	if lastGt < 0 {
+		return
+	}
 	var dead scannerDeadStateFullDocGo
 	rel := strings.IndexByte(src, '<')
-	if rel < 0 {
+	if rel < 0 || rel >= lastGt {
 		return
 	}
 	pos := rel
-	for pos >= 0 && pos < len(src) {
+	for pos >= 0 && pos < lastGt {
 		if dead.nextGtPos == -1 {
 			break
 		}
@@ -588,6 +594,17 @@ func replaceHTMLOpenTagsLinearFullDocGo(rawHTML string, tagNamesLower []string, 
 	}
 	src := truncateUTF8SafeFullDocGo(rawHTML, maxChars)
 	if strings.IndexByte(src, '<') < 0 {
+		return src
+	}
+	lower := asciiLowerExtractString(src)
+	hasAny := false
+	for _, t := range tagNamesLower {
+		if strings.Contains(lower, "<"+t) {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
 		return src
 	}
 	targetSet := make(map[string]bool, len(tagNamesLower))
@@ -954,7 +971,7 @@ func resolveSafeMarkdownHrefOrRelativeFullDocGo(rawHref, baseURL string, preserv
 	if trimmedRaw == "" {
 		return ""
 	}
-	decoded := strings.TrimSpace(DecodeHTMLEntities(trimmedRaw))
+	decoded := strings.TrimSpace(stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesGo(collapseAmpEntityChainsGo(trimmedRaw))))
 	if decoded == "" ||
 		strings.HasPrefix(decoded, "#") ||
 		strings.HasPrefix(decoded, "//") ||
@@ -969,7 +986,7 @@ func resolveSafeMarkdownHrefOrRelativeFullDocGo(rawHref, baseURL string, preserv
 	if colonIdx > 0 && (slashIdx < 0 || colonIdx < slashIdx) {
 		return ""
 	}
-	return decoded
+	return encodeUnsafeHrefCharsGo(decoded)
 }
 
 func isPunctClusterByteFullDocGo(b byte) bool {
@@ -1115,6 +1132,107 @@ func cleanInlineHTMLFullDocGo(fragment string) string {
 	return collapseTagBoundaryPunctuationFullDocGo(joined)
 }
 
+func hasASCIIPrefixFoldExtractGo(s, lowerPrefix string) bool {
+	if len(s) < len(lowerPrefix) {
+		return false
+	}
+	for i := 0; i < len(lowerPrefix); i++ {
+		if asciiLowerExtractByte(s[i]) != lowerPrefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// escapeUnsafeTextOpenersGo mirrors scrape.ts's post-entity-decode guard:
+// `/<(?=[a-zA-Z!/\?]|[ \t]*(?:javascript|vbscript|data|file|blob):)/gi` -> `&lt;`,
+// preserving benign math/prose such as `5 < 10`.
+func escapeUnsafeTextOpenersGo(s string) string {
+	if s == "" || strings.IndexByte(s, '<') < 0 {
+		return s
+	}
+	n := len(s)
+	var sb strings.Builder
+	last := 0
+	i := 0
+	for i < n {
+		rel := strings.IndexByte(s[i:], '<')
+		if rel < 0 {
+			break
+		}
+		pos := i + rel
+		escape := false
+		if pos+1 < n {
+			nx := s[pos+1]
+			if (nx >= 'a' && nx <= 'z') || (nx >= 'A' && nx <= 'Z') || nx == '!' || nx == '/' || nx == '?' {
+				escape = true
+			} else {
+				j := pos + 1
+				for j < n && (s[j] == ' ' || s[j] == '\t') {
+					j++
+				}
+				rem := s[j:]
+				if hasASCIIPrefixFoldExtractGo(rem, "javascript:") ||
+					hasASCIIPrefixFoldExtractGo(rem, "vbscript:") ||
+					hasASCIIPrefixFoldExtractGo(rem, "data:") ||
+					hasASCIIPrefixFoldExtractGo(rem, "file:") ||
+					hasASCIIPrefixFoldExtractGo(rem, "blob:") {
+					escape = true
+				}
+			}
+		}
+		if escape {
+			if sb.Cap() == 0 {
+				sb.Grow(n + 16)
+			}
+			sb.WriteString(s[last:pos])
+			sb.WriteString("&lt;")
+			last = pos + 1
+		}
+		i = pos + 1
+	}
+	if last == 0 {
+		return s
+	}
+	sb.WriteString(s[last:])
+	return sb.String()
+}
+
+func cleanPlainHTMLTextFullDocGo(fragment string) string {
+	if fragment == "" {
+		return ""
+	}
+	cleaned := fragment
+	for pass := 0; pass < 4 && strings.IndexByte(cleaned, '<') >= 0 && strings.IndexByte(cleaned, '>') >= 0; pass++ {
+		next := replaceHTMLTagsQuoteAwareLinearFullDocGo(cleaned, func(t scannedTagFullDocGo) string {
+			if !t.isClosing && t.tagNameLower == "wbr" {
+				return ""
+			}
+			return " "
+		}, maxHTMLScanCharsFullDocGo, true)
+		if next == cleaned {
+			break
+		}
+		cleaned = next
+	}
+	return cleanInlineHTMLFullDocGo(cleaned)
+}
+
+func cleanInlineHTMLMarkdownProseFullDocGo(fragment string) string {
+	if fragment == "" {
+		return ""
+	}
+	stripped := replaceHTMLTagsQuoteAwareLinearFullDocGo(fragment, func(t scannedTagFullDocGo) string {
+		if !t.isClosing && t.tagNameLower == "wbr" {
+			return ""
+		}
+		return " "
+	}, maxHTMLScanCharsFullDocGo, true)
+	decoded := stripInvisibleSmugglingCharsGo(decodeMarkdownProseEntitiesPreservingLinksAndLtGo(stripped))
+	joined := strings.Join(strings.Fields(decoded), " ")
+	return collapseTagBoundaryPunctuationFullDocGo(joined)
+}
+
 func isLazyPlaceholderImageURLFullDocGo(urlStr string) bool {
 	trimmed := strings.TrimSpace(urlStr)
 	if trimmed == "" || strings.HasPrefix(asciiLowerExtractString(trimmed[:minInt(len(trimmed), 6)]), "data:") {
@@ -1151,7 +1269,7 @@ func isDecorativeOrTinyImageFullDocGo(attrs map[string]string, resolvedSrc strin
 	return reTinyOrBadgeImgFullDocGo.MatchString(hay) || isLazyPlaceholderImageURLFullDocGo(resolvedSrc)
 }
 
-func convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL string, includeImages bool) string {
+func formatAnchorMarkdownWithBadgeImagesFullDocGo(inner, baseURL, href string, includeImages bool) string {
 	withoutEm := inner
 	lowInner := asciiLowerExtractString(inner)
 	if strings.Contains(lowInner, "<em") || strings.Contains(lowInner, "<i") ||
@@ -1165,26 +1283,99 @@ func convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL string, includeIm
 			return t.rawTag
 		}, 8192, false)
 	}
-	if !includeImages || !strings.Contains(asciiLowerExtractString(withoutEm), "<img") {
-		return cleanInlineHTMLFullDocGo(withoutEm)
+	cleanAnchorText := func(seg string) string {
+		if href != "" {
+			return cleanInlineHTMLFullDocGo(seg)
+		}
+		return cleanInlineHTMLMarkdownProseFullDocGo(seg)
 	}
-	withImgs := replaceHTMLOpenTagsLinearFullDocGo(withoutEm, []string{"img"}, func(tag scannedTagFullDocGo) string {
-		if hasInlineEventHandlerAttrGo(tag.attrs) {
+	if !includeImages || !strings.Contains(asciiLowerExtractString(withoutEm), "<img") {
+		label := cleanAnchorText(withoutEm)
+		if label == "" {
 			return ""
 		}
-		attrs := parseTagAttrsFullDocGo(tag.attrs)
-		srcCand := attrs["src"]
-		if srcCand == "" {
-			srcCand = attrs["data-src"]
+		if href != "" {
+			dupSuf := " (" + href + ")"
+			if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
+				if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
+					label = stripped
+				}
+			}
+			return "[" + escapeMarkdownLinkLabelGo(label) + "](" + href + ")"
 		}
-		resolvedSrc := resolveSafeMarkdownHrefOrRelativeFullDocGo(srcCand, baseURL, false)
-		alt := strings.NewReplacer("[", "", "]", "").Replace(cleanInlineHTMLFullDocGo(attrs["alt"]))
-		if resolvedSrc == "" || isTinyOrAvatarImageURLFullDocGo(resolvedSrc, alt) {
-			return ""
+		return label
+	}
+	type anchorSeg struct {
+		text    string
+		isBadge bool
+	}
+	var parts []anchorSeg
+	noDbl, noSgl := false, false
+	last := 0
+	pos := 0
+	for pos < len(withoutEm) {
+		tag, ok := scanNextHTMLTagQuoteAwareGo(withoutEm, pos, &noDbl, &noSgl)
+		if !ok {
+			break
 		}
-		return " ![" + alt + "](" + resolvedSrc + ") "
-	}, 8192)
-	return cleanInlineHTMLFullDocGo(withImgs)
+		if tag.tagLower == "img" && !tag.isClosing {
+			if tag.start > last {
+				if txt := cleanAnchorText(withoutEm[last:tag.start]); txt != "" {
+					parts = append(parts, anchorSeg{text: txt, isBadge: false})
+				}
+			}
+			if !hasInlineEventHandlerAttrGo(tag.attrs) {
+				attrs := parseTagAttrsFullDocGo(tag.attrs)
+				srcCand := attrs["src"]
+				if srcCand == "" {
+					srcCand = attrs["data-src"]
+				}
+				resolvedSrc := resolveSafeMarkdownHrefOrRelativeFullDocGo(srcCand, baseURL, false)
+				alt := sanitizeMarkdownImageAltGo(cleanInlineHTMLFullDocGo(attrs["alt"]))
+				if resolvedSrc != "" && !isTinyOrAvatarImageURLFullDocGo(resolvedSrc, alt) {
+					parts = append(parts, anchorSeg{text: "![" + alt + "](" + resolvedSrc + ")", isBadge: true})
+				}
+			}
+			last = tag.end
+		}
+		pos = tag.end
+	}
+	if last < len(withoutEm) {
+		if txt := cleanAnchorText(withoutEm[last:]); txt != "" {
+			parts = append(parts, anchorSeg{text: txt, isBadge: false})
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if href != "" {
+		dupSuf := " (" + href + ")"
+		lastIdx := len(parts) - 1
+		if !parts[lastIdx].isBadge && len(parts[lastIdx].text) > len(dupSuf) && strings.HasSuffix(parts[lastIdx].text, dupSuf) {
+			stripped := strings.TrimSpace(parts[lastIdx].text[:len(parts[lastIdx].text)-len(dupSuf)])
+			if stripped != "" {
+				parts[lastIdx].text = stripped
+			} else if len(parts) > 1 {
+				parts = parts[:lastIdx]
+			}
+		}
+	}
+	var out strings.Builder
+	for idx, p := range parts {
+		if idx > 0 {
+			out.WriteByte(' ')
+		}
+		if href != "" && !p.isBadge {
+			out.WriteString(escapeMarkdownLinkLabelGo(p.text))
+		} else {
+			out.WriteString(p.text)
+		}
+	}
+	joined := out.String()
+	if href != "" {
+		return "[" + joined + "](" + href + ")"
+	}
+	return joined
 }
 
 // SanitizeScrapedMetadataField sanitizes single-line metadata fields (`Title`, `Description`, `Author`, `SiteName`),
@@ -1313,9 +1504,6 @@ func inferCodeFenceLangFullDocGo(preAttrStr, codeAttrStr string) string {
 
 func cleanHeadingPermalinksFullDocGo(headingText string) string {
 	s := headingText
-	if strings.HasPrefix(s, "§") {
-		s = strings.TrimLeft(s[len("§"):], " \t")
-	}
 	s = reHeadingEditFullDocGo.ReplaceAllString(s, "")
 	s = reHeadingAddedInFullDocGo.ReplaceAllString(s, " ($1)")
 	s = reHeadingPilcrowLnkFullDocGo.ReplaceAllString(s, "")
@@ -1783,6 +1971,9 @@ func applyIncludeAndExcludeTagSelectorsFullDocGo(rawHTML string, includeTags, ex
 }
 
 func extractBalancedRoleMainHTMLFullDocGo(rawHTML string) (string, bool) {
+	if indexFoldASCIIExtract(rawHTML, "role") < 0 {
+		return "", false
+	}
 	targetTag := ""
 	contentStart := -1
 	depth := 0
@@ -1872,6 +2063,11 @@ func shouldStripSubtreeOpenTagFullDocGo(tagLower, attrStr string) bool {
 
 func stripHiddenAndChromeSubtreesFullDocGo(rawHTML string) string {
 	src := truncateUTF8SafeFullDocGo(rawHTML, maxHTMLScanCharsFullDocGo)
+	lowSrc := asciiLowerExtractString(src)
+	if !strings.Contains(lowSrc, "hidden") && !strings.Contains(lowSrc, "style") &&
+		!strings.Contains(lowSrc, "role") && !strings.Contains(lowSrc, "class") {
+		return src
+	}
 	var chunks []string
 	lastKeepIdx := 0
 	skipTag := ""
@@ -2153,7 +2349,12 @@ func hnFragmentToMarkdownFullDocGo(fragHTML, baseURL string) string {
 	s = replacePairedHTMLElementsLinearFullDocGo(s, []string{"a"}, func(_, _, attrStr, inner string) string {
 		attrs := parseTagAttrsFullDocGo(attrStr)
 		href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-		label := cleanInlineHTMLFullDocGo(inner)
+		var label string
+		if href != "" {
+			label = cleanInlineHTMLFullDocGo(inner)
+		} else {
+			label = cleanInlineHTMLMarkdownProseFullDocGo(inner)
+		}
 		if label == "" {
 			return href
 		}
@@ -2164,7 +2365,7 @@ func hnFragmentToMarkdownFullDocGo(fragHTML, baseURL string) string {
 					label = stripped
 				}
 			}
-			return "[" + label + "](" + href + ")"
+			return "[" + escapeMarkdownLinkLabelGo(label) + "](" + href + ")"
 		}
 		return label
 	}, maxHTMLScanCharsFullDocGo, 16384)
@@ -2791,7 +2992,18 @@ func convertCalloutsLinearFullDocGo(rawHTML string, stashInline func(string) str
 
 func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) string, stashInline func(string) string) string {
 	out := rawHTML
-	lowOut := asciiLowerExtractString(out)
+	var cachedLowOut string
+	var cachedLowOutFor string
+	hasCachedLowOut := false
+	getLowOut := func() string {
+		if !hasCachedLowOut || cachedLowOutFor != out {
+			cachedLowOut = asciiLowerExtractString(out)
+			cachedLowOutFor = out
+			hasCachedLowOut = true
+		}
+		return cachedLowOut
+	}
+	lowOut := getLowOut()
 
 	// 1. Strip pure line-number gutter cells in 2-column code tables, then unwrap 1x1 `<pre>` layout tables.
 	if strings.Contains(lowOut, "lntd") || strings.Contains(lowOut, "gutter") ||
@@ -2854,9 +3066,9 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 3. Convert GitHub / Sphinx `<div class="highlight ..."><pre>...</pre></div>` linearly.
-	if strings.Contains(asciiLowerExtractString(out), "highlight") {
+	if strings.Contains(getLowOut(), "highlight") {
 		src := out
-		lowerSrc := asciiLowerExtractString(src)
+		lowerSrc := getLowOut()
 		var chunks []string
 		lastCopied := 0
 		scanHTMLTagsLinearFullDocGo(src, func(tag scannedTagFullDocGo) bool {
@@ -2919,7 +3131,7 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 4. GFM task-list checkboxes (`<input type="checkbox" checked>`).
-	if strings.Contains(asciiLowerExtractString(out), "<input") {
+	if strings.Contains(getLowOut(), "<input") {
 		out = replaceHTMLOpenTagsLinearFullDocGo(out, []string{"input"}, func(tag scannedTagFullDocGo) string {
 			attrs := parseTagAttrsFullDocGo(tag.attrs)
 			if !strings.EqualFold(strings.TrimSpace(attrs["type"]), "checkbox") {
@@ -2935,7 +3147,7 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 5. HTML footnotes (`<sup id="fnref:1"><a href="#fn:1">1</a></sup>` + `<section id="footnotes"><ol>...</ol></section>`).
-	lowFn := asciiLowerExtractString(out)
+	lowFn := getLowOut()
 	if strings.Contains(lowFn, "fnref") || strings.Contains(lowFn, "footnote") {
 		out = reSupFootnoteRefFullDocGo.ReplaceAllStringFunc(out, func(full string) string {
 			sub := reSupFootnoteRefFullDocGo.FindStringSubmatch(full)
@@ -3032,7 +3244,9 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 6. Propagate VitePress / Docusaurus / Prism wrapper `<div class="... language-ts ...">` onto `<pre>`.
-	if reVitePressLangFullDocGo.MatchString(out) {
+	if lo := getLowOut(); strings.Contains(lo, "<pre") &&
+		(strings.Contains(lo, "language-") || strings.Contains(lo, "lang-") || strings.Contains(lo, "highlight-source-")) &&
+		reVitePressLangFullDocGo.MatchString(out) {
 		out = reVitePressPreFullDocGo.ReplaceAllStringFunc(out, func(full string) string {
 			sub := reVitePressPreFullDocGo.FindStringSubmatch(full)
 			if len(sub) < 3 {
@@ -3059,7 +3273,7 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 8. Mark `<math>` inside `.katex-display` or `.MathJax_Display` as block display.
-	lowMathDisp := asciiLowerExtractString(out)
+	lowMathDisp := getLowOut()
 	if strings.Contains(lowMathDisp, "katex-display") || strings.Contains(lowMathDisp, "mathjax_display") {
 		out = replacePairedHTMLElementsLinearFullDocGo(out, []string{"span", "div"}, func(full, _, attrStr, _ string) string {
 			if !hasClassTokenFullDocGo(attrStr, "katex-display") && !hasClassTokenFullDocGo(attrStr, "mathjax_display") {
@@ -3075,7 +3289,7 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 9. Convert `<math>` (KaTeX `<annotation encoding="application/x-tex">`, MathML `alttext`, or Parsoid `data-mw`) to LaTeX.
-	if strings.Contains(asciiLowerExtractString(out), "<math") {
+	if strings.Contains(getLowOut(), "<math") {
 		out = replacePairedHTMLElementsLinearFullDocGo(out, []string{"math"}, func(full, _, attrStr, inner string) string {
 			attrs := parseTagAttrsFullDocGo(attrStr)
 			annotTex := ""
@@ -3126,7 +3340,7 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	}
 
 	// 10. Convert MathJax `<mjx-container data-latex="...">`.
-	if strings.Contains(asciiLowerExtractString(out), "<mjx-container") {
+	if strings.Contains(getLowOut(), "<mjx-container") {
 		out = replacePairedHTMLElementsLinearFullDocGo(out, []string{"mjx-container"}, func(full, _, attrStr, _ string) string {
 			attrs := parseTagAttrsFullDocGo(attrStr)
 			rawTex := attrs["data-latex"]
@@ -3152,7 +3366,7 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 	out = convertCalloutsLinearFullDocGo(out, stashInline)
 
 	// 12. Upgrade `<picture><source srcset="..."><img></picture>` to highest-resolution image candidate.
-	if strings.Contains(asciiLowerExtractString(out), "<picture") {
+	if strings.Contains(getLowOut(), "<picture") {
 		out = replacePairedHTMLElementsLinearFullDocGo(out, []string{"picture"}, func(full, _, _, inner string) string {
 			bestSrc := ""
 			scanHTMLTagsLinearFullDocGo(inner, func(tag scannedTagFullDocGo) bool {
@@ -3192,6 +3406,11 @@ func standardizeElementsInHTMLFullDocGo(rawHTML string, stashCode func(string) s
 }
 
 func pruneHighLinkDensityBlocksFullDocGo(rawHTML string) string {
+	lowRaw := asciiLowerExtractString(rawHTML)
+	if !strings.Contains(lowRaw, "<a") ||
+		(!strings.Contains(lowRaw, "<div") && !strings.Contains(lowRaw, "<section") && !strings.Contains(lowRaw, "<ul")) {
+		return rawHTML
+	}
 	beforeWords := countTextWordsFullDocGo(stripHTMLTagsQuoteAwareLinearFullDocGo(rawHTML, " ", maxHTMLScanCharsFullDocGo))
 	if beforeWords < 140 {
 		return rawHTML
@@ -3607,7 +3826,8 @@ func stripMediaWikiInlineLinksLinearFullDocGo(ln string) string {
 			searchPos = scanCap
 			continue
 		}
-		isDoubleClose := mid > lastEmit && ln[mid-1] == ']'
+		isEscapedInnerClose := mid > lastEmit+1 && ln[mid-1] == ']' && isBackslashEscapedAt(ln, mid-1)
+		isDoubleClose := !isEscapedInnerClose && mid > lastEmit && ln[mid-1] == ']'
 		lblEnd := mid
 		if isDoubleClose {
 			lblEnd = mid - 1
@@ -3618,11 +3838,11 @@ func stripMediaWikiInlineLinksLinearFullDocGo(ln string) string {
 		}
 		openBr := -1
 		for b := lblEnd - 1; b >= minBack; b-- {
-			if ln[b] == '[' {
+			if ln[b] == '[' && !isBackslashEscapedAt(ln, b) {
 				openBr = b
 				break
 			}
-			if ln[b] == ']' {
+			if ln[b] == ']' && !isBackslashEscapedAt(ln, b) {
 				break
 			}
 		}
@@ -3634,6 +3854,14 @@ func stripMediaWikiInlineLinksLinearFullDocGo(ln string) string {
 					openStart = openBr - 1
 				}
 				label := ln[openBr+1 : lblEnd]
+				if isEscapedInnerClose && strings.IndexByte(label, '\\') >= 0 {
+					unesc := strings.NewReplacer(`\[`, `[`, `\]`, `]`, `\\`, `\`).Replace(label)
+					if len(unesc) >= 2 && unesc[0] == '[' && unesc[len(unesc)-1] == ']' {
+						label = unesc[1 : len(unesc)-1]
+					} else {
+						label = unesc
+					}
+				}
 				uStr := ln[mid+2 : endParen]
 				lowU := asciiLowerExtractString(uStr)
 				isWikidata := !hasDoubleOpen && (strings.HasPrefix(lowU, "https://www.wikidata.org/wiki/special:entitypage/") || strings.HasPrefix(lowU, "https://wikidata.org/wiki/special:entitypage/"))
@@ -4142,7 +4370,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 					}
 					return sf
 				}, 2048, 2048)
-				if cleaned := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(strippedChrome)); cleaned != "" {
+				if cleaned := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLMarkdownProseFullDocGo(strippedChrome)); cleaned != "" {
 					primaryH1Text = cleaned
 				}
 			}
@@ -4175,17 +4403,19 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 
 		firstMainEnd := -1
 		lastMainCloseIdx := -1
-		scanHTMLTagsLinearFullDocGo(work, func(tag scannedTagFullDocGo) bool {
-			if tag.tagNameLower != "main" {
+		if indexFoldASCIIExtract(work, "<main") >= 0 {
+			scanHTMLTagsLinearFullDocGo(work, func(tag scannedTagFullDocGo) bool {
+				if tag.tagNameLower != "main" {
+					return true
+				}
+				if !tag.isClosing && !tag.isSelfClosing && firstMainEnd < 0 {
+					firstMainEnd = tag.end
+				} else if tag.isClosing && firstMainEnd >= 0 {
+					lastMainCloseIdx = tag.index
+				}
 				return true
-			}
-			if !tag.isClosing && !tag.isSelfClosing && firstMainEnd < 0 {
-				firstMainEnd = tag.end
-			} else if tag.isClosing && firstMainEnd >= 0 {
-				lastMainCloseIdx = tag.index
-			}
-			return true
-		}, maxHTMLScanCharsFullDocGo, false)
+			}, maxHTMLScanCharsFullDocGo, false)
+		}
 		mainInner := ""
 		if firstMainEnd >= 0 && lastMainCloseIdx > firstMainEnd {
 			mainInner = work[firstMainEnd:lastMainCloseIdx]
@@ -4358,7 +4588,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		seenImages := make(map[string]bool)
-		if includeImages {
+		if includeImages && indexFoldASCIIExtract(work, "<img") >= 0 {
 			scanHTMLTagsLinearFullDocGo(work, func(tag scannedTagFullDocGo) bool {
 				if tag.isClosing || tag.tagNameLower != "img" {
 					return true
@@ -4404,45 +4634,53 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"a"}, func(_, _, attrStr, inner string) string {
 				attrs := parseTagAttrsFullDocGo(attrStr)
 				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-				label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
-				if label == "" {
+				res := formatAnchorMarkdownWithBadgeImagesFullDocGo(inner, baseURL, href, includeImages)
+				if res == "" {
 					return " "
 				}
-				if href != "" {
-					dupSuf := " (" + href + ")"
-					if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
-						if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
-							label = stripped
-						}
-					}
-					return "[" + label + "](" + href + ")"
-				}
-				return label
+				return res
 			}, 16384, 8192)
 			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"strong", "b"}, func(_, _, _, inner string) string {
-				txt := cleanInlineHTMLFullDocGo(inner)
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
 				if txt == "" {
 					return " "
 				}
 				return "**" + txt + "**"
 			}, 16384, 8192)
 			withInline = replacePairedHTMLElementsLinearFullDocGo(withInline, []string{"em", "i"}, func(_, _, _, inner string) string {
-				txt := cleanInlineHTMLFullDocGo(inner)
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
 				if txt == "" {
 					return " "
 				}
 				return "*" + txt + "*"
 			}, 16384, 8192)
-			return strings.ReplaceAll(cleanInlineHTMLFullDocGo(withInline), "|", `\|`)
+			return strings.ReplaceAll(cleanInlineHTMLMarkdownProseFullDocGo(withInline), "|", `\|`)
 		}
 
 		md = replaceHTMLOpenTagsLinearFullDocGo(work, []string{"wbr"}, func(scannedTagFullDocGo) string { return "" }, maxHTMLScanCharsFullDocGo)
-		md = reAdjacentAnchorsFullDocGo.ReplaceAllString(md, "$1 $2")
-		md = reAdjacentCodeFullDocGo.ReplaceAllString(md, "$1 $2")
-		md = reAlnumBeforeAnchorFullDocGo.ReplaceAllString(md, "$1 $2")
+		var cachedLowMd string
+		var cachedLowMdFor string
+		hasCachedLowMd := false
+		getLowMd := func() string {
+			if !hasCachedLowMd || cachedLowMdFor != md {
+				cachedLowMd = asciiLowerExtractString(md)
+				cachedLowMdFor = md
+				hasCachedLowMd = true
+			}
+			return cachedLowMd
+		}
+		if lm := getLowMd(); strings.Contains(lm, "<a") {
+			if strings.Contains(lm, "</a><a") {
+				md = reAdjacentAnchorsFullDocGo.ReplaceAllString(md, "$1 $2")
+			}
+			md = reAlnumBeforeAnchorFullDocGo.ReplaceAllString(md, "$1 $2")
+		}
+		if strings.Contains(getLowMd(), "</code><code") {
+			md = reAdjacentCodeFullDocGo.ReplaceAllString(md, "$1 $2")
+		}
 
 		// Strip Expressive Code empty header figcaptions.
-		if strings.Contains(asciiLowerExtractString(md), "<figcaption") {
+		if strings.Contains(getLowMd(), "<figcaption") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"figcaption"}, func(full, _, attrStr, inner string) string {
 				if !hasClassTokenFullDocGo(attrStr, "header") || len(inner) > 600 {
 					return full
@@ -4464,7 +4702,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// `<pre>` blocks (optionally wrapping `<code ...>...</code>`)
-		if strings.Contains(asciiLowerExtractString(md), "<pre") {
+		if strings.Contains(getLowMd(), "<pre") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"pre"}, func(_, _, preAttrs, preInner string) string {
 				if strings.Contains(asciiLowerExtractString(preInner), "<button") {
 					preInner = stripHTMLTagsLinearFullDocGo(preInner, []string{"button"}, "", maxHTMLScanCharsFullDocGo)
@@ -4503,7 +4741,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// `<figure>` with `<img>` and optional `<figcaption>`
-		if strings.Contains(asciiLowerExtractString(md), "<figure") {
+		if strings.Contains(getLowMd(), "<figure") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"figure"}, func(full, _, _, figInner string) string {
 				if strings.Contains(asciiLowerExtractString(figInner), "<figure") {
 					return full
@@ -4538,11 +4776,11 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				if resolvedSrc == "" || isDecorativeOrTinyImageFullDocGo(ia, resolvedSrc) {
 					return full
 				}
-				alt := cleanInlineHTMLFullDocGo(ia["alt"])
+				alt := sanitizeMarkdownImageAltGo(cleanInlineHTMLFullDocGo(ia["alt"]))
 				capText := ""
 				replacePairedHTMLElementsLinearFullDocGo(figInner, []string{"figcaption"}, func(_, _, _, cInner string) string {
 					if capText == "" {
-						capText = cleanInlineHTMLFullDocGo(cInner)
+						capText = cleanInlineHTMLMarkdownProseFullDocGo(cInner)
 					}
 					return ""
 				}, 8000, 1200)
@@ -4560,7 +4798,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// GFM `<table>` conversion
-		if strings.Contains(asciiLowerExtractString(md), "<table") {
+		if strings.Contains(getLowMd(), "<table") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"table"}, func(full, _, _, tbl string) string {
 				if strings.Contains(asciiLowerExtractString(tbl), "<table") {
 					return full
@@ -4616,14 +4854,14 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// Inline `<code>` and `<kbd>`
-		if lowMd := asciiLowerExtractString(md); strings.Contains(lowMd, "<code") || strings.Contains(lowMd, "<kbd") {
+		if lowMd := getLowMd(); strings.Contains(lowMd, "<code") || strings.Contains(lowMd, "<kbd") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"code", "kbd"}, func(_, _, _, c string) string {
 				return stashInline(formatInlineCodeSpanGo(cleanInlineHTMLFullDocGo(c)))
 			}, maxHTMLScanCharsFullDocGo, maxHTMLScanCharsFullDocGo)
 		}
 
 		// Links wrapping headings (`<a href="..."><h2>Title</h2></a>`)
-		if lowMd := asciiLowerExtractString(md); strings.Contains(lowMd, "<a") && strings.Contains(lowMd, "<h") {
+		if lowMd := getLowMd(); strings.Contains(lowMd, "<a") && strings.Contains(lowMd, "<h") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
 				trimmed := strings.TrimSpace(inner)
 				if len(trimmed) < 7 || trimmed[0] != '<' || (trimmed[1] != 'h' && trimmed[1] != 'H') || trimmed[2] < '1' || trimmed[2] > '6' {
@@ -4643,22 +4881,27 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				}
 				attrs := parseTagAttrsFullDocGo(attrStr)
 				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-				txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(hInnerMatched))
+				var txt string
+				if href != "" {
+					txt = cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(hInnerMatched))
+				} else {
+					txt = cleanHeadingPermalinksFullDocGo(cleanInlineHTMLMarkdownProseFullDocGo(hInnerMatched))
+				}
 				if txt == "" {
 					return ""
 				}
 				hashes := strings.Repeat("#", lvl)
 				if href != "" {
-					return "\n\n" + hashes + " [" + txt + "](" + href + ")\n\n"
+					return "\n\n" + hashes + " [" + escapeMarkdownLinkLabelGo(txt) + "](" + href + ")\n\n"
 				}
 				return "\n\n" + hashes + " " + txt + "\n\n"
 			}, maxHTMLScanCharsFullDocGo, 8192)
 		}
 
 		// Headings `<h1>`..`<h6>`
-		if strings.Contains(asciiLowerExtractString(md), "<h") {
+		if strings.Contains(getLowMd(), "<h") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"h1", "h2", "h3", "h4", "h5", "h6"}, func(_, tag, _, inner string) string {
-				txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(inner))
+				txt := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLMarkdownProseFullDocGo(inner))
 				if txt == "" {
 					return ""
 				}
@@ -4668,9 +4911,9 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// `<summary>`
-		if strings.Contains(asciiLowerExtractString(md), "<summary") {
+		if strings.Contains(getLowMd(), "<summary") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"summary"}, func(_, _, _, inner string) string {
-				cleaned := reSummarySeeAllFullDocGo.ReplaceAllString(cleanInlineHTMLFullDocGo(inner), "")
+				cleaned := reSummarySeeAllFullDocGo.ReplaceAllString(cleanInlineHTMLMarkdownProseFullDocGo(inner), "")
 				txt := cleanHeadingPermalinksFullDocGo(cleaned)
 				if txt == "" {
 					return ""
@@ -4683,73 +4926,74 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// Inline links, strikethrough, mark, bold, italic, `<dt>`, `<blockquote>`
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
-			if reBlockInsideInlineFullDocGo.MatchString(inner) {
-				return full
-			}
-			attrs := parseTagAttrsFullDocGo(attrStr)
-			href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-			label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
-			if label == "" {
-				return " "
-			}
-			if href != "" {
-				dupSuf := " (" + href + ")"
-				if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
-					if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
-						label = stripped
-					}
+		if strings.Contains(getLowMd(), "<a") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(full, _, attrStr, inner string) string {
+				if reBlockInsideInlineFullDocGo.MatchString(inner) {
+					return full
 				}
-				return "[" + label + "](" + href + ")"
-			}
-			return label
-		}, maxHTMLScanCharsFullDocGo, 16384)
+				attrs := parseTagAttrsFullDocGo(attrStr)
+				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
+				res := formatAnchorMarkdownWithBadgeImagesFullDocGo(inner, baseURL, href, includeImages)
+				if res == "" {
+					return " "
+				}
+				return res
+			}, maxHTMLScanCharsFullDocGo, 16384)
+		}
 
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"del", "s", "strike"}, func(full, _, _, inner string) string {
-			if reBlockInsideInlineFullDocGo.MatchString(inner) {
-				return full
-			}
-			txt := cleanInlineHTMLFullDocGo(inner)
-			if txt == "" {
-				return ""
-			}
-			return "~~" + txt + "~~"
-		}, maxHTMLScanCharsFullDocGo, 8192)
+		if lm := getLowMd(); strings.Contains(lm, "<del") || strings.Contains(lm, "<s") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"del", "s", "strike"}, func(full, _, _, inner string) string {
+				if reBlockInsideInlineFullDocGo.MatchString(inner) {
+					return full
+				}
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
+				if txt == "" {
+					return ""
+				}
+				return "~~" + txt + "~~"
+			}, maxHTMLScanCharsFullDocGo, 8192)
+		}
 
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"mark"}, func(full, _, _, inner string) string {
-			if reBlockInsideInlineFullDocGo.MatchString(inner) {
-				return full
-			}
-			txt := cleanInlineHTMLFullDocGo(inner)
-			if txt == "" {
-				return ""
-			}
-			return "==" + txt + "=="
-		}, maxHTMLScanCharsFullDocGo, 8192)
+		if strings.Contains(getLowMd(), "<mark") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"mark"}, func(full, _, _, inner string) string {
+				if reBlockInsideInlineFullDocGo.MatchString(inner) {
+					return full
+				}
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
+				if txt == "" {
+					return ""
+				}
+				return "==" + txt + "=="
+			}, maxHTMLScanCharsFullDocGo, 8192)
+		}
 
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"strong", "b"}, func(full, _, _, inner string) string {
-			if reBlockInsideInlineFullDocGo.MatchString(inner) {
-				return full
-			}
-			txt := cleanInlineHTMLFullDocGo(inner)
-			if txt == "" {
-				return " "
-			}
-			return "**" + txt + "**"
-		}, maxHTMLScanCharsFullDocGo, 8192)
+		if lm := getLowMd(); strings.Contains(lm, "<strong") || strings.Contains(lm, "<b") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"strong", "b"}, func(full, _, _, inner string) string {
+				if reBlockInsideInlineFullDocGo.MatchString(inner) {
+					return full
+				}
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
+				if txt == "" {
+					return " "
+				}
+				return "**" + txt + "**"
+			}, maxHTMLScanCharsFullDocGo, 8192)
+		}
 
-		md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"em", "i"}, func(full, _, _, inner string) string {
-			if reBlockInsideInlineFullDocGo.MatchString(inner) {
-				return full
-			}
-			txt := cleanInlineHTMLFullDocGo(inner)
-			if txt == "" {
-				return " "
-			}
-			return "*" + txt + "*"
-		}, maxHTMLScanCharsFullDocGo, 8192)
+		if lm := getLowMd(); strings.Contains(lm, "<em") || strings.Contains(lm, "<i") {
+			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"em", "i"}, func(full, _, _, inner string) string {
+				if reBlockInsideInlineFullDocGo.MatchString(inner) {
+					return full
+				}
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
+				if txt == "" {
+					return " "
+				}
+				return "*" + txt + "*"
+			}, maxHTMLScanCharsFullDocGo, 8192)
+		}
 
-		if strings.Contains(asciiLowerExtractString(md), "<dt") {
+		if strings.Contains(getLowMd(), "<dt") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"dt"}, func(_, _, _, inner string) string {
 				compactSpans := replaceHTMLTagsQuoteAwareLinearFullDocGo(inner, func(t scannedTagFullDocGo) string {
 					if t.tagNameLower == "span" {
@@ -4759,7 +5003,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				}, 2000, false)
 				compactSpans = reDtStarSpaceFullDocGo.ReplaceAllString(compactSpans, "$1 $2")
 				compactSpans = reDtStarPlainFullDocGo.ReplaceAllString(compactSpans, "$1")
-				term := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLFullDocGo(compactSpans))
+				term := cleanHeadingPermalinksFullDocGo(cleanInlineHTMLMarkdownProseFullDocGo(compactSpans))
 				if term == "" {
 					return ""
 				}
@@ -4768,9 +5012,9 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			}, maxHTMLScanCharsFullDocGo, 1800)
 		}
 
-		if strings.Contains(asciiLowerExtractString(md), "<blockquote") {
+		if strings.Contains(getLowMd(), "<blockquote") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"blockquote"}, func(_, _, _, inner string) string {
-				txt := cleanInlineHTMLFullDocGo(inner)
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(inner)
 				if txt == "" {
 					return ""
 				}
@@ -4779,7 +5023,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		}
 
 		// Standalone `<img>` tags when `IncludeImages` is enabled
-		if includeImages && strings.Contains(asciiLowerExtractString(md), "<img") {
+		if includeImages && strings.Contains(getLowMd(), "<img") {
 			md = replaceHTMLOpenTagsLinearFullDocGo(md, []string{"img"}, func(tag scannedTagFullDocGo) string {
 				if hasInlineEventHandlerAttrGo(tag.attrs) {
 					return ""
@@ -4799,13 +5043,13 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				if resolvedSrc == "" || isDecorativeOrTinyImageFullDocGo(attrs, resolvedSrc) {
 					return ""
 				}
-				alt := strings.NewReplacer("[", "", "]", "").Replace(cleanInlineHTMLFullDocGo(attrs["alt"]))
+				alt := sanitizeMarkdownImageAltGo(cleanInlineHTMLFullDocGo(attrs["alt"]))
 				return "\n\n![" + alt + "](" + resolvedSrc + ")\n\n"
 			}, maxHTMLScanCharsFullDocGo)
 		}
 
 		// `<ul>`/`<ol>`/`<li>` single O(N) stack pass
-		if strings.Contains(asciiLowerExtractString(md), "<li") {
+		if strings.Contains(getLowMd(), "<li") {
 			listSrc := md
 			var listOut []string
 			listDepth := 0
@@ -4851,7 +5095,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 					}
 					return
 				}
-				txt := cleanInlineHTMLFullDocGo(seg)
+				txt := cleanInlineHTMLMarkdownProseFullDocGo(seg)
 				if txt == "" {
 					return
 				}
@@ -4902,24 +5146,11 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			md = strings.Join(listOut, "")
 		}
 
-		if strings.Contains(asciiLowerExtractString(md), "<a") {
+		if strings.Contains(getLowMd(), "<a") {
 			md = replacePairedHTMLElementsLinearFullDocGo(md, []string{"a"}, func(_, _, attrStr, inner string) string {
 				attrs := parseTagAttrsFullDocGo(attrStr)
 				href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, true)
-				label := convertAnchorInnerWithBadgeImagesFullDocGo(inner, baseURL, includeImages)
-				if label == "" {
-					return ""
-				}
-				if href != "" {
-					dupSuf := " (" + href + ")"
-					if len(label) > len(dupSuf) && strings.HasSuffix(label, dupSuf) {
-						if stripped := strings.TrimSpace(label[:len(label)-len(dupSuf)]); stripped != "" {
-							label = stripped
-						}
-					}
-					return "[" + label + "](" + href + ")"
-				}
-				return label
+				return formatAnchorMarkdownWithBadgeImagesFullDocGo(inner, baseURL, href, includeImages)
 			}, maxHTMLScanCharsFullDocGo, 16384)
 		}
 
@@ -4970,7 +5201,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		if idx%2 == 1 {
 			continue
 		}
-		decodedPart := decodeMarkdownEntitiesPreservingLtGo(part)
+		decodedPart := decodeMarkdownProseEntitiesPreservingLinksAndLtGo(part)
 		withCleanLinks := sanitizeAndResolveMarkdownProseLinksLinearGo(decodedPart, baseURL)
 		if !includeImages {
 			withCleanLinks = stripMarkdownImagesLinearFullDocGo(withCleanLinks)
@@ -5044,6 +5275,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 
 	extractorID := ""
 	inertiaHydrated := false
+	siteReplacedLinks := false
 	var siteRecords []map[string]any
 	var siteTotal *int
 	var siteReturned *int
@@ -5082,9 +5314,22 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				hostLower = strings.ToLower(parsedBase.Hostname())
 			}
 		}
+		declRawHTML := boundedRawHTML
+		if len(rawHTML) > scanCap && scanCap < HardMaxHTMLDocChars {
+			declRawHTML = truncateUTF8SafeFullDocGo(rawHTML, HardMaxHTMLDocChars)
+			if strings.IndexByte(declRawHTML, 0) >= 0 {
+				declRawHTML = strings.ReplaceAll(declRawHTML, "\x00", "")
+			}
+			if strings.Contains(declRawHTML, "@@EF") {
+				declRawHTML = strings.ReplaceAll(declRawHTML, "@@EF", "")
+			}
+			if strings.Contains(declRawHTML, "@@HNCODE_") {
+				declRawHTML = strings.ReplaceAll(declRawHTML, "@@HNCODE_", "")
+			}
+		}
 		if baseURL != "" && reGitHubIssueURLFullDocGo.MatchString(baseURL) {
 			md = cleanGitHubIssueOrPRMarkdownFullDocGo(md)
-		} else if siteRes, siteOk := ApplyDeclarativeHTMLExtractor(boundedRawHTML, baseURL, md, func(frag, fragBase string) (string, []string) {
+		} else if siteRes, siteOk := ApplyDeclarativeHTMLExtractor(declRawHTML, baseURL, md, func(frag, fragBase string) (string, []string) {
 			sub := ExtractHTMLDocumentFull(frag, FullExtractOptions{
 				BaseURL:         fragBase,
 				OnlyMainContent: false,
@@ -5107,7 +5352,14 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			if siteRes.PublishedTime != "" && publishedTime == "" {
 				publishedTime = siteRes.PublishedTime
 			}
-			if len(siteRes.Links) > 0 {
+			if siteRes.ReplaceLinks {
+				siteReplacedLinks = true
+				if len(siteRes.Links) > 250 {
+					links = append([]string(nil), siteRes.Links[:250]...)
+				} else {
+					links = append([]string(nil), siteRes.Links...)
+				}
+			} else if len(siteRes.Links) > 0 {
 				merged := make([]string, 0, len(siteRes.Links)+len(links))
 				seen := make(map[string]bool, len(siteRes.Links))
 				for _, l := range siteRes.Links {
@@ -5164,9 +5416,9 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			if schemaWords > minReq {
 				var cleanSchemaMD string
 				if strings.IndexByte(schemaMeta.articleBody, '<') >= 0 {
-					cleanSchemaMD = cleanInlineHTMLFullDocGo(schemaMeta.articleBody)
+					cleanSchemaMD = cleanInlineHTMLMarkdownProseFullDocGo(schemaMeta.articleBody)
 				} else {
-					cleanSchemaMD = strings.TrimSpace(DecodeHTMLEntities(schemaMeta.articleBody))
+					cleanSchemaMD = strings.TrimSpace(decodeMarkdownProseEntitiesPreservingLinksAndLtGo(schemaMeta.articleBody))
 				}
 				if cleanSchemaMD != "" {
 					if title != "" && !strings.HasPrefix(cleanSchemaMD, "# ") {
@@ -5188,7 +5440,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 			}
 			if countTextWordsFullDocGo(rescued.Markdown) > minReq {
 				md = rescued.Markdown
-				if len(links) == 0 && len(rescued.Links) > 0 {
+				if len(links) == 0 && len(rescued.Links) > 0 && !siteReplacedLinks {
 					links = rescued.Links
 				}
 			}
@@ -5225,7 +5477,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		case inertiaHydrated:
 			plainText = md
 		default:
-			plainText = cleanInlineHTMLFullDocGo(work)
+			plainText = cleanPlainHTMLTextFullDocGo(work)
 		}
 	}
 
@@ -5235,7 +5487,17 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	}
 
 	rawSanitizedMD := SanitizeMarkdownWithOptions(md, baseURL, opts.AllowPdfPageMarkers)
-	plainText = stripInvisibleSmugglingCharsGo(plainText)
+	if !opts.IsFragment && plainText != "" {
+		if ytMeta != nil {
+			plainText = rawSanitizedMD
+		} else {
+			plainText = stripInvisibleSmugglingCharsGo(plainText)
+			plainText = neutralizeAllUnsafeMarkdownLinksLinearGo(plainText)
+			plainText = escapeUnsafeTextOpenersGo(plainText)
+		}
+	} else {
+		plainText = stripInvisibleSmugglingCharsGo(plainText)
+	}
 
 	if redactPII {
 		title = redactPIIMarkdownSafeFullDocGo(title)
@@ -5561,7 +5823,7 @@ func sanitizeFrontmatterFieldTextFullDocGo(raw string) string {
 	if strings.IndexByte(s, '<') >= 0 {
 		s = stripHTMLTagsQuoteAwareLinearFullDocGo(s, " ", 4096)
 	}
-	decoded := strings.Join(strings.Fields(stripInvisibleSmugglingCharsGo(DecodeHTMLEntities(s))), " ")
+	decoded := strings.Join(strings.Fields(stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(s))), " ")
 	return SanitizeScrapedMetadataField(decoded, 2000)
 }
 

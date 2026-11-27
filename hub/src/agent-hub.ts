@@ -20,6 +20,7 @@
  *    is returned directly to the caller without failing over to another IP.
  */
 import { sameBytes, SITE_ID_PATTERN } from './auth';
+import { validatePublicHttpsTargetUrl } from './overflow';
 
 export const DEFAULT_429_COOLDOWN_MS = 5 * 60_000; // 5m per-site/IP 429 cooldown when Retry-After is shorter/absent
 export const DEFAULT_429_NO_HEADER_WAIT_MS = 15_000; // 15s shared host wait before failover when 429 lacks Retry-After
@@ -531,6 +532,7 @@ export interface CrawlResultItem {
   bodyOmitted?: boolean;
   body?: string;
   bodyEncoding?: 'utf-8' | 'base64';
+  contentSha256?: string;
   [k: string]: unknown;
 }
 
@@ -563,6 +565,7 @@ export interface AgentHubDeps {
   hostWindows?: HostWindowStore;
   affinities?: AffinityStore;
   hostHealth?: HostHealthStore;
+  selfHost?: string;
   now?: () => number;
   uuid?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -574,6 +577,7 @@ export class AgentHubEngine {
   private readonly hostWindows: HostWindowStore;
   private readonly affinities: AffinityStore;
   private readonly hostHealth: HostHealthStore;
+  private readonly selfHost?: string;
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -590,6 +594,7 @@ export class AgentHubEngine {
     this.hostWindows = deps.hostWindows ?? createMemoryHostWindowStore();
     this.affinities = deps.affinities ?? createMemoryAffinityStore();
     this.hostHealth = deps.hostHealth ?? createMemoryHostHealthStore();
+    this.selfHost = deps.selfHost;
     this.now = deps.now ?? Date.now;
     this.uuid = deps.uuid ?? (() => crypto.randomUUID());
     this.sleep =
@@ -1327,12 +1332,59 @@ export class AgentHubEngine {
                 const origIdx = reqIndices[j]!;
                 const dispatchedReq = call.requests![origIdx];
                 const rawItem = parsed.results[j]!;
-                // H6: Force `id` and `url` to the exact dispatched request and strip any artifact hash not authorized for this job!
+                // H6: Force `id` and `url` to the exact dispatched request, validate node-supplied `finalUrl`, and strip unauthorized artifact hashes!
+                const rawFinalUrl = rawItem.finalUrl;
+                const validatedFinal =
+                  typeof rawFinalUrl === 'string' && rawFinalUrl.trim()
+                    ? validatePublicHttpsTargetUrl(rawFinalUrl, this.selfHost)
+                    : null;
                 const item: CrawlResultItem = {
                   ...rawItem,
                   ...(typeof dispatchedReq?.id === 'string' ? { id: dispatchedReq.id } : {}),
                   url: String(dispatchedReq?.url ?? ''),
                 };
+                if (validatedFinal?.ok) {
+                  item.finalUrl = validatedFinal.normalized;
+                } else {
+                  delete item.finalUrl;
+                }
+                const sanitizeActionUrls = (rawList: unknown): unknown => {
+                  if (!Array.isArray(rawList)) return rawList;
+                  return rawList.map((entry) => {
+                    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+                    const copy = { ...(entry as Record<string, unknown>) };
+                    for (const urlField of ['beforeUrl', 'afterUrl'] as const) {
+                      const rawFieldVal = copy[urlField];
+                      if (rawFieldVal !== undefined) {
+                        const fieldChk =
+                          typeof rawFieldVal === 'string' && rawFieldVal.trim()
+                            ? validatePublicHttpsTargetUrl(rawFieldVal, this.selfHost)
+                            : null;
+                        if (fieldChk?.ok) {
+                          copy[urlField] = fieldChk.normalized;
+                        } else {
+                          delete copy[urlField];
+                        }
+                      }
+                    }
+                    return copy;
+                  });
+                };
+                if (item.actionResults !== undefined) {
+                  item.actionResults = sanitizeActionUrls(item.actionResults);
+                }
+                if (item.actions !== undefined) {
+                  item.actions = sanitizeActionUrls(item.actions);
+                }
+                if (item.interact && typeof item.interact === 'object' && !Array.isArray(item.interact)) {
+                  const interactObj = item.interact as Record<string, unknown>;
+                  if (interactObj.actionResults !== undefined) {
+                    item.interact = {
+                      ...interactObj,
+                      actionResults: sanitizeActionUrls(interactObj.actionResults),
+                    };
+                  }
+                }
                 const rawArt = item.artifact as { blobSha256?: unknown } | undefined;
                 if (rawArt !== undefined) {
                   const bsha = typeof rawArt?.blobSha256 === 'string' ? rawArt.blobSha256.trim().toLowerCase() : '';

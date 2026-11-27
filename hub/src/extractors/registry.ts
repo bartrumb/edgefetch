@@ -11,13 +11,35 @@ import { runAdapterSyncInBulkhead } from '../adapter-sandbox';
 import {
   enrichShopifyProductFromJson,
   enrichWooCommerceProductFromStoreApi,
+  extractBigCommerceHtml,
+  extractMagento2ProductHtml,
+  extractSfccProductHtml,
   extractShopifyCurrencyFromHtml,
+  extractShopware6ProductHtml,
+  extractSquarespaceCommerceHtml,
+  extractWooCommerceCatalogHtml,
+  formatBigCommerceXmlSitemap,
+  formatMagento2RenderInfoJson,
+  formatSfccProductVariationJson,
+  formatShopifyProductsFeedTwin,
+  formatSquarespaceCommerceJson,
+  formatWcStoreApiListTwin,
+  isBigCommerceHtmlOrHeaders,
+  isMagento2HtmlOrHeaders,
+  isSfccDemandwareHtmlOrHeaders,
   isShopifyHtmlOrHeaders,
+  isShopware6HtmlOrHeaders,
+  isSquarespaceCommerceHtmlOrHeaders,
   isWooCommerceHtmlOrHeaders,
   normalizeShopifyProductRecord,
   normalizeWooCommerceProductRecord,
+  resolveCustomDomainShopifyCollectionTwinUrl,
   resolveCustomDomainShopifyProductTwinUrl,
+  resolveCustomDomainWooCommerceCatalogTwinUrl,
   resolveCustomDomainWooCommerceProductTwinUrl,
+  resolveMagento2RenderInfoTwinUrl,
+  resolveSfccProductVariationTwinUrl,
+  resolveSquarespaceCommerceTwinUrl,
 } from './commerce-engine';
 import { DECLARATIVE_SITE_ADAPTERS } from './declarative';
 import type {
@@ -52,14 +74,36 @@ export type {
 export {
   enrichShopifyProductFromJson,
   enrichWooCommerceProductFromStoreApi,
+  extractBigCommerceHtml,
+  extractMagento2ProductHtml,
+  extractSfccProductHtml,
   extractShopifyCurrencyFromHtml,
+  extractShopware6ProductHtml,
+  extractSquarespaceCommerceHtml,
+  extractWooCommerceCatalogHtml,
+  formatBigCommerceXmlSitemap,
+  formatMagento2RenderInfoJson,
+  formatSfccProductVariationJson,
+  formatShopifyProductsFeedTwin,
+  formatSquarespaceCommerceJson,
+  formatWcStoreApiListTwin,
   formatYamlFrontmatterCard,
+  isBigCommerceHtmlOrHeaders,
+  isMagento2HtmlOrHeaders,
+  isSfccDemandwareHtmlOrHeaders,
   isShopifyHtmlOrHeaders,
+  isShopware6HtmlOrHeaders,
+  isSquarespaceCommerceHtmlOrHeaders,
   isWooCommerceHtmlOrHeaders,
   normalizeShopifyProductRecord,
   normalizeWooCommerceProductRecord,
+  resolveCustomDomainShopifyCollectionTwinUrl,
   resolveCustomDomainShopifyProductTwinUrl,
+  resolveCustomDomainWooCommerceCatalogTwinUrl,
   resolveCustomDomainWooCommerceProductTwinUrl,
+  resolveMagento2RenderInfoTwinUrl,
+  resolveSfccProductVariationTwinUrl,
+  resolveSquarespaceCommerceTwinUrl,
   unescapeHrefUrl,
 };
 
@@ -142,9 +186,14 @@ const ALL_REGISTERED_ADAPTERS: SiteAdapter[] = [...DECLARATIVE_SITE_ADAPTERS];
 
 const DEFAULT_INDEX = new AdapterRegistryIndex(ALL_REGISTERED_ADAPTERS);
 
+/** Looks up a registered declarative `SiteAdapter` by exact `id`, returning `undefined` if absent. */
+export function findRegisteredAdapterById(id: string): SiteAdapter | undefined {
+  return DEFAULT_INDEX.all.find((a) => a.id === id);
+}
+
 /** Looks up a registered declarative `SiteAdapter` by exact `id`. */
 export function getRegisteredAdapterById(id: string): SiteAdapter {
-  const found = DEFAULT_INDEX.all.find((a) => a.id === id);
+  const found = findRegisteredAdapterById(id);
   if (!found) {
     throw new Error(`Missing required declarative site adapter "${id}"`);
   }

@@ -1,0 +1,32 @@
+# Shared Go + TypeScript Declarative Site Adapter: BigCommerce Stencil Storefronts
+id: bigcommerce-store
+name: "BigCommerce Stencil Storefronts"
+category: commerce-social
+description: "Extracts BigCommerce Stencil BCData, JSON-LD, Microdata, cart-form options, product specs, category grids, and bounded /xmlsitemap.php product sitemaps."
+domains:
+  - "*.mybigcommerce.com"
+  - www.bigcommerce.com
+universalEngine: true
+exampleUrls:
+  - https://demo.mybigcommerce.com/xmlsitemap.php
+  - https://demo.mybigcommerce.com/sample-product/
+
+routes:
+  - match:
+      exactSegments: true
+      pathEquals:
+        - /xmlsitemap.php
+    twin:
+      id: bigcommerce-store
+      fetchUrl: "{requestUrl}"
+      kind: text
+      accept: application/xml
+      maxBytes: 4194304
+    extract:
+      commerceMode: bigcommerce_sitemap
+
+htmlRoutes:
+  - id: bigcommerce-store
+    match:
+      exactSegments: false
+    mode: bigcommerce_html

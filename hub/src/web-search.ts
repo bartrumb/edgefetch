@@ -32,7 +32,7 @@ import {
 } from './otel';
 import { decodeHtmlEntities } from './scrape';
 import { D1FtsSearchIndex, executeExtractCall, resolveUserCollectionId } from './search-index';
-import type { OptionalStorageBindings } from './storage';
+import { isPrivateRequestPayload, type OptionalStorageBindings } from './storage';
 import {
   buildWikipediaDirectTitleGuessUrl,
   extractWikipediaLangFromHost,
@@ -865,13 +865,23 @@ export async function executeSearchCall(params: {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runSearchCall = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'search', userId = 'owner' } = params;
+  const isPrivateSearch = isPrivateRequestPayload(payload as Record<string, unknown>, userId);
   const providerFetchFn = params.providerFetchFn ?? fetch;
   const enforcePacing = params.providerFetchFn === undefined;
 
   const rawQuery = typeof payload.query === 'string' ? payload.query : typeof payload.q === 'string' ? payload.q : '';
   const query = rawQuery.trim();
   if (!query || query.length > 500) {
-    return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_query', message: 'query must be 1..500 characters' } };
+    return {
+      status: 400,
+      via: 'hub',
+      body: {
+        ok: false,
+        ...(isPrivateSearch ? { visibility: 'private' as const } : {}),
+        error: 'invalid_query',
+        message: 'query must be 1..500 characters',
+      },
+    };
   }
 
   const rawMax = payload.max_results ?? payload.maxResults ?? payload.limit ?? 5;
@@ -914,22 +924,46 @@ export async function executeSearchCall(params: {
 
   const explicitCollectionsPassed = payload.collectionId !== undefined || Array.isArray(payload.collections) || payload.collections === false;
   const requestedCollections: string[] = [];
+  const collectionDisplayMap = new Map<string, string>();
+  const searchVisibility = isPrivateSearch ? 'private' : 'public';
   if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
-    const resolved = resolveUserCollectionId(payload.collectionId, userId);
+    const resolved = resolveUserCollectionId(payload.collectionId, userId, searchVisibility);
     if (!resolved.ok && resolved.status === 403) {
-      return { status: 403, via: 'hub', body: { ok: false, error: 'forbidden_collection', message: 'Unauthorized collectionId' } };
+      return {
+        status: 403,
+        via: 'hub',
+        body: {
+          ok: false,
+          ...(isPrivateSearch ? { visibility: 'private' as const } : {}),
+          error: 'forbidden_collection',
+          message: 'Unauthorized collectionId',
+        },
+      };
     }
-    if (resolved.ok) requestedCollections.push(resolved.scopedId);
+    if (resolved.ok) {
+      requestedCollections.push(resolved.scopedId);
+      collectionDisplayMap.set(resolved.scopedId, resolved.displayId);
+    }
   }
   if (Array.isArray(payload.collections)) {
     for (const c of payload.collections) {
       if (typeof c === 'string' && c.trim()) {
-        const resolved = resolveUserCollectionId(c, userId);
+        const resolved = resolveUserCollectionId(c, userId, searchVisibility);
         if (!resolved.ok && resolved.status === 403) {
-          return { status: 403, via: 'hub', body: { ok: false, error: 'forbidden_collection', message: 'Unauthorized collectionId' } };
+          return {
+            status: 403,
+            via: 'hub',
+            body: {
+              ok: false,
+              ...(isPrivateSearch ? { visibility: 'private' as const } : {}),
+              error: 'forbidden_collection',
+              message: 'Unauthorized collectionId',
+            },
+          };
         }
         if (resolved.ok && !requestedCollections.includes(resolved.scopedId)) {
           requestedCollections.push(resolved.scopedId);
+          collectionDisplayMap.set(resolved.scopedId, resolved.displayId);
         }
       }
     }
@@ -947,8 +981,11 @@ export async function executeSearchCall(params: {
 
   // Always consult the Edge-crawled default D1 FTS5 collection at $0 when SEARCH D1 is bound unless disabled/overridden.
   if (hasD1Search && !explicitCollectionsPassed) {
-    const defColl = resolveUserCollectionId('default', userId);
-    if (defColl.ok) requestedCollections.push(defColl.scopedId);
+    const defColl = resolveUserCollectionId('default', userId, searchVisibility);
+    if (defColl.ok) {
+      requestedCollections.push(defColl.scopedId);
+      collectionDisplayMap.set(defColl.scopedId, defColl.displayId);
+    }
   }
 
   const edgeMapSpec = extractEdgeMapDomains(query, includeDomains);
@@ -1044,8 +1081,9 @@ export async function executeSearchCall(params: {
             });
           }
           if (filteredItems.length > 0 || explicitCollectionsPassed) {
+            const displayColl = collectionDisplayMap.get(coll) ?? coll;
             collectionLists.push({
-              provider: `collection:${coll}`,
+              provider: `collection:${displayColl}`,
               items: filteredItems,
             });
           }
@@ -1155,7 +1193,7 @@ export async function executeSearchCall(params: {
       .filter(Boolean)
       .join(',');
     const cacheKey =
-      env.META && cacheMaxAgeMs > 0 && enforcePacing
+      !isPrivateSearch && env.META && cacheMaxAgeMs > 0 && enforcePacing
         ? await sha256HexString(
             JSON.stringify({
               v: 2,
@@ -1304,7 +1342,7 @@ export async function executeSearchCall(params: {
       }
     }
 
-    if (cacheKey && env.META && countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains) > 0) {
+    if (!isPrivateSearch && cacheKey && env.META && countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains) > 0) {
       await writeCachedExternalLists(env.META, cacheKey, freshExternal, now, cacheMaxAgeMs);
     }
   };
@@ -1557,6 +1595,7 @@ export async function executeSearchCall(params: {
         includeRawContent: true,
         maxAgeMs: 3_600_000,
         ephemeral: true,
+        ...(isPrivateSearch ? { visibility: 'private' as const } : {}),
         target: payload.target ?? 'auto',
         site: payload.site,
       },
@@ -1565,6 +1604,7 @@ export async function executeSearchCall(params: {
       source: `${source}:enrich`,
       budgetMs: SEARCH_ENRICH_BUDGET_MS,
       maxFetchPerHost: SEARCH_ENRICH_MAX_FETCH_PER_HOST,
+      userId,
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (extractOut.status === 200 && Array.isArray(extractOut.body.results)) {
@@ -1594,6 +1634,7 @@ export async function executeSearchCall(params: {
     via,
     body: {
       ok: true,
+      ...(isPrivateSearch ? { visibility: 'private' as const } : {}),
       query,
       cached: cachedFlag,
       results,

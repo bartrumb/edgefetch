@@ -1,0 +1,12 @@
+{
+  "adapterId": "us-cfr-govinfo",
+  "mode": "twin",
+  "inputUrl": "https://www.govinfo.gov/app/details/CFR-2023-title16-vol2/CFR-2023-title16-vol2-part1500",
+  "expectedFetchUrl": "https://www.govinfo.gov/content/pkg/CFR-2023-title16-vol2/html/CFR-2023-title16-vol2-part1500.htm",
+  "mockPayload": "<!doctype html><html><head><title>16 CFR Part 1500</title></head><body><main><h1>Part 1500 Hazardous Substances and Articles</h1><p>Regulations promulgated under the Federal Hazardous Substances Act.</p></main></body></html>",
+  "expectTitleIncludes": "16 CFR Part 1500",
+  "expectMarkdownIncludes": [
+    "Hazardous Substances and Articles",
+    "Federal Hazardous Substances Act"
+  ]
+}

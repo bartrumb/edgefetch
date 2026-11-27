@@ -44,6 +44,18 @@ export const VALID_HTML_MODES = new Set([
   'icims_portal',
   'shopify_html',
   'woocommerce_html',
+  'xenforo_html',
+  'squarespace_html',
+  'bigcommerce_html',
+  'sfcc_html',
+  'shopware_magento_html',
+  'sram_docs_html',
+  'bosch_help_html',
+  'ukg_pro_html',
+  'paylocity_html',
+  'dover_html',
+  'sitecore_jss_html',
+  'giant_liv_html',
 ]);
 
 const pslDatPath = join(manifestsDir, 'public_suffix_list.dat');
@@ -150,10 +162,13 @@ function claimedRegistrableDomains(domains) {
  */
 const APPROVED_CROSS_DOMAIN_TWIN_HOSTS = Object.freeze(
   new Map([
+    ['cpsc-recalls', Object.freeze(new Set(['www.saferproducts.gov']))],
     ['doi-crossref', Object.freeze(new Set(['api.crossref.org']))],
     ['hackernews', Object.freeze(new Set(['hn.algolia.com', 'hacker-news.firebaseio.com']))],
     ['jazzhr', Object.freeze(new Set(['app.jazz.co']))],
+    ['maven-central', Object.freeze(new Set(['search.maven.org']))],
     ['npm-registry', Object.freeze(new Set(['registry.npmjs.org']))],
+    ['osv-ghsa', Object.freeze(new Set(['api.osv.dev']))],
     ['pubmed-pmc', Object.freeze(new Set(['www.ebi.ac.uk']))],
   ]),
 );
@@ -181,9 +196,13 @@ const APPROVED_WILDCARD_DOMAIN_PATTERNS = new Set([
   'careers.*.com',
   'jobs.*.com',
   '*.myshopify.com',
+  '*.mybigcommerce.com',
   '*.socrata.com',
   '*.stackexchange.com',
   '*.teamtailor.com',
+  '*.zendesk.com',
+  '*.giant-bicycles.com',
+  '*.liv-cycling.com',
 ]);
 
 const RESERVED_CORE_ATS_DOMAINS = new Set([
@@ -222,6 +241,7 @@ const APPROVED_SAP_ATS_EXACT_EXEMPTIONS = Object.freeze(
     'enterprise-ats:jobs.smartrecruiters.com',
     'enterprise-ats:jobs.jobvite.com',
     'gem-ats:jobs.gem.com',
+    'ukg-paylocity-dover:jobs.dover.com',
   ]),
 );
 
@@ -263,7 +283,7 @@ const SCHEMA_KEYS = {
   ]),
   overridePathIf: new Set(['matchPaths', 'newPath']),
   extract: new Set([
-    'commerceMode', 'icimsPortal', 'textMode', 'pathParam', 'xml', 'jsonSource',
+    'commerceMode', 'jsonMode', 'icimsPortal', 'textMode', 'pathParam', 'xml', 'jsonSource',
     'wrapRootArrayAs', 'unwrapFirstArrayElement', 'rootPath', 'rejectIfFieldTruthy',
     'requireFieldEquals', 'requireArrayItemField', 'findInArray', 'fallbackExtract',
     'requireFields', 'requireAnyFields', 'requireVars', 'vars', 'codeByPath',
@@ -271,7 +291,7 @@ const SCHEMA_KEYS = {
     'descriptionVar', 'descriptionTemplate', 'authorVar', 'authorTemplate', 'publishedTimeVar',
     'blockquoteTemplate', 'blockquoteWhenVar', 'metaLine', 'metaLineItalic',
     'footerItalicTemplate', 'footerItalicWhenVar', 'introVar', 'bullets',
-    'objectLinksPath', 'bodyVar', 'sections', 'linksVars', 'linkTemplates',
+    'objectLinksPath', 'bodyVar', 'sections', 'linksVars', 'linkTemplates', 'recordFields',
   ]),
   varSpec: new Set([
     'paths', 'dynamicKeyPath', 'nestedSubValues', 'tocHeading', 'findInArrayLang',

@@ -14,6 +14,7 @@ import { parseExactRetryAfterMs, recomputeSummary, type CrawlResultItem } from '
 import { signOutboundBotHeaders } from './bot-auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { getActiveRequestTracer } from './otel';
+import { isPublicOrPrivateSuffix } from './psl';
 import { classifyWafAndChallenge } from './waf';
 
 export const ROBOTS_MAX_BYTES = 1024 * 1024; // 1 MiB >= RFC 9309 500 KiB minimum
@@ -603,6 +604,7 @@ export function validateCallRobotsPolicy(
 
 const DISALLOWED_HOST_SUFFIXES = [
   '.localhost',
+  '.localhost.localdomain',
   '.local',
   '.internal',
   '.arpa',
@@ -622,6 +624,7 @@ const DISALLOWED_HOST_SUFFIXES = [
 
 const DISALLOWED_EXACT_HOSTS = new Set([
   'localhost',
+  'localhost.localdomain',
   'nip.io',
   'sslip.io',
   'xip.io',
@@ -666,6 +669,9 @@ export function isSafePublicHostname(rawHost: string, selfHost?: string): boolea
   // 2/3-part IPv4 (`127.1`), octal (`0177.0.0.1`), hex (`0x7f.0.0.1`), and integer IPv4s (`2130706433`).
   const tld = labels[labels.length - 1]!;
   if (/^(?:\d+|0x[0-9a-f]+)$/i.test(tld)) {
+    return false;
+  }
+  if (isPublicOrPrivateSuffix(host)) {
     return false;
   }
   return true;
@@ -799,6 +805,18 @@ export function validatePublicHttpsTargetUrl(
   return { ok: true, url: u, normalized: u.toString() };
 }
 
+/**
+ * Validates a node/remote-supplied `finalUrl` against public-HTTPS SSRF rules, returning the
+ * canonical normalized URL when valid or `fallbackUrl` when absent/invalid.
+ */
+export function resolveValidatedFinalUrl(rawFinal: unknown, fallbackUrl: string, selfHost?: string): string {
+  if (typeof rawFinal !== 'string' || !rawFinal.trim()) {
+    return fallbackUrl;
+  }
+  const check = validatePublicHttpsTargetUrl(rawFinal, selfHost);
+  return check.ok ? check.normalized : fallbackUrl;
+}
+
 /** Validates all target URLs inside a serialized Hub fetch call payload before dispatching to any agent or container. */
 export function validateCallTargetUrls(
   rawBody: string,
@@ -862,6 +880,13 @@ function isDisallowedOverflowUrl(u: URL, canonicalSelf: string): boolean {
     Boolean(u.port && u.port !== '443') ||
     !isSafePublicHostname(u.hostname, canonicalSelf)
   );
+}
+
+function overflowBytesToHex(buf: ArrayBuffer | Uint8Array): string {
+  const view = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let out = '';
+  for (let i = 0; i < view.length; i++) out += view[i]!.toString(16).padStart(2, '0');
+  return out;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -1581,6 +1606,10 @@ export async function cloudflareOverflowFetch(
           }
         }
         const safeHeaders = filterSafeResponseHeaders(resp.headers);
+        const contentSha256 =
+          outcome === 'ok' && !isNotModified && !truncated
+            ? overflowBytesToHex(await crypto.subtle.digest('SHA-256', bytes as unknown as BufferSource))
+            : undefined;
         results.push({
           id: r.id,
           url: r.url,
@@ -1604,6 +1633,7 @@ export async function cloudflareOverflowFetch(
           lastModified: resp.headers.get('last-modified') ?? undefined,
           retryAfter: resp.headers.get('retry-after') ?? undefined,
           ...(cfMitigated ? { cfMitigated } : {}),
+          ...(contentSha256 ? { contentSha256 } : {}),
           ...(encodedBody ? { body: encodedBody.body, bodyEncoding: encodedBody.bodyEncoding } : {}),
         });
         finished = true;

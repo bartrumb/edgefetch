@@ -1,0 +1,16 @@
+# Shared Go + TypeScript Declarative Site Adapter: Squarespace Commerce Storefronts
+id: squarespace-commerce
+name: "Squarespace Commerce Storefronts"
+category: commerce-social
+description: "Detects Squarespace Commerce storefronts structurally and formats ?format=json-pretty product/collection payloads and HTML fallback into GFM tables and normalized CatalogRecord arrays."
+domains:
+  - commerce.squarespace.com
+universalEngine: true
+exampleUrls:
+  - https://commerce.squarespace.com/shop
+
+htmlRoutes:
+  - id: squarespace-commerce
+    match:
+      exactSegments: false
+    mode: squarespace_html

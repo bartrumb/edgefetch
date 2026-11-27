@@ -16,6 +16,10 @@ routes:
   - match:
       pathEquals:
         - /api/jobs
+      excludeHosts:
+        - "jobs.dover.com"
+        - "app.dover.com"
+        - "*.dover.com"
     twin:
       id: jibe-careers
       fetchUrl: "{requestUrl}"
@@ -137,6 +141,10 @@ htmlRoutes:
     mode: xml_items_table
     match:
       pathSuffix: sitemap.xml
+      excludeHosts:
+        - "jobs.dover.com"
+        - "app.dover.com"
+        - "*.dover.com"
     xml:
       mode: items_table
       requireAnyTags:

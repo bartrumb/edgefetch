@@ -59,7 +59,7 @@ import {
 } from './otel';
 import { executeInteractCall, executeScrapeCall, extractStructuredJsonFromPage, type ScrapeRequestPayload } from './scrape';
 import { D1FtsSearchIndex, resolveUserCollectionId } from './search-index';
-import type { OptionalStorageBindings } from './storage';
+import { isPrivateRequestPayload, type OptionalStorageBindings } from './storage';
 import { callCoreWasm } from './wasm-bridge';
 import { executeSearchCall, type SearchBindings, type SearchRequestPayload } from './web-search';
 
@@ -264,7 +264,7 @@ export async function cancelAgentRun(
   agentId: string,
   metaDb?: D1Database,
   callerUserId?: string,
-): Promise<{ ok: boolean; status: number }> {
+): Promise<{ ok: boolean; status: number; visibility?: 'private' }> {
   const existing = await loadAgentRun(agentId, metaDb, callerUserId);
   if (!existing) return { ok: false, status: 404 };
   cancelledAgentIds.add(agentId);
@@ -275,7 +275,11 @@ export async function cancelAgentRun(
     existing.finishedAt = existing.updatedAt;
     await persistAgentRun(existing, metaDb);
   }
-  return { ok: true, status: 200 };
+  return {
+    ok: true,
+    status: 200,
+    ...(existing.visibility === 'private' ? { visibility: 'private' as const } : {}),
+  };
 }
 
 export function doesMcpServerSelectorMatchRow(rawSelector: string, row: StoredMcpServerRow): boolean {
@@ -596,6 +600,14 @@ export async function startOrExecuteAgentCall(params: {
       initRouterSpan.end();
     }
 
+    const isInitialPrivate =
+      isPrivateRequestPayload(payload, effectiveUserId) ||
+      Boolean(
+        priorThread &&
+          (priorThread.visibility === 'private' ||
+            (priorThread.routedMcps && priorThread.routedMcps.length > 0) ||
+            /untrusted_mcp/i.test(priorThread.threadMemory ?? '')),
+      );
     const record: AgentRunRecord = {
       id: agentId,
       userId: effectiveUserId,
@@ -610,6 +622,7 @@ export async function startOrExecuteAgentCall(params: {
       stepsUsed: 0,
       pagesRead: 0,
       zeroDataRetention,
+      ...(isInitialPrivate ? { visibility: 'private' as const } : {}),
       ...(routedMcps.length > 0 ? { routedMcps } : {}),
       llmUsed: Boolean(llmConfig),
       ...(llmConfig ? { llmInfo: redactLlmConfigForLog(llmConfig) } : {}),
@@ -764,9 +777,11 @@ export async function startOrExecuteAgentCall(params: {
           return withToolSpan(async (toolSpan) => {
             const qBase = typeof args.query === 'string' && args.query.trim() ? args.query.trim() : prompt;
             const qEffective = safeSearch ? `${qBase} -nsfw -adult` : qBase;
+            const isPrivateRun = zeroDataRetention || record.visibility === 'private';
             const sPayload: SearchRequestPayload = {
               query: qEffective,
               max_results: typeof args.maxResults === 'number' ? Math.min(10, Math.max(1, Math.floor(args.maxResults))) : 6,
+              ...(isPrivateRun ? { visibility: 'private' } : {}),
               ...(country ? { country } : {}),
               ...(languages[0] ? { language: languages[0] } : {}),
             } as SearchRequestPayload;
@@ -826,7 +841,10 @@ export async function startOrExecuteAgentCall(params: {
               ...(jTracer ? { tracer: jTracer } : {}),
               executeSearch: async (sArgs) => {
                 const sRes = await executeSearchCall({
-                  payload: sArgs as SearchRequestPayload,
+                  payload: {
+                    ...(sArgs as SearchRequestPayload),
+                    ...(zeroDataRetention || record.visibility === 'private' ? { visibility: 'private' as const } : {}),
+                  },
                   env,
                   executeHubFetch,
                   source: `agent:${principal}:jobs-search`,
@@ -837,7 +855,11 @@ export async function startOrExecuteAgentCall(params: {
               },
               executeScrape: async (scArgs) => {
                 const scRes = await executeScrapeCall({
-                  payload: { ...(scArgs as ScrapeRequestPayload), ...(zeroDataRetention ? { ephemeral: true } : {}) },
+                  payload: {
+                    ...(scArgs as ScrapeRequestPayload),
+                    ...(zeroDataRetention ? { ephemeral: true } : {}),
+                    ...(record.visibility === 'private' ? { visibility: 'private' as const } : {}),
+                  },
                   env: zeroDataRetention ? {} : env,
                   executeHubFetch,
                   selfHost,
@@ -931,7 +953,12 @@ export async function startOrExecuteAgentCall(params: {
           return withToolSpan(async (toolSpan) => {
             const iTracer = getLoopTracer();
             const iOut = await executeInteractCall({
-              payload: { url: targetUrl, actions: filteredActions, formats: ['markdown'] },
+              payload: {
+                url: targetUrl,
+                actions: filteredActions,
+                formats: ['markdown'],
+                ...(zeroDataRetention || record.visibility === 'private' ? { visibility: 'private' as const } : {}),
+              },
               env: zeroDataRetention ? {} : env,
               executeHubFetch,
               selfHost,
@@ -965,7 +992,12 @@ export async function startOrExecuteAgentCall(params: {
 
         if (toolName === 'search_collection' && env.SEARCH) {
           const rawCollId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
-          const resolvedColl = resolveUserCollectionId(rawCollId, userId);
+          const isPrivateSearchColl =
+            zeroDataRetention ||
+            record.visibility === 'private' ||
+            args.visibility === 'private' ||
+            isPrivateRequestPayload(payload, userId);
+          const resolvedColl = resolveUserCollectionId(rawCollId, userId, isPrivateSearchColl ? 'private' : 'public');
           if (!resolvedColl.ok) return { ok: false, summaryForLlm: JSON.stringify({ error: resolvedColl.error }) };
           const collId = resolvedColl.scopedId;
           const q = typeof args.query === 'string' ? args.query : prompt;
@@ -1706,7 +1738,7 @@ export async function startOrExecuteAgentCall(params: {
           status: 200,
           headers: {
             'content-type': 'text/event-stream; charset=utf-8',
-            'cache-control': 'no-store',
+            'cache-control': record.visibility === 'private' ? 'private, no-store' : 'no-store',
             connection: 'keep-alive',
           },
         }),
@@ -1724,6 +1756,7 @@ export async function startOrExecuteAgentCall(params: {
         body: {
           ok: true,
           success: true,
+          ...(record.visibility === 'private' ? { visibility: 'private' as const } : {}),
           id: record.id,
           threadId: record.threadId,
           status: 'processing',

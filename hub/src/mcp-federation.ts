@@ -489,12 +489,16 @@ async function refreshDownstreamOAuthIfNeeded(params: {
     return { ok: false, error: 'Malformed JSON nesting from downstream OAuth token refresh' };
   }
 
-  let tokenJson: Record<string, unknown>;
+  let parsedTokenJson: unknown;
   try {
-    tokenJson = JSON.parse(bodyRead.text) as Record<string, unknown>;
+    parsedTokenJson = JSON.parse(bodyRead.text);
   } catch {
     return { ok: false, error: 'Malformed JSON from downstream OAuth token refresh' };
   }
+  if (!parsedTokenJson || typeof parsedTokenJson !== 'object' || Array.isArray(parsedTokenJson)) {
+    return { ok: false, error: 'Malformed JSON object from downstream OAuth token refresh' };
+  }
+  const tokenJson = parsedTokenJson as Record<string, unknown>;
 
   const nextAccess = typeof tokenJson.access_token === 'string' ? tokenJson.access_token.trim() : '';
   if (!nextAccess || /[\x00-\x08\x0a-\x1f\x7f]/.test(nextAccess)) {

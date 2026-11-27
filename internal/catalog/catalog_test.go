@@ -335,3 +335,52 @@ func TestCatalogStoreBoundedLRUConcurrencyAndSingleflightGzip(t *testing.T) {
 		t.Fatal("expected expired origin currency entry evicted")
 	}
 }
+
+func TestCustomDomainTwinResolversRejectUnsafeHostnamesGO1(t *testing.T) {
+	unsafeHosts := []string{
+		"127.0.0.1",
+		"localhost",
+		"localhost.localdomain",
+		"[::1]",
+		"169.254.169.254",
+		"10.0.0.1",
+		"192.168.1.10",
+		"shop.example.com:8443",
+		"shop.example.com.",
+		"intranet",
+	}
+	for _, host := range unsafeHosts {
+		if got := ResolveCustomDomainShopifyProductTwinURL("https://" + host + "/products/summit-hat"); got != nil {
+			t.Fatalf("expected Shopify product twin to reject %q, got %+v", host, got)
+		}
+		if got := ResolveCustomDomainShopifyCollectionTwinURL("https://" + host + "/collections/bikes"); got != nil {
+			t.Fatalf("expected Shopify collection twin to reject %q, got %+v", host, got)
+		}
+		if got := ResolveCustomDomainWooCommerceProductTwinURL("https://" + host + "/product/frame"); got != nil {
+			t.Fatalf("expected WooCommerce product twin to reject %q, got %+v", host, got)
+		}
+		if got := ResolveCustomDomainWooCommerceCatalogTwinURL("https://" + host + "/product-category/helmets"); got != nil {
+			t.Fatalf("expected WooCommerce catalog twin to reject %q, got %+v", host, got)
+		}
+		// Malformed percent escape fallback branch must also reject unsafe hostnames.
+		if got := ResolveCustomDomainShopifyProductTwinURL("https://" + host + "/products/%ZZbad"); got != nil {
+			t.Fatalf("expected Shopify fallback branch to reject %q, got %+v", host, got)
+		}
+		if got := ResolveCustomDomainWooCommerceProductTwinURL("https://" + host + "/product/%ZZbad"); got != nil {
+			t.Fatalf("expected WooCommerce fallback branch to reject %q, got %+v", host, got)
+		}
+	}
+
+	if got := ResolveCustomDomainShopifyProductTwinURL("https://customshop.example.com/products/summit-hat"); got == nil || got.JSONURL != "https://customshop.example.com/products/summit-hat.json" {
+		t.Fatalf("expected valid public Shopify custom-domain product twin, got %+v", got)
+	}
+	if got := ResolveCustomDomainShopifyCollectionTwinURL("https://customshop.example.com/collections/bikes"); got == nil || got.JSONURL == "" {
+		t.Fatalf("expected valid public Shopify custom-domain collection twin, got %+v", got)
+	}
+	if got := ResolveCustomDomainWooCommerceProductTwinURL("https://customshop.example.com/product/frame"); got == nil || got.StoreAPIURL == "" {
+		t.Fatalf("expected valid public WooCommerce custom-domain product twin, got %+v", got)
+	}
+	if got := ResolveCustomDomainWooCommerceCatalogTwinURL("https://customshop.example.com/product-category/helmets"); got == nil || got.StoreAPIURL == "" {
+		t.Fatalf("expected valid public WooCommerce custom-domain catalog twin, got %+v", got)
+	}
+}

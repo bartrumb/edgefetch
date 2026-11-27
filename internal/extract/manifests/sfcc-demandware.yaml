@@ -1,0 +1,16 @@
+# Shared Go + TypeScript Declarative Site Adapter: Salesforce Commerce Cloud (Demandware)
+id: sfcc-demandware
+name: "Salesforce Commerce Cloud (Demandware) Storefronts"
+category: commerce-social
+description: "Structurally detects Salesforce Commerce Cloud storefronts and extracts Product-Variation twins, JSON-LD, variation options, and product geometry/specification tables."
+domains:
+  - www.demandware.com
+universalEngine: true
+exampleUrls:
+  - https://www.demandware.com/product/sample
+
+htmlRoutes:
+  - id: sfcc-demandware
+    match:
+      exactSegments: false
+    mode: sfcc_html

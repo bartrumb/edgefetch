@@ -1,0 +1,13 @@
+{
+  "adapterId": "osv-ghsa",
+  "mode": "twin",
+  "inputUrl": "https://github.com/advisories/GHSA-JFH8-C2JP-5V3Q",
+  "expectedFetchUrl": "https://api.osv.dev/v1/vulns/GHSA-jfh8-c2jp-5v3q",
+  "mockPayload": "{\"id\":\"GHSA-jfh8-c2jp-5v3q\",\"summary\":\"Apache Log4j2 JNDI RCE\",\"details\":\"Improper neutralization of input in Log4j2.\",\"aliases\":[\"CVE-2021-44228\"],\"severity\":[{\"type\":\"CVSS_V3\",\"score\":\"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H\"}],\"published\":\"2021-12-10T00:00:00Z\",\"affected\":[{\"package\":{\"ecosystem\":\"Maven\",\"name\":\"org.apache.logging.log4j:log4j-core\"},\"versions\":[\"2.14.1\"]}],\"references\":[{\"type\":\"ADVISORY\",\"url\":\"https://nvd.nist.gov/vuln/detail/CVE-2021-44228\"}]}",
+  "expectTitleIncludes": "GHSA-jfh8-c2jp-5v3q",
+  "expectMarkdownIncludes": [
+    "CVE-2021-44228",
+    "org.apache.logging.log4j:log4j-core",
+    "Improper neutralization of input in Log4j2."
+  ]
+}

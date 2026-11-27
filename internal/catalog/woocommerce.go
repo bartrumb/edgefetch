@@ -30,7 +30,10 @@ func IsWooCommerceHTMLOrHeaders(rawHTML string, headers map[string]string) bool 
 		slice = slice[:100_000]
 	}
 	return strings.Contains(slice, "woocommerce-page") ||
+		strings.Contains(slice, "woocommerce-loop-product") ||
+		strings.Contains(slice, "woocommerce-products-header") ||
 		strings.Contains(slice, "wc-block-grid") ||
+		strings.Contains(slice, "wc-blocks") ||
 		strings.Contains(slice, "/plugins/woocommerce/") ||
 		strings.Contains(slice, "WooCommerce") ||
 		strings.Contains(slice, "wc_add_to_cart_params") ||
@@ -45,7 +48,7 @@ type WooCommerceProductTwinURL struct {
 
 func parseHTTPSHostAndRawPath(productURL string) (host string, rawPath string, ok bool) {
 	s := strings.TrimSpace(productURL)
-	if len(s) <= len("https://") || !strings.EqualFold(s[:8], "https://") {
+	if len(s) <= len("https://") || !strings.EqualFold(s[:8], "https://") || strings.IndexByte(s, '\\') >= 0 {
 		return "", "", false
 	}
 	u, err := url.Parse(s)
@@ -53,11 +56,18 @@ func parseHTTPSHostAndRawPath(productURL string) (host string, rawPath string, o
 		if !strings.EqualFold(u.Scheme, "https") || u.User != nil || u.Host == "" {
 			return "", "", false
 		}
+		if port := u.Port(); port != "" && port != "443" {
+			return "", "", false
+		}
+		rawHost := strings.ToLower(u.Hostname())
+		if rawHost == "" || strings.HasSuffix(rawHost, ".") || !strings.Contains(rawHost, ".") || !IsSafePublicHostname(rawHost, "") {
+			return "", "", false
+		}
 		rp := u.EscapedPath()
 		if rp == "" {
 			rp = u.Path
 		}
-		return strings.ToLower(u.Host), rp, true
+		return rawHost, rp, true
 	}
 	// Fallback when pathname contains malformed percent-escapes (e.g. `%E0%A4%A`) accepted by WHATWG `new URL`.
 	rest := s[8:]
@@ -76,6 +86,13 @@ func parseHTTPSHostAndRawPath(productURL string) (host string, rawPath string, o
 	if errH != nil || uHost.User != nil || uHost.Host == "" {
 		return "", "", false
 	}
+	if port := uHost.Port(); port != "" && port != "443" {
+		return "", "", false
+	}
+	rawHost := strings.ToLower(uHost.Hostname())
+	if rawHost == "" || strings.HasSuffix(rawHost, ".") || !strings.Contains(rawHost, ".") || !IsSafePublicHostname(rawHost, "") {
+		return "", "", false
+	}
 	tail := rest[endAuth:]
 	if idx := strings.IndexAny(tail, "?#"); idx >= 0 {
 		tail = tail[:idx]
@@ -83,7 +100,7 @@ func parseHTTPSHostAndRawPath(productURL string) (host string, rawPath string, o
 	if tail == "" {
 		tail = "/"
 	}
-	return strings.ToLower(uHost.Host), tail, true
+	return rawHost, tail, true
 }
 
 // ResolveCustomDomainWooCommerceProductTwinURL upgrades `/product/<slug>/` URLs to `/wp-json/wc/store/v1/products?slug=<slug>`.
@@ -109,6 +126,84 @@ func ResolveCustomDomainWooCommerceProductTwinURL(productURL string) *WooCommerc
 		Slug:        slug,
 		StoreAPIURL: origin + "/wp-json/wc/store/v1/products?slug=" + EncodeURIComponent(slug),
 	}
+}
+
+// WooCommerceCatalogTwinURL holds the resolved Store API v1 list endpoint for a custom-domain
+// `/product-category/<slug>/` or `/shop/` URL.
+type WooCommerceCatalogTwinURL struct {
+	Kind        string `json:"kind"`
+	Slug        string `json:"slug,omitempty"`
+	StoreAPIURL string `json:"storeApiUrl"`
+}
+
+func isAllDigitsASCII(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// ResolveCustomDomainWooCommerceCatalogTwinURL upgrades `/product-category/.../<slug>/` and `/shop/` URLs
+// to `/wp-json/wc/store/v1/products?category=<slug>&per_page=50` or `?per_page=50`.
+func ResolveCustomDomainWooCommerceCatalogTwinURL(pageURL string) *WooCommerceCatalogTwinURL {
+	host, rawPath, ok := parseHTTPSHostAndRawPath(pageURL)
+	if !ok {
+		return nil
+	}
+	var segs []string
+	for _, seg := range strings.Split(rawPath, "/") {
+		if seg != "" {
+			segs = append(segs, seg)
+		}
+	}
+	if len(segs) > 0 && reCatalogLocaleSeg.MatchString(segs[0]) {
+		segs = segs[1:]
+	}
+	if len(segs) == 0 {
+		return nil
+	}
+
+	pageNum := ""
+	if len(segs) >= 3 && strings.EqualFold(segs[len(segs)-2], "page") && isAllDigitsASCII(segs[len(segs)-1]) {
+		pageNum = segs[len(segs)-1]
+		segs = segs[:len(segs)-2]
+	}
+
+	origin := "https://" + host
+	pageSuffix := ""
+	if pageNum != "" && pageNum != "1" {
+		pageSuffix = "&page=" + pageNum
+	}
+
+	if len(segs) >= 2 && strings.EqualFold(segs[0], "product-category") {
+		rawSlug := segs[len(segs)-1]
+		slug := rawSlug
+		if dec, okDec := SafeDecodeURIComponent(rawSlug); okDec {
+			slug = dec
+		}
+		slug = strings.TrimSpace(slug)
+		if slug == "" || len(slug) > 160 || strings.Contains(slug, "/") {
+			return nil
+		}
+		return &WooCommerceCatalogTwinURL{
+			Kind:        "category",
+			Slug:        slug,
+			StoreAPIURL: origin + "/wp-json/wc/store/v1/products?category=" + EncodeURIComponent(slug) + "&per_page=50" + pageSuffix,
+		}
+	}
+
+	if len(segs) == 1 && strings.EqualFold(segs[0], "shop") {
+		return &WooCommerceCatalogTwinURL{
+			Kind:        "shop",
+			StoreAPIURL: origin + "/wp-json/wc/store/v1/products?per_page=50" + pageSuffix,
+		}
+	}
+	return nil
 }
 
 func scaleMinorUnitPrice(raw any, minorUnit int) *float64 {
@@ -556,6 +651,12 @@ func EnrichWooCommerceProductFromStoreAPI(params WooEnrichParams) *TwinFormatted
 
 // FormatWCStoreAPIListTwin formats a `/wp-json/wc/store/v1/products` list response into a TwinFormattedDoc.
 func FormatWCStoreAPIListTwin(rawBody, origURL string) *TwinFormattedDoc {
+	return FormatWCStoreAPIListTwinWithOptions(rawBody, origURL, "")
+}
+
+// FormatWCStoreAPIListTwinWithOptions formats a `/wp-json/wc/store/v1/products` list response into a TwinFormattedDoc,
+// reading `per_page`, `page`, and `NextURL` base from `twinURL` when provided (so custom-domain HTML URLs get accurate pagination).
+func FormatWCStoreAPIListTwinWithOptions(rawBody, origURL, twinURL string) *TwinFormattedDoc {
 	parsed, ok := parseJSONValueCommerce(rawBody)
 	if !ok {
 		return nil
@@ -568,7 +669,13 @@ func FormatWCStoreAPIListTwin(rawBody, origURL string) *TwinFormattedDoc {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil
 	}
-	q := u.Query()
+	queryURL := u
+	if strings.TrimSpace(twinURL) != "" {
+		if tu, errT := url.Parse(strings.TrimSpace(twinURL)); errT == nil && tu.Scheme != "" && tu.Host != "" {
+			queryURL = tu
+		}
+	}
+	q := queryURL.Query()
 	page := 1
 	if p, errP := strconv.Atoi(q.Get("page")); errP == nil && p > 1 {
 		page = p
@@ -587,12 +694,16 @@ func FormatWCStoreAPIListTwin(rawBody, origURL string) *TwinFormattedDoc {
 			}
 		}
 	}
+	if tTwin := strings.TrimSpace(twinURL); tTwin != "" && tTwin != strings.TrimSpace(origURL) && len(records) == 0 {
+		// Fail open cleanly to HTML when custom-domain Store API category/shop returns an empty array.
+		return nil
+	}
 
 	returned := len(records)
-	hasMore := returned >= perPage
+	hasMore := returned > 0 && returned >= perPage
 	nextURL := ""
 	if hasMore {
-		nextU := *u
+		nextU := *queryURL
 		nq := nextU.Query()
 		nq.Set("page", strconv.Itoa(page+1))
 		nextU.RawQuery = nq.Encode()
@@ -628,7 +739,7 @@ func FormatWCStoreAPIListTwin(rawBody, origURL string) *TwinFormattedDoc {
 			catCell = *r.ProductType
 		}
 		rows = append(rows, []string{
-			fmt.Sprintf("[%s](%s)", r.Title, r.URL),
+			FormatMarkdownLinkCommerce(r.Title, r.URL),
 			formatCommerceSKUDisplay(sku, false),
 			catCell,
 			formatWooMoneyCell(price, cur),

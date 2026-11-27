@@ -25,6 +25,7 @@ var (
 
 	disallowedHostSuffixes = []string{
 		".localhost",
+		".localhost.localdomain",
 		".local",
 		".internal",
 		".arpa",
@@ -44,6 +45,7 @@ var (
 
 	disallowedExactHosts = map[string]bool{
 		"localhost":                  true,
+		"localhost.localdomain":      true,
 		"nip.io":                     true,
 		"sslip.io":                   true,
 		"xip.io":                     true,
@@ -145,12 +147,47 @@ func escapeUnescapedChar(s string, target byte) string {
 	var sb strings.Builder
 	sb.Grow(len(s) + 8)
 	for i := 0; i < len(s); i++ {
-		if s[i] == target && (i == 0 || s[i-1] != '\\') {
-			sb.WriteByte('\\')
+		if s[i] == target {
+			bs := 0
+			for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+				bs++
+			}
+			if bs%2 == 0 {
+				sb.WriteByte('\\')
+			}
 		}
 		sb.WriteByte(s[i])
 	}
 	return sb.String()
+}
+
+// FormatMarkdownLinkCommerce safely formats `[label](url)` by escaping brackets/angle-brackets
+// and odd trailing backslashes in `label`, and percent-encoding unsafe URL delimiters in `rawURL`.
+func FormatMarkdownLinkCommerce(label, rawURL string) string {
+	safeLabel := extract.StripInvisibleSchemaChars(label)
+	safeLabel = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ", "<", "&lt;", ">", "&gt;").Replace(safeLabel)
+	safeLabel = strings.TrimSpace(safeLabel)
+	if strings.Contains(safeLabel, "](") {
+		safeLabel = reCloseBracketSpaceParen.ReplaceAllString(safeLabel, `\] \(`)
+	}
+	safeLabel = escapeUnescapedChar(safeLabel, '[')
+	safeLabel = escapeUnescapedChar(safeLabel, ']')
+	bs := 0
+	for i := len(safeLabel) - 1; i >= 0 && safeLabel[i] == '\\'; i-- {
+		bs++
+	}
+	if bs%2 == 1 {
+		safeLabel += `\`
+	}
+	trimmedURL := strings.TrimSpace(rawURL)
+	if trimmedURL == "" {
+		return safeLabel
+	}
+	dest := extract.PercentEncodeUnsafeRecordURLChars(trimmedURL)
+	if safeLabel == "" {
+		safeLabel = dest
+	}
+	return "[" + safeLabel + "](" + dest + ")"
 }
 
 // SanitizeCommerceField sanitizes untrusted e-commerce text fields (`title`, `vendor`, `productType`,

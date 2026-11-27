@@ -1038,11 +1038,11 @@ func TestR8ValidateDeclarativeManifestsOverlapHostingCatalogAndRedirects(t *test
 	if err := dec.Decode(&bundle); err != nil {
 		t.Fatalf("Decode compiled.json: %v", err)
 	}
-	if len(bundle.Manifests) != 56 {
-		t.Fatalf("expected 56 compiled manifests, got %d", len(bundle.Manifests))
+	if len(bundle.Manifests) < 68 {
+		t.Fatalf("expected at least 68 compiled manifests, got %d", len(bundle.Manifests))
 	}
 	if err := ValidateDeclarativeManifests(bundle.Manifests); err != nil {
-		t.Fatalf("expected embedded 56 manifests to pass ValidateDeclarativeManifests, got: %v", err)
+		t.Fatalf("expected embedded %d manifests to pass ValidateDeclarativeManifests, got: %v", len(bundle.Manifests), err)
 	}
 
 	makeRogue := func(id, dom, fetchURL string) DeclarativeManifest {
@@ -1578,5 +1578,126 @@ connected</pre>
 		if strings.Contains(fullDoc.Markdown+"\n", leaked) {
 			t.Fatalf("expected ExtractHTMLDocumentFull to strip Go Playground toolbar chrome %q, got:\n%s", leaked, fullDoc.Markdown)
 		}
+	}
+}
+
+func TestEurLexCaseInsensitiveURIQueryParamGO6(t *testing.T) {
+	t.Parallel()
+	upperTwin, okUpper := ResolveDeclarativeTwin("https://eur-lex.europa.eu/legal-content/EN/TXT/?URI=CELEX:32016R0679")
+	if !okUpper || upperTwin == nil || upperTwin.ID != "eur-lex" {
+		t.Fatalf("expected uppercase ?URI= to match eur-lex twin, got ok=%v twin=%+v", okUpper, upperTwin)
+	}
+	lowerTwin, okLower := ResolveDeclarativeTwin("https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679")
+	if !okLower || lowerTwin == nil || lowerTwin.ID != "eur-lex" {
+		t.Fatalf("expected lowercase ?uri= to match eur-lex twin, got ok=%v twin=%+v", okLower, lowerTwin)
+	}
+	if upperTwin.FetchURL != lowerTwin.FetchURL {
+		t.Fatalf("expected ?URI= and ?uri= to resolve identically: upper=%q lower=%q", upperTwin.FetchURL, lowerTwin.FetchURL)
+	}
+}
+
+func TestTier5R4GO1AndR4GO3_DeclarativeSSRFAndEscaping(t *testing.T) {
+	// R4-GO-1: isSafePublicHostnameGo parity with IsSafePublicHostname
+	badHosts := []string{
+		"metadata.goog",
+		"127.0.0.1.localtest.me",
+		"foo.lvh.me",
+		"foo.vcap.me",
+		"foo.traefik.me",
+		"foo.1u.ms",
+		"foo.rebind.network",
+		"1.0.0.127.in-addr.arpa",
+		"db.corp",
+		"router.lan",
+		"portal.intranet",
+		"nip.io",
+		"co.uk",
+		"-bad.example.com",
+	}
+	for _, h := range badHosts {
+		u := "https://" + h + "/products.json"
+		if IsSafeDeclarativeTwinURL(u) {
+			t.Fatalf("R4-GO-1: IsSafeDeclarativeTwinURL(%q) = true, want false", u)
+		}
+		if m, ok := ResolveDeclarativeTwin(u); ok || m != nil {
+			t.Fatalf("R4-GO-1: ResolveDeclarativeTwin(%q) matched %+v, want false", u, m)
+		}
+	}
+	if m, ok := ResolveDeclarativeTwin("https://example.co.uk/products.json"); !ok || m == nil {
+		t.Fatal("R4-GO-1: expected legitimate multi-label public domain example.co.uk to still resolve")
+	}
+
+	// R4-GO-3b: SubsectionSubkeys (openfda) & plain-text SubsectionBodyVar must neutralize Markdown link/heading injection
+	fdaTwin, okFda := ResolveDeclarativeTwin("https://api.fda.gov/drug/label.json?limit=1")
+	if !okFda || fdaTwin == nil {
+		t.Fatal("expected openfda twin")
+	}
+	fdaJSON, _ := json.Marshal(map[string]any{
+		"meta": map[string]any{"results": map[string]any{"total": 1}},
+		"results": []map[string]any{{
+			"openfda":  map[string]any{"brand_name": []string{"SafeDrug"}},
+			"warnings": []string{"Warning [Phish](https://evil.com/fda)\n\n## Fake Section"},
+		}},
+	})
+	fdaDoc, okFdaFmt := fdaTwin.Format(string(fdaJSON))
+	if !okFdaFmt || fdaDoc == nil {
+		t.Fatal("expected openfda format to succeed")
+	}
+	if hasUnescapedClickableEvilLinkR10(fdaDoc.Markdown) || strings.Contains(fdaDoc.Markdown, "\n## Fake Section") {
+		t.Fatalf("R4-GO-3b: openfda leaked unescaped Markdown link or heading:\n%s", fdaDoc.Markdown)
+	}
+
+	// Plain-text SubsectionBodyVar must escape brackets/headings
+	plainSubSpec := DeclarativeExtractSpec{
+		TitleTemplate: "Plain Subsections",
+		Sections: []DeclarativeSectionSpec{{
+			SubsectionsArrayPath:      "items",
+			SubsectionHeadingTemplate: "Item {index1}",
+			SubsectionBodyVar:         "body",
+			ItemVars: map[string]DeclarativeVarSpec{
+				"body": {Paths: []string{"text"}},
+			},
+		}},
+	}
+	plainSubDoc, okPlainSub := FormatJSONWithExtractSpec(
+		`{"items":[{"text":"Body [Phish](https://evil.com/sub)\n\n## Injected"}]}`,
+		plainSubSpec,
+		nil,
+		"https://example.com/items",
+	)
+	if !okPlainSub || plainSubDoc == nil {
+		t.Fatal("expected plain SubsectionBodyVar format to succeed")
+	}
+	if hasUnescapedClickableEvilLinkR10(plainSubDoc.Markdown) || strings.Contains(plainSubDoc.Markdown, "\n## Injected") {
+		t.Fatalf("R4-GO-3b: plain SubsectionBodyVar leaked link or heading:\n%s", plainSubDoc.Markdown)
+	}
+
+	// Legitimate html_to_md SubsectionBodyVar (discourse) preserves links and paragraphs
+	discTwin, okDisc := ResolveDeclarativeTwin("https://meta.discourse.org/t/test-topic/123")
+	if !okDisc || discTwin == nil {
+		t.Fatal("expected discourse twin")
+	}
+	discDoc, okDiscFmt := discTwin.Format(`{"title":"Test","post_stream":{"posts":[{"post_number":1,"username":"alice","created_at":"2026-01-01T00:00:00Z","cooked":"<p>Read <a href=\"https://meta.discourse.org/docs\">the docs</a>.</p>"}]}}`)
+	if !okDiscFmt || discDoc == nil || !strings.Contains(discDoc.Markdown, "[the docs](https://meta.discourse.org/docs)") {
+		t.Fatalf("R4-GO-3b: discourse html_to_md SubsectionBodyVar lost legitimate link:\n%+v", discDoc)
+	}
+
+	// R4-GO-3c: BlockquoteTemplate (gitlab-forgejo) & MetaItalicTemplate (enterprise-ats jobvite)
+	cbHTML := `<!doctype html><html><head><meta name="og:description" content="Repo desc [Phish](https://evil.com/cb)&#10;## Fake"></head><body><div class="markup"><p>Forgejo README content for testing blockquote escaping across multiple words.</p></div></body></html>`
+	cbDoc, okCb := ApplyDeclarativeHTMLExtractor(cbHTML, "https://codeberg.org/forgejo/forgejo", "", nil)
+	if !okCb || cbDoc == nil {
+		t.Fatal("expected codeberg extraction")
+	}
+	if hasUnescapedClickableEvilLinkR10(cbDoc.Markdown) || strings.Contains(cbDoc.Markdown, "\n## Fake") {
+		t.Fatalf("R4-GO-3c: gitlab-forgejo BlockquoteTemplate leaked link/heading:\n%s", cbDoc.Markdown)
+	}
+
+	jvHTML := `<!doctype html><html><body><h2 class="jv-header">Senior Engineer</h2><p class="jv-job-detail-meta">Austin [Phish](https://evil.com/jv)*bad**</p><div class="jv-job-detail-description"><p>Build reliable systems.</p></div></body></html>`
+	jvDoc, okJv := ApplyDeclarativeHTMLExtractor(jvHTML, "https://jobs.jobvite.com/acme/job/abc123", "", nil)
+	if !okJv || jvDoc == nil {
+		t.Fatal("expected jobvite extraction")
+	}
+	if hasUnescapedClickableEvilLinkR10(jvDoc.Markdown) || !strings.Contains(jvDoc.Markdown, `\*bad\*\*`) {
+		t.Fatalf("R4-GO-3c: jobvite MetaItalicTemplate leaked link or asterisk breakout:\n%s", jvDoc.Markdown)
 	}
 }

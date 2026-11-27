@@ -348,3 +348,126 @@ test('L-01: a filtered result is never returned to a later unfiltered (or differ
     assert.equal(md(sales).includes('Platform Role Alpha'), false, `${label}: ${md(sales).slice(0, 400)}`);
   }
 });
+
+test('TS-6: ocrMode and pdfParserOpts affect scrapeOptionsHash and do not collide in options cache', async (t) => {
+  const dirs: string[] = [];
+  t.after(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+  const { bucket, puts } = recordingBucket(dirs);
+  const now = 1_800_000_100_000;
+  const PDF_URL = 'https://docs.example.com/ts6-manual.pdf';
+
+  const pdfReply = async () => ({
+    status: 200,
+    via: 'agent:stub',
+    bodyText: JSON.stringify({
+      results: [
+        {
+          id: 'r1',
+          url: PDF_URL,
+          finalUrl: PDF_URL,
+          status: 200,
+          outcome: 'ok',
+          contentType: 'application/pdf',
+          markdown: '# Manual\nAlpha Page One\fBeta Page Two',
+          bodyBase64: Buffer.from('%PDF-1.7 mock bytes').toString('base64'),
+        },
+      ],
+    }),
+  });
+
+  const hashFor = async (extra: Record<string, unknown>, at: number): Promise<string> => {
+    const before = puts.length;
+    const res = await executeScrapeCall({
+      payload: { url: PDF_URL, maxAgeMs: 0, discoverLlmsTxt: false, ...extra },
+      env: { ARTIFACTS: bucket },
+      now: at,
+      executeHubFetch: pdfReply,
+    });
+    assert.equal(res.status, 200);
+    const written = puts.slice(before);
+    assert.equal(written.length, 1, `expected one options-cache write, got ${written.length}`);
+    const h = written[0]!.json?.optionsHash;
+    assert.equal(typeof h, 'string');
+    return h as string;
+  };
+
+  const hashDefault = await hashFor({}, now);
+  const hashOcrAuto = await hashFor({ ocr: 'auto' }, now + 1);
+  const hashOcrOff = await hashFor({ ocr: 'off' }, now + 2);
+  const hashPagesMarkers = await hashFor({ parsers: [{ type: 'pdf', pages: true, pageMarkers: true }] }, now + 3);
+  const hashMaxPages = await hashFor({ parsers: [{ type: 'pdf', maxPages: 5 }] }, now + 4);
+  const hashFast = await hashFor({ parsers: [{ type: 'pdf', mode: 'fast' }] }, now + 5);
+
+  assert.equal(hashDefault, V282_DEFAULT_OPTIONS_HASH, 'default request optionsHash must equal v2.8.2');
+  assert.equal(hashOcrAuto, hashDefault, 'explicit ocr:auto matches default');
+  assert.notEqual(hashOcrOff, hashDefault, 'ocr:off must hash differently from ocr:auto');
+  assert.notEqual(hashPagesMarkers, hashDefault, 'pdf pages/pageMarkers must hash differently from default');
+  assert.notEqual(hashMaxPages, hashDefault, 'pdf maxPages must hash differently from default');
+  assert.notEqual(hashFast, hashDefault, 'pdf mode:fast must hash differently from default');
+  assert.notEqual(hashMaxPages, hashPagesMarkers);
+
+  // Separate bucket: verify cache hit restores pages + pageMarkers while plain default does NOT receive them.
+  const { bucket: bucket2 } = recordingBucket(dirs);
+  let originFetches = 0;
+  const countedPdfFetch = async () => {
+    originFetches++;
+    return await pdfReply();
+  };
+
+  const firstWithPages = await executeScrapeCall({
+    payload: {
+      url: PDF_URL,
+      maxAgeMs: 600_000,
+      discoverLlmsTxt: false,
+      parsers: [{ type: 'pdf', pages: true, pageMarkers: true }],
+    },
+    env: { ARTIFACTS: bucket2 },
+    now: now + 10,
+    executeHubFetch: countedPdfFetch,
+  });
+  assert.equal(firstWithPages.status, 200);
+  const b1 = firstWithPages.body as { markdown?: string; pages?: unknown[]; cached?: boolean };
+  assert.ok(b1.markdown?.includes('<!-- page 1 -->'), 'first response must include page 1 marker');
+  assert.ok(b1.markdown?.includes('<!-- page 2 -->'), 'first response must include page 2 marker');
+  assert.equal(Array.isArray(b1.pages), true);
+  assert.equal(b1.pages?.length, 2);
+  assert.equal(originFetches, 1);
+
+  const plainFollowUp = await executeScrapeCall({
+    payload: {
+      url: PDF_URL,
+      maxAgeMs: 600_000,
+      discoverLlmsTxt: false,
+    },
+    env: { ARTIFACTS: bucket2 },
+    now: now + 11,
+    executeHubFetch: countedPdfFetch,
+  });
+  assert.equal(plainFollowUp.status, 200);
+  const bPlain = plainFollowUp.body as { markdown?: string; pages?: unknown[]; cached?: boolean };
+  assert.equal(originFetches, 2, 'plain scrape must NOT collide with parsers:[{pages:true,pageMarkers:true}] cache');
+  assert.equal(bPlain.markdown?.includes('<!-- page 1 -->'), false, 'plain scrape must not leak pageMarkers');
+  assert.equal(bPlain.pages, undefined, 'plain scrape must not receive pages array');
+
+  const cachedPagesHit = await executeScrapeCall({
+    payload: {
+      url: PDF_URL,
+      maxAgeMs: 600_000,
+      discoverLlmsTxt: false,
+      parsers: [{ type: 'pdf', pages: true, pageMarkers: true }],
+    },
+    env: { ARTIFACTS: bucket2 },
+    now: now + 12,
+    executeHubFetch: countedPdfFetch,
+  });
+  assert.equal(cachedPagesHit.status, 200);
+  const bHit = cachedPagesHit.body as { markdown?: string; pages?: unknown[]; cached?: boolean };
+  assert.equal(originFetches, 2, 'identical pdfParserOpts must hit cache');
+  assert.equal(bHit.cached, true);
+  assert.ok(bHit.markdown?.includes('<!-- page 1 -->'), 'cache hit must preserve page 1 marker');
+  assert.ok(bHit.markdown?.includes('<!-- page 2 -->'), 'cache hit must preserve page 2 marker');
+  assert.equal(Array.isArray(bHit.pages), true);
+  assert.equal(bHit.pages?.length, 2);
+});

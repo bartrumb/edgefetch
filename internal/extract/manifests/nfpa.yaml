@@ -1,0 +1,22 @@
+# Shared Go + TypeScript Declarative Site Adapter: NFPA Sitecore JSS Standards & Codes
+id: nfpa
+name: NFPA Standards & Codes (www.nfpa.org)
+category: public-records
+description: "Unpacks Sitecore JSS __NEXT_DATA__ storefront-main placeholders (PageTitle, ContentBlock, SplitScreenCalloutComponent, Accordion, TwoColumnVideo) on www.nfpa.org without headless browser rendering, never touching link.nfpa.org or robots-disallowed /en/ and /-/media/."
+domains:
+  - www.nfpa.org
+exampleUrls:
+  - "https://www.nfpa.org/codes-and-standards/nfpa-70-standard-development/70"
+  - "https://www.nfpa.org/education-and-research/electrical/nfpa-70"
+
+htmlRoutes:
+  - id: nfpa
+    mode: sitecore_jss_html
+    match:
+      exactSegments: false
+      reservedFirstSegment:
+        - "-"
+        - ar
+        - en
+        - data
+        - standard_items

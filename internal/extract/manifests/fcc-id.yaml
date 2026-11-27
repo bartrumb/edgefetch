@@ -1,0 +1,55 @@
+# Shared Go + TypeScript Declarative Site Adapter: FCC ID Equipment Authorization Lookup
+id: fcc-id
+name: FCC ID Equipment Authorization
+category: public-records
+description: "Extracts FCC ID grant metadata, technical frequency/power tables, and exhibit PDF links from fccid.io public HTML pages while respecting robots.txt disallows."
+domains:
+  - fccid.io
+  - www.fccid.io
+exampleUrls:
+  - "https://fccid.io/BCG-E3542A"
+
+htmlRoutes:
+  - id: fcc-id
+    mode: dom
+    match:
+      exactSegments: false
+      reservedFirstSegment:
+        - ViewExhibitReport.cfm
+        - subscribe.php
+        - frequency
+        - search
+        - api
+      pathSegments:
+        - param: grantee
+          charset: url_seg
+          minLen: 2
+          maxLen: 64
+        - param: product
+          charset: url_seg
+          optional: true
+          minLen: 1
+          maxLen: 120
+    vars:
+      title:
+        cssText:
+          - h1
+          - title
+        metaKeys:
+          - og:title
+        trim: true
+      body:
+        cssHtmlToMd:
+          - main
+          - article
+          - body
+        format: strip_leading_h1
+        trim: true
+    requireVars:
+      - title
+    titleTemplate: "{title}"
+    bullets:
+      - label: FCC ID
+        template: "`{grantee}`"
+    bodyVar: body
+    preserveBodyLinksFromVar: body

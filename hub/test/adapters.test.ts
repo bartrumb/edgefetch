@@ -691,8 +691,9 @@ test('ADAPTER-6: GET /v1/extractors authenticated catalog endpoint', async () =>
   assert.equal(okRes.status, 200);
   const body = (await okRes.json()) as { ok: boolean; total: number; extractors: Array<{ id: string }> };
   assert.equal(body.ok, true);
-  assert.equal(body.total, 5);
+  assert.ok(body.total >= 9, `expected >= 9 public-records extractors, got ${body.total}`);
   assert.ok(body.extractors.some((e) => e.id === 'socrata'));
+  assert.ok(body.extractors.some((e) => e.id === 'federal-register'));
 });
 
 test('ADAPTER-7: Podcast & HN Hardening — Fault-isolated adapter bulkhead + Indirect Prompt Injection (CSS hidden & Unicode Tag smuggling) stripping', () => {

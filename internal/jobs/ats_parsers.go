@@ -7,11 +7,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
 )
 
 var (
 	reWorkdaySafeExtPath = newLazyRegexp(`^/?job/(?:[A-Za-z0-9._~%-]+/)*[A-Za-z0-9._~%-]+$`)
-	reWorkdayBadPct      = newLazyRegexp(`(?i)%2e|%2f|%5c`)
+	reWorkdayBadPct      = newLazyRegexp(`(?i)%2e|%2f|%5c|%25`)
 	reMarkdownLinkChars  = newLazyRegexp(`([\\\[\]()])`)
 	reBracketParenStrip  = newLazyRegexp(`[\[\]()]`)
 
@@ -25,6 +27,55 @@ var (
 	reSRBracketOrHTTP = newLazyRegexp(`(?i)\[|\]|\bhttp`)
 	reBuiltInMDCard   = newLazyRegexp(`(?i)\[([^\[\]\n]{4,120})\]\((https://(?:www\.)?builtin\.com/job/[^)\s]+)\)`)
 )
+
+func sanitizeATSMarkdownText(raw string, maxLen int) string {
+	clean := SanitizeJobFieldPlain(raw, maxLen)
+	if clean == "" {
+		return ""
+	}
+	clean = strings.NewReplacer("\r", " ", "\n", " ").Replace(clean)
+	clean = strings.TrimSpace(clean)
+	if clean == "" {
+		return ""
+	}
+	return reMarkdownLinkChars.ReplaceAllString(clean, `\$1`)
+}
+
+func sanitizeATSHttpsURL(raw, fallback string) string {
+	validate := func(candidate string) string {
+		trimmed := strings.TrimSpace(StripInvisibleJobChars(candidate))
+		if trimmed == "" || len(trimmed) > 2048 || strings.ContainsAny(trimmed, " \t\r\n\x00<>\"'`") {
+			return ""
+		}
+		u, ok := parseStrictURL(trimmed)
+		if !ok || !strings.EqualFold(u.Scheme, "https") || u.User != nil {
+			return ""
+		}
+		if port := u.Port(); port != "" && port != "443" {
+			return ""
+		}
+		if !extract.IsSafePublicHostname(u.Hostname()) {
+			return ""
+		}
+		safe := canonicalWhatwgURLString(u)
+		return strings.NewReplacer(
+			"(", "%28",
+			")", "%29",
+			"[", "%5B",
+			"]", "%5D",
+			`\`, "%5C",
+		).Replace(safe)
+	}
+	if s := validate(raw); s != "" {
+		return s
+	}
+	if fallback != "" {
+		if f := validate(fallback); f != "" {
+			return f
+		}
+	}
+	return ""
+}
 
 func (s *ATSPreFetchSpec) formatWithNow(rawBody, origURL string, htmlToMD HTMLToMDFunc, now time.Time) *ATSFormattedResult {
 	if htmlToMD == nil {
@@ -155,7 +206,14 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		if match == nil {
 			return nil
 		}
-		title := strings.TrimSpace(firstNonEmpty(anyString(match["title"]), "Job Posting"))
+		title := SanitizeJobFieldPlain(firstNonEmpty(anyString(match["title"]), "Job Posting"), 512)
+		if title == "" {
+			title = "Job Posting"
+		}
+		cleanOrg := SanitizeJobFieldPlain(orgTitle, 256)
+		if cleanOrg == "" {
+			cleanOrg = s.org
+		}
 		allLocs := extractAshbyLocations(match)
 		descHTML, _ := match["descriptionHtml"].(string)
 		descPlain, _ := match["descriptionPlain"].(string)
@@ -178,14 +236,10 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		postedAt, _ := match["publishedAt"].(string)
 		empType, _ := match["employmentType"].(string)
 		jobURL := normalizeCanonicalAshbyURL(match["jobUrl"], s.org, s.jobID)
-		applyCand := normalizeCanonicalAshbyURL(match["applyUrl"], s.org, s.jobID)
-		var applyURL string
-		if strings.HasSuffix(strings.TrimRight(applyCand, "/"), "/application") {
-			applyURL = applyCand
-		} else if rawApply, ok := match["applyUrl"].(string); ok && strings.TrimSpace(rawApply) != "" {
-			applyURL = applyCand
-		} else {
-			applyURL = strings.TrimRight(jobURL, "/") + "/application"
+		defaultApply := strings.TrimRight(jobURL, "/") + "/application"
+		applyURL := defaultApply
+		if rawApply, ok := match["applyUrl"].(string); ok && strings.TrimSpace(rawApply) != "" {
+			applyURL = sanitizeATSHttpsURL(rawApply, defaultApply)
 		}
 
 		var baseSal *NormalizedPay
@@ -194,13 +248,13 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		}
 		jp := &StructuredJobPosting{
 			Title:              title,
-			HiringOrganization: orgTitle,
+			HiringOrganization: cleanOrg,
 			JobLocation:        allLocs,
 			WorkplaceType:      wp,
 			BaseSalary:         baseSal,
 			Pay:                pay,
 			DatePosted:         postedAt,
-			EmploymentType:     empType,
+			EmploymentType:     SanitizeJobFieldPlain(empType, 80),
 			URL:                jobURL,
 			ApplyURL:           applyURL,
 			Source:             "ashby",
@@ -210,12 +264,13 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		if descPlain != "" {
 			descOut = sliceUTF16Max(descPlain, 280)
 		}
+		mdHeading := "# " + sanitizeATSMarkdownText(title, 512) + " @ " + sanitizeATSMarkdownText(cleanOrg, 256)
 		return &ATSFormattedResult{
-			Title:         title + " @ " + orgTitle,
+			Title:         title + " @ " + cleanOrg,
 			Description:   descOut,
 			PublishedTime: postedAt,
 			JobPosting:    jp,
-			Markdown:      joinNonEmptyBlocks("# "+title+" @ "+orgTitle, headerMD, bodyMD),
+			Markdown:      joinNonEmptyBlocks(mdHeading, headerMD, bodyMD),
 			Links:         []string{applyURL},
 		}
 	}
@@ -248,7 +303,10 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		if idx < s.reqOffset || len(records) >= maxBoardRecords {
 			return
 		}
-		jTitle := strings.TrimSpace(firstNonEmpty(anyString(j["title"]), "Role"))
+		jTitle := SanitizeJobFieldPlain(firstNonEmpty(anyString(j["title"]), "Role"), 512)
+		if jTitle == "" {
+			jTitle = "Role"
+		}
 		allLocs := extractAshbyLocations(j)
 		if allLocs == nil {
 			allLocs = []string{}
@@ -273,7 +331,7 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		pay := parseAshbyPay(j, sliceUTF16Max(descPlain, 24_000))
 		applyURL := strings.TrimRight(jURL, "/") + "/application"
 		if rawApply, ok := j["applyUrl"].(string); ok && strings.TrimSpace(rawApply) != "" {
-			applyURL = normalizeCanonicalAshbyURL(rawApply, s.org, jID)
+			applyURL = sanitizeATSHttpsURL(rawApply, applyURL)
 		}
 		var postedAt *string
 		if pub, ok := j["publishedAt"].(string); ok {
@@ -310,7 +368,7 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 			if pay != nil {
 				payMeta = FormatNormalizedPay(pay)
 			}
-			meta := joinNonEmptySep(" · ", firstLoc, wpMeta, payMeta)
+			meta := joinNonEmptySep(" · ", sanitizeATSMarkdownText(firstLoc, 200), wpMeta, sanitizeATSMarkdownText(payMeta, 120))
 			suffix := ""
 			if meta != "" {
 				suffix = " — " + meta
@@ -346,16 +404,20 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		}
 	}
 
-	if orgTitle != s.org {
+	cleanOrgTitle := SanitizeJobFieldPlain(orgTitle, 256)
+	if cleanOrgTitle == "" {
+		cleanOrgTitle = s.org
+	}
+	if cleanOrgTitle != s.org {
 		for i := range records {
-			records[i].Company = orgTitle
+			records[i].Company = cleanOrgTitle
 		}
 	}
 
 	if total == 0 {
 		return &ATSFormattedResult{
-			Title:     fmt.Sprintf("%s Jobs (0)", orgTitle),
-			Markdown:  fmt.Sprintf("# %s — Open Roles (0)\n\nNo open positions currently listed.", orgTitle),
+			Title:     fmt.Sprintf("%s Jobs (0)", cleanOrgTitle),
+			Markdown:  fmt.Sprintf("# %s — Open Roles (0)\n\nNo open positions currently listed.", sanitizeATSMarkdownText(cleanOrgTitle, 256)),
 			Links:     []string{},
 			Jobs:      []StructuredJobRecord{},
 			Total:     intPtr(0),
@@ -376,9 +438,9 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		countLabel = strconv.Itoa(total) + "+"
 	}
 	lines := make([]string, 0, len(bullets)+4)
-	lines = append(lines, fmt.Sprintf("# %s — Open Roles (%s)", orgTitle, countLabel))
+	lines = append(lines, fmt.Sprintf("# %s — Open Roles (%s)", sanitizeATSMarkdownText(cleanOrgTitle, 256), countLabel))
 	for _, b := range bullets {
-		lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", b.title, b.url, b.suffix))
+		lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", sanitizeATSMarkdownText(b.title, 512), b.url, b.suffix))
 	}
 
 	returned := len(records)
@@ -400,7 +462,7 @@ func (s *ATSPreFetchSpec) formatAshby(rawBody, origURL string, htmlToMD HTMLToMD
 		nextCur = strconv.Itoa(nextOffsetVal)
 	}
 	return &ATSFormattedResult{
-		Title:      fmt.Sprintf("%s Jobs (%s)", orgTitle, countLabel),
+		Title:      fmt.Sprintf("%s Jobs (%s)", cleanOrgTitle, countLabel),
 		Markdown:   strings.Join(lines, "\n"),
 		Links:      links,
 		Jobs:       records,
@@ -497,7 +559,7 @@ func (s *ATSPreFetchSpec) formatWorkdayJob(rawBody, origURL string, htmlToMD HTM
 		Title:         fmt.Sprintf("%s (%s)", title, s.org),
 		PublishedTime: postedOn,
 		JobPosting:    jp,
-		Markdown:      joinNonEmptyBlocks("# "+title, headerMD, bodyMD),
+		Markdown:      joinNonEmptyBlocks("# "+sanitizeATSMarkdownText(title, 512), headerMD, bodyMD),
 		Links:         []string{extURL},
 	}
 }
@@ -537,11 +599,14 @@ func (s *ATSPreFetchSpec) formatWorkdayBoard(rawBody string, now time.Time) *ATS
 		cleanSearchHeading = strings.ReplaceAll(SanitizeJobFieldPlain(s.searchText, 120), `"`, "'")
 	}
 	searchSuffix := ""
+	mdSearchSuffix := ""
 	if cleanSearchHeading != "" {
 		searchSuffix = fmt.Sprintf(` matching "%s"`, cleanSearchHeading)
+		mdSearchSuffix = fmt.Sprintf(` matching "%s"`, sanitizeATSMarkdownText(cleanSearchHeading, 120))
 	}
 	heading := fmt.Sprintf("%s (%s) — Workday Job Board (%s%s)", s.org, s.site, countDesc, searchSuffix)
-	lines := []string{"# " + heading}
+	mdHeading := fmt.Sprintf("%s (%s) — Workday Job Board (%s%s)", sanitizeATSMarkdownText(s.org, 160), sanitizeATSMarkdownText(s.site, 160), countDesc, mdSearchSuffix)
+	lines := []string{"# " + mdHeading}
 	links := make([]string, 0, len(postingsAny))
 	records := make([]StructuredJobRecord, 0, len(postingsAny))
 
@@ -562,6 +627,19 @@ func (s *ATSPreFetchSpec) formatWorkdayBoard(rawBody string, now time.Time) *ATS
 			!strings.Contains(rawExtPath, "..") &&
 			!reWorkdayBadPct.MatchString(rawExtPath) &&
 			reWorkdaySafeExtPath.MatchString(rawExtPath)
+		if isSafeExtPath {
+			segs := splitCleanPathSegments(rawExtPath)
+			if len(segs) == 0 {
+				isSafeExtPath = false
+			} else {
+				for _, seg := range segs {
+					if !isSafeWorkdayPathSegment(seg) {
+						isSafeExtPath = false
+						break
+					}
+				}
+			}
+		}
 		fullURL := "https://" + s.host + "/" + s.site
 		if isSafeExtPath {
 			if strings.HasPrefix(rawExtPath, "/") {
@@ -615,8 +693,8 @@ func (s *ATSPreFetchSpec) formatWorkdayBoard(rawBody string, now time.Time) *ATS
 		if postedAt != nil {
 			postedDisplay = *postedAt
 		}
-		meta := joinNonEmptySep(" · ", locTxt, postedDisplay, bullets)
-		mdSafeTitle := reMarkdownLinkChars.ReplaceAllString(pTitle, `\$1`)
+		meta := joinNonEmptySep(" · ", sanitizeATSMarkdownText(locTxt, 256), sanitizeATSMarkdownText(postedDisplay, 64), sanitizeATSMarkdownText(bullets, 256))
+		mdSafeTitle := sanitizeATSMarkdownText(pTitle, 512)
 		suffix := ""
 		if meta != "" {
 			suffix = " — " + meta
@@ -725,23 +803,25 @@ func (s *ATSPreFetchSpec) formatGreenhouseBoard(rawBody string) *ATSFormattedRes
 		jobsCount++
 		j, okJ := it.(map[string]any)
 		if idx < linkCap && okJ && j != nil {
-			jURL := "https://" + s.host + "/" + s.org + "/jobs/" + anyString(j["id"])
-			if abs, okA := j["absolute_url"].(string); okA && strings.HasPrefix(abs, "https://") {
-				jURL = abs
+			fallbackURL := "https://" + s.host + "/" + EncodeURIComponent(s.org) + "/jobs/" + EncodeURIComponent(anyString(j["id"]))
+			jURL := fallbackURL
+			if abs, okA := j["absolute_url"].(string); okA {
+				jURL = sanitizeATSHttpsURL(abs, fallbackURL)
 			}
 			links = append(links, jURL)
 		}
 		if idx < s.reqOffset || idx >= s.reqOffset+maxBoardRecords || !okJ || j == nil {
 			return
 		}
-		jTitle := strings.TrimSpace(anyString(j["title"]))
+		jTitle := SanitizeJobFieldPlain(anyString(j["title"]), 512)
 		if jTitle == "" {
 			return
 		}
 		ghLocs := extractGreenhouseLocations(j)
-		jURL := "https://" + s.host + "/" + s.org + "/jobs/" + anyString(j["id"])
-		if abs, okA := j["absolute_url"].(string); okA && strings.HasPrefix(abs, "https://") {
-			jURL = abs
+		fallbackURL := "https://" + s.host + "/" + EncodeURIComponent(s.org) + "/jobs/" + EncodeURIComponent(anyString(j["id"]))
+		jURL := fallbackURL
+		if abs, okA := j["absolute_url"].(string); okA {
+			jURL = sanitizeATSHttpsURL(abs, fallbackURL)
 		}
 		rawContent, _ := j["content"].(string)
 		plainPreview := ""
@@ -757,8 +837,10 @@ func (s *ATSPreFetchSpec) formatGreenhouseBoard(rawBody string) *ATSFormattedRes
 			postedAt = strPtr(fp)
 		}
 		companyName := s.org
-		if cn, okC := j["company_name"].(string); okC && strings.TrimSpace(cn) != "" {
-			companyName = strings.TrimSpace(cn)
+		if cn, okC := j["company_name"].(string); okC {
+			if cleanCN := SanitizeJobFieldPlain(cn, 256); cleanCN != "" {
+				companyName = cleanCN
+			}
 		}
 		snippet := ""
 		if plainPreview != "" {
@@ -786,12 +868,12 @@ func (s *ATSPreFetchSpec) formatGreenhouseBoard(rawBody string) *ATSFormattedRes
 			if pay != nil {
 				payMeta = FormatNormalizedPay(pay)
 			}
-			meta := joinNonEmptySep(" · ", locMeta, wpMeta, payMeta)
+			meta := joinNonEmptySep(" · ", sanitizeATSMarkdownText(locMeta, 256), wpMeta, sanitizeATSMarkdownText(payMeta, 120))
 			suffix := ""
 			if meta != "" {
 				suffix = " — " + meta
 			}
-			bulletLines = append(bulletLines, fmt.Sprintf("- **[%s](%s)**%s", jTitle, jURL, suffix))
+			bulletLines = append(bulletLines, fmt.Sprintf("- **[%s](%s)**%s", sanitizeATSMarkdownText(jTitle, 512), jURL, suffix))
 		}
 	})
 	if !ok {
@@ -846,10 +928,15 @@ func (s *ATSPreFetchSpec) formatGreenhouseJob(rawBody, origURL string, htmlToMD 
 	if !ok {
 		return nil
 	}
-	title := strings.TrimSpace(rawTitle)
+	title := SanitizeJobFieldPlain(rawTitle, 512)
+	if title == "" {
+		return nil
+	}
 	companyName := s.org
-	if cn, okC := data["company_name"].(string); okC && cn != "" {
-		companyName = cn
+	if cn, okC := data["company_name"].(string); okC {
+		if cleanCN := SanitizeJobFieldPlain(cn, 256); cleanCN != "" {
+			companyName = cleanCN
+		}
 	}
 	ghLocs := extractGreenhouseLocations(data)
 	loc := strings.Join(ghLocs, " ")
@@ -869,9 +956,9 @@ func (s *ATSPreFetchSpec) formatGreenhouseJob(rawBody, origURL string, htmlToMD 
 	} else if fp, okF := data["first_published"].(string); okF {
 		updatedAt = fp
 	}
-	absURL := origURL
-	if au, okA := data["absolute_url"].(string); okA && strings.HasPrefix(au, "http") {
-		absURL = au
+	absURL := sanitizeATSHttpsURL(origURL, origURL)
+	if au, okA := data["absolute_url"].(string); okA {
+		absURL = sanitizeATSHttpsURL(au, absURL)
 	}
 	wp := InferWorkplaceType(loc + " " + title + " " + sliceUTF16Max(bodyMD, 400))
 	var baseSal *NormalizedPay
@@ -891,11 +978,12 @@ func (s *ATSPreFetchSpec) formatGreenhouseJob(rawBody, origURL string, htmlToMD 
 		Source:             "greenhouse",
 	}
 	headerMD := FormatJobPostingHeaderMarkdown(*jp)
+	mdHeading := "# " + sanitizeATSMarkdownText(title, 512) + " @ " + sanitizeATSMarkdownText(companyName, 256)
 	return &ATSFormattedResult{
 		Title:         title + " @ " + companyName,
 		PublishedTime: updatedAt,
 		JobPosting:    jp,
-		Markdown:      joinNonEmptyBlocks("# "+title+" @ "+companyName, headerMD, bodyMD),
+		Markdown:      joinNonEmptyBlocks(mdHeading, headerMD, bodyMD),
 		Links:         []string{absURL},
 	}
 }

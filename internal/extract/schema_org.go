@@ -95,6 +95,7 @@ var (
 
 	disallowedHostSuffixesSchemaGo = []string{
 		".localhost",
+		".localhost.localdomain",
 		".local",
 		".internal",
 		".arpa",
@@ -114,6 +115,7 @@ var (
 
 	disallowedExactHostsSchemaGo = map[string]bool{
 		"localhost":                  true,
+		"localhost.localdomain":      true,
 		"nip.io":                     true,
 		"sslip.io":                   true,
 		"xip.io":                     true,
@@ -426,7 +428,14 @@ func SanitizeSchemaPlainField(raw any, maxLen int) string {
 		return ""
 	}
 	pre := StripInvisibleSchemaChars(str)
-	tagStripped := stripHTMLTagsQuoteAwareSchemaGo(pre, " ", maxHTMLScanBytesSchemaGo)
+	tagStripped := pre
+	for pass := 0; pass < 4 && strings.IndexByte(tagStripped, '<') >= 0 && strings.IndexByte(tagStripped, '>') >= 0; pass++ {
+		next := stripHTMLTagsQuoteAwareSchemaGo(tagStripped, " ", maxHTMLScanBytesSchemaGo)
+		if next == tagStripped {
+			break
+		}
+		tagStripped = next
+	}
 	decoded := tagStripped
 	if strings.IndexByte(tagStripped, '&') >= 0 {
 		decoded = decodeBasicEntitiesSchemaGo(tagStripped)
@@ -907,13 +916,18 @@ func extractPublisherNameSchemaGo(rawPub any) string {
 }
 
 func formatSafeMarkdownLinkSchemaGo(label, safeHTTPSURL string) string {
-	safeLabel := strings.ReplaceAll(label, `\`, `\\`)
-	safeLabel = strings.ReplaceAll(safeLabel, "[", `\[`)
-	safeLabel = strings.ReplaceAll(safeLabel, "]", `\]`)
+	safeLabel := escapeMarkdownLinkLabelGo(label)
 	if safeHTTPSURL == "" {
 		return safeLabel
 	}
-	escapedURL := PercentEncodeUnsafeRecordURLChars(safeHTTPSURL)
+	targetURL := safeHTTPSURL
+	if strings.IndexByte(targetURL, '&') >= 0 {
+		targetURL = decodeURIEntitiesLinearGo(targetURL)
+	}
+	if isDisallowedMarkdownLinkDestinationGo(targetURL) {
+		return "[" + safeLabel + "](#)"
+	}
+	escapedURL := PercentEncodeUnsafeRecordURLChars(targetURL)
 	return "[" + safeLabel + "](" + escapedURL + ")"
 }
 
@@ -987,7 +1001,7 @@ func extractFAQPageSchemaGo(obj map[string]any, baseURL string, htmlToMD func(fr
 			rec["url"] = safeURL
 		}
 		records = append(records, rec)
-		sections = append(sections, "## "+question+"\n\n"+answerMD)
+		sections = append(sections, "## "+escapeUnescapedMarkdownBracketsGo(question)+"\n\n"+answerMD)
 	}
 
 	if len(records) == 0 {
@@ -997,7 +1011,7 @@ func extractFAQPageSchemaGo(obj map[string]any, baseURL string, htmlToMD func(fr
 	description := SanitizeSchemaPlainField(obj["description"], 1_000)
 	var mdParts []string
 	if title != "" {
-		mdParts = append(mdParts, "# "+title)
+		mdParts = append(mdParts, "# "+escapeUnescapedMarkdownBracketsGo(title))
 	}
 	mdParts = append(mdParts, sections...)
 
@@ -1092,10 +1106,10 @@ func extractQAOrForumThreadSchemaGo(obj map[string]any, schemaType, baseURL stri
 			metaParts = append(metaParts, "**Reply**")
 		}
 		if author != "" {
-			metaParts = append(metaParts, "by "+author)
+			metaParts = append(metaParts, "by "+escapeUnescapedMarkdownBracketsGo(author))
 		}
 		if created != "" {
-			metaParts = append(metaParts, "("+created+")")
+			metaParts = append(metaParts, "("+escapeUnescapedMarkdownBracketsGo(created)+")")
 		}
 		if hasUpvotes {
 			metaParts = append(metaParts, fmt.Sprintf("· %v upvotes", rec["upvoteCount"]))
@@ -1140,16 +1154,16 @@ func extractQAOrForumThreadSchemaGo(obj map[string]any, schemaType, baseURL stri
 
 	var opMetaBits []string
 	if opAuthor != "" {
-		opMetaBits = append(opMetaBits, "**Author**: "+opAuthor)
+		opMetaBits = append(opMetaBits, "**Author**: "+escapeUnescapedMarkdownBracketsGo(opAuthor))
 	}
 	if publishedTime != "" {
-		opMetaBits = append(opMetaBits, "**Posted**: "+publishedTime)
+		opMetaBits = append(opMetaBits, "**Posted**: "+escapeUnescapedMarkdownBracketsGo(publishedTime))
 	}
 	opMeta := strings.Join(opMetaBits, " · ")
 
 	var mdParts []string
 	if title != "" {
-		mdParts = append(mdParts, "# "+title)
+		mdParts = append(mdParts, "# "+escapeUnescapedMarkdownBracketsGo(title))
 	}
 	if opMeta != "" {
 		mdParts = append(mdParts, opMeta)
@@ -1246,7 +1260,7 @@ func extractHowToSchemaGo(obj map[string]any, baseURL string, htmlToMD func(frag
 				"position": pos,
 				"text":     txt,
 			})
-			stepLines = append(stepLines, fmt.Sprintf("%d. %s", pos, txt))
+			stepLines = append(stepLines, fmt.Sprintf("%d. %s", pos, escapeUnescapedMarkdownBracketsGo(txt)))
 		case []any:
 			for _, sub := range st {
 				pushStep(sub)
@@ -1293,10 +1307,10 @@ func extractHowToSchemaGo(obj map[string]any, baseURL string, htmlToMD func(frag
 			stepRecords = append(stepRecords, rec)
 			body := stepBody
 			if body == "" {
-				body = stepPlain
+				body = escapeUnescapedMarkdownBracketsGo(stepPlain)
 			}
 			if stepName != "" && stepName != stepPlain {
-				stepLines = append(stepLines, fmt.Sprintf("%d. **%s** — %s", pos, stepName, strings.ReplaceAll(body, "\n", " ")))
+				stepLines = append(stepLines, fmt.Sprintf("%d. **%s** — %s", pos, escapeUnescapedMarkdownBracketsGo(stepName), strings.ReplaceAll(body, "\n", " ")))
 			} else {
 				stepLines = append(stepLines, fmt.Sprintf("%d. %s", pos, strings.ReplaceAll(body, "\n", " ")))
 			}
@@ -1324,15 +1338,15 @@ func extractHowToSchemaGo(obj map[string]any, baseURL string, htmlToMD func(frag
 	}
 	if totalTime != "" {
 		structured["totalTime"] = totalTime
-		bullets = append(bullets, "- **Total Time**: "+totalTime)
+		bullets = append(bullets, "- **Total Time**: "+escapeUnescapedMarkdownBracketsGo(totalTime))
 	}
 	if len(supplies) > 0 {
 		structured["supply"] = supplies
-		bullets = append(bullets, "- **Supplies**: "+strings.Join(supplies, ", "))
+		bullets = append(bullets, "- **Supplies**: "+escapeUnescapedMarkdownBracketsGo(strings.Join(supplies, ", ")))
 	}
 	if len(tools) > 0 {
 		structured["tool"] = tools
-		bullets = append(bullets, "- **Tools**: "+strings.Join(tools, ", "))
+		bullets = append(bullets, "- **Tools**: "+escapeUnescapedMarkdownBracketsGo(strings.Join(tools, ", ")))
 	}
 	if len(stepRecords) > 0 {
 		structured["stepCount"] = len(stepRecords)
@@ -1341,13 +1355,13 @@ func extractHowToSchemaGo(obj map[string]any, baseURL string, htmlToMD func(frag
 	headerMD := strings.Join(bullets, "\n")
 	var mdBlocks []string
 	if title != "" {
-		mdBlocks = append(mdBlocks, "# "+title)
+		mdBlocks = append(mdBlocks, "# "+escapeUnescapedMarkdownBracketsGo(title))
 	}
 	if headerMD != "" {
 		mdBlocks = append(mdBlocks, headerMD)
 	}
 	if description != "" {
-		mdBlocks = append(mdBlocks, description)
+		mdBlocks = append(mdBlocks, escapeDeclMarkdownBlock(description))
 	}
 	if len(stepLines) > 0 {
 		mdBlocks = append(mdBlocks, "## Steps\n\n"+strings.Join(stepLines, "\n"))
@@ -1485,10 +1499,10 @@ func extractItemListSchemaGo(obj map[string]any, schemaType, baseURL string) *Un
 		}
 		var detailBits []string
 		if priceStr != "" {
-			detailBits = append(detailBits, priceStr)
+			detailBits = append(detailBits, escapeUnescapedMarkdownBracketsGo(priceStr))
 		}
 		if desc != "" {
-			detailBits = append(detailBits, desc)
+			detailBits = append(detailBits, escapeUnescapedMarkdownBracketsGo(desc))
 		}
 		detailCell := "-"
 		if len(detailBits) > 0 {
@@ -1529,10 +1543,10 @@ func extractItemListSchemaGo(obj map[string]any, schemaType, baseURL string) *Un
 	tableMD := formatGFMTableSchemaGo(headers, compactRows)
 	var mdParts []string
 	if title != "" {
-		mdParts = append(mdParts, "# "+title)
+		mdParts = append(mdParts, "# "+escapeUnescapedMarkdownBracketsGo(title))
 	}
 	if description != "" {
-		mdParts = append(mdParts, description)
+		mdParts = append(mdParts, escapeDeclMarkdownBlock(description))
 	}
 	if tableMD != "" {
 		mdParts = append(mdParts, tableMD)
@@ -1579,16 +1593,16 @@ func extractArticleSchemaGo(obj map[string]any, schemaType, baseURL string, html
 
 	var metaBits []string
 	if author != "" {
-		metaBits = append(metaBits, "**Author**: "+author)
+		metaBits = append(metaBits, "**Author**: "+escapeUnescapedMarkdownBracketsGo(author))
 	}
 	if siteName != "" {
-		metaBits = append(metaBits, "**Publisher**: "+siteName)
+		metaBits = append(metaBits, "**Publisher**: "+escapeUnescapedMarkdownBracketsGo(siteName))
 	}
 	if publishedTime != "" {
-		metaBits = append(metaBits, "**Published**: "+publishedTime)
+		metaBits = append(metaBits, "**Published**: "+escapeUnescapedMarkdownBracketsGo(publishedTime))
 	}
 	if section != "" {
-		metaBits = append(metaBits, "**Section**: "+section)
+		metaBits = append(metaBits, "**Section**: "+escapeUnescapedMarkdownBracketsGo(section))
 	}
 	headerMD := strings.Join(metaBits, " · ")
 
@@ -1596,7 +1610,7 @@ func extractArticleSchemaGo(obj map[string]any, schemaType, baseURL string, html
 	if bodyWords >= 30 {
 		var parts []string
 		if title != "" {
-			parts = append(parts, "# "+title)
+			parts = append(parts, "# "+escapeUnescapedMarkdownBracketsGo(title))
 		}
 		if headerMD != "" {
 			parts = append(parts, headerMD)
@@ -1688,26 +1702,26 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		organizer := extractPublisherNameSchemaGo(obj["organizer"])
 		if startDate != "" {
 			structured["startDate"] = startDate
-			bullets = append(bullets, "- **Start**: "+startDate)
+			bullets = append(bullets, "- **Start**: "+escapeUnescapedMarkdownBracketsGo(startDate))
 		}
 		if endDate != "" {
 			structured["endDate"] = endDate
-			bullets = append(bullets, "- **End**: "+endDate)
+			bullets = append(bullets, "- **End**: "+escapeUnescapedMarkdownBracketsGo(endDate))
 		}
 		if locName != "" {
 			structured["location"] = locName
-			bullets = append(bullets, "- **Location**: "+locName)
+			bullets = append(bullets, "- **Location**: "+escapeUnescapedMarkdownBracketsGo(locName))
 		}
 		if attendance != "" {
 			structured["attendanceMode"] = attendance
-			bullets = append(bullets, "- **Mode**: "+attendance)
+			bullets = append(bullets, "- **Mode**: "+escapeUnescapedMarkdownBracketsGo(attendance))
 		}
 		if status != "" {
 			structured["eventStatus"] = status
 		}
 		if organizer != "" {
 			structured["organizer"] = organizer
-			bullets = append(bullets, "- **Organizer**: "+organizer)
+			bullets = append(bullets, "- **Organizer**: "+escapeUnescapedMarkdownBracketsGo(organizer))
 		}
 
 	case "software":
@@ -1722,23 +1736,23 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		}
 		if appCat != "" {
 			structured["applicationCategory"] = appCat
-			bullets = append(bullets, "- **Category**: "+appCat)
+			bullets = append(bullets, "- **Category**: "+escapeUnescapedMarkdownBracketsGo(appCat))
 		}
 		if osStr != "" {
 			structured["operatingSystem"] = osStr
-			bullets = append(bullets, "- **Operating System**: "+osStr)
+			bullets = append(bullets, "- **Operating System**: "+escapeUnescapedMarkdownBracketsGo(osStr))
 		}
 		if version != "" {
 			structured["softwareVersion"] = version
-			bullets = append(bullets, "- **Version**: "+version)
+			bullets = append(bullets, "- **Version**: "+escapeUnescapedMarkdownBracketsGo(version))
 		}
 		if ratingValue != "" {
 			structured["ratingValue"] = ratingValue
 			if ratingCount != "" {
 				structured["ratingCount"] = ratingCount
-				bullets = append(bullets, fmt.Sprintf("- **Rating**: %s (%s reviews)", ratingValue, ratingCount))
+				bullets = append(bullets, fmt.Sprintf("- **Rating**: %s (%s reviews)", escapeUnescapedMarkdownBracketsGo(ratingValue), escapeUnescapedMarkdownBracketsGo(ratingCount)))
 			} else {
-				bullets = append(bullets, "- **Rating**: "+ratingValue)
+				bullets = append(bullets, "- **Rating**: "+escapeUnescapedMarkdownBracketsGo(ratingValue))
 			}
 		}
 
@@ -1754,15 +1768,15 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		if creator != "" {
 			structured["creator"] = creator
 			author = creator
-			bullets = append(bullets, "- **Creator**: "+creator)
+			bullets = append(bullets, "- **Creator**: "+escapeUnescapedMarkdownBracketsGo(creator))
 		}
 		if license != "" {
 			structured["license"] = license
-			bullets = append(bullets, "- **License**: "+license)
+			bullets = append(bullets, "- **License**: "+escapeUnescapedMarkdownBracketsGo(license))
 		}
 		if temporal != "" {
 			structured["temporalCoverage"] = temporal
-			bullets = append(bullets, "- **Coverage**: "+temporal)
+			bullets = append(bullets, "- **Coverage**: "+escapeUnescapedMarkdownBracketsGo(temporal))
 		}
 		if identifier != "" {
 			structured["identifier"] = identifier
@@ -1802,11 +1816,11 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 			}
 			tStr := strings.Join(tBits, ", ")
 			structured["timing"] = tStr
-			bullets = append(bullets, "- **Time**: "+tStr)
+			bullets = append(bullets, "- **Time**: "+escapeUnescapedMarkdownBracketsGo(tStr))
 		}
 		if recipeYield != "" {
 			structured["recipeYield"] = recipeYield
-			bullets = append(bullets, "- **Yield**: "+recipeYield)
+			bullets = append(bullets, "- **Yield**: "+escapeUnescapedMarkdownBracketsGo(recipeYield))
 		}
 		if len(ingredients) > 0 {
 			structured["recipeIngredient"] = ingredients
@@ -1819,15 +1833,15 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		lang := SanitizeSchemaPlainField(obj["inLanguage"], 40)
 		if provider != "" {
 			structured["provider"] = provider
-			bullets = append(bullets, "- **Provider**: "+provider)
+			bullets = append(bullets, "- **Provider**: "+escapeUnescapedMarkdownBracketsGo(provider))
 		}
 		if courseCode != "" {
 			structured["courseCode"] = courseCode
-			bullets = append(bullets, "- **Course Code**: "+courseCode)
+			bullets = append(bullets, "- **Course Code**: "+escapeUnescapedMarkdownBracketsGo(courseCode))
 		}
 		if eduLevel != "" {
 			structured["educationalLevel"] = eduLevel
-			bullets = append(bullets, "- **Level**: "+eduLevel)
+			bullets = append(bullets, "- **Level**: "+escapeUnescapedMarkdownBracketsGo(eduLevel))
 		}
 		if lang != "" {
 			structured["inLanguage"] = lang
@@ -1841,16 +1855,16 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		if uploadDate != "" {
 			publishedTime = uploadDate
 			structured["uploadDate"] = uploadDate
-			bullets = append(bullets, "- **Uploaded**: "+uploadDate)
+			bullets = append(bullets, "- **Uploaded**: "+escapeUnescapedMarkdownBracketsGo(uploadDate))
 		}
 		if duration != "" {
 			structured["duration"] = duration
-			bullets = append(bullets, "- **Duration**: "+duration)
+			bullets = append(bullets, "- **Duration**: "+escapeUnescapedMarkdownBracketsGo(duration))
 		}
 		if creator != "" {
 			author = creator
 			structured["author"] = creator
-			bullets = append(bullets, "- **Creator**: "+creator)
+			bullets = append(bullets, "- **Creator**: "+escapeUnescapedMarkdownBracketsGo(creator))
 		}
 		if embedURL != "" {
 			structured["embedUrl"] = embedURL
@@ -1865,11 +1879,11 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		}
 		if addrStr != "" {
 			structured["address"] = addrStr
-			bullets = append(bullets, "- **Address**: "+addrStr)
+			bullets = append(bullets, "- **Address**: "+escapeUnescapedMarkdownBracketsGo(addrStr))
 		}
 		if tel != "" {
 			structured["telephone"] = tel
-			bullets = append(bullets, "- **Phone**: "+tel)
+			bullets = append(bullets, "- **Phone**: "+escapeUnescapedMarkdownBracketsGo(tel))
 		}
 		if priceRange != "" {
 			structured["priceRange"] = priceRange
@@ -1885,15 +1899,15 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 		}
 		if addrStr != "" {
 			structured["address"] = addrStr
-			bullets = append(bullets, "- **Address**: "+addrStr)
+			bullets = append(bullets, "- **Address**: "+escapeUnescapedMarkdownBracketsGo(addrStr))
 		}
 		if tel != "" {
 			structured["telephone"] = tel
-			bullets = append(bullets, "- **Phone**: "+tel)
+			bullets = append(bullets, "- **Phone**: "+escapeUnescapedMarkdownBracketsGo(tel))
 		}
 		if founding != "" {
 			structured["foundingDate"] = founding
-			bullets = append(bullets, "- **Founded**: "+founding)
+			bullets = append(bullets, "- **Founded**: "+escapeUnescapedMarkdownBracketsGo(founding))
 		}
 	}
 
@@ -1902,12 +1916,12 @@ func extractDomainEntitySchemaGo(obj map[string]any, schemaType, kind, baseURL s
 	}
 	headerMD := strings.Join(bullets, "\n")
 	var mdBlocks []string
-	mdBlocks = append(mdBlocks, "# "+title)
+	mdBlocks = append(mdBlocks, "# "+escapeUnescapedMarkdownBracketsGo(title))
 	if headerMD != "" {
 		mdBlocks = append(mdBlocks, headerMD)
 	}
 	if description != "" {
-		mdBlocks = append(mdBlocks, description)
+		mdBlocks = append(mdBlocks, escapeDeclMarkdownBlock(description))
 	}
 
 	return &UniversalSchemaOrgResult{

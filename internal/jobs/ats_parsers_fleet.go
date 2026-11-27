@@ -15,14 +15,16 @@ func extractLeverLocations(cats map[string]any) []string {
 	if allArr, ok := cats["allLocations"].([]any); ok {
 		out := make([]string, 0, len(allArr))
 		for _, x := range allArr {
-			if s := anyString(x); s != "" {
+			if s := SanitizeJobFieldPlain(anyString(x), 180); s != "" {
 				out = append(out, s)
 			}
 		}
 		return out
 	}
-	if loc, ok := cats["location"].(string); ok && loc != "" {
-		return []string{loc}
+	if loc, ok := cats["location"].(string); ok {
+		if clean := SanitizeJobFieldPlain(loc, 180); clean != "" {
+			return []string{clean}
+		}
 	}
 	return []string{}
 }
@@ -40,13 +42,14 @@ func (s *ATSPreFetchSpec) formatLeverBoard(rawBody string) *ATSFormattedResult {
 		if !okJ {
 			continue
 		}
-		jURL := "https://" + s.host + "/" + s.org + "/" + anyString(j["id"])
-		if hu, okH := j["hostedUrl"].(string); okH && strings.HasPrefix(hu, "https://") {
-			jURL = hu
+		fallbackURL := "https://" + s.host + "/" + EncodeURIComponent(s.org) + "/" + EncodeURIComponent(anyString(j["id"]))
+		jURL := fallbackURL
+		if hu, okH := j["hostedUrl"].(string); okH {
+			jURL = sanitizeATSHttpsURL(hu, fallbackURL)
 		}
 		links = append(links, jURL)
 	}
-	lines := []string{fmt.Sprintf("# %s — Lever Job Board (%d open roles)", s.org, total)}
+	lines := []string{fmt.Sprintf("# %s — Lever Job Board (%d open roles)", sanitizeATSMarkdownText(s.org, 256), total)}
 	const maxBoardRecords = 2_500
 	const maxMarkdownBullets = 120
 	start := min(s.reqOffset, total)
@@ -58,20 +61,21 @@ func (s *ATSPreFetchSpec) formatLeverBoard(rawBody string) *ATSFormattedResult {
 		if !okJ || j == nil {
 			continue
 		}
-		jTitle := strings.TrimSpace(anyString(j["text"]))
+		jTitle := SanitizeJobFieldPlain(anyString(j["text"]), 512)
 		if jTitle == "" {
 			continue
 		}
 		cats, _ := j["categories"].(map[string]any)
 		allLocs := extractLeverLocations(cats)
 		wp := InferWorkplaceType(anyString(j["workplaceType"]) + " " + strings.Join(allLocs, " "))
-		jURL := "https://" + s.host + "/" + s.org + "/" + anyString(j["id"])
-		if hu, okH := j["hostedUrl"].(string); okH && strings.HasPrefix(hu, "https://") {
-			jURL = hu
+		fallbackURL := "https://" + s.host + "/" + EncodeURIComponent(s.org) + "/" + EncodeURIComponent(anyString(j["id"]))
+		jURL := fallbackURL
+		if hu, okH := j["hostedUrl"].(string); okH {
+			jURL = sanitizeATSHttpsURL(hu, fallbackURL)
 		}
-		applyURL := jURL + "/apply"
-		if au, okA := j["applyUrl"].(string); okA && strings.HasPrefix(au, "https://") {
-			applyURL = au
+		applyURL := strings.TrimRight(jURL, "/") + "/apply"
+		if au, okA := j["applyUrl"].(string); okA {
+			applyURL = sanitizeATSHttpsURL(au, applyURL)
 		}
 		var createdISO *string
 		if cm, okC := j["createdAt"].(float64); okC && !math.IsNaN(cm) && !math.IsInf(cm, 0) {
@@ -108,12 +112,12 @@ func (s *ATSPreFetchSpec) formatLeverBoard(rawBody string) *ATSFormattedResult {
 			if pay != nil {
 				payMeta = FormatNormalizedPay(pay)
 			}
-			meta := joinNonEmptySep(" · ", firstLoc, wpMeta, payMeta)
+			meta := joinNonEmptySep(" · ", sanitizeATSMarkdownText(firstLoc, 180), wpMeta, sanitizeATSMarkdownText(payMeta, 120))
 			suffix := ""
 			if meta != "" {
 				suffix = " — " + meta
 			}
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", jTitle, jURL, suffix))
+			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", sanitizeATSMarkdownText(jTitle, 512), jURL, suffix))
 		}
 	}
 
@@ -151,12 +155,17 @@ func (s *ATSPreFetchSpec) formatLeverJob(rawBody, origURL string, htmlToMD HTMLT
 	if !ok {
 		return nil
 	}
-	title := strings.TrimSpace(rawText)
+	title := SanitizeJobFieldPlain(rawText, 512)
+	if title == "" {
+		return nil
+	}
 	cats, _ := data["categories"].(map[string]any)
 	allLocs := extractLeverLocations(cats)
 	commitment := ""
 	if cats != nil {
-		commitment, _ = cats["commitment"].(string)
+		if cmStr, okC := cats["commitment"].(string); okC {
+			commitment = SanitizeJobFieldPlain(cmStr, 80)
+		}
 	}
 	wp := InferWorkplaceType(anyString(data["workplaceType"]) + " " + strings.Join(allLocs, " "))
 
@@ -173,7 +182,7 @@ func (s *ATSPreFetchSpec) formatLeverJob(rawBody, origURL string, htmlToMD HTMLT
 			if !okM || lst == nil {
 				continue
 			}
-			lHead := strings.TrimSpace(anyString(lst["text"]))
+			lHead := sanitizeATSMarkdownText(anyString(lst["text"]), 256)
 			lContent := ""
 			if lc, okC := lst["content"].(string); okC {
 				md, _ := htmlToMD("<ul>"+lc+"</ul>", origURL)
@@ -201,9 +210,9 @@ func (s *ATSPreFetchSpec) formatLeverJob(rawBody, origURL string, htmlToMD HTMLT
 	if cm, okC := data["createdAt"].(float64); okC && !math.IsNaN(cm) && !math.IsInf(cm, 0) {
 		createdISO = time.UnixMilli(int64(cm)).UTC().Format("2006-01-02T15:04:05.000Z")
 	}
-	applyURL := strings.TrimRight(origURL, "/") + "/apply"
-	if au, okU := data["applyUrl"].(string); okU && strings.HasPrefix(au, "http") {
-		applyURL = au
+	applyURL := sanitizeATSHttpsURL(strings.TrimRight(origURL, "/")+"/apply", origURL)
+	if au, okU := data["applyUrl"].(string); okU {
+		applyURL = sanitizeATSHttpsURL(au, applyURL)
 	}
 	var baseSal *NormalizedPay
 	if pay != nil && pay.Basis == PayBasisBase {
@@ -223,11 +232,12 @@ func (s *ATSPreFetchSpec) formatLeverJob(rawBody, origURL string, htmlToMD HTMLT
 		Source:             "lever",
 	}
 	headerMD := FormatJobPostingHeaderMarkdown(*jp)
+	mdHeading := "# " + sanitizeATSMarkdownText(title, 512) + " @ " + sanitizeATSMarkdownText(s.org, 256)
 	return &ATSFormattedResult{
 		Title:         title + " @ " + s.org,
 		PublishedTime: createdISO,
 		JobPosting:    jp,
-		Markdown:      joinNonEmptyBlocks("# "+title+" @ "+s.org, headerMD, bodyMD),
+		Markdown:      joinNonEmptyBlocks(mdHeading, headerMD, bodyMD),
 		Links:         []string{applyURL},
 	}
 }
@@ -242,8 +252,10 @@ func (s *ATSPreFetchSpec) formatWorkableBoard(rawBody string) *ATSFormattedResul
 		return nil
 	}
 	orgName := s.org
-	if nm, okN := data["name"].(string); okN && strings.TrimSpace(nm) != "" {
-		orgName = strings.TrimSpace(nm)
+	if nm, okN := data["name"].(string); okN {
+		if cleanOrg := SanitizeJobFieldPlain(nm, 256); cleanOrg != "" {
+			orgName = cleanOrg
+		}
 	}
 	var order []string
 	merged := make(map[string]*StructuredJobRecord)
@@ -254,14 +266,16 @@ func (s *ATSPreFetchSpec) formatWorkableBoard(rawBody string) *ATSFormattedResul
 			continue
 		}
 		code := strings.TrimSpace(anyString(j["shortcode"]))
-		jTitle := strings.TrimSpace(anyString(j["title"]))
+		jTitle := SanitizeJobFieldPlain(anyString(j["title"]), 512)
 		if code == "" || jTitle == "" {
 			continue
 		}
 		var locParts []string
 		for _, k := range []string{"city", "state", "country"} {
-			if sv, okS := j[k].(string); okS && sv != "" {
-				locParts = append(locParts, sv)
+			if sv, okS := j[k].(string); okS {
+				if cleanPart := SanitizeJobFieldPlain(sv, 120); cleanPart != "" {
+					locParts = append(locParts, cleanPart)
+				}
 			}
 		}
 		loc := strings.Join(locParts, ", ")
@@ -272,9 +286,10 @@ func (s *ATSPreFetchSpec) formatWorkableBoard(rawBody string) *ATSFormattedResul
 		if !isRemote {
 			wp = InferWorkplaceType(wpTypeStr + " " + loc)
 		}
-		jURL := "https://apply.workable.com/" + s.org + "/j/" + code + "/"
-		if uStr, okU := j["url"].(string); okU && strings.HasPrefix(uStr, "https://") {
-			jURL = uStr
+		fallbackURL := "https://apply.workable.com/" + EncodeURIComponent(s.org) + "/j/" + EncodeURIComponent(code) + "/"
+		jURL := fallbackURL
+		if uStr, okU := j["url"].(string); okU {
+			jURL = sanitizeATSHttpsURL(uStr, fallbackURL)
 		}
 		if existing, exists := merged[code]; exists {
 			if loc != "" && !containsString(existing.Locations, loc) {
@@ -311,7 +326,7 @@ func (s *ATSPreFetchSpec) formatWorkableBoard(rawBody string) *ATSFormattedResul
 
 	records := make([]StructuredJobRecord, 0, len(order))
 	links := make([]string, 0, len(order))
-	lines := []string{fmt.Sprintf("# %s — Workable Job Board (%d open roles)", orgName, len(order))}
+	lines := []string{fmt.Sprintf("# %s — Workable Job Board (%d open roles)", sanitizeATSMarkdownText(orgName, 256), len(order))}
 	for _, code := range order {
 		r := *merged[code]
 		records = append(records, r)
@@ -320,12 +335,12 @@ func (s *ATSPreFetchSpec) formatWorkableBoard(rawBody string) *ATSFormattedResul
 		if r.WorkplaceType != WorkplaceUnknown {
 			wpMeta = string(r.WorkplaceType)
 		}
-		meta := joinNonEmptySep(" · ", strings.Join(r.Locations, "; "), wpMeta)
+		meta := joinNonEmptySep(" · ", sanitizeATSMarkdownText(strings.Join(r.Locations, "; "), 256), wpMeta)
 		suffix := ""
 		if meta != "" {
 			suffix = " — " + meta
 		}
-		lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", r.Title, r.URL, suffix))
+		lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", sanitizeATSMarkdownText(r.Title, 512), r.URL, suffix))
 	}
 	return &ATSFormattedResult{
 		Title:    fmt.Sprintf("%s Jobs (%d)", orgName, len(records)),
@@ -344,13 +359,18 @@ func (s *ATSPreFetchSpec) formatWorkableJob(rawBody, origURL string, htmlToMD HT
 	if !ok {
 		return nil
 	}
-	title := strings.TrimSpace(rawTitle)
+	title := SanitizeJobFieldPlain(rawTitle, 512)
+	if title == "" {
+		return nil
+	}
 	locObj, _ := data["location"].(map[string]any)
 	var locParts []string
 	if locObj != nil {
 		for _, k := range []string{"city", "region", "country"} {
-			if sv, okS := locObj[k].(string); okS && sv != "" {
-				locParts = append(locParts, sv)
+			if sv, okS := locObj[k].(string); okS {
+				if cleanPart := SanitizeJobFieldPlain(sv, 120); cleanPart != "" {
+					locParts = append(locParts, cleanPart)
+				}
 			}
 		}
 	}
@@ -425,11 +445,12 @@ func (s *ATSPreFetchSpec) formatWorkableJob(rawBody, origURL string, htmlToMD HT
 		Source:             "workable",
 	}
 	headerMD := FormatJobPostingHeaderMarkdown(*jp)
+	mdHeading := "# " + sanitizeATSMarkdownText(title, 512) + " @ " + sanitizeATSMarkdownText(s.org, 256)
 	return &ATSFormattedResult{
 		Title:         title + " @ " + s.org,
 		PublishedTime: published,
 		JobPosting:    jp,
-		Markdown:      joinNonEmptyBlocks("# "+title+" @ "+s.org, headerMD, bodyMD),
+		Markdown:      joinNonEmptyBlocks(mdHeading, headerMD, bodyMD),
 		Links:         []string{applyURL},
 	}
 }
@@ -442,24 +463,25 @@ func (s *ATSPreFetchSpec) formatGemBoard(rawBody string) *ATSFormattedResult {
 	capPosts := min(len(posts), 2_500)
 	records := make([]StructuredJobRecord, 0, capPosts)
 	links := make([]string, 0, capPosts)
-	lines := []string{fmt.Sprintf("# %s — Gem Job Board (%d open roles)", s.org, len(posts))}
+	lines := []string{fmt.Sprintf("# %s — Gem Job Board (%d open roles)", sanitizeATSMarkdownText(s.org, 256), len(posts))}
 	for _, it := range posts[:capPosts] {
 		p, okP := it.(map[string]any)
 		if !okP || p == nil {
 			continue
 		}
-		pTitle := strings.TrimSpace(anyString(p["title"]))
+		pTitle := SanitizeJobFieldPlain(anyString(p["title"]), 512)
 		if pTitle == "" {
 			continue
 		}
 		loc := ""
 		if locObj, okL := p["location"].(map[string]any); okL && locObj != nil {
-			loc = strings.TrimSpace(anyString(locObj["name"]))
+			loc = SanitizeJobFieldPlain(anyString(locObj["name"]), 180)
 		}
 		wp := InferWorkplaceType(anyString(p["location_type"]) + " " + loc)
-		pURL := "https://jobs.gem.com/" + s.org + "/" + anyString(p["id"])
-		if au, okA := p["absolute_url"].(string); okA && strings.HasPrefix(au, "https://") {
-			pURL = au
+		fallbackURL := "https://jobs.gem.com/" + EncodeURIComponent(s.org) + "/" + EncodeURIComponent(anyString(p["id"]))
+		pURL := fallbackURL
+		if au, okA := p["absolute_url"].(string); okA {
+			pURL = sanitizeATSHttpsURL(au, fallbackURL)
 		}
 		locs := []string{}
 		if loc != "" {
@@ -484,9 +506,9 @@ func (s *ATSPreFetchSpec) formatGemBoard(rawBody string) *ATSFormattedResult {
 		if len(lines)-1 < 120 {
 			suffix := ""
 			if loc != "" {
-				suffix = " — " + loc
+				suffix = " — " + sanitizeATSMarkdownText(loc, 180)
 			}
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", pTitle, pURL, suffix))
+			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", sanitizeATSMarkdownText(pTitle, 512), pURL, suffix))
 		}
 	}
 	return &ATSFormattedResult{
@@ -520,16 +542,18 @@ func (s *ATSPreFetchSpec) formatRipplingBoard(rawBody string) *ATSFormattedResul
 			continue
 		}
 		uuid := strings.TrimSpace(firstNonEmpty(anyString(item["uuid"]), anyString(item["id"])))
-		jTitle := strings.TrimSpace(firstNonEmpty(anyString(item["name"]), anyString(item["title"])))
+		jTitle := SanitizeJobFieldPlain(firstNonEmpty(anyString(item["name"]), anyString(item["title"])), 512)
 		if uuid == "" || jTitle == "" {
 			continue
 		}
 		locLabel := ""
 		switch wl := item["workLocation"].(type) {
 		case string:
-			locLabel = wl
+			locLabel = SanitizeJobFieldPlain(wl, 180)
 		case map[string]any:
-			locLabel, _ = wl["label"].(string)
+			if lbl, okL := wl["label"].(string); okL {
+				locLabel = SanitizeJobFieldPlain(lbl, 180)
+			}
 		}
 		if locLabel == "" {
 			if wlArr, okA := item["workLocations"].([]any); okA {
@@ -537,21 +561,24 @@ func (s *ATSPreFetchSpec) formatRipplingBoard(rawBody string) *ATSFormattedResul
 				for _, w := range wlArr {
 					switch wv := w.(type) {
 					case string:
-						if wv != "" {
-							parts = append(parts, wv)
+						if cleanW := SanitizeJobFieldPlain(wv, 180); cleanW != "" {
+							parts = append(parts, cleanW)
 						}
 					case map[string]any:
-						if lbl, okL := wv["label"].(string); okL && lbl != "" {
-							parts = append(parts, lbl)
+						if lbl, okL := wv["label"].(string); okL {
+							if cleanL := SanitizeJobFieldPlain(lbl, 180); cleanL != "" {
+								parts = append(parts, cleanL)
+							}
 						}
 					}
 				}
 				locLabel = strings.Join(parts, "; ")
 			}
 		}
-		jURL := "https://ats.rippling.com/" + s.org + "/jobs/" + uuid
-		if uStr, okU := item["url"].(string); okU && strings.HasPrefix(uStr, "https://") {
-			jURL = uStr
+		fallbackURL := "https://ats.rippling.com/" + EncodeURIComponent(s.org) + "/jobs/" + EncodeURIComponent(uuid)
+		jURL := fallbackURL
+		if uStr, okU := item["url"].(string); okU {
+			jURL = sanitizeATSHttpsURL(uStr, fallbackURL)
 		}
 		var createdAt *string
 		if co, okC := item["createdOn"].(string); okC {
@@ -589,7 +616,7 @@ func (s *ATSPreFetchSpec) formatRipplingBoard(rawBody string) *ATSFormattedResul
 
 	records := make([]StructuredJobRecord, 0, len(order))
 	links := make([]string, 0, len(order))
-	lines := []string{fmt.Sprintf("# %s — Rippling Job Board (%d open roles)", s.org, len(order))}
+	lines := []string{fmt.Sprintf("# %s — Rippling Job Board (%d open roles)", sanitizeATSMarkdownText(s.org, 256), len(order))}
 	for idx, uuid := range order {
 		r := *byUUID[uuid]
 		records = append(records, r)
@@ -597,9 +624,9 @@ func (s *ATSPreFetchSpec) formatRipplingBoard(rawBody string) *ATSFormattedResul
 		if idx < 120 {
 			suffix := ""
 			if len(r.Locations) > 0 {
-				suffix = " — " + strings.Join(r.Locations, "; ")
+				suffix = " — " + sanitizeATSMarkdownText(strings.Join(r.Locations, "; "), 256)
 			}
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", r.Title, r.URL, suffix))
+			lines = append(lines, fmt.Sprintf("- **[%s](%s)**%s", sanitizeATSMarkdownText(r.Title, 512), r.URL, suffix))
 		}
 	}
 	return &ATSFormattedResult{
@@ -633,23 +660,27 @@ func (s *ATSPreFetchSpec) formatRipplingJob(rawBody, origURL string, htmlToMD HT
 	if data == nil {
 		return nil
 	}
-	title := strings.TrimSpace(firstNonEmpty(anyString(data["name"]), anyString(data["title"])))
+	title := SanitizeJobFieldPlain(firstNonEmpty(anyString(data["name"]), anyString(data["title"])), 512)
 	if title == "" {
 		return nil
 	}
 	companyName := s.org
-	if cn, okC := data["companyName"].(string); okC && strings.TrimSpace(cn) != "" {
-		companyName = strings.TrimSpace(cn)
+	if cn, okC := data["companyName"].(string); okC {
+		if cleanCN := SanitizeJobFieldPlain(cn, 256); cleanCN != "" {
+			companyName = cleanCN
+		}
 	}
 	var locs []string
 	switch wl := data["workLocation"].(type) {
 	case string:
-		if strings.TrimSpace(wl) != "" {
-			locs = append(locs, strings.TrimSpace(wl))
+		if cleanW := SanitizeJobFieldPlain(wl, 180); cleanW != "" {
+			locs = append(locs, cleanW)
 		}
 	case map[string]any:
-		if lbl, okL := wl["label"].(string); okL && strings.TrimSpace(lbl) != "" {
-			locs = append(locs, strings.TrimSpace(lbl))
+		if lbl, okL := wl["label"].(string); okL {
+			if cleanL := SanitizeJobFieldPlain(lbl, 180); cleanL != "" {
+				locs = append(locs, cleanL)
+			}
 		}
 	}
 	if wlArr, okA := data["workLocations"].([]any); okA {
@@ -657,10 +688,10 @@ func (s *ATSPreFetchSpec) formatRipplingJob(rawBody, origURL string, htmlToMD HT
 			lbl := ""
 			switch wv := w.(type) {
 			case string:
-				lbl = strings.TrimSpace(wv)
+				lbl = SanitizeJobFieldPlain(wv, 180)
 			case map[string]any:
 				if l, okL := wv["label"].(string); okL {
-					lbl = strings.TrimSpace(l)
+					lbl = SanitizeJobFieldPlain(l, 180)
 				}
 			}
 			if lbl != "" && !containsString(locs, lbl) {
@@ -696,9 +727,9 @@ func (s *ATSPreFetchSpec) formatRipplingJob(rawBody, origURL string, htmlToMD HT
 	} else if pa, okP := data["publishedAt"].(string); okP {
 		postedAt = pa
 	}
-	jobURL := origURL
-	if uStr, okU := data["url"].(string); okU && strings.HasPrefix(uStr, "https://") {
-		jobURL = uStr
+	jobURL := sanitizeATSHttpsURL(origURL, origURL)
+	if uStr, okU := data["url"].(string); okU {
+		jobURL = sanitizeATSHttpsURL(uStr, jobURL)
 	}
 	var baseSal *NormalizedPay
 	if pay != nil && pay.Basis == PayBasisBase {
@@ -717,11 +748,12 @@ func (s *ATSPreFetchSpec) formatRipplingJob(rawBody, origURL string, htmlToMD HT
 		Source:             "rippling",
 	}
 	headerMD := FormatJobPostingHeaderMarkdown(*jp)
+	mdHeading := "# " + sanitizeATSMarkdownText(title, 512) + " @ " + sanitizeATSMarkdownText(companyName, 256)
 	return &ATSFormattedResult{
 		Title:         title + " @ " + companyName,
 		PublishedTime: postedAt,
 		JobPosting:    jp,
-		Markdown:      joinNonEmptyBlocks("# "+title+" @ "+companyName, headerMD, bodyMD),
+		Markdown:      joinNonEmptyBlocks(mdHeading, headerMD, bodyMD),
 		Links:         []string{jobURL},
 	}
 }

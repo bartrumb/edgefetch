@@ -1,0 +1,11 @@
+{
+  "adapterId": "sfcc-demandware",
+  "mode": "html",
+  "inputUrl": "https://www.demandware.com/product/sample",
+  "mockPayload": "<!doctype html><html><head><link rel=\"stylesheet\" href=\"/on/demandware.static/Sites-Demo-Site/-/en_US/v1/global.css\" /></head><body><h1 class=\"product-name\" data-pid=\"FX-3-DISC\">FX 3 Disc</h1><table class=\"geometry-table\"><tr><th>Size</th><th>Stack (mm)</th><th>Reach (mm)</th></tr><tr><td>M</td><td>568</td><td>394</td></tr></table></body></html>",
+  "expectMarkdownIncludes": [
+    "FX 3 Disc",
+    "568",
+    "394"
+  ]
+}

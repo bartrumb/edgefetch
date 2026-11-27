@@ -52,9 +52,18 @@ routes:
           - developer
           - developers
           - login
-      exactSegments: false
-      pathSegments:
-        - jobs
+      anyOf:
+        - exactSegments: true
+          pathSegments:
+            - jobs
+        - exactSegments: true
+          pathSegments:
+            - jobs
+            - intro
+        - exactSegments: true
+          pathSegments:
+            - jobs
+            - search
     twin:
       id: icims
       fetchUrl: "{requestUrl}"
@@ -66,6 +75,30 @@ routes:
         newPath: /jobs/search
       defaultQueryParams:
         ss: "1"
+      setQueryParams:
+        in_iframe: "1"
+      kind: text
+      accept: text/html
+    extract:
+      icimsPortal: true
+  - match:
+      hostSubdomain:
+        suffix: .icims.com
+        param: org
+        reserved:
+          - www
+          - status
+          - support
+          - community
+          - developer
+          - developers
+          - login
+      exactSegments: false
+      pathSegments:
+        - jobs
+    twin:
+      id: icims
+      fetchUrl: "{requestUrl}"
       setQueryParams:
         in_iframe: "1"
       kind: text

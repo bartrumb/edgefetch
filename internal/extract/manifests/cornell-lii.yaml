@@ -1,0 +1,57 @@
+# Shared Go + TypeScript Declarative Site Adapter: Cornell Law School Legal Information Institute (LII)
+id: cornell-lii
+name: Cornell Law LII (CFR & US Code)
+category: public-records
+description: "Extracts clean statutory and CFR regulatory text from www.law.cornell.edu/cfr/* and /uscode/* while stripping navigation and donation sidebars."
+domains:
+  - www.law.cornell.edu
+  - law.cornell.edu
+exampleUrls:
+  - "https://www.law.cornell.edu/cfr/text/16/part-1512"
+  - "https://www.law.cornell.edu/uscode/text/15/2051"
+
+htmlRoutes:
+  - id: cornell-lii
+    mode: dom
+    match:
+      anyOf:
+        - exactSegments: false
+          pathSegments:
+            - cfr
+            - param: rest
+              charset: safe_subpath
+              greedy: true
+              minLen: 1
+              maxLen: 200
+        - exactSegments: false
+          pathSegments:
+            - uscode
+            - param: rest
+              charset: safe_subpath
+              greedy: true
+              minLen: 1
+              maxLen: 200
+    vars:
+      title:
+        cssText:
+          - "#page-title"
+          - "main#content h1"
+          - "#content h1"
+          - h1
+          - title
+        trim: true
+      body:
+        cssHtmlToMd:
+          - "#content .tab-pane.active"
+          - "main#content"
+          - "#content"
+          - main
+          - article
+        format: strip_leading_h1
+        trim: true
+    requireVars:
+      - title
+      - body
+    titleTemplate: "{title}"
+    bodyVar: body
+    preserveBodyLinksFromVar: body

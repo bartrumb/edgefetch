@@ -1,0 +1,13 @@
+{
+  "adapterId": "terraform-registry",
+  "mode": "twin",
+  "inputUrl": "https://registry.terraform.io/providers/hashicorp/random/3.8.1",
+  "expectedFetchUrl": "https://registry.terraform.io/v1/providers/hashicorp/random/3.8.1",
+  "mockPayload": "{\"namespace\":\"hashicorp\",\"name\":\"random\",\"version\":\"3.8.1\",\"tier\":\"official\",\"downloads\":250000000,\"published_at\":\"2025-11-01T00:00:00Z\",\"description\":\"Terraform Random Provider\",\"source\":\"https://github.com/hashicorp/terraform-provider-random\",\"versions\":[\"3.8.0\",\"3.8.1\"],\"docs\":[{\"title\":\"random_id\",\"category\":\"resources\",\"language\":\"hcl\",\"path\":\"docs/resources/id.md\"}]}",
+  "expectTitleIncludes": "hashicorp/random v3.8.1 (Terraform Provider)",
+  "expectMarkdownIncludes": [
+    "250,000,000",
+    "random_id",
+    "docs/resources/id.md"
+  ]
+}

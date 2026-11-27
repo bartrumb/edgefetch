@@ -1,0 +1,96 @@
+# Shared Go + TypeScript Declarative Site Adapter: UKG Pro, Paylocity & Dover ATS (Robots-Strict)
+id: ukg-paylocity-dover
+name: UKG Pro, Paylocity & Dover Job Boards
+category: jobs
+description: "Extracts structured open roles from Paylocity (/recruiting/api/feed/jobs & window.pageData), UKG Pro (*/JobBoard/* only, never / or */JobBoardView), and Dover HTML/SSR __NEXT_DATA__ (never /api/)."
+domains:
+  - recruiting.ultipro.com
+  - recruiting.paylocity.com
+  - app.dover.com
+  - jobs.dover.com
+exampleUrls:
+  - "https://recruiting.ultipro.com/ACM1001/JobBoard/11111111-2222-3333-4444-555555555555/"
+  - "https://recruiting.paylocity.com/Recruiting/Jobs/All/aaaa-bbbb-cccc"
+  - "https://app.dover.com/jobs/acme"
+
+routes:
+  # Paylocity public JSON feed upgrade from HTML board /Recruiting/Jobs/All/<guid>
+  - match:
+      hosts:
+        - recruiting.paylocity.com
+      pathPrefix: /recruiting/jobs/all/
+      scanSegment:
+        afterLiteral: all
+        param: guid
+        charset: slug
+        minLen: 4
+        maxLen: 80
+    twin:
+      fetchUrl: "https://recruiting.paylocity.com/recruiting/api/feed/jobs/{guid}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      jsonMode: paylocity_feed
+
+  # Direct Paylocity JSON feed URL
+  - match:
+      hosts:
+        - recruiting.paylocity.com
+      pathPrefix: /recruiting/api/feed/jobs/
+      scanSegment:
+        afterLiteral: jobs
+        param: guid
+        charset: slug
+        minLen: 4
+        maxLen: 80
+    twin:
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      jsonMode: paylocity_feed
+
+htmlRoutes:
+  # UKG Pro: strictly */JobBoard/* (robots.txt Disallow: / & Disallow: */JobBoardView)
+  - id: ukg-paylocity-dover
+    mode: ukg_pro_html
+    match:
+      hosts:
+        - recruiting.ultipro.com
+      pathContainsSegment: JobBoard
+      minSegments: 3
+
+  # Paylocity HTML fallback (e.g., when feed returns 404; window.pageData or HTML)
+  - id: ukg-paylocity-dover
+    mode: paylocity_html
+    match:
+      hosts:
+        - recruiting.paylocity.com
+      pathPrefix: /recruiting/jobs/
+
+  # Dover SSR HTML (__NEXT_DATA__) — strictly HTML, never /api/
+  - id: ukg-paylocity-dover
+    mode: dover_html
+    match:
+      anyOf:
+        - hosts:
+            - app.dover.com
+          exactSegments: false
+          pathSegments:
+            - jobs
+            - param: org
+              charset: slug
+              minLen: 1
+              maxLen: 120
+        - hosts:
+            - jobs.dover.com
+          minSegments: 1
+          reservedFirstSegment:
+            - api
+            - apply
+            - static
+            - assets
+            - _next
+            - login

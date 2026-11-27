@@ -315,6 +315,22 @@ export function resolveSiteExtractorTwin(urlStr: string): SiteExtractorTwin | nu
 /**
  * Applies platform-specific post-fetch DOM or Markdown extraction when `baseUrl` matches a registered adapter.
  */
+/**
+ * True when a site adapter that parses fetched HTML (`extractHtml`) is registered for `urlStr`'s host. The scrape then
+ * asks for HTML instead of origin Markdown: sites that answer `Accept: text/markdown` (fccid.io, BigCommerce storefronts)
+ * otherwise return Markdown that the DOM adapter cannot parse, so the adapter silently never runs.
+ */
+export function hasHtmlSiteAdapterForHost(urlStr: string): boolean {
+  let host: string;
+  try {
+    host = new URL(urlStr).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  // Universal engines (content-detected platforms) are candidates for every host; only host-specific adapters count.
+  return DEFAULT_INDEX.candidatesForHost(host).some((a) => !a.universalEngine && typeof a.extractHtml === 'function');
+}
+
 export function applyPostFetchSiteExtractor(
   rawHtml: string,
   baseUrl: string | undefined,

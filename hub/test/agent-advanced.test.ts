@@ -65,6 +65,11 @@ import {
   parseX402PaymentTerms,
   resolveAtsPreFetchSpec,
   salvageAshbyBoardFromTruncatedJson,
+  JOBS_BROAD_CHUNK_URLS,
+  JOBS_WALL_BUDGET_MS,
+  decodeJobsContinuation,
+  encodeJobsContinuation,
+  resetJobsCacheForTests,
 } from '../src/jobs';
 import {
   cancelBatchScrape,
@@ -5698,5 +5703,110 @@ test('R13: search keeps the provider trailing slash for fetching while deduping 
   assert.equal(results[0]!.url, 'https://docs.example.com/do/limits/', 'result returns the provider URL that serves the page');
   assert.deepEqual(fetched, ['https://docs.example.com/do/limits/'], 'enrichment fetches the slash URL (no redirect hop)');
   assert.equal(typeof results[0]!.rawContent, 'string');
+});
+
+test('R17: jobs returns partial results inside its wall-clock budget instead of timing out, and only blames keys when no provider exists', async () => {
+  resetJobsCacheForTests();
+  assert.equal(JOBS_WALL_BUDGET_MS, 40_000, 'stays under the 60 s MCP client timeout with margin');
+  const boards = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'].map((co) => `https://boards.greenhouse.io/${co}/jobs/${co.length}000`);
+  const searchHits = async () => ({
+    status: 200,
+    body: { ok: true, results: boards.map((url, i) => ({ url, title: `Solutions Engineer ${i}`, content: 'Solutions Engineer remote' })) },
+  });
+  let scrapes = 0;
+  const slowScrape = async (args: Record<string, unknown>) => {
+    scrapes++;
+    await new Promise((r) => setTimeout(r, 1_500));
+    return { status: 200, body: { ok: true, url: String(args.url), jobs: [], records: [] } };
+  };
+
+  // A. Broad search whose board scrapes outlast the budget: returns near the budget, flagged and explained.
+  const t0 = Date.now();
+  const partial = await executeJobsCall({
+    payload: { query: 'Solutions Engineer', remote: true, includeBuiltIn: false, limit: 5 },
+    env: { SERPER_API_KEY: 'k' } as never,
+    executeSearch: searchHits,
+    executeScrape: slowScrape,
+    wallBudgetMs: 1_000,
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(partial.status, 200);
+  assert.ok(elapsed < 3_500, `returned in ${elapsed} ms (budget 1 000 ms + in-flight cap), not after every board scrape`);
+  assert.ok(scrapes < boards.length + 1, `stopped starting scrapes after the budget (${scrapes} started)`);
+  assert.equal(partial.body.timeBudgetExhausted, true);
+  const notesA = (partial.body.notes as string[] | undefined) ?? [];
+  assert.ok(notesA.some((n) => /Time budget \(1 s\)/.test(n)), `notes: ${JSON.stringify(notesA)}`);
+  assert.ok(!notesA.some((n) => /SERPER_API_KEY/.test(n)), 'never blames missing keys when a key is configured');
+
+  // B. Provider configured but the search matched nothing: says so, no key blame.
+  resetJobsCacheForTests();
+  const empty = await executeJobsCall({
+    payload: { query: 'Underwater Basket Weaving Lead', includeBuiltIn: false },
+    env: { SERPER_API_KEY: 'k' } as never,
+    executeSearch: async () => ({ status: 200, body: { ok: true, results: [] } }),
+    executeScrape: slowScrape,
+  });
+  const notesB = (empty.body.notes as string[] | undefined) ?? [];
+  assert.ok(notesB.some((n) => /matched no ATS boards/.test(n)), `notes: ${JSON.stringify(notesB)}`);
+  assert.ok(!notesB.some((n) => /SERPER_API_KEY/.test(n)));
+  assert.equal(empty.body.timeBudgetExhausted, undefined);
+
+  // C. No provider configured at all: the configuration hint is still given.
+  resetJobsCacheForTests();
+  const noProvider = await executeJobsCall({
+    payload: { query: 'Solutions Engineer', includeBuiltIn: false },
+    env: {} as never,
+    executeSearch: async () => ({ status: 200, body: { ok: true, results: [] } }),
+    executeScrape: slowScrape,
+  });
+  const notesC = (noProvider.body.notes as string[] | undefined) ?? [];
+  assert.ok(notesC.some((n) => /no search provider is configured/.test(n) && /SERPER_API_KEY/.test(n)), `notes: ${JSON.stringify(notesC)}`);
+});
+
+test('R18: broad jobs searches return results in chunks with a continueCursor that resumes without a new web search', async () => {
+  resetJobsCacheForTests();
+  const cos = Array.from({ length: 10 }, (_, i) => `company${i}`);
+  const postings = cos.map((co, i) => `https://boards.greenhouse.io/${co}/jobs/${1000 + i}`);
+  let searchCalls = 0;
+  const executeSearch = async () => {
+    searchCalls++;
+    return { status: 200, body: { ok: true, results: postings.map((url, i) => ({ url, title: `Solutions Engineer ${i}`, content: 'Solutions Engineer remote' })) } };
+  };
+  const scraped: string[] = [];
+  const executeScrape = async (args: Record<string, unknown>) => {
+    scraped.push(String(args.url));
+    return { status: 200, body: { ok: true, url: String(args.url), jobs: [], records: [] } };
+  };
+  const payload = { query: 'Solutions Engineer', remote: true, includeBuiltIn: false, limit: 10 };
+
+  const first = await executeJobsCall({ payload, env: { SERPER_API_KEY: 'k' } as never, executeSearch, executeScrape });
+  assert.equal(first.status, 200);
+  assert.equal(searchCalls > 0, true);
+  const firstScrapes = scraped.length;
+  assert.ok(firstScrapes <= JOBS_BROAD_CHUNK_URLS, `first chunk scraped ${firstScrapes} (cap ${JOBS_BROAD_CHUNK_URLS})`);
+  const cursor = first.body.continueCursor as string;
+  assert.match(String(cursor), /^jc1\./);
+  assert.equal(first.body.remainingCandidates, postings.length - JOBS_BROAD_CHUNK_URLS);
+  assert.ok(((first.body.notes as string[]) ?? []).some((n) => /continueCursor/.test(n)));
+
+  // Resume: no new web search, only the remaining candidates, and nothing left afterwards.
+  const searchCallsBefore = searchCalls;
+  const second = await executeJobsCall({ payload: { ...payload, cursor }, env: { SERPER_API_KEY: 'k' } as never, executeSearch, executeScrape });
+  assert.equal(second.status, 200);
+  assert.equal(searchCalls, searchCallsBefore, 'a continuation must not re-run the web search');
+  const secondScraped = scraped.slice(firstScrapes);
+  assert.equal(secondScraped.length, postings.length - JOBS_BROAD_CHUNK_URLS);
+  assert.ok(secondScraped.every((u) => !scraped.slice(0, firstScrapes).includes(u)), 'no candidate is scraped twice');
+  assert.equal(second.body.continueCursor, undefined);
+
+  // A cursor is bound to its query: another query ignores it and searches normally.
+  const otherQuery = decodeJobsContinuation(cursor, JSON.stringify(['site reliability engineer', true]));
+  assert.equal(otherQuery, null);
+  // A hand-made cursor cannot steer the hub at non-ATS hosts.
+  resetJobsCacheForTests();
+  const evil = encodeJobsContinuation({ q: JSON.stringify(['solutions engineer', true]), b: [], p: ['https://evil.example.com/x', postings[0]!] });
+  const before = scraped.length;
+  await executeJobsCall({ payload: { ...payload, cursor: evil }, env: { SERPER_API_KEY: 'k' } as never, executeSearch, executeScrape });
+  assert.ok(!scraped.slice(before).some((u) => u.includes('evil.example.com')), 'non-ATS cursor URLs are dropped');
 });
 

@@ -648,7 +648,7 @@ func extractMicrodataProductSliceGo(rawBody, finalURL, fallbackTitle, fallbackDe
 	}
 	mpn := SanitizePlainMetadataText(firstNonEmptySliceGo(microMPN, offerMPN), 160)
 	sku := SanitizePlainMetadataText(firstNonEmptySliceGo(microSKU, offerSKU, mpn, microProductID), 160)
-	gtin := SanitizePlainMetadataText(firstNonEmptySliceGo(microGTIN13, microGTIN14, microGTIN12, microGTIN8, microGTIN, microEAN, microUPC), 64)
+	gtin := firstPlausibleGTINGo(microGTIN13, microGTIN14, microGTIN12, microGTIN8, microGTIN, microEAN, microUPC)
 
 	if title == "" || (!hasPrice && sku == "" && mpn == "" && gtin == "" && brand == "" && availability == "" && len(images) == 0 && len(offerList) == 0) {
 		return nil
@@ -989,8 +989,10 @@ func extractSpecTableProductSliceGo(rawBody, finalURL, fallbackTitle, fallbackDe
 			}
 		case "upc", "ean", "ean-13", "ean13", "gtin", "gtin-13", "gtin-12", "gtin-8", "gtin-14", "barcode", "isbn", "isbn-10", "isbn-13":
 			if gtin == "" {
-				gtin = SanitizePlainMetadataText(val, 64)
-				recognizedSpecCount++
+				if g := plausibleGTINGo(val); g != "" {
+					gtin = g
+					recognizedSpecCount++
+				}
 			}
 			if camel := toCamelSpecKeySliceGo(baseKey); camel != "" {
 				specs[camel] = val
@@ -1257,4 +1259,38 @@ func extractSpecTableProductSliceGo(rawBody, finalURL, fallbackTitle, fallbackDe
 		out["specs"] = specs
 	}
 	return out
+}
+
+// plausibleGTINGo returns the digits of `raw` when they form a GS1 GTIN length (8, 12, 13 or 14 digits; ISBN-13 is a
+// GTIN-13), after dropping spaces and hyphens. Anything else (hex or alphanumeric store IDs, ISBN-10, partial codes)
+// returns "" so it is never reported as `gtin`; the raw value still appears under `specs`. Check digits are not
+// enforced: real catalogs sometimes publish codes with a bad check digit, and dropping those would hide real barcodes.
+func plausibleGTINGo(raw string) string {
+	var b strings.Builder
+	for _, r := range raw {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ' || r == '-' || r == ' ':
+			continue
+		default:
+			return ""
+		}
+	}
+	switch d := b.String(); len(d) {
+	case 8, 12, 13, 14:
+		return d
+	default:
+		return ""
+	}
+}
+
+// firstPlausibleGTINGo returns the first candidate that passes plausibleGTINGo, in priority order.
+func firstPlausibleGTINGo(candidates ...string) string {
+	for _, c := range candidates {
+		if g := plausibleGTINGo(c); g != "" {
+			return g
+		}
+	}
+	return ""
 }

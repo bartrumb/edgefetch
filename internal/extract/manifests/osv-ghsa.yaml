@@ -85,8 +85,8 @@ routes:
         - label: Aliases
           template: "{aliases}"
           whenVar: aliases
-        - label: Severity ({severityType})
-          template: "`{severityScore}`"
+        - label: Severity
+          template: "`{severityScore}` ({severityType})"
           whenVar: severityScore
         - label: Published
           template: "{published}"
@@ -234,8 +234,8 @@ routes:
         - label: Aliases
           template: "{aliases}"
           whenVar: aliases
-        - label: Severity ({severityType})
-          template: "`{severityScore}`"
+        - label: Severity
+          template: "`{severityScore}` ({severityType})"
           whenVar: severityScore
         - label: Published
           template: "{published}"

@@ -197,6 +197,57 @@ export const MAX_JOBS_TOTAL_SCRAPES = 40;
 export const JOBS_CACHE_TTL_MS = 5 * 60 * 1_000;
 export const MAX_JOBS_CACHE_ENTRIES = 128;
 export const JOBS_PER_ITEM_TIMEOUT_MS = 18_000;
+/**
+ * Wall-clock budget for one jobs call. MCP clients give up at 60 s; a broad (no company/domains) search spent ~4 s on
+ * SERP queries and then ~19 s per candidate-board scrape, so it was cancelled at 60 s with nothing returned. After this
+ * budget no new board scrape starts, in-flight scrapes are capped to the time left, and the call returns what it has.
+ */
+export const JOBS_WALL_BUDGET_MS = 40_000;
+/**
+ * Broad searches (no `company` / `domains`) scrape at most this many candidate boards/postings per call and hand back a
+ * `continueCursor` for the rest, so results arrive in chunks well inside the client timeout instead of one call trying
+ * to cover every candidate (~19 s per board scrape).
+ */
+export const JOBS_BROAD_CHUNK_URLS = 6;
+const JOBS_CONTINUATION_PREFIX = 'jc1.';
+const MAX_JOBS_CONTINUATION_URLS = 60;
+
+/** Continuation state for a chunked broad jobs search: the query it belongs to and the candidates not yet scraped. */
+export interface JobsContinuation {
+  q: string;
+  b: string[];
+  p: string[];
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let bin = '';
+  for (const byte of bytes) bin += String.fromCharCode(byte);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function encodeJobsContinuation(state: JobsContinuation): string {
+  return JOBS_CONTINUATION_PREFIX + bytesToBase64Url(new TextEncoder().encode(JSON.stringify(state)));
+}
+
+/**
+ * Decodes a `continueCursor`. Returns null unless it is well-formed, belongs to `expectedQuery`, and every URL is an
+ * `https://` URL (callers additionally keep only known multi-tenant ATS hosts), so a hand-made cursor cannot steer the
+ * hub at arbitrary sites.
+ */
+export function decodeJobsContinuation(raw: string, expectedQuery: string): JobsContinuation | null {
+  if (!raw.startsWith(JOBS_CONTINUATION_PREFIX) || raw.length > 16_384) return null;
+  try {
+    const b64 = raw.slice(JOBS_CONTINUATION_PREFIX.length).replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+    const parsed = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)))) as Partial<JobsContinuation>;
+    if (!parsed || parsed.q !== expectedQuery || !Array.isArray(parsed.b) || !Array.isArray(parsed.p)) return null;
+    const clean = (list: unknown[]): string[] =>
+      list.filter((u): u is string => typeof u === 'string' && u.length <= 2_048 && u.startsWith('https://')).slice(0, MAX_JOBS_CONTINUATION_URLS);
+    return { q: parsed.q, b: clean(parsed.b), p: clean(parsed.p) };
+  } catch {
+    return null;
+  }
+}
 
 const MAX_JOBS_QUERY_CHARS = 256;
 const REMOTE_LOCATION_TOKENS = new Set(['remote', 'anywhere', 'work from home', 'wfh']);
@@ -1294,6 +1345,8 @@ export async function executeJobsCall(params: {
   userId?: string;
   authTier?: string;
   tracer?: RequestTracer | TraceContext;
+  /** Overrides `JOBS_WALL_BUDGET_MS` (tests). */
+  wallBudgetMs?: number;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const activeCallerCtx = getActiveCallerAuthContext();
@@ -1316,6 +1369,21 @@ export async function executeJobsCall(params: {
     let activeScrapes = 0;
     let totalScrapesUsed = 0;
     let budgetExhausted = false;
+    const wallBudgetMs =
+      typeof params.wallBudgetMs === 'number' && Number.isFinite(params.wallBudgetMs) && params.wallBudgetMs > 0
+        ? params.wallBudgetMs
+        : JOBS_WALL_BUDGET_MS;
+    const wallDeadlineAt = Date.now() + wallBudgetMs;
+    let timeBudgetExhausted = false;
+    /** True once the call's wall-clock budget is spent; also marks the scrape budget exhausted so later waves stop. */
+    const overWallBudget = (): boolean => {
+      if (Date.now() < wallDeadlineAt) return false;
+      timeBudgetExhausted = true;
+      budgetExhausted = true;
+      return true;
+    };
+    const remainingItemTimeoutMs = (): number =>
+      Math.max(500, Math.min(JOBS_PER_ITEM_TIMEOUT_MS, wallDeadlineAt - Date.now()));
     const scrapeWaitQueue: Array<() => void> = [];
     const activeHostScrapes = new Set<string>();
     const hostWaitQueues = new Map<string, Array<() => void>>();
@@ -1375,7 +1443,7 @@ export async function executeJobsCall(params: {
       const effectiveHost = resolveEffectiveScrapeHost(args);
       if (effectiveHost) {
         while (activeHostScrapes.has(effectiveHost)) {
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
             budgetExhausted = true;
             wakeAllWaiters();
             return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
@@ -1409,7 +1477,7 @@ export async function executeJobsCall(params: {
       let flightPromise: Promise<JobsScrapeResponse> | null = null;
       try {
         while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
             budgetExhausted = true;
             wakeAllWaiters();
             return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
@@ -1429,7 +1497,7 @@ export async function executeJobsCall(params: {
             }
           }
         }
-        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
           budgetExhausted = true;
           wakeAllWaiters();
           return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
@@ -1440,6 +1508,7 @@ export async function executeJobsCall(params: {
         const runSingle = (): Promise<JobsScrapeResponse> =>
           withJobsItemTimeout(
             Promise.resolve().then(() => (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args))),
+            remainingItemTimeoutMs(),
           );
         flightPromise = runSingle();
         if (cacheKey) cachePartition.inFlight.set(cacheKey, flightPromise);
@@ -1454,12 +1523,12 @@ export async function executeJobsCall(params: {
         }
         if (acquiredGlobal) {
           activeScrapes--;
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) wakeAllWaiters();
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || timeBudgetExhausted) wakeAllWaiters();
           else scrapeWaitQueue.shift()?.();
         }
         if (effectiveHost) {
           activeHostScrapes.delete(effectiveHost);
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) wakeAllWaiters();
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || timeBudgetExhausted) wakeAllWaiters();
           else wakeNextHostWaiter(effectiveHost);
         }
       }
@@ -1578,6 +1647,10 @@ export async function executeJobsCall(params: {
           ? Math.min(10_000, parseInt(rawCursorStr, 10))
           : 0;
     const hasCompanyOrDomainScope = Boolean(companyFilter) || domainsInput.length > 0;
+    // Chunked broad search: a `continueCursor` from the previous call resumes with its unscraped candidates and skips
+    // the SERP / Built In / public-feed steps that already ran. Bound to the same query + remote flag.
+    const continuationKey = JSON.stringify([query.toLowerCase(), wantRemote ?? null]);
+    const resumeState = !hasCompanyOrDomainScope ? decodeJobsContinuation(rawCursorStr, continuationKey) : null;
     const includeBuiltIn = hasCompanyOrDomainScope ? payload.includeBuiltIn === true : payload.includeBuiltIn !== false;
     const excludeList = Array.isArray(payload.exclude)
       ? (payload.exclude as Array<Record<string, unknown>>)
@@ -1839,7 +1912,9 @@ export async function executeJobsCall(params: {
           });
           notes.push(
             domHitBudgetCap
-              ? `Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before completing ATS board discovery for "${dom}".`
+              ? timeBudgetExhausted
+                ? `Time budget (${Math.round(wallBudgetMs / 1_000)} s) reached before completing ATS board discovery for "${dom}".`
+                : `Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before completing ATS board discovery for "${dom}".`
               : `No ATS job board discovered for "${dom}" after probing ${tried.length} candidates.`,
           );
         }
@@ -1933,7 +2008,7 @@ export async function executeJobsCall(params: {
       }).ok;
     };
 
-    if (coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
+    if (!resumeState && coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
       const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
       const searchCandidateCap =
         postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(40, Math.max(30, limit * 2));
@@ -2047,7 +2122,7 @@ export async function executeJobsCall(params: {
 
     const collected: StructuredJobRecord[] = [];
 
-    if (includeBuiltIn && query) {
+    if (includeBuiltIn && query && !resumeState) {
       const builtInUrl = `https://builtin.com/jobs${wantRemote !== false ? '/remote' : ''}?search=${encodeURIComponent(query)}`;
       const biRes = await executeScrape({
         url: builtInUrl,
@@ -2068,7 +2143,7 @@ export async function executeJobsCall(params: {
       }
     }
 
-    if (payload.includePublicFeeds === true) {
+    if (payload.includePublicFeeds === true && !resumeState) {
       const feedOuts = await Promise.all(
         PUBLIC_JOB_FEEDS.map(async (feed) => ({
           feed,
@@ -2090,6 +2165,16 @@ export async function executeJobsCall(params: {
       }
     }
 
+    if (resumeState) {
+      for (const u of [...resumeState.b, ...resumeState.p]) {
+        try {
+          if (isKnownMultiTenantAtsHost(new URL(u).hostname.toLowerCase().replace(/\.+$/, ''))) candidateUrls.add(u);
+        } catch {
+          // skip malformed cursor entries
+        }
+      }
+      sourcesUsed.add('ats_search_continuation');
+    }
     const rawUrlList = [...candidateUrls].filter((u) => matchesScopedAtsCandidateUrl(u));
     const postingCountByBoard = new Map<string, { count: number; boardUrl: string; platform: string; slug: string; hasBoard: boolean }>();
     const smartRecruitersPostingOrgs = new Set<string>();
@@ -2168,6 +2253,22 @@ export async function executeJobsCall(params: {
         }),
       ),
     ];
+
+    // Broad searches scrape one chunk per call (boards first) and return the rest as a continuation cursor.
+    let remainingContinuation: JobsContinuation | null = null;
+    let candidatesInChunk = boardWaveUrls.length + postingWaveUrls.length;
+    if (!hasCompanyOrDomainScope && candidatesInChunk > JOBS_BROAD_CHUNK_URLS) {
+      const boardTake = Math.min(boardWaveUrls.length, JOBS_BROAD_CHUNK_URLS);
+      const postingTake = Math.min(postingWaveUrls.length, JOBS_BROAD_CHUNK_URLS - boardTake);
+      const restBoards = boardWaveUrls.splice(boardTake);
+      const restPostings = postingWaveUrls.splice(postingTake);
+      remainingContinuation = {
+        q: continuationKey,
+        b: restBoards.slice(0, MAX_JOBS_CONTINUATION_URLS),
+        p: restPostings.slice(0, MAX_JOBS_CONTINUATION_URLS),
+      };
+      candidatesInChunk = boardWaveUrls.length + postingWaveUrls.length;
+    }
 
     const fetchedCompleteBoards = new Set<string>();
     const fetchedQueriedWorkdayBoards = new Map<string, { matchedCount: number; reqIds: Set<string> }>();
@@ -2777,7 +2878,19 @@ export async function executeJobsCall(params: {
         `Board listing was cut short; pass \`cursor: "${resolvedTopCursor}"\` (or \`offset: ${resolvedTopCursor}\`) to fetch the next page.`,
       );
     }
-    if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
+    if (remainingContinuation) {
+      notes.push(
+        `Checked ${candidatesInChunk} candidate job board(s)/posting(s) in this call; ` +
+          `${remainingContinuation.b.length + remainingContinuation.p.length} more remain. ` +
+          'Pass `cursor` = `continueCursor` with the same query to check the next chunk (no new web search).',
+      );
+    }
+    if (timeBudgetExhausted && !notes.some((n) => n.includes('Time budget'))) {
+      notes.push(
+        `Time budget (${Math.round(wallBudgetMs / 1_000)} s) reached before all candidate boards could be checked; results are partial. ` +
+          'Add `company` or `domains` to narrow the search.',
+      );
+    } else if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
       notes.push(`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all candidate boards could be checked.`);
     }
     if (payUnverifiedCount > 0 && !notes.some((n) => n.includes('pay not verified'))) {
@@ -2786,7 +2899,17 @@ export async function executeJobsCall(params: {
       );
     }
     if (candidateUrls.size === 0 && collected.length === 0 && domainsInput.length === 0) {
-      notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
+      // Only blame configuration when no search provider is configured; otherwise the search ran and matched nothing.
+      const hasSearchProvider = Boolean(
+        env?.SERPER_API_KEY || env?.BRAVE_API_KEY || env?.TAVILY_API_KEY || env?.SEARXNG_URL || env?.SEARCH,
+      );
+      notes.push(
+        hasSearchProvider
+          ? timeBudgetExhausted
+            ? 'No ATS job boards were found within the time budget. Add `company` or `domains` to narrow the search.'
+            : 'The job-board search ran but matched no ATS boards for this query. Try a broader query, or add `company` or `domains`.'
+          : 'No ATS search results returned: no search provider is configured on the Hub (set SERPER_API_KEY, BRAVE_API_KEY, TAVILY_API_KEY or SEARXNG_URL).',
+      );
     }
 
     const boardsDiscoveredCount = discoveredBoards.filter((b) => b.boardStatus !== 'not_found' && Boolean(b.boardUrl)).length;
@@ -2816,6 +2939,13 @@ export async function executeJobsCall(params: {
         ...(responseTruncated ? { truncated: true } : {}),
         ...(resolvedTopCursor ? { nextCursor: resolvedTopCursor } : {}),
         ...(budgetExhausted ? { budgetExhausted: true } : {}),
+        ...(timeBudgetExhausted ? { timeBudgetExhausted: true } : {}),
+        ...(remainingContinuation
+          ? {
+              continueCursor: encodeJobsContinuation(remainingContinuation),
+              remainingCandidates: remainingContinuation.b.length + remainingContinuation.p.length,
+            }
+          : {}),
         sourcesUsed: [...sourcesUsed],
         count: finalJobs.length,
         candidatesChecked: candidateUrls.size,

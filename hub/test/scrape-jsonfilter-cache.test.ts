@@ -19,9 +19,10 @@ import { executeScrapeCall } from '../src/scrape';
 import { r2ArtifactKey } from '../src/storage';
 import { NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks';
 
-// `scrapeOptionsHash` of a default `{ url, maxAgeMs }` markdown scrape, as computed by v2.8.2.
+// `scrapeOptionsHash` of a default `{ url, maxAgeMs }` markdown scrape (unchanged since v2.8.2 except the pipeline v35 bump).
 // Requests without `jsonFilter` must keep this exact value so the release invalidates no existing cache entry.
-const V282_DEFAULT_OPTIONS_HASH = '3123a9941edc199ddad82efa4219ed986c99f120ebdede97ed8d60240134d0cf';
+// Pinned for SCRAPE_PIPELINE_VERSION 35 (v2.8.14 bump): the hash includes the pipeline version, so it changes only on a deliberate bump.
+const V282_DEFAULT_OPTIONS_HASH = '40ea6bad57d8d0bf712486b7647a8406c0c09f1452668c917eec9983f476e71d';
 
 const JSON_URL = 'https://api.example.com/roles.json';
 const RECORDS = [
@@ -294,7 +295,7 @@ test('L-01: scrapeOptionsHash includes the trimmed jsonFilter and is unchanged w
   const platformPadded = await hashFor({ jsonFilter: '  team=Platform  ' }, now + 3);
   const sales = await hashFor({ jsonFilter: 'team=Sales' }, now + 4);
 
-  assert.equal(plain, V282_DEFAULT_OPTIONS_HASH, 'no-filter options hash must equal v2.8.2 (no cache invalidation)');
+  assert.equal(plain, V282_DEFAULT_OPTIONS_HASH, 'no-filter options hash must equal the pinned default (no unintended cache invalidation)');
   assert.equal(emptyFilter, plain, 'a blank jsonFilter is no filter');
   assert.notEqual(platform, plain, 'a jsonFilter must change the options hash');
   assert.notEqual(sales, plain);
@@ -400,7 +401,7 @@ test('TS-6: ocrMode and pdfParserOpts affect scrapeOptionsHash and do not collid
   const hashMaxPages = await hashFor({ parsers: [{ type: 'pdf', maxPages: 5 }] }, now + 4);
   const hashFast = await hashFor({ parsers: [{ type: 'pdf', mode: 'fast' }] }, now + 5);
 
-  assert.equal(hashDefault, V282_DEFAULT_OPTIONS_HASH, 'default request optionsHash must equal v2.8.2');
+  assert.equal(hashDefault, V282_DEFAULT_OPTIONS_HASH, 'default request optionsHash must equal the pinned default');
   assert.equal(hashOcrAuto, hashDefault, 'explicit ocr:auto matches default');
   assert.notEqual(hashOcrOff, hashDefault, 'ocr:off must hash differently from ocr:auto');
   assert.notEqual(hashPagesMarkers, hashDefault, 'pdf pages/pageMarkers must hash differently from default');

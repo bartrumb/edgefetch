@@ -512,7 +512,7 @@ test('ADAPTER-4: job-hunt-kit ATS Fleet — Gem, Pinpoint, Rippling uuid dedup, 
 
   // Lever EU board
   const levEu = resolveAtsPreFetchSpec('https://jobs.eu.lever.co/spotify');
-  assert.equal(levEu?.fetchUrl, 'https://api.eu.lever.co/v0/postings/spotify?mode=json');
+  assert.equal(levEu?.fetchUrl, 'https://api.eu.lever.co/v0/postings/spotify?mode=json&skip=0&limit=100');
 
   // Rippling locale-prefix strip + multi-location row merge on `uuid`
   const rip = resolveAtsPreFetchSpec('https://ats.rippling.com/en-GB/acme/jobs');

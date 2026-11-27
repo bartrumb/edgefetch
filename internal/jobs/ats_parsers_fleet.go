@@ -29,13 +29,29 @@ func extractLeverLocations(cats map[string]any) []string {
 	return []string{}
 }
 
+// LeverBoardPageSize is the Lever postings page requested per board fetch (~19 KB per posting with descriptions).
+const LeverBoardPageSize = 100
+
 func (s *ATSPreFetchSpec) formatLeverBoard(rawBody string) *ATSFormattedResult {
 	jobsAny, ok := SafeJSONParse(rawBody).([]any)
 	if !ok {
 		return nil
 	}
 	total := len(jobsAny)
-	linkCap := min(total, 2500)
+	pageStart := 0
+	if !s.serverPaged {
+		pageStart = min(s.reqOffset, total)
+	}
+	// Server-paged: the page is jobsAny itself; a full page means more remain (no total from the API).
+	fullPage := s.serverPaged && len(jobsAny) >= LeverBoardPageSize
+	if s.serverPaged {
+		total = s.reqOffset + len(jobsAny)
+	}
+	countLabel := strconv.Itoa(total)
+	if fullPage {
+		countLabel += "+"
+	}
+	linkCap := min(len(jobsAny), 2500)
 	links := make([]string, 0, linkCap)
 	for _, it := range jobsAny[:linkCap] {
 		j, okJ := it.(map[string]any)
@@ -49,11 +65,11 @@ func (s *ATSPreFetchSpec) formatLeverBoard(rawBody string) *ATSFormattedResult {
 		}
 		links = append(links, jURL)
 	}
-	lines := []string{fmt.Sprintf("# %s — Lever Job Board (%d open roles)", sanitizeATSMarkdownText(s.org, 256), total)}
+	lines := []string{fmt.Sprintf("# %s — Lever Job Board (%s open roles)", sanitizeATSMarkdownText(s.org, 256), countLabel)}
 	const maxBoardRecords = 2_500
 	const maxMarkdownBullets = 120
-	start := min(s.reqOffset, total)
-	end := min(start+maxBoardRecords, total)
+	start := pageStart
+	end := min(start+maxBoardRecords, len(jobsAny))
 	records := make([]StructuredJobRecord, 0, end-start)
 
 	for _, it := range jobsAny[start:end] {
@@ -123,19 +139,19 @@ func (s *ATSPreFetchSpec) formatLeverBoard(rawBody string) *ATSFormattedResult {
 
 	returned := len(records)
 	nextOffsetVal := s.reqOffset + returned
-	truncated := total > nextOffsetVal
+	truncated := total > nextOffsetVal || fullPage
 	if len(records) > maxMarkdownBullets {
 		lines = append(lines, fmt.Sprintf("- *... and %d additional open roles in `jobs[]`*", len(records)-maxMarkdownBullets))
 	}
 	if truncated {
-		lines = append(lines, "", fmt.Sprintf("*Showing %d–%d of %d open roles (list cut short — pass `?offset=%d` on `scrape` or `cursor: \"%d\"` on `jobs` for the next page).*", s.reqOffset+1, nextOffsetVal, total, nextOffsetVal, nextOffsetVal))
+		lines = append(lines, "", fmt.Sprintf("*Showing %d–%d of %s open roles (list cut short — pass `?offset=%d` on `scrape` or `cursor: \"%d\"` on `jobs` for the next page).*", s.reqOffset+1, nextOffsetVal, countLabel, nextOffsetVal, nextOffsetVal))
 	}
 	nextCur := ""
 	if truncated {
 		nextCur = strconv.Itoa(nextOffsetVal)
 	}
 	return &ATSFormattedResult{
-		Title:      fmt.Sprintf("%s Jobs (%d)", s.org, total),
+		Title:      fmt.Sprintf("%s Jobs (%s)", s.org, countLabel),
 		Markdown:   strings.Join(lines, "\n"),
 		Links:      links,
 		Jobs:       records,

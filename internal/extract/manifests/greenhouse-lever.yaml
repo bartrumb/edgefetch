@@ -195,7 +195,7 @@ routes:
             - favicon.ico
     twin:
       id: lever-board
-      fetchUrl: "https://api.lever.co/v0/postings/{org}?mode=json"
+      fetchUrl: "https://api.lever.co/v0/postings/{org}?mode=json&limit=100"
       kind: json
       accept: application/json
     extract:
@@ -271,7 +271,7 @@ routes:
             - favicon.ico
     twin:
       id: lever-eu-board
-      fetchUrl: "https://api.eu.lever.co/v0/postings/{org}?mode=json"
+      fetchUrl: "https://api.eu.lever.co/v0/postings/{org}?mode=json&limit=100"
       kind: json
       accept: application/json
     extract:

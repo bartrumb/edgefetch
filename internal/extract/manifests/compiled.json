@@ -10281,8 +10281,8 @@
                 "whenVar": "aliases"
               },
               {
-                "label": "Severity ({severityType})",
-                "template": "`{severityScore}`",
+                "label": "Severity",
+                "template": "`{severityScore}` ({severityType})",
                 "whenVar": "severityScore"
               },
               {
@@ -10509,8 +10509,8 @@
                 "whenVar": "aliases"
               },
               {
-                "label": "Severity ({severityType})",
-                "template": "`{severityScore}`",
+                "label": "Severity",
+                "template": "`{severityScore}` ({severityType})",
                 "whenVar": "severityScore"
               },
               {
@@ -15091,7 +15091,8 @@
         "sram.com"
       ],
       "exampleUrls": [
-        "https://www.sram.com/en/sram/models/rd-xx-e-b1"
+        "https://www.sram.com/en/sram/models/rd-xx-e-b1",
+        "https://www.sram.com/en/service/models/rd-gx-1-b1"
       ],
       "htmlRoutes": [
         {
@@ -15100,14 +15101,30 @@
           "match": {
             "optionalLeadingLocale": true,
             "exactSegments": false,
-            "pathSegments": [
-              "sram",
-              "models",
+            "anyOf": [
               {
-                "param": "modelSlug",
-                "charset": "url_seg",
-                "minLen": 1,
-                "maxLen": 140
+                "pathSegments": [
+                  "sram",
+                  "models",
+                  {
+                    "param": "modelSlug",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 140
+                  }
+                ]
+              },
+              {
+                "pathSegments": [
+                  "service",
+                  "models",
+                  {
+                    "param": "modelSlug",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 140
+                  }
+                ]
               }
             ]
           },
@@ -16681,7 +16698,7 @@
         "tq-ebike.com"
       ],
       "exampleUrls": [
-        "https://www.tq-ebike.com/en/products/hpr50"
+        "https://www.tq-ebike.com/en/e-bike-system/hpr50/"
       ],
       "htmlRoutes": [
         {
@@ -16694,6 +16711,18 @@
               {
                 "pathSegments": [
                   "products",
+                  {
+                    "param": "slug",
+                    "charset": "safe_subpath",
+                    "greedy": true,
+                    "minLen": 1,
+                    "maxLen": 160
+                  }
+                ]
+              },
+              {
+                "pathSegments": [
+                  "e-bike-system",
                   {
                     "param": "slug",
                     "charset": "safe_subpath",
@@ -19081,7 +19110,8 @@
       "category": "developer",
       "description": "Upgrades *.zendesk.com Help Center article, section, and category pages to the official Help Center v2 JSON API with breadcrumbs, updated timestamps, and Markdown conversion.",
       "domains": [
-        "*.zendesk.com"
+        "*.zendesk.com",
+        "support.sram.com"
       ],
       "exampleUrls": [
         "https://support.zendesk.com/hc/en-us/articles/4408886858138-What-is-Zendesk",

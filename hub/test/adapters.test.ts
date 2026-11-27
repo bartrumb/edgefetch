@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { isTwinRedirectedToErrorPage } from '../src/scrape.ts';
 
 import {
   applyPostFetchSiteExtractor,
@@ -13,6 +14,7 @@ import {
   getRawRegisteredSiteAdapters,
   getRegisteredAdapterById,
   GO_KIND_TEXT_ACCEPT_ALLOWLIST,
+  hasHtmlSiteAdapterForHost,
   icimsAdapter,
   isShopifyHtmlOrHeaders,
   isWooCommerceHtmlOrHeaders,
@@ -4794,3 +4796,56 @@ test('ADAPTER-21: JSR <pre><code><button><code></code> preservation & Product of
   assert.equal(jsonOut.url, 'https://shop.example.com/item%281%29%3Cx%3E');
   assert.equal(jsonOut.manufacturer, 'https://shop.example.com/brand%5Balpha%29%3Cy%3E');
 });
+
+test('R19: live-test adapter repairs (HTML for DOM adapters, moved paths, custom Zendesk domain, CFR XML twin, error redirects, label templates)', () => {
+  // 1. Hosts with a DOM (extractHtml) adapter get HTML, not origin Markdown, so the adapter can run.
+  for (const u of ['https://fccid.io/BCG-E3542A', 'https://www.sram.com/en/service/models/rd-gx-1-b1', 'https://www.tq-ebike.com/en/e-bike-system/hpr50/']) {
+    assert.equal(hasHtmlSiteAdapterForHost(u), true, `${u} should request HTML for its DOM adapter`);
+  }
+  assert.equal(hasHtmlSiteAdapterForHost('https://developers.cloudflare.com/workers/'), false, 'other hosts keep origin Markdown');
+  assert.equal(hasHtmlSiteAdapterForHost('not a url'), false);
+
+  // 2. Moved paths now match their DOM routes.
+  const productHtml = (title: string) =>
+    `<!doctype html><html><head><title>${title}</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"${title}","sku":"SKU-1","brand":{"@type":"Brand","name":"Brand"}}</script></head>` +
+    `<body><main><h1>${title}</h1><table><tr><th>Weight</th><td>1 kg</td></tr></table><p>Technical details for ${title} with enough words to extract.</p></main></body></html>`;
+  for (const [url, id] of [
+    ['https://www.sram.com/en/service/models/rd-gx-1-b1', 'sram-models'],
+    ['https://www.sram.com/en/sram/models/rd-xx-e-b1', 'sram-models'],
+    ['https://www.tq-ebike.com/en/e-bike-system/hpr50/', 'tq-ebike'],
+  ] as const) {
+    const res = applyPostFetchSiteExtractor(productHtml('Model X'), url, '', simpleHtmlToMd);
+    assert.ok(res, `${id} should engage on ${url}`);
+    assert.equal(res.extractorId, id);
+  }
+
+  // 3. Custom-domain Zendesk Help Center uses the Help Center API twin.
+  const zd = resolveSiteExtractorTwin('https://support.sram.com/hc/en-us/articles/6180779265691-How-do-I-size-a-chain');
+  assert.equal(zd?.id, 'zendesk-hc');
+  assert.match(String(zd?.fetchUrl), /^https:\/\/support\.sram\.com\/api\/v2\/help_center\//);
+
+  // 4. GovInfo granules keep the .htm twin; when GovInfo redirects it to /error the guard below rejects it and the
+  //    existing summary fallback (getContentDetail) answers instead of a "Page Not Found" page.
+  const gov = resolveSiteExtractorTwin('https://www.govinfo.gov/app/details/CFR-2023-title16-vol2/CFR-2023-title16-vol2-part1500');
+  assert.equal(gov?.fetchUrl, 'https://www.govinfo.gov/content/pkg/CFR-2023-title16-vol2/html/CFR-2023-title16-vol2-part1500.htm');
+
+  // 5. A twin redirected to an error page is never accepted as the document.
+  const twinUrl = 'https://www.govinfo.gov/content/pkg/X/html/Y.htm';
+  assert.equal(isTwinRedirectedToErrorPage(twinUrl, { finalUrl: 'https://www.govinfo.gov/error' }), true);
+  assert.equal(isTwinRedirectedToErrorPage(twinUrl, { finalUrl: 'https://example.com/en/404' }), true);
+  assert.equal(isTwinRedirectedToErrorPage(twinUrl, { finalUrl: twinUrl }), false);
+  assert.equal(isTwinRedirectedToErrorPage(twinUrl, { finalUrl: 'https://www.govinfo.gov/content/pkg/X/html/Y2.htm' }), false);
+  assert.equal(isTwinRedirectedToErrorPage(twinUrl, {}), false);
+
+  // 6. Labels are never interpolated, so no manifest may put a {var} in a label (osv-ghsa printed "{severityType}").
+  const hubRoot = process.env.EDGEFETCH_HUB_ROOT || resolve('.');
+  const manifestsDir = join(hubRoot, '..', 'internal', 'extract', 'manifests');
+  const offenders: string[] = [];
+  for (const f of readdirSync(manifestsDir).filter((x) => x.endsWith('.yaml'))) {
+    for (const line of readFileSync(join(manifestsDir, f), 'utf8').split('\n')) {
+      if (/^\s*-?\s*label:\s*.*\{[A-Za-z_][A-Za-z0-9_]*\}/.test(line)) offenders.push(`${f}: ${line.trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `labels with uninterpolated {vars}: ${offenders.join('; ')}`);
+});
+

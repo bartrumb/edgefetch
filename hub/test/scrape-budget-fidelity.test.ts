@@ -625,3 +625,24 @@ test('R16: inline records[] stay within the scrape maxChars budget (catalog twin
   assert.equal(resolveScrapeMaxChars({ maxChars: 10 }), 500, 'clamped to the same 500..500000 range as markdown');
 });
 
+
+test('R19b: scrape asks for HTML (not origin Markdown) when a DOM site adapter is registered for the host', async () => {
+  const sentAccept = new Map<string, string>();
+  const hub = async (_t: string, bodyText: string) => {
+    const call = JSON.parse(bodyText) as { requests?: Array<{ id?: string; url?: string; accept?: string }> };
+    for (const r of call.requests ?? []) if (r.id === 'scrape-1') sentAccept.set(String(r.url), String(r.accept ?? ''));
+    const r0 = call.requests?.[0];
+    return {
+      status: 200,
+      via: 'cf',
+      bodyText: JSON.stringify({
+        results: [{ id: r0?.id, url: r0?.url, status: 200, outcome: 'ok', contentType: 'text/html', body: '<html><body><main><h1>Doc</h1><p>Body text here.</p></main></body></html>' }],
+      }),
+    };
+  };
+  for (const url of ['https://fccid.io/BCG-E3542A', 'https://example.com/docs/page']) {
+    await executeScrapeCall({ payload: { url, maxAgeMs: 0 }, env: {}, executeHubFetch: hub as never });
+  }
+  assert.match(String(sentAccept.get('https://fccid.io/BCG-E3542A')), /^text\/html/, 'DOM-adapter host requests HTML');
+  assert.match(String(sentAccept.get('https://example.com/docs/page')), /text\/markdown/, 'other hosts still prefer origin Markdown');
+});

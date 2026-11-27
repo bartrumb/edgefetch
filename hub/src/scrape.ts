@@ -36,6 +36,7 @@ import {
   type PaginationInfo,
   type PostFetchSiteResult,
   type TwinFormattedDoc,
+  hasHtmlSiteAdapterForHost,
 } from './extractors/registry';
 import { tryFetchCmsAutoTwin, type CmsAutoTwinResult } from './extractors/cms-twins';
 import {
@@ -4042,7 +4043,10 @@ export async function executeScrapeCall(params: {
           ? {
               accept:
                 callerExplicitAccept ??
-                (!preferOriginMarkdown || stringFormats.has('html') || stringFormats.has('rawHtml')
+                (!preferOriginMarkdown ||
+                stringFormats.has('html') ||
+                stringFormats.has('rawHtml') ||
+                hasHtmlSiteAdapterForHost(normalizedUrl)
                   ? 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8'
                   : MARKDOWN_FOR_AGENTS_ACCEPT),
             }
@@ -4701,7 +4705,8 @@ export async function executeScrapeCall(params: {
           twinItem &&
           twinItem.outcome === 'ok' &&
           twinBody.trim().length > 0 &&
-          isTrustedTwinRedirectUrl(registryTwin.id, registryTwin.fetchUrl, twinItem, selfHost)
+          isTrustedTwinRedirectUrl(registryTwin.id, registryTwin.fetchUrl, twinItem, selfHost) &&
+          !isTwinRedirectedToErrorPage(registryTwin.fetchUrl, twinItem)
         ) {
           formatted = registryTwin.formatTwin(twinBody, normalizedUrl, htmlFragToMd);
         } else if (registryTwin.fetchUrl === normalizedUrl && twinItem && twinItem.outcome !== 'ok') {
@@ -8583,6 +8588,23 @@ export async function executeScrapeCall(params: {
     return { ...scrapeResult, body: { ...scrapeResult.body, visibility: 'private' as const } };
   }
   return scrapeResult;
+}
+
+/**
+ * True when a twin fetch was redirected to the origin's error page (`/error`, `/404`, `/not-found`, ...), which many
+ * sites serve with HTTP 200. Such a body must never be formatted as the requested document: GovInfo redirects a
+ * missing `/content/pkg/.../html/*.htm` to `/error`, and the "Page Not Found" text came back as `ok: true`.
+ */
+export function isTwinRedirectedToErrorPage(fetchUrl: string, item: Record<string, unknown> | undefined): boolean {
+  const finalUrl = typeof item?.finalUrl === 'string' ? item.finalUrl : '';
+  if (!finalUrl || finalUrl === fetchUrl) return false;
+  try {
+    const finalPath = new URL(finalUrl).pathname;
+    if (finalPath === new URL(fetchUrl).pathname) return false;
+    return /^\/(?:[a-z]{2}(?:[-_][a-z]{2})?\/)?(?:errors?|40[34]|not-?found|page-?not-?found|notfound)(?:[/.]|$)/i.test(finalPath);
+  } catch {
+    return false;
+  }
 }
 
 /** The scrape's inline character budget: explicit `maxChars`, else the caller's `defaultMaxChars` (MCP), else none. */

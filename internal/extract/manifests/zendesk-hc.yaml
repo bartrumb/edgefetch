@@ -5,6 +5,8 @@ category: developer
 description: "Upgrades *.zendesk.com Help Center article, section, and category pages to the official Help Center v2 JSON API with breadcrumbs, updated timestamps, and Markdown conversion."
 domains:
   - "*.zendesk.com"
+  # Custom-domain Help Centers (same /hc/ paths and /api/v2/help_center API).
+  - support.sram.com
 exampleUrls:
   - "https://support.zendesk.com/hc/en-us/articles/4408886858138-What-is-Zendesk"
   - "https://support.zendesk.com/hc/en-us/sections/4408886858138"

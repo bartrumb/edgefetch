@@ -8,6 +8,7 @@ domains:
   - sram.com
 exampleUrls:
   - "https://www.sram.com/en/sram/models/rd-xx-e-b1"
+  - "https://www.sram.com/en/service/models/rd-gx-1-b1"
 
 htmlRoutes:
   - id: sram-models
@@ -15,13 +16,22 @@ htmlRoutes:
     match:
       optionalLeadingLocale: true
       exactSegments: false
-      pathSegments:
-        - sram
-        - models
-        - param: modelSlug
-          charset: url_seg
-          minLen: 1
-          maxLen: 140
+      anyOf:
+        - pathSegments:
+            - sram
+            - models
+            - param: modelSlug
+              charset: url_seg
+              minLen: 1
+              maxLen: 140
+        # www.sram.com now redirects /<locale>/sram/models/<slug> to /<locale>/service/models/<slug>.
+        - pathSegments:
+            - service
+            - models
+            - param: modelSlug
+              charset: url_seg
+              minLen: 1
+              maxLen: 140
     jsonLdTypes:
       - Product
     vars:

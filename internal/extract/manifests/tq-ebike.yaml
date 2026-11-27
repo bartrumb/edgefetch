@@ -7,7 +7,7 @@ domains:
   - www.tq-ebike.com
   - tq-ebike.com
 exampleUrls:
-  - "https://www.tq-ebike.com/en/products/hpr50"
+  - "https://www.tq-ebike.com/en/e-bike-system/hpr50/"
 
 htmlRoutes:
   - id: tq-ebike
@@ -18,6 +18,14 @@ htmlRoutes:
       anyOf:
         - pathSegments:
             - products
+            - param: slug
+              charset: safe_subpath
+              greedy: true
+              minLen: 1
+              maxLen: 160
+        # /<locale>/products/<model> now redirects to the overview; model pages live under /e-bike-system/<model>/.
+        - pathSegments:
+            - "e-bike-system"
             - param: slug
               charset: safe_subpath
               greedy: true

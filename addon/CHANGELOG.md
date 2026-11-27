@@ -2,6 +2,20 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.14] - 2026-11-27
+
+### Fixed
+- Inline `records[]` (catalog, twin and adapter rows) now respect the `maxChars` budget. Whole records are kept, and the body reports `recordsTruncated`, `recordsReturned`, `recordsTotal` and `recordsHint` (#106).
+- `jobs`: a 40 s wall-clock budget. Broad searches check at most 6 candidate boards per call and return a query-bound `continueCursor` plus `remainingCandidates` for the next chunk. The "configure SERPER_API_KEY" note appears only when no search provider is configured (#106).
+- `gtin` is set only for plausible GTIN-8/12/13/14 codes, so store IDs no longer appear as `gtin` (#106).
+- Hosts with a host-specific HTML adapter are fetched as `text/html`, so Markdown-for-agents responses no longer bypass the adapter (#106).
+- Registry twins whose final URL is an error or 404 page on a different path are rejected (#106).
+- Budgeted extract/search dispatches round the remaining budget to the nearest second. Flooring cut a 5 s budget to a 4 s batch after a few ms of setup.
+- Adapter routes: sram-models service pages, tq-ebike `e-bike-system`, zendesk-hc on `support.sram.com`, and osv-ghsa severity labels (#106).
+
+### Changed
+- `SCRAPE_PIPELINE_VERSION` is now 35, so cached scrapes from earlier pipelines are refreshed (#106).
+
 ## [2.8.13] - 2026-11-27
 
 ### Added

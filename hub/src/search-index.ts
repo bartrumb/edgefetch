@@ -1250,9 +1250,9 @@ export async function executeExtractCall(params: {
     typeof params.budgetMs === 'number' && Number.isFinite(params.budgetMs) && params.budgetMs > 0
       ? Date.now() + params.budgetMs
       : null;
-  /** `capSecs` clamped to the whole seconds left in the budget (never below 1), or `capSecs` when unbudgeted. */
+  /** `capSecs` clamped to the budget left, rounded to the nearest whole second (never below 1; flooring dropped ~1 s after a few ms of setup), or `capSecs` when unbudgeted. */
   const budgetSecs = (capSecs: number): number =>
-    budgetDeadlineAt === null ? capSecs : Math.max(1, Math.min(capSecs, Math.floor((budgetDeadlineAt - Date.now()) / 1_000)));
+    budgetDeadlineAt === null ? capSecs : Math.max(1, Math.min(capSecs, Math.round((budgetDeadlineAt - Date.now()) / 1_000)));
   /** True when unbudgeted, or when at least `minSecs` of the budget remain for an optional follow-up fetch. */
   const hasBudgetFor = (minSecs: number): boolean =>
     budgetDeadlineAt === null || budgetDeadlineAt - Date.now() >= minSecs * 1_000;

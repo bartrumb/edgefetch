@@ -2,6 +2,14 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.8] - 2026-11-26
+
+### Fixed
+- check users columns via PRAGMA before ALTER to stop D1 error spans (#92)
+
+### Changed
+- bound search include_raw_content enrichment to a 15 s budget (#93)
+
 ## [2.8.7] - 2026-11-26
 
 ### Fixed

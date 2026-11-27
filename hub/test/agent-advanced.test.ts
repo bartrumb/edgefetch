@@ -104,6 +104,7 @@ import {
   resetSearchProviderPacingForTests,
   SEARCH_ENRICH_BUDGET_MS,
   SEARCH_ENRICH_MAX_FETCH_PER_HOST,
+  searchResultFetchUrl,
 } from '../src/web-search';
 
 function createMockOAuthStore() {
@@ -5648,5 +5649,54 @@ test('R12: search enrichment caps live fetches per host so one docs site cannot 
   const results = s.body.results as Array<Record<string, unknown>>;
   assert.equal(results.length, 5, 'capped results are still returned with their SERP snippet');
   assert.ok(results.filter((r) => typeof r.rawContent === 'string').length >= 3, 'two docs pages + the blog page are enriched');
+});
+
+test('R13: search keeps the provider trailing slash for fetching while deduping on the slashless canonical key', async () => {
+  // Unit: only a path whose trailing slash canonicalization removed gets a distinct fetch URL.
+  assert.equal(
+    searchResultFetchUrl('https://Docs.Example.com/do/limits/?utm_source=x&v=2#top', 'https://docs.example.com/do/limits?v=2'),
+    'https://docs.example.com/do/limits/?v=2',
+  );
+  assert.equal(searchResultFetchUrl('https://docs.example.com/do/limits', 'https://docs.example.com/do/limits'), undefined);
+  assert.equal(searchResultFetchUrl('https://docs.example.com/', 'https://docs.example.com/'), undefined);
+  assert.equal(searchResultFetchUrl('not a url', 'https://docs.example.com/x'), undefined);
+
+  const fetched: string[] = [];
+  const hub = async (_t: string, bodyText: string) => {
+    const parsed = JSON.parse(bodyText) as { requests?: Array<{ id?: string; url?: string }> };
+    const reqs = parsed.requests ?? [];
+    for (const r of reqs) fetched.push(String(r.url));
+    return {
+      status: 200,
+      via: 'cf',
+      bodyText: JSON.stringify({
+        results: reqs.map((r) => ({
+          id: r.id,
+          url: r.url,
+          status: 200,
+          outcome: 'ok',
+          contentType: 'text/html',
+          body: '<html><head><title>Limits</title></head><body><main><h1>Limits</h1><p>Durable Objects storage limits are documented here with enough words.</p></main></body></html>',
+        })),
+      }),
+    };
+  };
+  resetSearchProviderPacingForTests();
+  const s = await executeSearchCall({
+    payload: { query: 'durable objects limits', mode: 'rrf', providers: ['serper', 'brave'], max_results: 5, include_raw_content: true, noCache: true },
+    env: { SERPER_API_KEY: 'serper-slash', BRAVE_API_KEY: 'brave-slash' } as never,
+    executeHubFetch: hub as never,
+    providerFetchFn: async (u) =>
+      String(u).includes('serper.dev')
+        ? Response.json({ organic: [{ title: 'Limits', link: 'https://docs.example.com/do/limits/', snippet: 'Durable Objects limits' }] })
+        : Response.json({ web: { results: [{ url: 'https://docs.example.com/do/limits', title: 'Limits', description: 'Durable Objects limits' }] } }),
+  });
+  assert.equal(s.status, 200);
+  const results = s.body.results as Array<Record<string, unknown>>;
+  assert.equal(results.length, 1, 'slash and slashless provider URLs still fuse into one result');
+  assert.deepEqual(results[0]!.providers, ['serper', 'brave']);
+  assert.equal(results[0]!.url, 'https://docs.example.com/do/limits/', 'result returns the provider URL that serves the page');
+  assert.deepEqual(fetched, ['https://docs.example.com/do/limits/'], 'enrichment fetches the slash URL (no redirect hop)');
+  assert.equal(typeof results[0]!.rawContent, 'string');
 });
 

@@ -121,6 +121,8 @@ export interface SearchRequestPayload {
 
 interface RawSearchHit {
   url: string;
+  /** Provider's own URL when canonicalization changed its path (see `searchResultFetchUrl`); `url` stays the dedupe key. */
+  fetchUrl?: string;
   title: string;
   snippet: string;
   isFiller?: boolean;
@@ -338,6 +340,24 @@ export function canonicalizeSearchResultUrl(rawUrl: string): string | null {
   }
 }
 
+/**
+ * The URL to fetch/return for a provider hit whose canonical dedupe key dropped a trailing slash. Docs sites commonly
+ * serve `/page/` and 301 `/page` to it; fetching the slashless key costs a redirect plus a full same-host politeness
+ * pause (~2-4 s live per page) before the first real byte. Returns `undefined` when the canonical URL is already exact.
+ */
+export function searchResultFetchUrl(rawUrl: string, canon: string): string | undefined {
+  try {
+    const raw = new URL(rawUrl.trim());
+    if (raw.pathname.length <= 1 || !raw.pathname.endsWith('/')) return undefined;
+    const fetchUrl = new URL(canon);
+    if (fetchUrl.pathname.endsWith('/')) return undefined;
+    fetchUrl.pathname = `${fetchUrl.pathname}/`;
+    return fetchUrl.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeDomainList(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -518,8 +538,10 @@ async function querySerperWebSearch(params: {
         if (typeof r.link !== 'string') continue;
         const canon = canonicalizeSearchResultUrl(r.link);
         if (!canon) continue;
+        const fetchUrl = searchResultFetchUrl(r.link, canon);
         out.push({
           url: canon,
+          ...(fetchUrl ? { fetchUrl } : {}),
           title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
           snippet: cleanProviderText(r.snippet),
         });
@@ -578,8 +600,10 @@ async function queryBraveWebSearch(params: {
         if (typeof r.url !== 'string') continue;
         const canon = canonicalizeSearchResultUrl(r.url);
         if (!canon) continue;
+        const fetchUrl = searchResultFetchUrl(r.url, canon);
         out.push({
           url: canon,
+          ...(fetchUrl ? { fetchUrl } : {}),
           title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
           snippet: cleanProviderText(r.description),
         });
@@ -646,8 +670,10 @@ async function queryTavilyWebSearch(params: {
         if (typeof r.url !== 'string') continue;
         const canon = canonicalizeSearchResultUrl(r.url);
         if (!canon) continue;
+        const fetchUrl = searchResultFetchUrl(r.url, canon);
         out.push({
           url: canon,
+          ...(fetchUrl ? { fetchUrl } : {}),
           title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
           snippet: cleanProviderText(r.content),
         });
@@ -707,8 +733,10 @@ async function querySearxngSearch(params: {
         if (typeof r.url !== 'string') continue;
         const canon = canonicalizeSearchResultUrl(r.url);
         if (!canon) continue;
+        const fetchUrl = searchResultFetchUrl(r.url, canon);
         out.push({
           url: canon,
+          ...(fetchUrl ? { fetchUrl } : {}),
           title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
           snippet: cleanProviderText(r.content),
         });
@@ -1409,6 +1437,7 @@ export async function executeSearchCall(params: {
     string,
     {
       url: string;
+      fetchUrl?: string;
       title: string;
       content: string;
       rrfScore: number;
@@ -1450,6 +1479,7 @@ export async function executeSearchCall(params: {
       const existing = fused.get(itemUrl);
       if (existing) {
         existing.rrfScore += rrfAdd;
+        if (!existing.fetchUrl && item.fetchUrl && itemUrl === item.url) existing.fetchUrl = item.fetchUrl;
         if (!existing.providers.includes(provider)) existing.providers.push(provider);
         if (
           item.snippet &&
@@ -1464,6 +1494,7 @@ export async function executeSearchCall(params: {
       } else {
         fused.set(itemUrl, {
           url: itemUrl,
+          ...(item.fetchUrl && itemUrl === item.url ? { fetchUrl: item.fetchUrl } : {}),
           title: item.title || (wikiMeta ? `${wikiMeta.canonicalTitle} — Wikipedia` : ''),
           content: item.snippet,
           rrfScore: rrfAdd,
@@ -1504,7 +1535,8 @@ export async function executeSearchCall(params: {
   const maxRrf = ranked[0]?.rrfScore ?? 1;
   const results: SearchResultEntry[] = ranked.map((r) => ({
     title: r.title,
-    url: r.url,
+    // The provider's real URL (e.g. with its trailing slash) so clients and enrichment skip a redirect + politeness pause.
+    url: r.fetchUrl ?? r.url,
     content: r.content,
     score: Number(Math.min(1, (r.rrfScore / Math.max(maxRrf, 1e-6)) * 0.95).toFixed(4)),
     provider: r.providers[0]!,

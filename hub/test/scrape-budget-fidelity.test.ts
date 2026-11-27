@@ -611,6 +611,13 @@ test('R16: inline records[] stay within the scrape maxChars budget (catalog twin
   // B. Under budget: returned unchanged (no truncation fields).
   const small = { records: [product(1)] };
   assert.equal(capInlineRecordsToBudget(small, 100_000), small);
+  // ATS board `jobs[]` is held to the same budget (a Greenhouse board returned ~83 KB inline under the MCP default).
+  const jobsBody = { ok: true, jobs: Array.from({ length: 200 }, (_, i) => ({ title: `Role ${i}`, url: `https://x.example/jobs/${i}`, snippet: 'z'.repeat(300) })) };
+  const cappedJobs = capInlineRecordsToBudget(jobsBody, 5_000);
+  assert.ok(JSON.stringify(cappedJobs.jobs).length <= 5_000);
+  assert.equal(cappedJobs.jobsTruncated, true);
+  assert.equal(cappedJobs.jobsTotal, 200);
+  assert.equal((cappedJobs.jobs as unknown[]).length, cappedJobs.jobsReturned);
 
   // C. A single record larger than the budget: none kept, still reported.
   const huge = capInlineRecordsToBudget({ records: [{ body: 'y'.repeat(5_000) }] }, 1_000);

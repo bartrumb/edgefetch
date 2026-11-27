@@ -195,6 +195,11 @@ export const PUBLIC_JOB_FEEDS = [
 export const MAX_JOBS_CONCURRENT_SCRAPES = 4;
 export const MAX_JOBS_TOTAL_SCRAPES = 40;
 export const JOBS_CACHE_TTL_MS = 5 * 60 * 1_000;
+/** Concurrent scrapes allowed per host for ATS JSON-API fetches served from the Cloudflare edge (node fetches stay at 1). */
+export const JOBS_ATS_API_HOST_CONCURRENCY = 3;
+/** Cross-call (R2 + META D1 index) cache lifetime for ATS board responses. */
+export const JOBS_BOARD_CACHE_TTL_MS = 10 * 60 * 1_000;
+const JOBS_BOARD_CACHE_MAX_BYTES = 3 * 1024 * 1024;
 export const MAX_JOBS_CACHE_ENTRIES = 128;
 export const JOBS_PER_ITEM_TIMEOUT_MS = 18_000;
 /**
@@ -1338,6 +1343,80 @@ async function executeJobsVerifyMode(params: {
 }
 
 /**
+ * Cross-call ATS board cache. Board responses (public JSON APIs) are kept for `JOBS_BOARD_CACHE_TTL_MS` in R2, gated by a
+ * META D1 index row so a cold lookup never issues a blind R2 GET (an error-level `NoSuchKey` span). Repeat and paginated
+ * company searches then skip the board fetch entirely, across Worker isolates.
+ */
+const JOBS_BOARD_CACHE_DDL =
+  'CREATE TABLE IF NOT EXISTS jobs_board_cache (cache_key TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL)';
+const jobsBoardCacheReady = new WeakSet<object>();
+async function ensureJobsBoardCache(metaDb: D1Database): Promise<boolean> {
+  const key = metaDb as unknown as object;
+  if (jobsBoardCacheReady.has(key)) return true;
+  try {
+    await metaDb.prepare(JOBS_BOARD_CACHE_DDL).run();
+    jobsBoardCacheReady.add(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function jobsBoardCacheKey(scopeFreeKey: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`jobs-board-v1|${scopeFreeKey}`));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function readJobsBoardCache(
+  env: OptionalStorageBindings | undefined,
+  cacheKey: string,
+  now: number,
+): Promise<{ status: number; body: Record<string, unknown> } | null> {
+  if (!env?.META || !env.ARTIFACTS || !(await ensureJobsBoardCache(env.META))) return null;
+  const row = await env.META.prepare('SELECT fetched_at FROM jobs_board_cache WHERE cache_key = ? LIMIT 1')
+    .bind(cacheKey)
+    .first<{ fetched_at: number }>()
+    .catch(() => null);
+  if (!row || typeof row.fetched_at !== 'number' || now - row.fetched_at > JOBS_BOARD_CACHE_TTL_MS) return null;
+  const obj = await env.ARTIFACTS.get(`derived/jobs-board-cache/${cacheKey}.json`).catch(() => null);
+  if (!obj) return null;
+  try {
+    const parsed = (await obj.json()) as { fetchedAt?: number; body?: Record<string, unknown> };
+    if (
+      !parsed?.body ||
+      parsed.body.ok !== true ||
+      typeof parsed.fetchedAt !== 'number' ||
+      now - parsed.fetchedAt > JOBS_BOARD_CACHE_TTL_MS
+    ) {
+      return null;
+    }
+    return { status: 200, body: { ...parsed.body, boardCacheHit: true } };
+  } catch {
+    return null;
+  }
+}
+async function writeJobsBoardCache(
+  env: OptionalStorageBindings | undefined,
+  cacheKey: string,
+  body: Record<string, unknown>,
+  now: number,
+): Promise<void> {
+  if (!env?.META || !env.ARTIFACTS || !(await ensureJobsBoardCache(env.META))) return;
+  const json = JSON.stringify({ fetchedAt: now, body });
+  if (json.length > JOBS_BOARD_CACHE_MAX_BYTES) return;
+  try {
+    await env.ARTIFACTS.put(`derived/jobs-board-cache/${cacheKey}.json`, json, {
+      httpMetadata: { contentType: 'application/json' },
+    });
+    await env.META.prepare(
+      'INSERT INTO jobs_board_cache (cache_key, fetched_at) VALUES (?, ?) ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at',
+    )
+      .bind(cacheKey, now)
+      .run();
+  } catch {
+    // best-effort cache
+  }
+}
+
+/**
  * Known-boards index (META D1): which ATS board a company actually uses, learned from successful board scrapes. A
  * company search probes these first, so companies whose tenant cannot be guessed (Workday `<tenant>.wdN`, custom
  * Greenhouse slugs) skip the web search after their first lookup. Rows are only written for boards that returned jobs,
@@ -1453,7 +1532,9 @@ export async function executeJobsCall(params: {
     const remainingItemTimeoutMs = (): number =>
       Math.max(500, Math.min(JOBS_PER_ITEM_TIMEOUT_MS, wallDeadlineAt - Date.now()));
     const scrapeWaitQueue: Array<() => void> = [];
-    const activeHostScrapes = new Set<string>();
+    /** In-flight scrapes per effective host; ATS API hosts served from the edge allow `JOBS_ATS_API_HOST_CONCURRENCY`. */
+    const activeHostScrapes = new Map<string, number>();
+    const hostActive = (h: string): number => activeHostScrapes.get(h) ?? 0;
     const hostWaitQueues = new Map<string, Array<() => void>>();
 
     const resolveEffectiveScrapeHost = (args: Record<string, unknown>): string => {
@@ -1508,9 +1589,31 @@ export async function executeJobsCall(params: {
         }
       }
 
+      // ATS JSON APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday) are public endpoints that do not block bots:
+      // fetch them from the Cloudflare edge instead of a home node unless the caller pinned a target.
+      // `JOBS_EDGE_ATS_FETCH=off` disables edge routing (operator kill switch).
+      const edgeAtsEnabled = String(env?.JOBS_EDGE_ATS_FETCH ?? '').trim().toLowerCase() !== 'off';
+      const atsSpecForRoute =
+        edgeAtsEnabled && args.target === undefined && !payload.target && typeof args.url === 'string'
+          ? resolveAtsPreFetchSpec(args.url)
+          : null;
+      const edgeRouted = Boolean(atsSpecForRoute);
+      const routedArgs: Record<string, unknown> = edgeRouted ? { ...args, target: 'container' } : args;
+      const hostCap = edgeRouted ? JOBS_ATS_API_HOST_CONCURRENCY : 1;
+
+      // Cross-call board cache (public ATS board APIs only; never caller-specific requests).
+      const isCacheableBoard =
+        edgeRouted &&
+        args.noCache !== true &&
+        args.headers === undefined &&
+        args.cookies === undefined &&
+        Boolean(classifyFullBoardKey(String(args.url))?.isBoard || isSmartRecruitersBoardUrl(String(args.url)));
+      const scopeFreeKey = isCacheableBoard ? buildJobsScrapeCacheKey(args, 'public') : null;
+      let boardCacheKey: string | null = null;
+
       const effectiveHost = resolveEffectiveScrapeHost(args);
       if (effectiveHost) {
-        while (activeHostScrapes.has(effectiveHost)) {
+        while (hostActive(effectiveHost) >= hostCap) {
           if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
             budgetExhausted = true;
             wakeAllWaiters();
@@ -1527,18 +1630,18 @@ export async function executeJobsCall(params: {
           if (cacheKey) {
             const cachedAfterHostWait = readJobsScrapeCache(cachePartition, cacheKey);
             if (cachedAfterHostWait) {
-              if (!activeHostScrapes.has(effectiveHost)) wakeNextHostWaiter(effectiveHost);
+              if (hostActive(effectiveHost) < hostCap) wakeNextHostWaiter(effectiveHost);
               return cachedAfterHostWait;
             }
             const flightAfterHostWait = cachePartition.inFlight.get(cacheKey);
             if (flightAfterHostWait) {
-              if (!activeHostScrapes.has(effectiveHost)) wakeNextHostWaiter(effectiveHost);
+              if (hostActive(effectiveHost) < hostCap) wakeNextHostWaiter(effectiveHost);
               const sharedRes = await withJobsItemTimeout(flightAfterHostWait);
               return cloneJobsScrapeResponse(sharedRes);
             }
           }
         }
-        activeHostScrapes.add(effectiveHost);
+        activeHostScrapes.set(effectiveHost, hostActive(effectiveHost) + 1);
       }
 
       let acquiredGlobal = false;
@@ -1575,7 +1678,29 @@ export async function executeJobsCall(params: {
         totalScrapesUsed++;
         const runSingle = (): Promise<JobsScrapeResponse> =>
           withJobsItemTimeout(
-            Promise.resolve().then(() => (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args))),
+            Promise.resolve().then(async () => {
+              // Inside the shared flight so parallel callers still coalesce onto one lookup/fetch.
+              if (scopeFreeKey) {
+                boardCacheKey = await jobsBoardCacheKey(scopeFreeKey);
+                const persisted = await readJobsBoardCache(env, boardCacheKey, Date.now());
+                if (persisted) return persisted;
+              }
+              const runRaw = (a: Record<string, unknown>) =>
+                activeTracer ? activeTracer.run(() => rawExecuteScrape(a)) : rawExecuteScrape(a);
+              const first = await runRaw(routedArgs);
+              // Edge fetch failed (anything but success or a definitive 404/410): retry once through the normal route
+              // while budget remains, so an edge outage never costs results.
+              if (
+                edgeRouted &&
+                !(first.status === 200 && first.body?.ok === true) &&
+                first.status !== 404 &&
+                first.status !== 410 &&
+                wallDeadlineAt - Date.now() > 3_000
+              ) {
+                return runRaw(args);
+              }
+              return first;
+            }),
             remainingItemTimeoutMs(),
           );
         flightPromise = runSingle();
@@ -1583,6 +1708,9 @@ export async function executeJobsCall(params: {
         const out = await flightPromise;
         if (cacheKey && out.status === 200 && out.body?.ok === true) {
           writeJobsScrapeCache(cachePartition, cacheKey, out);
+        }
+        if (boardCacheKey && out.status === 200 && out.body?.ok === true && out.body.boardCacheHit !== true && Array.isArray(out.body.jobs)) {
+          await writeJobsBoardCache(env, boardCacheKey, out.body, Date.now());
         }
         return cacheKey ? cloneJobsScrapeResponse(out) : out;
       } finally {
@@ -1595,7 +1723,9 @@ export async function executeJobsCall(params: {
           else scrapeWaitQueue.shift()?.();
         }
         if (effectiveHost) {
-          activeHostScrapes.delete(effectiveHost);
+          const left = hostActive(effectiveHost) - 1;
+          if (left > 0) activeHostScrapes.set(effectiveHost, left);
+          else activeHostScrapes.delete(effectiveHost);
           if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || timeBudgetExhausted) wakeAllWaiters();
           else wakeNextHostWaiter(effectiveHost);
         }
@@ -2822,9 +2952,13 @@ export async function executeJobsCall(params: {
       }
     };
 
-    for (const waveUrls of [boardWaveUrls, postingWaveUrls]) {
-      await runCandidateWave(waveUrls);
-    }
+    await runCandidateWave(boardWaveUrls);
+    // Company-scoped: once the company's board was read, individual postings only add pay/details for the jobs still
+    // missing, so fetch at most 2x the remaining slots instead of every search hit (each is a ~4 s detail fetch).
+    const boardRead = fetchedCompleteBoards.size > 0 || fetchedQueriedWorkdayBoards.size > 0;
+    const postingCap =
+      hasCompanyOrDomainScope && boardRead ? Math.max(2, (limit - collected.length) * 2) : postingWaveUrls.length;
+    await runCandidateWave(postingWaveUrls.slice(0, postingCap));
 
     if (
       companyFilter &&

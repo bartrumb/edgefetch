@@ -8614,7 +8614,7 @@ export async function executeScrapeCall(params: {
   const rawScrapeResult = await (activeTracer ? activeTracer.run(runScrape) : runScrape());
   const recordsBudget = resolveScrapeMaxChars(params.payload);
   const scrapeResult =
-    recordsBudget !== undefined && Array.isArray(rawScrapeResult.body.records)
+    recordsBudget !== undefined && (Array.isArray(rawScrapeResult.body.records) || Array.isArray(rawScrapeResult.body.jobs))
       ? { ...rawScrapeResult, body: capInlineRecordsToBudget(rawScrapeResult.body, recordsBudget) }
       : rawScrapeResult;
   if (
@@ -8659,7 +8659,12 @@ export function resolveScrapeMaxChars(payload: Pick<ScrapeRequestPayload, 'maxCh
  * where to get the rest. Callers without a budget (REST without `maxChars`) keep the full array.
  */
 export function capInlineRecordsToBudget(body: Record<string, unknown>, budgetChars: number): Record<string, unknown> {
-  const records = body.records;
+  return capInlineArrayToBudget(capInlineArrayToBudget(body, 'records', budgetChars), 'jobs', budgetChars);
+}
+
+/** `capInlineRecordsToBudget` for one array field (`records` or ATS board `jobs`), adding `<key>Truncated` etc. */
+function capInlineArrayToBudget(body: Record<string, unknown>, key: 'records' | 'jobs', budgetChars: number): Record<string, unknown> {
+  const records = body[key];
   if (!Array.isArray(records) || records.length === 0) return body;
   if (JSON.stringify(records).length <= budgetChars) return body;
   const kept: unknown[] = [];
@@ -8672,12 +8677,12 @@ export function capInlineRecordsToBudget(body: Record<string, unknown>, budgetCh
   }
   return {
     ...body,
-    records: kept,
-    recordsTruncated: true,
-    recordsReturned: kept.length,
-    recordsTotal: records.length,
-    recordsHint:
-      `records[] trimmed to ${kept.length} of ${records.length} to fit maxChars ${budgetChars}. ` +
+    [key]: kept,
+    [`${key}Truncated`]: true,
+    [`${key}Returned`]: kept.length,
+    [`${key}Total`]: records.length,
+    [`${key}Hint`]:
+      `${key}[] trimmed to ${kept.length} of ${records.length} to fit maxChars ${budgetChars}. ` +
       'Raise maxChars (up to 500000), follow pagination when present, or page the raw response with read_artifact(artifactId).',
   };
 }

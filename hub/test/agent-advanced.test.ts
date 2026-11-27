@@ -6054,3 +6054,65 @@ test('R25: company searches cap individual posting fetches once the company boar
   const postingFetches = scraped.filter((u) => u.includes('/job/')).length;
   assert.ok(postingFetches <= 4, `posting fetches capped at 2x remaining slots, got ${postingFetches}`);
 });
+
+test('R26: Cloudflare Web Search API provider (REST + Workers AI binding), skipped for site:-scoped queries', async () => {
+  resetSearchProviderPacingForTests();
+  const accountId = 'a'.repeat(32);
+  const calls: Array<{ url: string; auth: string | null; body: Record<string, unknown> }> = [];
+  const providerFetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const u = String(input);
+    const headers = new Headers(init?.headers);
+    calls.push({ url: u, auth: headers.get('authorization'), body: JSON.parse(String(init?.body ?? '{}')) });
+    if (u.includes('/ai/websearch/')) {
+      return Response.json({
+        items: [{ url: 'https://example.org/workers-guide', title: 'Workers guide', description: 'How Workers run at the edge.' }],
+        metadata: { query: 'q', requestId: 'r1', latencyMs: 12 },
+      });
+    }
+    return new Response('{}', { status: 404 });
+  }) as unknown as typeof fetch;
+  const executeHubFetch = async () => ({ status: 200, via: 'cf', bodyText: JSON.stringify({ results: [] }) });
+  const restEnv = {
+    CLOUDFLARE_ACCOUNT_ID: accountId,
+    CLOUDFLARE_WEBSEARCH_API_TOKEN: 'cf-test-token',
+    CLOUDFLARE_WEBSEARCH_PROVIDER: 'exa',
+  };
+
+  const rest = await executeSearchCall({ payload: { query: 'what are cloudflare workers' }, env: restEnv as never, executeHubFetch, providerFetchFn });
+  assert.equal(rest.status, 200, JSON.stringify(rest.body).slice(0, 300));
+  const cf = calls.find((c) => c.url.includes('/ai/websearch/'))!;
+  assert.ok(cf, 'REST endpoint called');
+  assert.equal(cf.url, `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/websearch/`);
+  assert.equal(cf.auth, 'Bearer cf-test-token');
+  assert.equal(cf.body.provider, 'exa');
+  assert.deepEqual(cf.body.options, { gateway: { id: 'default' } });
+  assert.ok((cf.body.limit as number) <= 10);
+  assert.ok(((rest.body.results as Array<{ url: string }>) ?? []).some((r) => r.url === 'https://example.org/workers-guide'));
+
+  // site:-scoped queries never go to Cloudflare Web Search (no documented domain filtering).
+  calls.length = 0;
+  resetSearchProviderPacingForTests();
+  await executeSearchCall({ payload: { query: 'site:jobs.lever.co platform engineer' }, env: restEnv as never, executeHubFetch, providerFetchFn });
+  assert.equal(calls.filter((c) => c.url.includes('/ai/websearch/')).length, 0);
+
+  // Workers AI binding is preferred over REST and receives gatewayId.
+  calls.length = 0;
+  resetSearchProviderPacingForTests();
+  const bindingCalls: Array<Record<string, unknown>> = [];
+  const bindingEnv = {
+    AI: {
+      run: async () => ({}),
+      websearch: async (opts: Record<string, unknown>) => {
+        bindingCalls.push(opts);
+        return Response.json({ items: [{ url: 'https://example.net/a', title: 'A', description: 'd' }] });
+      },
+    },
+    CLOUDFLARE_AI_GATEWAY_ID: 'my-gateway',
+  };
+  const viaBinding = await executeSearchCall({ payload: { query: 'edge compute basics' }, env: bindingEnv as never, executeHubFetch, providerFetchFn });
+  assert.equal(viaBinding.status, 200);
+  assert.equal(bindingCalls.length, 1);
+  assert.equal(bindingCalls[0]!.gatewayId, 'my-gateway');
+  assert.equal(bindingCalls[0]!.provider, 'ceramic', 'defaults to ceramic');
+  assert.equal(calls.filter((c) => c.url.includes('/ai/websearch/')).length, 0, 'binding path issues no REST call');
+});

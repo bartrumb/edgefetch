@@ -13,6 +13,7 @@ import { getActiveCallerAuthContext } from './oauth';
 import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { compileSafeUserRegex } from './safe-input';
 import type { OptionalStorageBindings } from './storage';
+import { recordSalaryObservations } from './salaries';
 import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawMetaPair } from './wasm-bridge';
 
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
@@ -3179,6 +3180,8 @@ export async function executeJobsCall(params: {
     if (resolvedAdapterIds.size > 0) {
       activeTracer?.setAttribute('edgefetch.adapter_id', [...resolvedAdapterIds].join(','));
     }
+    // Salary aggregation: record the employer-posted pay ranges this search returned (Go plausibility gate).
+    await recordSalaryObservations(env?.META, collected).catch(() => 0);
     if (companyFilter && learnedCompanyBoards.size > 0) {
       await recordKnownJobsBoards(env?.META, jobsKnownBoardCompanyKey(companyFilter), learnedCompanyBoards, Date.now());
     }

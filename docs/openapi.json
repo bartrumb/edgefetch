@@ -2289,6 +2289,166 @@
         }
       }
     },
+    "/v1/company": {
+      "post": {
+        "tags": [
+          "Vertical Intelligence"
+        ],
+        "operationId": "getCompanyProfile",
+        "summary": "Build a sourced company profile",
+        "description": "Merges the company website (schema.org Organization), Wikidata, SEC EDGAR, GitHub, the official ATS job board, and (when connected) Google Maps place details into one profile with per-field source attribution.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2Pkce": [
+              "crawl:fetch"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompanyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Company profile with `fieldSources`, `sources`, and a Markdown summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON body or invalid request parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Bearer token / OAuth 2.1 access token.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "RFC 9728 OAuth 2.1 Protected Resource challenge header.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient OAuth 2.1 scope (`crawl:read`, `crawl:fetch`, or `mcp:call`) or policy block.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/salaries": {
+      "post": {
+        "tags": [
+          "Vertical Intelligence"
+        ],
+        "operationId": "aggregateSalaries",
+        "summary": "Aggregate employer-posted pay ranges for a job title",
+        "description": "Percentiles and breakdowns (seniority, location, company) over pay ranges employers posted on official ATS boards, with sample postings. Runs a fresh jobs search when data is thin or `refresh` is true.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2Pkce": [
+              "crawl:fetch"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SalariesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Salary report (stats, breakdowns, sample, notes, Markdown).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON body or invalid request parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Bearer token / OAuth 2.1 access token.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "RFC 9728 OAuth 2.1 Protected Resource challenge header.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient OAuth 2.1 scope (`crawl:read`, `crawl:fetch`, or `mcp:call`) or policy block.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/catalog/{catalogId}": {
       "get": {
         "tags": [
@@ -2959,6 +3119,76 @@
         "responses": {
           "200": {
             "description": "Normalized dual-source MCP registry search results.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON body or invalid request parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Bearer token / OAuth 2.1 access token.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "RFC 9728 OAuth 2.1 Protected Resource challenge header.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient OAuth 2.1 scope (`crawl:read`, `crawl:fetch`, or `mcp:call`) or policy block.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mcp/shared": {
+      "get": {
+        "tags": [
+          "Coordinator & MCP"
+        ],
+        "operationId": "listSharedMcpServers",
+        "summary": "List MCP servers other hub users shared with the caller",
+        "description": "Returns name, slug, and cached tools of connected MCP servers shared with the caller via the hub access policy. Remote URLs, auth summaries, and credentials are never returned; call tools through `POST /v1/mcp/query` with `server: \"<ownerUserId>/<slug>\"`.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2Pkce": [
+              "crawl:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Servers shared with the caller.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4799,6 +5029,80 @@
             "description": "Optional worker site ID when target=\"agent\"."
           }
         },
+        "additionalProperties": false
+      },
+      "CompanyRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Company name (e.g. \"Cloudflare\"). Provide name and/or domain."
+          },
+          "domain": {
+            "type": "string",
+            "description": "Company website domain (e.g. \"cloudflare.com\"); strongly recommended for accurate matching."
+          },
+          "includeHiring": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include the official ATS hiring summary (open roles, locations, sample titles)."
+          },
+          "includePlaces": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include Google Maps place details when a Google Maps MCP server is connected."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SalariesRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Job title (e.g. \"Senior Software Engineer\", \"Solutions Engineer\")."
+          },
+          "location": {
+            "type": "string",
+            "description": "Optional location (\"Remote\", \"United States\", \"New York, NY\", \"London\")."
+          },
+          "seniority": {
+            "type": "string",
+            "description": "Optional seniority filter (junior, mid, senior, staff, principal, manager, director, ...)."
+          },
+          "company": {
+            "type": "string",
+            "description": "Optional company filter."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional ISO 4217 currency (defaults to the most common in the matches)."
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "base",
+              "total",
+              "ote",
+              "all"
+            ],
+            "description": "Pay basis filter (default: base when enough base ranges exist)."
+          },
+          "maxAgeDays": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 730,
+            "description": "Only use postings seen within this many days (default 180)."
+          },
+          "refresh": {
+            "type": "boolean",
+            "default": false,
+            "description": "Run a fresh jobs search first to collect new observations."
+          }
+        },
+        "required": [
+          "title"
+        ],
         "additionalProperties": false
       },
       "BatchScrapeRequest": {
@@ -7264,6 +7568,84 @@
         },
         "required": [
           "query"
+        ],
+        "additionalProperties": false
+      },
+      "McpTool_CompanyInput": {
+        "title": "Company Profile (Sourced) (MCP company)",
+        "description": "Builds a sourced company profile from official and public sources: the company website (schema.org Organization, socials), Wikidata (founded, HQ, industry, employees, ticker), SEC EDGAR (legal name, SIC, latest annual revenue), GitHub, its official ATS job board (open roles, locations), and Google Maps place details when a Google Maps MCP is connected. Every field carries its source.",
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Company name (e.g. \"Cloudflare\"). Provide name and/or domain."
+          },
+          "domain": {
+            "type": "string",
+            "description": "Company website domain (e.g. \"cloudflare.com\"); strongly recommended for accurate matching."
+          },
+          "includeHiring": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include the official ATS hiring summary (open roles, locations, sample titles)."
+          },
+          "includePlaces": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include Google Maps place details when a Google Maps MCP server is connected."
+          }
+        },
+        "additionalProperties": false
+      },
+      "McpTool_SalariesInput": {
+        "title": "Salary Ranges from Employer Postings (MCP salaries)",
+        "description": "Aggregates employer-posted pay ranges for a job title from official ATS job postings EdgeFetch has seen (p10/p25/median/p75/p90, by seniority, location, and company, with sample postings). Runs a fresh jobs search when data is thin or refresh=true. Ranges are posted by employers, not self-reported estimates.",
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Job title (e.g. \"Senior Software Engineer\", \"Solutions Engineer\")."
+          },
+          "location": {
+            "type": "string",
+            "description": "Optional location (\"Remote\", \"United States\", \"New York, NY\", \"London\")."
+          },
+          "seniority": {
+            "type": "string",
+            "description": "Optional seniority filter (junior, mid, senior, staff, principal, manager, director, ...)."
+          },
+          "company": {
+            "type": "string",
+            "description": "Optional company filter."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional ISO 4217 currency (defaults to the most common in the matches)."
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "base",
+              "total",
+              "ote",
+              "all"
+            ],
+            "description": "Pay basis filter (default: base when enough base ranges exist)."
+          },
+          "maxAgeDays": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 730,
+            "description": "Only use postings seen within this many days (default 180)."
+          },
+          "refresh": {
+            "type": "boolean",
+            "default": false,
+            "description": "Run a fresh jobs search first to collect new observations."
+          }
+        },
+        "required": [
+          "title"
         ],
         "additionalProperties": false
       },

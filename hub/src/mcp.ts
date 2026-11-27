@@ -14,7 +14,8 @@ import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
-import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
+import { evaluateToolAccess, filterToolDefinitions, type AccessCallerContext, type AccessPolicyStore } from './access-policy';
+import { authorizeMcpRequest, getActiveCallerAuthContext, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { formatFenceSafeUntrustedMcpEnvelope, sanitizeConnectorStructuredValue } from './mcp-federation';
 import { parseAllowedMcpTools, resolveCallerUserId } from './mcp-vault';
 import { getActiveRequestTracer, type RequestTracer } from './otel';
@@ -167,6 +168,10 @@ export interface McpExecuteFetchResult {
 }
 
 export interface McpServerDeps {
+  /** Hub access policy (tools/list filter + tools/call gate). Absent = no policy (default allow). */
+  accessPolicy?: AccessPolicyStore;
+  /** Snapshot cache key for `accessPolicy` (the AGENT_HUB binding object in production). */
+  accessPolicyCacheKey?: string | object;
   serverName: string;
   serverVersion: string;
   ownerSecret?: string;
@@ -233,6 +238,16 @@ export interface McpServerDeps {
     userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeCatalog?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+    userId?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeCompany?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+    userId?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeSalaries?: (params: {
     args: Record<string, unknown>;
     principal?: string;
     userId?: string;
@@ -351,6 +366,8 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'crawl' ||
     toolName === 'jobs' ||
     toolName === 'catalog' ||
+    toolName === 'company' ||
+    toolName === 'salaries' ||
     toolName === 'agent'
   ) {
     return 'crawl:fetch';
@@ -1223,6 +1240,55 @@ export function buildCanonicalMcpToolSchemas(options?: {
       },
     },
     {
+      name: 'company',
+      description:
+        'Builds a sourced company profile from official and public sources: the company website (schema.org Organization, socials), Wikidata (founded, HQ, industry, employees, ticker), SEC EDGAR (legal name, SIC, latest annual revenue), GitHub, its official ATS job board (open roles, locations), and Google Maps place details when a Google Maps MCP is connected. Every field carries its source.',
+      annotations: {
+        title: 'Company Profile (Sourced)',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Company name (e.g. "Cloudflare"). Provide name and/or domain.' },
+          domain: { type: 'string', description: 'Company website domain (e.g. "cloudflare.com"); strongly recommended for accurate matching.' },
+          includeHiring: { type: 'boolean', default: true, description: 'Include the official ATS hiring summary (open roles, locations, sample titles).' },
+          includePlaces: { type: 'boolean', default: true, description: 'Include Google Maps place details when a Google Maps MCP server is connected.' },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'salaries',
+      description:
+        'Aggregates employer-posted pay ranges for a job title from official ATS job postings EdgeFetch has seen (p10/p25/median/p75/p90, by seniority, location, and company, with sample postings). Runs a fresh jobs search when data is thin or refresh=true. Ranges are posted by employers, not self-reported estimates.',
+      annotations: {
+        title: 'Salary Ranges from Employer Postings',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Job title (e.g. "Senior Software Engineer", "Solutions Engineer").' },
+          location: { type: 'string', description: 'Optional location ("Remote", "United States", "New York, NY", "London").' },
+          seniority: { type: 'string', description: 'Optional seniority filter (junior, mid, senior, staff, principal, manager, director, ...).' },
+          company: { type: 'string', description: 'Optional company filter.' },
+          currency: { type: 'string', description: 'Optional ISO 4217 currency (defaults to the most common in the matches).' },
+          basis: { type: 'string', enum: ['base', 'total', 'ote', 'all'], description: 'Pay basis filter (default: base when enough base ranges exist).' },
+          maxAgeDays: { type: 'integer', minimum: 1, maximum: 730, description: 'Only use postings seen within this many days (default 180).' },
+          refresh: { type: 'boolean', default: false, description: 'Run a fresh jobs search first to collect new observations.' },
+        },
+        required: ['title'],
+        additionalProperties: false,
+      },
+    },
+    {
       name: 'catalog',
       description:
         'Extracts normalized product, variant, pricing, SKU, and availability records from a public Shopify or WooCommerce storefront (respecting robots.txt and rate limits), or pages and filters an existing catalog snapshot by catalogId.',
@@ -1432,6 +1498,8 @@ function buildToolDefinitions(deps: McpServerDeps) {
       if (t.name === 'read_artifact') return Boolean(deps.readArtifact);
       if (t.name === 'jobs') return Boolean(deps.executeJobs);
       if (t.name === 'catalog') return Boolean(deps.executeCatalog);
+      if (t.name === 'company') return Boolean(deps.executeCompany);
+      if (t.name === 'salaries') return Boolean(deps.executeSalaries);
       if (t.name === 'find_extractors') return Boolean(deps.findExtractors);
       if (t.name === 'agent') return Boolean(deps.executeAgent);
       if (t.name === 'discover_mcps') return Boolean(deps.discoverMcps);
@@ -2234,6 +2302,21 @@ async function handleToolCallInner(
     };
   }
 
+  if (name === 'company' || name === 'salaries') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    const exec = name === 'company' ? deps.executeCompany : deps.executeSalaries;
+    if (!exec) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `${name}_not_configured` }) }], isError: true };
+    }
+    const res = await exec({ args, principal, userId });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
+    };
+  }
+
   if (name === 'find_extractors') {
     if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
       return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
@@ -2450,6 +2533,13 @@ async function handleToolCall(
   }
 }
 
+/** Caller identity for tool policy: the request's auth context, else derived from the dispatch userId. */
+function toolPolicyCaller(userId: string): AccessCallerContext {
+  const active = getActiveCallerAuthContext();
+  if (active && active.userId === userId) return { userId: active.userId, role: active.role };
+  return { userId, role: userId === 'owner' ? 'owner' : 'member' };
+}
+
 async function dispatchRpcMessage(
   msg: JsonRpcRequest,
   scopes: string[],
@@ -2607,7 +2697,12 @@ async function dispatchRpcMessage(
       return {
         body: jsonRpcResult(id, {
           ...modernMeta,
-          tools: buildToolDefinitions(deps),
+          tools: deps.accessPolicy
+            ? await filterToolDefinitions(toolPolicyCaller(userId), buildToolDefinitions(deps), {
+                store: deps.accessPolicy,
+                ...(deps.accessPolicyCacheKey !== undefined ? { cacheKey: deps.accessPolicyCacheKey } : {}),
+              })
+            : buildToolDefinitions(deps),
           ...(isModern ? { ttlMs: 300_000, cacheScope: 'private' as const } : {}),
         }),
       };
@@ -2620,6 +2715,37 @@ async function dispatchRpcMessage(
       if (!toolName) {
         await finishMcpTurn();
         return { body: jsonRpcError(id, -32602, 'Missing tool name') };
+      }
+      // Access policy gate. Unknown tool names fall through to the normal "Unknown tool" result.
+      if (deps.accessPolicy && buildToolDefinitions(deps).some((t) => t.name === toolName)) {
+        const policyCaller = toolPolicyCaller(userId);
+        let decision: { allowed: boolean; reason: string };
+        try {
+          decision = await evaluateToolAccess(policyCaller, toolName, {
+            store: deps.accessPolicy,
+            ...(deps.accessPolicyCacheKey !== undefined ? { cacheKey: deps.accessPolicyCacheKey } : {}),
+          });
+        } catch {
+          decision = policyCaller.role === 'owner' ? { allowed: true, reason: 'owner_bypass' } : { allowed: false, reason: 'policy_unavailable' };
+        }
+        if (!decision.allowed) {
+          await finishMcpTurn({
+            level: 'warn',
+            category: 'admin',
+            event: 'access_denied_tool',
+            summary: `Tool ${toolName} denied by access policy for ${policyCaller.userId}`,
+            details: { userId: policyCaller.userId, tool: toolName, reason: decision.reason, principal },
+          });
+          return {
+            status: 403,
+            body: jsonRpcError(id, -32003, `Tool ${toolName} is not permitted by the hub access policy.`, {
+              error: 'forbidden_by_policy',
+              status: 403,
+              tool: toolName,
+              reason: decision.reason,
+            }),
+          };
+        }
       }
       const activeTracer = deps.tracer ?? getActiveRequestTracer();
       const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps, userId);

@@ -90,6 +90,8 @@ var (
 	phase2AgentRawRPC   func(op string, meta json.RawMessage, rawStr string) (any, bool, error)
 	phase2McpRPC        func(op string, payload json.RawMessage) (any, bool, error)
 	phase2McpRawRPC     func(op string, meta json.RawMessage, rawStr string) (any, bool, error)
+	phase2CompanyRPC    func(op string, payload json.RawMessage) (any, bool, error)
+	phase2SalaryRPC     func(op string, payload json.RawMessage) (any, bool, error)
 )
 
 func lookupDomNode(docID int32, nodeID int) *extract.HTMLNode {
@@ -2178,6 +2180,8 @@ func dispatchWasmRPC(rawReq []byte) (any, error) {
 			phase2CatalogRPC,
 			phase2AgentRPC,
 			phase2McpRPC,
+			phase2CompanyRPC,
+			phase2SalaryRPC,
 		} {
 			if fn != nil {
 				if out, handled, err := fn(env.Op, env.Payload); handled {

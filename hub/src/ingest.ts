@@ -7,6 +7,7 @@
  *  - Every D1 write uses unique constraints (`ON CONFLICT DO UPDATE`) so Workflow retries and duplicate runs are 100% idempotent.
  *  - `fetches` never stores URL query strings or bodies (linking to `pages.id`).
  */
+import { applyHubSecretOverlayFromBinding } from './hub-secrets';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { deriveMarkdownDocument, sanitizeInlineHtmlInMarkdown, SCRAPE_PIPELINE_VERSION } from './scrape';
 import { D1FtsSearchIndex, INTERNAL_COLLECTION_ID_RE, sanitizeExtractedTitle } from './search-index';
@@ -1001,7 +1002,8 @@ export async function pruneExpiredFetchHistory(
 export class IngestWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, IngestWorkflowParams> {
   override async run(event: WorkflowEvent<IngestWorkflowParams>, step: WorkflowStep): Promise<{ jobId: string; totalItems: number; chunks: number }> {
     return await executeIngestPipeline(
-      this.env,
+      // Admin-managed provider-key overrides (vault) apply to workflow runs too.
+      await applyHubSecretOverlayFromBinding(this.env),
       event.payload,
       <T>(name: string, fn: () => Promise<T>) => step.do(name, () => fn() as never) as Promise<T>,
     );

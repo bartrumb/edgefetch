@@ -383,6 +383,8 @@ export function buildCapabilities(
     BRAVE_API_KEY?: string;
     TAVILY_API_KEY?: string;
     SEARXNG_URL?: string;
+    CLOUDFLARE_ACCOUNT_ID?: string;
+    CLOUDFLARE_WEBSEARCH_API_TOKEN?: string;
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
@@ -394,10 +396,20 @@ export function buildCapabilities(
   if (env.BRAVE_API_KEY?.trim()) searchProviders.push('brave');
   if (env.TAVILY_API_KEY?.trim()) searchProviders.push('tavily');
   if (env.SEARXNG_URL?.trim()) searchProviders.push('searxng');
+  if (
+    typeof env.AI?.websearch === 'function' ||
+    (env.CLOUDFLARE_ACCOUNT_ID?.trim() && env.CLOUDFLARE_WEBSEARCH_API_TOKEN?.trim())
+  ) {
+    searchProviders.push('cloudflare');
+  }
   const spaFallbacks = listConfiguredSpaFallbacks(env);
 
   const hasWebProvider = Boolean(
-    env.SERPER_API_KEY?.trim() || env.BRAVE_API_KEY?.trim() || env.TAVILY_API_KEY?.trim() || env.SEARXNG_URL?.trim(),
+    env.SERPER_API_KEY?.trim() ||
+      env.BRAVE_API_KEY?.trim() ||
+      env.TAVILY_API_KEY?.trim() ||
+      env.SEARXNG_URL?.trim() ||
+      searchProviders.includes('cloudflare'),
   );
   return {
     version,

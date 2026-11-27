@@ -82,6 +82,10 @@ import {
   type CatalogCallPayload,
   type CatalogHubFetchFn,
 } from './catalog';
+import { executeCompanyCall, type CompanyToolPayload } from './company';
+import { executeSalariesCall, type SalariesToolPayload } from './salaries';
+/** Slug of Google's official hosted Maps MCP preset (Go `mcpfed.GoogleMapsMCPSlug`). */
+const GOOGLE_MAPS_MCP_SLUG = 'google-maps';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   cancelBatchScrape,
@@ -104,7 +108,25 @@ import {
 } from './map-crawl';
 import { handleMcpRequest, isMcpRootRequest } from './mcp';
 import {
+  createSqliteHubSecretsStore,
+  applyHubSecretOverlayFromBinding,
+  HUB_SECRETS_SQLITE_SCHEMA,
+  type HubSecretRow,
+  type HubSecretsStore,
+} from './hub-secrets';
+import {
+  ACCESS_POLICY_SQLITE_SCHEMA,
+  createSqliteAccessPolicyStore,
+  evaluateRouteAccess,
+  listSharedServersFor,
+  loadAccessPolicySnapshot,
+  type AccessPolicyRuleRow,
+  type AccessPolicyStore,
+  type McpServerShareRow,
+} from './access-policy';
+import {
   executeFederatedMcpQuery,
+  sanitizeConnectorStructuredValue,
   tryScrapeViaConnectedMcp,
   type QueryMcpCallInput,
 } from './mcp-federation';
@@ -218,6 +240,11 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   BRAVE_API_KEY?: string;
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_WEBSEARCH_API_TOKEN?: string;
+  CLOUDFLARE_AI_GATEWAY_ID?: string;
+  CLOUDFLARE_WEBSEARCH_PROVIDER?: string;
+  CLOUDFLARE_WEBSEARCH_BYOK_ALIAS?: string;
   WEBHOOK_SECRET?: string;
   EDGEFETCH_PUBLIC_ORIGIN?: string;
   EDGEFETCH_DISABLE_UPDATE_CHECK?: string;
@@ -275,6 +302,8 @@ export class AgentHubDO extends DurableObject<Env> {
   private readonly mcpVault: McpVaultStore;
   private readonly activity: ActivityStore;
   private readonly settings: HubSettingsStore;
+  private readonly hubSecrets: HubSecretsStore;
+  private readonly accessPolicy: AccessPolicyStore;
   private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
   private trackerHydrated = false;
@@ -316,6 +345,8 @@ export class AgentHubDO extends DurableObject<Env> {
         ${MCP_VAULT_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
         ${HUB_SETTINGS_SQLITE_SCHEMA}
+        ${HUB_SECRETS_SQLITE_SCHEMA}
+        ${ACCESS_POLICY_SQLITE_SCHEMA}
       `);
       const existingAlarm = await this.ctx.storage.getAlarm();
       if (existingAlarm === null) {
@@ -558,6 +589,8 @@ export class AgentHubDO extends DurableObject<Env> {
     this.mcpVault = createSqliteMcpVaultStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.settings = createSqliteHubSettingsStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.hubSecrets = createSqliteHubSecretsStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.accessPolicy = createSqliteAccessPolicyStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
 
   override async alarm(): Promise<void> {
@@ -955,6 +988,36 @@ export class AgentHubDO extends DurableObject<Env> {
     return await this.mcpVault.consumeOAuthState(stateHash, userId, now);
   }
 
+  // `hub_secrets` + `access_policies`/`mcp_server_shares` RPCs. Names match HubSecretsStore / AccessPolicyStore so the
+  // stub itself satisfies those ports (hub/src/hub-secrets.ts, hub/src/access-policy.ts).
+  async listHubSecretRows(): Promise<HubSecretRow[]> {
+    return await this.hubSecrets.listHubSecretRows();
+  }
+  async putHubSecretRow(row: HubSecretRow): Promise<void> {
+    await this.hubSecrets.putHubSecretRow(row);
+  }
+  async deleteHubSecretRow(name: string): Promise<boolean> {
+    return await this.hubSecrets.deleteHubSecretRow(name);
+  }
+  async listAccessPolicyRules(): Promise<AccessPolicyRuleRow[]> {
+    return await this.accessPolicy.listAccessPolicyRules();
+  }
+  async putAccessPolicyRule(row: AccessPolicyRuleRow): Promise<void> {
+    await this.accessPolicy.putAccessPolicyRule(row);
+  }
+  async deleteAccessPolicyRule(subject: string, resource: string): Promise<boolean> {
+    return await this.accessPolicy.deleteAccessPolicyRule(subject, resource);
+  }
+  async listMcpServerShares(): Promise<McpServerShareRow[]> {
+    return await this.accessPolicy.listMcpServerShares();
+  }
+  async putMcpServerShare(row: McpServerShareRow): Promise<void> {
+    await this.accessPolicy.putMcpServerShare(row);
+  }
+  async deleteMcpServerShare(ownerUserId: string, slug: string, subject: string): Promise<boolean> {
+    return await this.accessPolicy.deleteMcpServerShare(ownerUserId, slug, subject);
+  }
+
   async getHubSetting(key: string): Promise<string | null> {
     return await this.settings.getSetting(key);
   }
@@ -1227,8 +1290,36 @@ function wrapSseResponseWithFlush(res: Response, onClose: () => void | Promise<u
 
 const devTelemetrySettingCache = new WeakMap<object, { value: string | null; expiresAt: number }>();
 
+/** Module-level handle on the real authorizer; `fetch()` shadows `authorizeMcpRequest` with a policy-gated wrapper. */
+const authorizeMcpRequestUngated = authorizeMcpRequest;
+
+/** Thrown by the gated authorizer when access policy denies a route; converted to a 403 by `withRouteSpan`/`fetch`. */
+class AccessPolicyDeniedSignal extends Error {
+  constructor(readonly response: Response) {
+    super('forbidden_by_policy');
+  }
+}
+
+/**
+ * Route-policy resource path for a request path: `/v1/*` as-is, Firecrawl-compatible `/v2/*` and
+ * `/compat/firecrawl/v2/*` and Tavily `/compat/tavily/*` mapped onto their `/v1/*` equivalents so compat aliases
+ * can't bypass a `/v1` rule. `null` = not policy-governed (e.g. `/mcp`, `/admin`, `/oauth/*`).
+ */
+function policyRoutePathFor(pathname: string): string | null {
+  if (pathname === '/v1' || pathname.startsWith('/v1/')) return pathname;
+  if (pathname.startsWith('/v2/')) return `/v1${pathname.slice('/v2'.length)}`;
+  if (pathname.startsWith('/compat/firecrawl/v2/')) return `/v1${pathname.slice('/compat/firecrawl/v2'.length)}`;
+  if (pathname.startsWith('/compat/tavily/')) return `/v1/${pathname.slice('/compat/tavily/'.length)}`;
+  return null;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    // Admin-managed provider-key overrides (hub_secrets) win over deployment env for this request. Bootstrap
+    // secrets (CALLER_TOKEN, VAULT_MASTER_KEY, ...) can never be overridden, so auth is unaffected. No-op without
+    // VAULT_MASTER_KEY; cached 30 s per isolate; never throws.
+    const deploymentEnv: Env = env;
+    env = await applyHubSecretOverlayFromBinding(env);
     const url = new URL(request.url);
     if (typeof env.EDGEFETCH_PUBLIC_ORIGIN === 'string' && env.EDGEFETCH_PUBLIC_ORIGIN.trim() !== '') {
       try {
@@ -1668,13 +1759,70 @@ export default {
         },
       );
 
+    const accessPolicyStore = (): AccessPolicyStore | null => {
+      if (!env.AGENT_HUB) return null;
+      const stub = hub() as unknown as Partial<AccessPolicyStore>;
+      // Real DO stubs expose every RPC; minimal test doubles without the policy RPCs mean "no policy configured".
+      return typeof stub.listAccessPolicyRules === 'function' && typeof stub.listMcpServerShares === 'function'
+        ? (stub as AccessPolicyStore)
+        : null;
+    };
+    const accessPolicyCacheKey = (env.AGENT_HUB as unknown as object | undefined) ?? 'default';
+    /** Spread into executeFederatedMcpQuery / tryScrapeViaConnectedMcp so shared MCP servers resolve for members. */
+    const federationPolicyOpts = (): { accessPolicy?: AccessPolicyStore; accessPolicyCacheKey?: string | object } => {
+      const store = accessPolicyStore();
+      return store ? { accessPolicy: store, accessPolicyCacheKey } : {};
+    };
+
+    /**
+     * Policy-gated authorizer (shadows the module import for every route below). After a SUCCESSFUL auth on a
+     * policy-governed path it evaluates `route:<path>`; a denial throws AccessPolicyDeniedSignal carrying the 403
+     * `forbidden_by_policy` response (logged to the activity log), so every /v1 route is covered by this one hook.
+     * Owners bypass route policy. Policy-store failures fail closed for non-owners.
+     */
+    const authorizeMcpRequest: typeof authorizeMcpRequestUngated = async (params) => {
+      const res = await authorizeMcpRequestUngated(params);
+      const policyPath = policyRoutePathFor(url.pathname);
+      if (!res.ok || !policyPath || res.role === 'owner') return res;
+      const store = accessPolicyStore();
+      if (!store) return res;
+      const caller = { userId: res.userId || resolveCallerUserId(res), role: res.role };
+      let decision: { allowed: boolean; reason: string };
+      try {
+        decision = await evaluateRouteAccess(caller, policyPath, { store, cacheKey: accessPolicyCacheKey });
+      } catch {
+        decision = { allowed: false, reason: 'policy_unavailable' };
+      }
+      if (decision.allowed) return res;
+      void request.body?.cancel().catch(() => undefined);
+      await hubActivityProxy(hub).recordEvent({
+        level: 'warn',
+        category: 'admin',
+        event: 'access_denied_route',
+        summary: `Route ${policyPath} denied by access policy for ${caller.userId}`,
+        details: { userId: caller.userId, path: policyPath, reason: decision.reason },
+      });
+      throw new AccessPolicyDeniedSignal(
+        Response.json(
+          { ok: false, error: 'forbidden_by_policy', path: policyPath, reason: decision.reason },
+          { status: 403, headers: { 'cache-control': 'private, no-store' } },
+        ),
+      );
+    };
+
     const withRouteSpan = async (
       name: string,
       attrs: Record<string, string | number | boolean | undefined>,
       fn: () => Promise<Response>,
     ): Promise<Response> =>
       (getActiveRequestTracer() ?? rootTracer).withSpan(name, { kind: 1, attributes: attrs }, async (routeSpan) => {
-        const res = await fn();
+        let res: Response;
+        try {
+          res = await fn();
+        } catch (err) {
+          if (!(err instanceof AccessPolicyDeniedSignal)) throw err;
+          res = err.response;
+        }
         routeSpan.setAttribute('http.response.status_code', res.status);
         routeSpan.setStatus(res.status < 500);
         return res;
@@ -1770,6 +1918,108 @@ export default {
           };
       const activity = hubActivityProxy(hub);
       const safePublicFetch = env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch;
+
+      /** `company` + `salaries` executors shared by the MCP tools and the REST routes. */
+      const makeVerticalExecutors = (sourceLabel: string, callerUserId: string, callerTier: string) => {
+        const runJobs = (jobsArgs: Record<string, unknown>) =>
+          executeJobsCall({
+            payload: jobsArgs as JobsToolPayload,
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+            userId: callerUserId,
+            authTier: callerTier,
+            executeSearch: async (sArgs) => {
+              const sOut = await executeSearchCall({
+                payload: sArgs as SearchRequestPayload,
+                env,
+                executeHubFetch,
+                source: `${sourceLabel}-jobs-search`,
+                userId: callerUserId,
+              });
+              return { status: sOut.status, body: sOut.body };
+            },
+            executeScrape: async (scArgs) => {
+              const scOut = await executeScrapeCall({
+                payload: scArgs as ScrapeRequestPayload,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `${sourceLabel}-jobs-scrape`,
+                userId: callerUserId,
+              });
+              return { status: scOut.status, body: scOut.body };
+            },
+          });
+        const activeScopes = getActiveCallerAuthContext()?.scopes ?? [];
+        // Google Maps enrichment calls the caller's own connected Maps MCP, so it needs the same `mcp:call` scope.
+        const mayCallMcp = activeScopes.length === 0 || activeScopes.includes('mcp:call');
+        const callMapsPlaces = mayCallMcp
+          ? async (query: string): Promise<string | null> => {
+              const listed = await executeFederatedMcpQuery({
+                userId: callerUserId,
+                input: { action: 'list_tools', server: GOOGLE_MAPS_MCP_SLUG },
+                vaultStore,
+                ...federationPolicyOpts(),
+                vaultMasterKey: env.VAULT_MASTER_KEY,
+                fetchFn: safePublicFetch,
+                selfHost: url.hostname,
+              });
+              if (listed.status !== 200) return null;
+              const tools = Array.isArray(listed.body.tools) ? (listed.body.tools as Array<Record<string, unknown>>) : [];
+              const tool = tools.find((t) => t.name === 'search_places');
+              if (!tool) return null;
+              const props = ((tool.inputSchema as { properties?: Record<string, { type?: string }> } | undefined)?.properties ?? {});
+              const required = ((tool.inputSchema as { required?: string[] } | undefined)?.required ?? []).filter(
+                (k) => props[k]?.type === 'string',
+              );
+              const argName =
+                required[0] ??
+                Object.keys(props).find((k) => /query|text/i.test(k) && props[k]?.type === 'string') ??
+                'textQuery';
+              const out = await executeFederatedMcpQuery({
+                userId: callerUserId,
+                input: { action: 'call_tool', server: GOOGLE_MAPS_MCP_SLUG, tool: 'search_places', arguments: { [argName]: query } },
+                vaultStore,
+                ...federationPolicyOpts(),
+                vaultMasterKey: env.VAULT_MASTER_KEY,
+                fetchFn: safePublicFetch,
+                selfHost: url.hostname,
+              });
+              if (out.status !== 200) return null;
+              const res = (out.body.result ?? out.body) as unknown;
+              return JSON.stringify(res);
+            }
+          : undefined;
+        return {
+          company: (args: Record<string, unknown>) =>
+            executeCompanyCall({
+              payload: args as CompanyToolPayload,
+              deps: {
+                scrapePage: async (pageUrl) => {
+                  const scOut = await executeScrapeCall({
+                    payload: { url: pageUrl, formats: ['markdown', 'rawHtml'], renderMode: 'auto' } as ScrapeRequestPayload,
+                    env,
+                    executeHubFetch,
+                    selfHost: url.hostname,
+                    source: `${sourceLabel}-company-page`,
+                    userId: callerUserId,
+                  });
+                  return { status: scOut.status, body: scOut.body };
+                },
+                fetchFn: safePublicFetch,
+                runJobs: async ({ company, domains, limit }) =>
+                  runJobs({ company, ...(domains ? { domains } : {}), limit, includeBuiltIn: false }),
+                ...(callMapsPlaces ? { callMapsPlaces } : {}),
+              },
+            }),
+          salaries: (args: Record<string, unknown>) =>
+            executeSalariesCall({
+              payload: args as SalariesToolPayload,
+              env: { ...(env.META ? { META: env.META } : {}) },
+              runJobsSearch: async ({ query, locations, company }) =>
+                runJobs({ query, ...(locations ? { locations } : {}), ...(company ? { company } : {}), limit: 50, includeBuiltIn: false }),
+            }),
+        };
+      };
 
       const makeCatalogHubFetch = (sourceLabel: string): CatalogHubFetchFn => {
         const boundTracer = getActiveRequestTracer();
@@ -1872,6 +2122,10 @@ export default {
 
       if (url.pathname === '/mcp' || isMcpRootRequest(request, url)) {
         return await handleMcpRequest(request, url, {
+          ...(() => {
+            const store = accessPolicyStore();
+            return store ? { accessPolicy: store, accessPolicyCacheKey } : {};
+          })(),
           serverName: 'edgefetch-hub',
           serverVersion: HUB_VERSION,
           ownerSecret: env.CALLER_TOKEN,
@@ -2000,6 +2254,7 @@ export default {
                     ? { allowedMcpTools: cleanArgs.allowedMcpTools as ReadonlyArray<string> }
                     : {}),
                   vaultStore,
+                  ...federationPolicyOpts(),
                   vaultMasterKey: env.VAULT_MASTER_KEY,
                   fetchFn: safePublicFetch,
                   selfHost: url.hostname,
@@ -2277,6 +2532,18 @@ export default {
           findExtractors: ({ query, category, limit }) => {
             return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
           },
+          executeCompany: async ({ args, principal, userId }) => {
+            const activeAuth = getActiveCallerAuthContext();
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
+            const effectiveTier = activeAuth?.role ?? (effectiveUserId === 'owner' ? 'owner' : 'member');
+            return makeVerticalExecutors(`mcp:${principal ?? 'client'}`, effectiveUserId, effectiveTier).company(args);
+          },
+          executeSalaries: async ({ args, principal, userId }) => {
+            const activeAuth = getActiveCallerAuthContext();
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
+            const effectiveTier = activeAuth?.role ?? (effectiveUserId === 'owner' ? 'owner' : 'member');
+            return makeVerticalExecutors(`mcp:${principal ?? 'client'}`, effectiveUserId, effectiveTier).salaries(args);
+          },
           executeCatalog: async ({ args, principal }) => {
             const effectiveUserId = getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
             return await executeCatalogCall({
@@ -2355,6 +2622,7 @@ export default {
               userId: effectiveUserId,
               sessionSigningSecret: sessionSecret,
               vaultStore,
+              ...federationPolicyOpts(),
               waitUntil: mcpAgentWaitUntil,
             });
             if (out.kind === 'sse') {
@@ -2397,6 +2665,7 @@ export default {
               userId: effectiveUserId,
               input: args as QueryMcpCallInput,
               vaultStore,
+              ...federationPolicyOpts(),
               vaultMasterKey: env.VAULT_MASTER_KEY,
               fetchFn: safePublicFetch,
               selfHost: url.hostname,
@@ -2451,6 +2720,13 @@ export default {
       }
 
       const adminRes = await handleAdminRoute(request, url, {
+        ...(env.AGENT_HUB ? { hubSecretsStore: hub() as unknown as HubSecretsStore } : {}),
+        secretsEnv: deploymentEnv as unknown as Record<string, unknown>,
+        ...(() => {
+          const store = accessPolicyStore();
+          return store ? { accessPolicyStore: store } : {};
+        })(),
+        recordAdminEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
         serviceName: 'EdgeFetch Hub',
         mcpSlug: 'edgefetch',
         ownerSecret: env.CALLER_TOKEN,
@@ -2746,6 +3022,23 @@ export default {
       const compatMeta = resolveCompatSpanMeta(url.pathname);
       if (compatMeta) {
         const compatRes = await withRouteSpan(compatMeta.spanName, { 'edgefetch.compat': compatMeta.flavor }, async () => {
+          // Compat aliases authenticate inside handleCompatRoutes; when any access rule exists, pre-authorize through
+          // the policy-gated authorizer so /v2 and /compat/* can't bypass a /v1 route rule (throws -> 403).
+          const compatPolicyStore = accessPolicyStore();
+          if (compatPolicyStore) {
+            const compatSnap = await loadAccessPolicySnapshot({ store: compatPolicyStore, cacheKey: accessPolicyCacheKey }).catch(
+              () => null,
+            );
+            if (!compatSnap || compatSnap.rules.length > 0) {
+              await authorizeMcpRequest({
+                request,
+                origin: url.origin,
+                ownerSecret: env.CALLER_TOKEN,
+                ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
+                store: oauthStore,
+              });
+            }
+          }
           let releaseCompatScrapeSlot: (() => void) | null = null;
           let preReadBody:
             | { ok: true; text: string; byteLength: number }
@@ -2939,6 +3232,38 @@ export default {
         });
       }
 
+      if (request.method === 'GET' && url.pathname === '/v1/mcp/shared') {
+        return withRouteSpan('edgefetch.mcp_shared', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            mcpToken: env.MCP_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch') && !auth.scopes.includes('mcp:call')) {
+            return Response.json({ error: 'insufficient_scope', visibility: 'private' as const }, { status: 403, headers: { 'cache-control': 'private, no-store' } });
+          }
+          const userId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const store = accessPolicyStore();
+          // Members see only name/slug/tools of servers shared with them: never URLs, auth summaries, or credentials.
+          const shared = store
+            ? await listSharedServersFor(userId, { store, vaultStore, cacheKey: accessPolicyCacheKey })
+            : [];
+          const san = sanitizeConnectorStructuredValue(shared);
+          return Response.json(
+            { ok: true, visibility: 'private', userId, count: shared.length, sanitized: san.sanitized, fullySanitized: san.fullySanitized, servers: san.value },
+            { status: 200, headers: { 'cache-control': 'private, no-store' } },
+          );
+        });
+      }
+
       if (request.method === 'POST' && url.pathname === '/v1/mcp/query') {
         return withRouteSpan('edgefetch.mcp_query', {}, async () => {
           const auth = await authorizeMcpRequest({
@@ -3005,6 +3330,7 @@ export default {
             userId,
             input: payload,
             vaultStore,
+            ...federationPolicyOpts(),
             vaultMasterKey: env.VAULT_MASTER_KEY,
             fetchFn: safePublicFetch,
             selfHost: url.hostname,
@@ -3144,6 +3470,7 @@ export default {
                   ? { allowedMcpTools: cleanScrapeObj.allowedMcpTools as ReadonlyArray<string> }
                   : {}),
                 vaultStore,
+                ...federationPolicyOpts(),
                 vaultMasterKey: env.VAULT_MASTER_KEY,
                 fetchFn: safePublicFetch,
                 selfHost: url.hostname,
@@ -4031,6 +4358,7 @@ export default {
             userId: callerUserId,
             sessionSigningSecret: sessionSecret,
             vaultStore,
+            ...federationPolicyOpts(),
             wantSseStream: wantSse,
             waitUntil: agentWaitUntil,
           });
@@ -4628,6 +4956,106 @@ export default {
         });
       }
 
+      if (request.method === 'POST' && url.pathname === '/v1/company') {
+        return withRouteSpan('edgefetch.company', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
+          }
+          const capped = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!capped.ok) {
+            return Response.json({ error: 'payload_too_large' }, { status: 413, headers: callerHdrs });
+          }
+          let args: Record<string, unknown>;
+          try {
+            const parsed = JSON.parse(capped.text || '{}') as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+            args = parsed as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'invalid_json' }, { status: 400, headers: callerHdrs });
+          }
+          const tier = (auth as { role?: string }).role ?? (callerUserId === 'owner' ? 'owner' : 'member');
+          const releaseSlot = tryAcquireUserConcurrencySlot(inFlightScrapesByUser, callerUserId, MAX_CONCURRENT_SCRAPES_PER_USER);
+          if (!releaseSlot) {
+            return Response.json({ ok: false, error: 'user_quota_exceeded' }, { status: 429, headers: callerHdrs });
+          }
+          try {
+            const ex = makeVerticalExecutors('api:company', callerUserId, tier);
+            const out = await ex.company(args);
+            return Response.json(out.body, { status: out.status, headers: callerHdrs });
+          } finally {
+            releaseSlot();
+          }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/salaries') {
+        return withRouteSpan('edgefetch.salaries', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
+          }
+          const capped = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!capped.ok) {
+            return Response.json({ error: 'payload_too_large' }, { status: 413, headers: callerHdrs });
+          }
+          let args: Record<string, unknown>;
+          try {
+            const parsed = JSON.parse(capped.text || '{}') as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+            args = parsed as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'invalid_json' }, { status: 400, headers: callerHdrs });
+          }
+          const tier = (auth as { role?: string }).role ?? (callerUserId === 'owner' ? 'owner' : 'member');
+          const releaseSlot = tryAcquireUserConcurrencySlot(inFlightScrapesByUser, callerUserId, MAX_CONCURRENT_SCRAPES_PER_USER);
+          if (!releaseSlot) {
+            return Response.json({ ok: false, error: 'user_quota_exceeded' }, { status: 429, headers: callerHdrs });
+          }
+          try {
+            const ex = makeVerticalExecutors('api:salaries', callerUserId, tier);
+            const out = await ex.salaries(args);
+            return Response.json(out.body, { status: out.status, headers: callerHdrs });
+          } finally {
+            releaseSlot();
+          }
+        });
+      }
+
       if (request.method === 'POST' && url.pathname === '/v1/catalog') {
         return withRouteSpan('edgefetch.catalog', {}, async () => {
           const auth = await authorizeMcpRequest({
@@ -4952,7 +5380,18 @@ export default {
             },
           },
           async (httpSpan) => {
-            const res = await runWithCallerAuthContext(async () => annotateCallerAuthFailure(url, await routeRequest()), undefined, env);
+            const res = await runWithCallerAuthContext(
+              async () => {
+                try {
+                  return annotateCallerAuthFailure(url, await routeRequest());
+                } catch (err) {
+                  if (err instanceof AccessPolicyDeniedSignal) return err.response;
+                  throw err;
+                }
+              },
+              undefined,
+              env,
+            );
             httpSpan.setAttribute('http.response.status_code', res.status);
             httpSpan.setStatus(res.status < 500);
             return res;

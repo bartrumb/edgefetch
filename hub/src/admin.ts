@@ -22,6 +22,7 @@ import {
   resolveSessionSecret,
   startGitHubOAuthFlow,
   type GitHubAuthEnv,
+  USERS_PROMOTED_BY_MIGRATION,
 } from './github-auth';
 import { testAndListRemoteMcpTools } from './mcp-federation';
 import { discoverMcps, isSafePublicHttpsUrl, validateConnectorDomains } from './mcp-registry';
@@ -48,6 +49,7 @@ import {
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
 import { queryHostGapRadar } from './gap-radar';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
+import { ensureD1ColumnsIfMissing } from './d1-schema';
 import { stripInvisibleSmugglingChars } from './scrape';
 import {
   EASYPRIVACY_LICENCE_URL,
@@ -2635,7 +2637,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           updated = await deps.oauthStore.updateUserRole(targetUserId, targetRole!, promotedByOwnerId);
         }
         if (updated && deps.metaDb) {
-          await deps.metaDb.prepare('ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT').run().catch(() => undefined);
+          await ensureD1ColumnsIfMissing({ db: deps.metaDb, table: 'users', columns: USERS_PROMOTED_BY_MIGRATION });
           await deps.metaDb
             .prepare(
               'UPDATE users SET role = ?1, promoted_by_owner_id = ?2, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?3',

@@ -31,6 +31,19 @@ import {
   type UserRole,
 } from './oauth';
 import { normalizeClientRateLimitIp } from './safe-input';
+import { ensureD1ColumnsIfMissing } from './d1-schema';
+
+/** Columns added to `users` after the original schema; checked via PRAGMA so sign-ins emit no D1 error spans. */
+export const USERS_LEGACY_COLUMN_MIGRATIONS: ReadonlyArray<{ column: string; alterSql: string }> = [
+  { column: 'promoted_by_owner_id', alterSql: 'ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT' },
+  { column: 'session_epoch', alterSql: 'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1' },
+  { column: 'disabled', alterSql: 'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0' },
+  { column: 'admitted_via', alterSql: 'ALTER TABLE users ADD COLUMN admitted_via TEXT' },
+  { column: 'admitted_org', alterSql: 'ALTER TABLE users ADD COLUMN admitted_org TEXT' },
+  { column: 'encrypted_gh_token', alterSql: 'ALTER TABLE users ADD COLUMN encrypted_gh_token TEXT' },
+  { column: 'org_verified_at', alterSql: 'ALTER TABLE users ADD COLUMN org_verified_at INTEGER' },
+];
+export const USERS_PROMOTED_BY_MIGRATION = USERS_LEGACY_COLUMN_MIGRATIONS.slice(0, 1);
 
 export const GITHUB_STATE_COOKIE_SECURE = '__Host-ef_gh_oauth';
 export const GITHUB_STATE_COOKIE_DEV = 'ef_gh_oauth';
@@ -232,7 +245,7 @@ export async function reconcileUpgradedFounderOwners(params: {
   if (params.metaDb) {
     const dbObj = params.metaDb as unknown as object;
     if (!migratedMetaDbSet.has(dbObj)) {
-      await params.metaDb.prepare('ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT').run().catch(() => undefined);
+      await ensureD1ColumnsIfMissing({ db: params.metaDb, table: 'users', columns: USERS_PROMOTED_BY_MIGRATION });
       migratedMetaDbSet.add(dbObj);
     }
     await params.metaDb
@@ -758,13 +771,7 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
          )`,
       )
       .run();
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT').run().catch(() => undefined);
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1').run().catch(() => undefined);
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0').run().catch(() => undefined);
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN admitted_via TEXT').run().catch(() => undefined);
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN admitted_org TEXT').run().catch(() => undefined);
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN encrypted_gh_token TEXT').run().catch(() => undefined);
-    await metaDb.prepare('ALTER TABLE users ADD COLUMN org_verified_at INTEGER').run().catch(() => undefined);
+    await ensureD1ColumnsIfMissing({ db: metaDb, table: 'users', columns: USERS_LEGACY_COLUMN_MIGRATIONS });
     await metaDb
       .prepare(
         `INSERT INTO users (

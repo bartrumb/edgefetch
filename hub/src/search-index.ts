@@ -106,95 +106,9 @@ export const MAX_SEARCH_DB_BYTES = 9 * 1024 * 1024 * 1024; // 9 GB hard stop for
 export const COLLECTION_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 export const INTERNAL_COLLECTION_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 
-interface D1PragmaStatementLike {
-  all?: <T = Record<string, unknown>>() => Promise<{ results?: T[] }>;
-  run?: () => Promise<unknown>;
-  bind?: (...values: unknown[]) => {
-    all?: <T = Record<string, unknown>>() => Promise<{ results?: T[] }>;
-    run?: () => Promise<unknown>;
-  };
-}
+export { ensureD1ColumnIfMissing } from './d1-schema';
 
-interface D1SchemaInspectableDb {
-  prepare(query: string): D1PragmaStatementLike;
-}
-
-const d1ColumnVerifiedByTarget = new Map<string, WeakSet<object>>();
 const searchDbSchemaVerified = new WeakSet<object>();
-
-/**
- * Inspects `PRAGMA table_info(<table>)` before running `ALTER TABLE <table> ADD COLUMN <col> ...` so cold Worker
- * isolates never emit `d1_run ERROR: duplicate column name: ...: SQLITE_ERROR` spans in Cloudflare Observability.
- */
-export async function ensureD1ColumnIfMissing(params: {
-  db: D1SchemaInspectableDb;
-  table: string;
-  column: string;
-  alterSql: string;
-  cacheSet?: WeakSet<object>;
-}): Promise<boolean> {
-  const { db, table, column, alterSql } = params;
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(column)) {
-    throw new Error(`Invalid SQLite identifier: ${table}.${column}`);
-  }
-  const mapKey = `${table}.${column}`;
-  let verified = params.cacheSet ?? d1ColumnVerifiedByTarget.get(mapKey);
-  if (!verified) {
-    verified = new WeakSet<object>();
-    if (!params.cacheSet) d1ColumnVerifiedByTarget.set(mapKey, verified);
-  }
-  const dbObj = db as unknown as object;
-  if (verified.has(dbObj)) return false;
-
-  const stmt = db.prepare(`PRAGMA table_info(${table})`);
-  const allFn = typeof stmt.all === 'function' ? stmt.all.bind(stmt) : null;
-  const bindFn = typeof stmt.bind === 'function' ? stmt.bind.bind(stmt) : null;
-  const queryAll = allFn
-    ? () => allFn<{ name?: unknown }>()
-    : bindFn
-      ? () => {
-          const bound = bindFn();
-          return typeof bound.all === 'function' ? bound.all<{ name?: unknown }>() : null;
-        }
-      : null;
-  if (!queryAll) {
-    verified.add(dbObj);
-    return false;
-  }
-
-  let cols: Array<{ name?: unknown }> = [];
-  try {
-    const res = await queryAll();
-    cols = Array.isArray(res?.results) ? res.results : [];
-  } catch {
-    cols = [];
-  }
-
-  if (cols.length === 0) {
-    verified.add(dbObj);
-    return false;
-  }
-
-  const wantLower = column.toLowerCase();
-  const hasColumn = cols.some((c) => typeof c?.name === 'string' && c.name.trim().toLowerCase() === wantLower);
-  if (!hasColumn) {
-    try {
-      const alterStmt = db.prepare(alterSql);
-      if (typeof alterStmt.run === 'function') {
-        await alterStmt.run();
-      } else if (typeof alterStmt.bind === 'function') {
-        await alterStmt.bind().run?.();
-      }
-      verified.add(dbObj);
-      return true;
-    } catch {
-      // Ignore concurrent isolate race if another isolate added the column simultaneously
-    }
-  }
-
-  verified.add(dbObj);
-  return false;
-}
 
 export function markSearchDbSchemaVerified(searchDb: D1Database): boolean {
   const key = searchDb as unknown as object;

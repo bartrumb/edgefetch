@@ -1,5 +1,5 @@
 name: "EdgeFetch"
-version: "2.8.14"
+version: "2.8.15"
 slug: "edgefetch"
 image: "ghcr.io/bartrumb/edgefetch-addon-{arch}"
 description: "Outbound-only Go HTTP/2 + on-demand Headless Chromium JS rendering + streaming Poppler PDF worker for EdgeFetch Hubs (zero inbound ports, loopback SSRF CONNECT proxy, AppArmor confined)."

@@ -258,12 +258,12 @@ func TestTier5R3GO1to3_ATSSanitizationAndWorkdayGuards(t *testing.T) {
 	ashbyBoard, _ := json.Marshal(map[string]any{
 		"jobs": []map[string]any{
 			{
-				"id":          "j1",
-				"title":       "Eng",
-				"jobUrl":      "https://evil.com/x)[phish](https://evil.com/p)",
-				"applyUrl":    "https://sub.localhost.localdomain/apply",
-				"isRemote":    true,
-				"location":    "Remote",
+				"id":       "j1",
+				"title":    "Eng",
+				"jobUrl":   "https://evil.com/x)[phish](https://evil.com/p)",
+				"applyUrl": "https://sub.localhost.localdomain/apply",
+				"isRemote": true,
+				"location": "Remote",
 			},
 			{
 				"id":       "j2",
@@ -292,10 +292,10 @@ func TestTier5R3GO1to3_ATSSanitizationAndWorkdayGuards(t *testing.T) {
 
 	ashJob, _ := json.Marshal(map[string]any{
 		"jobs": []map[string]any{{
-			"id":          "j9",
-			"title":       "Staff Eng",
-			"jobUrl":      "https://evil.com/x)[phish](https://evil.com/p)",
-			"applyUrl":    "https://sub.localhost.localdomain/apply",
+			"id":               "j9",
+			"title":            "Staff Eng",
+			"jobUrl":           "https://evil.com/x)[phish](https://evil.com/p)",
+			"applyUrl":         "https://sub.localhost.localdomain/apply",
 			"descriptionPlain": "Build systems.",
 		}},
 	})

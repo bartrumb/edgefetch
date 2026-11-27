@@ -32,37 +32,37 @@ type FullExtractOptions struct {
 // ExtractedDocumentFull holds the full-fidelity Markdown, metadata, links, images, branding,
 // structured JSON-LD entities, and pagination state extracted from an HTML document.
 type ExtractedDocumentFull struct {
-	Title                string           `json:"title,omitempty"`
-	Description          string           `json:"description,omitempty"`
-	Author               string           `json:"author,omitempty"`
-	PublishedTime        string           `json:"publishedTime,omitempty"`
-	ModifiedTime         string           `json:"modifiedTime,omitempty"`
-	SiteName             string           `json:"siteName,omitempty"`
-	WordCount            int              `json:"wordCount,omitempty"`
-	Language             string           `json:"language,omitempty"`
-	Favicon              string           `json:"favicon,omitempty"`
-	OGImage              string           `json:"ogImage,omitempty"`
-	CanonicalURL         string           `json:"canonicalUrl,omitempty"`
-	MarkdownAlternateURL string           `json:"markdownAlternateUrl,omitempty"`
-	RobotsMeta           string           `json:"robotsMeta,omitempty"`
+	Title                    string           `json:"title,omitempty"`
+	Description              string           `json:"description,omitempty"`
+	Author                   string           `json:"author,omitempty"`
+	PublishedTime            string           `json:"publishedTime,omitempty"`
+	ModifiedTime             string           `json:"modifiedTime,omitempty"`
+	SiteName                 string           `json:"siteName,omitempty"`
+	WordCount                int              `json:"wordCount,omitempty"`
+	Language                 string           `json:"language,omitempty"`
+	Favicon                  string           `json:"favicon,omitempty"`
+	OGImage                  string           `json:"ogImage,omitempty"`
+	CanonicalURL             string           `json:"canonicalUrl,omitempty"`
+	MarkdownAlternateURL     string           `json:"markdownAlternateUrl,omitempty"`
+	RobotsMeta               string           `json:"robotsMeta,omitempty"`
 	ExtractorID              string           `json:"extractorId,omitempty"`
 	Records                  []map[string]any `json:"records,omitempty"`
 	PreferRecordAvailability bool             `json:"preferRecordAvailability,omitempty"`
 	Total                    *int             `json:"total,omitempty"`
-	Returned             *int             `json:"returned,omitempty"`
-	NextCursor           string           `json:"nextCursor,omitempty"`
-	InertiaHydrated      bool             `json:"inertiaHydrated,omitempty"`
-	Markdown             string           `json:"markdown"`
-	RawSanitizedMarkdown string           `json:"rawSanitizedMarkdown,omitempty"`
-	Text                 string           `json:"text,omitempty"`
-	Links                []string         `json:"links"`
-	Images               []ImageInfo      `json:"images"`
-	Branding             BrandingProfile  `json:"branding"`
-	StructuredData       []map[string]any `json:"structuredData,omitempty"`
-	TotalChars           int              `json:"totalChars"`
-	ReturnedChars        int              `json:"returnedChars"`
-	Truncated            bool             `json:"truncated,omitempty"`
-	NextOffset           *int             `json:"nextOffset,omitempty"`
+	Returned                 *int             `json:"returned,omitempty"`
+	NextCursor               string           `json:"nextCursor,omitempty"`
+	InertiaHydrated          bool             `json:"inertiaHydrated,omitempty"`
+	Markdown                 string           `json:"markdown"`
+	RawSanitizedMarkdown     string           `json:"rawSanitizedMarkdown,omitempty"`
+	Text                     string           `json:"text,omitempty"`
+	Links                    []string         `json:"links"`
+	Images                   []ImageInfo      `json:"images"`
+	Branding                 BrandingProfile  `json:"branding"`
+	StructuredData           []map[string]any `json:"structuredData,omitempty"`
+	TotalChars               int              `json:"totalChars"`
+	ReturnedChars            int              `json:"returnedChars"`
+	Truncated                bool             `json:"truncated,omitempty"`
+	NextOffset               *int             `json:"nextOffset,omitempty"`
 }
 
 var (

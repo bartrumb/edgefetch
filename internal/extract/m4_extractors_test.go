@@ -1092,11 +1092,11 @@ func TestTier5R3GO4and5_JSParserAndMarkdownEscaping(t *testing.T) {
 		"totalCount": 1,
 		"jobs": []map[string]any{{
 			"data": map[string]any{
-				"title":     "Role [x](https://evil.com/r)",
-				"req_id":    "R1`|x",
-				"category":  "Eng [c](https://evil.com/c)",
+				"title":         "Role [x](https://evil.com/r)",
+				"req_id":        "R1`|x",
+				"category":      "Eng [c](https://evil.com/c)",
 				"full_location": "NY [l](https://evil.com/l)",
-				"apply_url": "https://careers.rivian.com/jobs/1)bad",
+				"apply_url":     "https://careers.rivian.com/jobs/1)bad",
 			},
 		}},
 	})

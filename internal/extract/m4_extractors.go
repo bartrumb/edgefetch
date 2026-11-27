@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	reUKGPreloadedDeclHTML     = newLazyRegexp(`(?i)window\.__PRELOADED_STATE__\s*=`)
+	reUKGPreloadedDeclHTML      = newLazyRegexp(`(?i)window\.__PRELOADED_STATE__\s*=`)
 	rePaylocityPageDataDeclHTML = newLazyRegexp(`(?i)window\.pageData\s*=`)
 	reGiantDisallowedPath       = newLazyRegexp(`(?i)/(?:shop|cart|comparison|account|apiproxy)(?:/|$|\?)`)
 )

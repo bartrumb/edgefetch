@@ -446,7 +446,7 @@ func NewStandbyDevTelemetryExporter(getenv func(string) string, defaultService, 
 		svc = "edgefetch-go-hub"
 	}
 	if version == "" {
-		version = "2.8.11"
+		version = "2.8.12"
 	}
 	e := &Exporter{
 		serviceName:    svc,
@@ -490,7 +490,7 @@ func newExporterFromEnv(
 		svc = "edgefetch-go"
 	}
 	if version == "" {
-		version = "2.8.11"
+		version = "2.8.12"
 	}
 	client := &http.Client{
 		Transport: transport,

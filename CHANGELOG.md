@@ -2,6 +2,12 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.12] - 2026-11-26
+
+### Added
+- **`/v1/*` 401s say why:** `authorizeMcpRequest` records a reason, and `/v1/*` 401 bodies add `reason` (`missing_token`, `token_rejected` or `grant_revoked`) and a `message`. `error: "unauthorized"` and the `WWW-Authenticate` challenge are unchanged. Each `token_rejected` or `grant_revoked` logs a warn-level `caller_auth_rejected` line with the path and a 10-character token-hash fingerprint (`tokenFp`, never the token), so repeated rejections of one caller's token can be alerted on (#101).
+- **Caller-token rotation overlap:** an optional `CALLER_TOKEN_PREVIOUS` secret is accepted beside `CALLER_TOKEN` on `/v1/*`, `/fetch`, `/fetch/batch` and `/agents`. Each use logs `caller_token_previous_used`, so it can be removed once no caller sends it. It's a separate secret, not a list inside `CALLER_TOKEN`, because `CALLER_TOKEN` also serves as the fallback session HMAC key (#101).
+
 ## [2.8.11] - 2026-11-26
 
 ### Fixed

@@ -1189,6 +1189,13 @@ export async function executeExtractCall(params: {
    * the standalone `extract` tool's unbounded behaviour.
    */
   budgetMs?: number;
+  /**
+   * Optional per-host fetch cap (used by `search` enrichment). Nodes fetch same-host URLs serially behind the per-host
+   * politeness floor (~2-4 s per page), so the 3rd+ URL from one host rarely fits a search budget. In request order,
+   * the first `maxFetchPerHost` URLs per host are fetched normally; later same-host URLs are served from the scrape
+   * cache when fresh and otherwise returned as `failedResults` with `error: "host_fetch_cap"` without being fetched.
+   */
+  maxFetchPerHost?: number;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runExtract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
@@ -1301,6 +1308,11 @@ export async function executeExtractCall(params: {
   >();
 
   const toFetch: Array<{ idx: number; url: string }> = [];
+  const fetchCapPerHost =
+    typeof params.maxFetchPerHost === 'number' && Number.isFinite(params.maxFetchPerHost) && params.maxFetchPerHost >= 1
+      ? Math.floor(params.maxFetchPerHost)
+      : null;
+  const fetchesQueuedByHost = new Map<string, number>();
   for (let i = 0; i < normalizedUrls.length; i++) {
     const u = normalizedUrls[i]!;
     if (
@@ -1357,6 +1369,27 @@ export async function executeExtractCall(params: {
         });
         continue;
       }
+    }
+    if (fetchCapPerHost !== null) {
+      let capHost = u;
+      try {
+        capHost = new URL(u).hostname.toLowerCase();
+      } catch {
+        // keep the raw URL as its own bucket
+      }
+      const queued = fetchesQueuedByHost.get(capHost) ?? 0;
+      if (queued >= fetchCapPerHost) {
+        byUrl.set(u, {
+          url: u,
+          status: 0,
+          cached: false,
+          failedReason: 'host_fetch_cap',
+          retryable: true,
+          errorMessage: `Skipped: already fetching ${fetchCapPerHost} page(s) from ${capHost} in this batch (per-host politeness keeps same-host fetches serial).`,
+        });
+        continue;
+      }
+      fetchesQueuedByHost.set(capHost, queued + 1);
     }
     toFetch.push({ idx: i, url: u });
   }

@@ -2,6 +2,28 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.15] - 2026-11-27
+
+### Added
+- New content state `temporarily_unavailable` for maintenance and "try again later" pages: 2xx, under 250 words, a present-tense maintenance notice plus a retry phrase, and no rich JSON-LD. Such pages are returned with that label but are never cached or indexed. `jobs` verify reports them as `unknown`, and a jobs search skips them without marking the board closed (#108).
+
+### Fixed
+- Node and CLI scrapes use the full-document extractor, so `display:none` text and `<script>` content no longer leak into Markdown. The hub never falls back to node-supplied Markdown for HTML bodies. **Update your nodes** to get the node half of this fix (#108).
+- Next.js RSC hydration: `T` rows are framed by their byte length, so a text row with no newline no longer swallows the rows after it. `TableSpecContents` spec tables (models and attributes) are now extracted, which fixes empty Shimano spec tables (#108).
+- `<html lang>` accepts only BCP 47 shaped tags, so route parameters like `{lang}` no longer appear as the page language (#108).
+- Registry-twin adapter output goes through the content-state classifier instead of always being reported as `active` (#108).
+- Adapters (#108):
+  - NuGet shows the newest stable version first, plus a "Latest Prerelease" bullet.
+  - Maven's versioned route uses `central.sonatype.com`.
+  - Wikidata has curated claims (instance of, gender, citizenship, occupation, birth, death, inception, website).
+  - Open Library takes the author from `by_statement`, falling back to `contributions`.
+  - iCIMS skips generic headings as job titles and has a company fallback.
+  - Federal Register warns when the publication date doesn't match the date in the URL.
+
+### Changed
+- CLI and node Markdown now escape `<` inside inline code spans (`Promise&lt;void>`), the same as the hub's sanitizer (#108).
+- `SCRAPE_PIPELINE_VERSION` is now 36, so cached scrapes that may contain leaked node Markdown are refreshed (#108).
+
 ## [2.8.14] - 2026-11-27
 
 ### Fixed

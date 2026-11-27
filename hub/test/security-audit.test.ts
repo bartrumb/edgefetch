@@ -7974,3 +7974,32 @@ test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, w
   assert.equal(normalizeClientRateLimitIp('1:2:3:4:5:6:7'), '1:2:3:4:5:6:7');
   assert.equal(normalizeClientRateLimitIp('1:2:3:4:5:6:7:8:9'), '1:2:3:4:5:6:7:8:9');
 });
+
+// Shop Shepherd security audit run-3 (crawler-search-read-scope-triggers-fetch): search is a crawl:read tool, but a
+// site: query ran the same edge-map crawl /v1/map refuses without crawl:fetch, and include_raw_content ran extract.
+test('search without crawl:fetch never makes the hub fetch a caller-chosen site', async () => {
+  const fetched: string[] = [];
+  const executeHubFetch = async (_target: unknown, body: string) => {
+    fetched.push(body);
+    return { status: 200, via: 'container', bodyText: JSON.stringify({ results: [] }) };
+  };
+  const payload = { query: 'site:example.test pricing', include_raw_content: true };
+
+  // crawl:read only: no site crawl, no extraction; no other source is configured, so it says so.
+  const readOnly = await executeSearchCall({ payload, env: {}, executeHubFetch, allowLiveFetch: false });
+  assert.equal(fetched.length, 0, 'a crawl:read search must not call executeHubFetch');
+  assert.equal(readOnly.status, 503);
+
+  // crawl:fetch: the same request is allowed to crawl the named site.
+  await executeSearchCall({ payload, env: {}, executeHubFetch, allowLiveFetch: true });
+  assert.ok(fetched.length > 0, 'a crawl:fetch search still runs the site crawl');
+
+  // Both crawl:read entry points pass the caller's scope through (MCP search and POST /v1/search).
+  // The runner bundles tests into a temp dir and runs from hub/, so read the source from the working directory.
+  const { readFileSync } = await import('node:fs');
+  const index = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8');
+  assert.match(index, /allowLiveFetch: Array\.isArray\(scopes\) && scopes\.includes\('crawl:fetch'\)/);
+  assert.match(index, /allowLiveFetch: auth\.scopes\.includes\('crawl:fetch'\)/);
+  const mcp = readFileSync(join(process.cwd(), 'src/mcp.ts'), 'utf8');
+  assert.match(mcp, /deps\.executeSearch\(\{ args, principal, userId, scopes \}\)/);
+});

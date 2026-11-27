@@ -861,10 +861,19 @@ export async function executeSearchCall(params: {
   source?: string;
   userId?: string;
   tracer?: RequestTracer | TraceContext;
+  /**
+   * Whether this caller may make the hub fetch caller-chosen sites: the `site:`/include_domains edge-map crawl, the
+   * Wikipedia direct-title guess and include_raw_content extraction. Pass false for a token holding crawl:read but
+   * not crawl:fetch; search then answers from stored collections and external SERP providers only, and names the
+   * skipped options in `unhonoredOptions`. Default true (callers already behind crawl:fetch). Without this, a
+   * crawl:read token reached the same fetches /v1/map refuses without crawl:fetch.
+   */
+  allowLiveFetch?: boolean;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runSearchCall = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'search', userId = 'owner' } = params;
+  const allowLiveFetch = params.allowLiveFetch !== false;
   const providerFetchFn = params.providerFetchFn ?? fetch;
   const enforcePacing = params.providerFetchFn === undefined;
 
@@ -963,7 +972,8 @@ export async function executeSearchCall(params: {
   );
   const resolvedWikiHost = `${resolvedWikiLang}.wikipedia.org`;
   // Never run `edge-map` on Wikipedia during `search` (never fetch sitemap, `/llms.txt`, `Special:`, `/w/`, or `/api/` on article discovery).
-  const canEdgeMap = edgeMapSpec.domains.length > 0 && !isWikipediaResolver && !edgeMapSpec.domains.some((d) => isWikipediaHost(d));
+  const canEdgeMap =
+    allowLiveFetch && edgeMapSpec.domains.length > 0 && !isWikipediaResolver && !edgeMapSpec.domains.some((d) => isWikipediaHost(d));
   const effectiveIncludeDomains = isWikipediaResolver
     ? explicitWikipediaMode && includeDomains.length === 0 && edgeMapSpec.siteDomains.length === 0
       ? [resolvedWikiHost]
@@ -981,6 +991,11 @@ export async function executeSearchCall(params: {
   const unhonoredOptions: string[] = [];
   if (wantsAnswer) {
     unhonoredOptions.push('include_answer');
+  }
+  if (!allowLiveFetch) {
+    // crawl:read only: no hub fetch of caller-chosen sites. Say which requested behaviours were skipped.
+    if (includeRawContent) unhonoredOptions.push('include_raw_content');
+    if (edgeMapSpec.domains.length > 0 && !isWikipediaResolver) unhonoredOptions.push('site_crawl');
   }
   if (timeRange && requestedCollections.length > 0 && !hasExternalProvider) {
     unhonoredOptions.push('time_range');
@@ -1383,7 +1398,7 @@ export async function executeSearchCall(params: {
   // Reciprocal Rank Fusion (RRF, k = 60) across all active providers + domain allow/block filtering.
   // Tier 2 Wikipedia Direct-Title Guess fallback: if targeting Wikipedia and SERP/collections returned 0 valid `/wiki/<Title>`
   // article hits (e.g. keyless self-hosted Hub), try at most ONE `/wiki/<Title_Cased_Query>` fetch (never touching Special:, /w/, or /api/).
-  if (isWikipediaResolver) {
+  if (isWikipediaResolver && allowLiveFetch) {
     const preWikiArticles = [...externalLists, ...collectionLists].reduce(
       (acc, l) => acc + l.items.filter((it) => parseWikipediaArticleUrl(it.url) !== null).length,
       0,
@@ -1548,7 +1563,7 @@ export async function executeSearchCall(params: {
   let via = viaParts.join('+') || providerLists.map((p) => p.provider).join('+') || 'search';
 
   // Optional live page fetch + BM25 chunk reranking — ALWAYS prioritizing HAOS EdgeFetch nodes (`target: "auto"` -> `agent:site-*` first!).
-  if (includeRawContent && results.length > 0) {
+  if (includeRawContent && allowLiveFetch && results.length > 0) {
     const extractOut = await executeExtractCall({
       payload: {
         urls: results.map((r) => r.url),

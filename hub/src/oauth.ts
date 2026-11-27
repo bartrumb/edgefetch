@@ -41,6 +41,61 @@ export interface ActiveCallerAuthContext {
 interface CallerAuthSlot {
   current?: ActiveCallerAuthContext;
   githubAuthEnv?: GitHubAuthEnv;
+  /** Why the last `authorizeMcpRequest` in this request failed, for `annotateCallerAuthFailure`. */
+  authFailure?: { reason: CallerAuthFailureReason; tokenFp?: string };
+}
+
+/**
+ * Why a `/v1/*` caller got 401, returned as `reason` beside the existing `error: "unauthorized"` so callers can alert on
+ * "our token is wrong" instead of treating it as a site failure:
+ * - `missing_token`: no `Authorization: Bearer` / `X-API-Key` was sent;
+ * - `token_rejected`: the token is not this hub's `CALLER_TOKEN`, `CALLER_TOKEN_PREVIOUS`, `MCP_TOKEN`, or a live OAuth
+ *   access token for this resource (unknown, rotated away, expired, or issued for another hub);
+ * - `grant_revoked`: a valid OAuth token whose grant was just revoked (user disabled, de-allowlisted, or failed org
+ *   re-verification).
+ */
+export type CallerAuthFailureReason = 'missing_token' | 'token_rejected' | 'grant_revoked';
+
+const CALLER_AUTH_FAILURE_MESSAGES: Record<CallerAuthFailureReason, string> = {
+  missing_token: 'No caller token was sent. Use Authorization: Bearer <token>.',
+  token_rejected:
+    "The token was not accepted: it is not this hub's CALLER_TOKEN, CALLER_TOKEN_PREVIOUS, MCP_TOKEN, or a live OAuth access token for this resource.",
+  grant_revoked: 'The OAuth grant behind this token was revoked (user disabled or no longer allowed). Sign in again.',
+};
+
+function noteCallerAuthFailure(reason: CallerAuthFailureReason, tokenHash?: string): void {
+  const slot = callerAuthAls.getStore();
+  if (slot) slot.authFailure = { reason, ...(tokenHash ? { tokenFp: tokenHash.slice(0, 10) } : {}) };
+}
+
+/**
+ * Adds `reason` and `message` to a `/v1/*` 401 `{ "error": "unauthorized" }` body when `authorizeMcpRequest` recorded
+ * why, and logs a warn-level `caller_auth_rejected` line (with a short token-hash fingerprint, never the token) so
+ * repeated rejections of one caller's token are easy to alert on. Must run inside `runWithCallerAuthContext`.
+ */
+export async function annotateCallerAuthFailure(url: URL, response: Response): Promise<Response> {
+  if (response.status !== 401 || !url.pathname.startsWith('/v1/')) return response;
+  const failure = callerAuthAls.getStore()?.authFailure;
+  if (!failure) return response;
+  if (failure.reason !== 'missing_token') {
+    console.warn(
+      JSON.stringify({ event: 'caller_auth_rejected', reason: failure.reason, path: url.pathname, tokenFp: failure.tokenFp ?? null }),
+    );
+  }
+  if (!/^application\/json\b/i.test(response.headers.get('content-type') ?? '')) return response;
+  let body: unknown;
+  try {
+    body = await response.clone().json();
+  } catch {
+    return response;
+  }
+  if (!body || typeof body !== 'object' || (body as { error?: unknown }).error !== 'unauthorized') return response;
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  return new Response(
+    JSON.stringify({ ...(body as Record<string, unknown>), reason: failure.reason, message: CALLER_AUTH_FAILURE_MESSAGES[failure.reason] }),
+    { status: 401, headers },
+  );
 }
 
 interface AsyncLocalStorageLike<T> {
@@ -4747,13 +4802,33 @@ export async function authorizeMcpRequest(params: {
 }): Promise<McpAuthResult> {
   const wwwAuthenticate = `Bearer resource_metadata="${params.origin}/.well-known/oauth-protected-resource", scope="${MCP_SCOPES.join(' ')}"`;
   const tok = callerToken(params.request);
-  if (!tok) return { ok: false, status: 401, wwwAuthenticate };
+  if (!tok) {
+    noteCallerAuthFailure('missing_token');
+    return { ok: false, status: 401, wwwAuthenticate };
+  }
 
   if (isValidSecretMatch(tok, params.ownerSecret)) {
     const res: McpAuthResult = {
       ok: true,
       scopes: [...SUPPORTED_MCP_SCOPES],
       principal: 'owner_token',
+      userId: 'owner',
+      role: 'owner',
+    };
+    setActiveCallerAuthContext(res);
+    return res;
+  }
+  // Rotation overlap: while `CALLER_TOKEN_PREVIOUS` is set, the old owner token keeps working beside the new
+  // `CALLER_TOKEN`, so callers can switch without a hard cut-over. Each use is logged so you can see who still sends it.
+  const previousOwnerSecret = params.ownerSecret
+    ? (callerAuthAls.getStore()?.githubAuthEnv as { CALLER_TOKEN_PREVIOUS?: string } | undefined)?.CALLER_TOKEN_PREVIOUS
+    : undefined;
+  if (previousOwnerSecret && isValidSecretMatch(tok, previousOwnerSecret)) {
+    console.warn(JSON.stringify({ event: 'caller_token_previous_used', tokenFp: (await sha256Base64Url(tok)).slice(0, 10) }));
+    const res: McpAuthResult = {
+      ok: true,
+      scopes: [...SUPPORTED_MCP_SCOPES],
+      principal: 'owner_token_previous',
       userId: 'owner',
       role: 'owner',
     };
@@ -4800,6 +4875,7 @@ export async function authorizeMcpRequest(params: {
     record = await params.store.getAccessToken(tokenHash, nowMs);
   }
   if (!record || record.resource.toLowerCase() !== `${params.origin.toLowerCase()}/mcp`) {
+    noteCallerAuthFailure('token_rejected', tokenHash);
     return { ok: false, status: 401, wwwAuthenticate };
   }
   const userId = record.userId ?? 'owner';
@@ -4812,6 +4888,7 @@ export async function authorizeMcpRequest(params: {
     let liveUser = preloadedUser !== undefined ? preloadedUser : ((await params.store.getUser?.(userId)) ?? null);
     if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, effectiveGhEnv)) {
       await params.store.revokeGrant(record.grantId);
+      noteCallerAuthFailure('grant_revoked', tokenHash);
       return { ok: false, status: 401, wwwAuthenticate };
     }
     if (
@@ -4830,11 +4907,13 @@ export async function authorizeMcpRequest(params: {
       });
       if (!orgCheck.ok) {
         await params.store.revokeGrant(record.grantId);
+        noteCallerAuthFailure('grant_revoked', tokenHash);
         return { ok: false, status: 401, wwwAuthenticate };
       }
       liveUser = (await params.store.getUser?.(userId)) ?? null;
       if (!liveUser || liveUser.disabled || (liveUser.sessionEpoch ?? 1) !== initialEpoch) {
         await params.store.revokeGrant(record.grantId);
+        noteCallerAuthFailure('grant_revoked', tokenHash);
         return { ok: false, status: 401, wwwAuthenticate };
       }
     }

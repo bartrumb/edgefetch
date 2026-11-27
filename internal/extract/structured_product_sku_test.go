@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -217,8 +218,12 @@ func TestExtractStructuredProductSpecTablesAndJsonDiagnostics(t *testing.T) {
 	if bookProd["title"] != "A Light in the Attic" || bookProd["price"] != 51.77 || bookProd["currency"] != "GBP" {
 		t.Fatalf("unexpected book product core fields: %#v", bookProd)
 	}
-	if bookProd["gtin"] != "a897fe39b1053632" || bookProd["availability"] != "InStock" {
-		t.Fatalf("unexpected book gtin/availability: %#v", bookProd)
+	// The book's "UPC" row is a 16-char hex store ID, not a GS1 GTIN: never report it as gtin, keep it in specs.
+	if _, hasGTIN := bookProd["gtin"]; hasGTIN || bookProd["availability"] != "InStock" {
+		t.Fatalf("unexpected book gtin/availability (hex UPC must not become gtin): %#v", bookProd)
+	}
+	if fmt.Sprint(specValueGo(bookProd["specs"], "upc")) != "a897fe39b1053632" {
+		t.Fatalf("raw UPC must stay in specs.upc, got specs %#v", bookProd["specs"])
 	}
 	bookImgs, _ := bookProd["images"].([]string)
 	if len(bookImgs) != 1 || bookImgs[0] != "https://books.toscrape.com/media/cache/a.jpg" {
@@ -531,3 +536,37 @@ func TestStructuredProductJSONLDUrlObjectAndCurrencySpecGO6(t *testing.T) {
 		t.Fatalf("expected GBP price 39.50 without literal 'price' label, got %#v", prodGBP)
 	}
 }
+
+func specValueGo(specs any, key string) any {
+	switch m := specs.(type) {
+	case map[string]string:
+		return m[key]
+	case map[string]any:
+		return m[key]
+	}
+	return nil
+}
+
+func TestPlausibleGTINGo(t *testing.T) {
+	cases := map[string]string{
+		"012345678905":      "012345678905",  // UPC-A / GTIN-12
+		"4006381333931":     "4006381333931", // EAN-13
+		"978-0-14-032872-1": "9780140328721", // ISBN-13 with hyphens
+		"9650 1234":         "96501234",      // GTIN-8 with a space
+		"10012345678902":    "10012345678902", // GTIN-14
+		"a897fe39b1053632":  "",              // hex store ID
+		"0140328726":        "",              // ISBN-10 is not a GTIN
+		"12345":             "",
+		"":                  "",
+		"SKU-123456789012":  "",
+	}
+	for in, want := range cases {
+		if got := plausibleGTINGo(in); got != want {
+			t.Errorf("plausibleGTINGo(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := firstPlausibleGTINGo("", "a897fe39b1053632", "4006381333931"); got != "4006381333931" {
+		t.Errorf("firstPlausibleGTINGo skipped to the wrong candidate: %q", got)
+	}
+}
+

@@ -12,6 +12,8 @@ import {
   sanitizeNodeSuppliedUrls,
   sniffLargeStructuredJsonKind,
   tryParseJsonPayloadForScrape,
+  capInlineRecordsToBudget,
+  resolveScrapeMaxChars,
 } from '../src/scrape';
 import {
   hydrateReplyBodiesFromR2,
@@ -584,3 +586,42 @@ test('L-05: wd-stub-render-1 and auto-render-1 pass maxInlineBodyBytes: MAX_WASM
   assert.equal(autoCap.maxInlineBodyBytes, MAX_WASM_INPUT_BYTES);
   assert.equal(wdCap.maxInlineBodyBytes, MAX_WASM_INPUT_BYTES);
 });
+
+test('R16: inline records[] stay within the scrape maxChars budget (catalog twins could return ~439 KB for maxChars 600)', () => {
+  const product = (i: number) => ({ id: i, title: `Product ${i}`, body: 'x'.repeat(2_000), variants: [{ sku: `SKU-${i}`, price: 999 }] });
+  const records = Array.from({ length: 50 }, (_, i) => product(i));
+  const body = { ok: true, markdown: '# Catalog', records, pagination: { page: 1, hasMore: true } };
+  const fullLen = JSON.stringify(records).length;
+  assert.ok(fullLen > 100_000, 'fixture is large enough to need trimming');
+
+  // A. Over budget: whole records from the front, serialized size within the budget, and an explicit trim report.
+  const capped = capInlineRecordsToBudget(body, 10_000);
+  const kept = capped.records as unknown[];
+  assert.ok(kept.length > 0 && kept.length < 50);
+  assert.ok(JSON.stringify(kept).length <= 10_000, `kept ${JSON.stringify(kept).length} chars`);
+  assert.deepEqual(kept[0], records[0], 'records are kept whole and in order');
+  assert.equal(capped.recordsTruncated, true);
+  assert.equal(capped.recordsReturned, kept.length);
+  assert.equal(capped.recordsTotal, 50);
+  assert.match(String(capped.recordsHint), /read_artifact/);
+  assert.equal(capped.markdown, '# Catalog');
+  assert.deepEqual(capped.pagination, body.pagination, 'other fields are untouched');
+  assert.equal(body.records.length, 50, 'the input body is not mutated');
+
+  // B. Under budget: returned unchanged (no truncation fields).
+  const small = { records: [product(1)] };
+  assert.equal(capInlineRecordsToBudget(small, 100_000), small);
+
+  // C. A single record larger than the budget: none kept, still reported.
+  const huge = capInlineRecordsToBudget({ records: [{ body: 'y'.repeat(5_000) }] }, 1_000);
+  assert.deepEqual(huge.records, []);
+  assert.equal(huge.recordsTotal, 1);
+
+  // D. Budget source: explicit maxChars, else the MCP default, else none (REST callers keep full records).
+  assert.equal(resolveScrapeMaxChars({ maxChars: 600 }), 600);
+  assert.equal(resolveScrapeMaxChars({ defaultMaxChars: 100_000 }), 100_000);
+  assert.equal(resolveScrapeMaxChars({ maxChars: 600, defaultMaxChars: 100_000 }), 600);
+  assert.equal(resolveScrapeMaxChars({}), undefined);
+  assert.equal(resolveScrapeMaxChars({ maxChars: 10 }), 500, 'clamped to the same 500..500000 range as markdown');
+});
+

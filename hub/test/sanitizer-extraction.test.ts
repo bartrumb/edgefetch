@@ -6169,7 +6169,9 @@ test('L-04 & R2 #14: product backfill from recordsForJson, relative product.url 
   const bookProd = bookRes.body.product as Record<string, unknown>;
   assert.equal(bookProd.price, 51.77);
   assert.equal(bookProd.currency, 'GBP');
-  assert.equal(bookProd.gtin, 'a897fe39b1053632');
+  // The hex 'UPC' is a store ID, not a GS1 GTIN: it must not be reported as gtin, but stays in specs.
+  assert.equal(bookProd.gtin, undefined);
+  assert.equal((bookProd.specs as Record<string, unknown> | undefined)?.upc, 'a897fe39b1053632');
   const bookJson = bookRes.body.json as Record<string, unknown>;
   assert.equal(bookJson.price, 51.77);
   assert.equal(bookJson.currency, 'GBP');

@@ -3398,12 +3398,7 @@ export async function executeScrapeCall(params: {
   const excludeTags = Array.isArray(payload.excludeTags)
     ? payload.excludeTags.filter((s): s is string => typeof s === 'string' && s.trim().length > 0).slice(0, 25)
     : [];
-  const maxChars =
-    typeof payload.maxChars === 'number' && Number.isFinite(payload.maxChars)
-      ? Math.min(500_000, Math.max(500, Math.floor(payload.maxChars)))
-      : typeof payload.defaultMaxChars === 'number' && Number.isFinite(payload.defaultMaxChars)
-        ? Math.min(500_000, Math.max(500, Math.floor(payload.defaultMaxChars)))
-        : undefined;
+  const maxChars = resolveScrapeMaxChars(payload);
   const explicitDiscoverLlms = typeof payload.discoverLlmsTxt === 'boolean' ? payload.discoverLlmsTxt : undefined;
   const discoverLlmsTxt = explicitDiscoverLlms ?? true;
   const goDiscoverLlms =
@@ -8575,7 +8570,12 @@ export async function executeScrapeCall(params: {
     isolateLease.release();
   }
   };
-  const scrapeResult = await (activeTracer ? activeTracer.run(runScrape) : runScrape());
+  const rawScrapeResult = await (activeTracer ? activeTracer.run(runScrape) : runScrape());
+  const recordsBudget = resolveScrapeMaxChars(params.payload);
+  const scrapeResult =
+    recordsBudget !== undefined && Array.isArray(rawScrapeResult.body.records)
+      ? { ...rawScrapeResult, body: capInlineRecordsToBudget(rawScrapeResult.body, recordsBudget) }
+      : rawScrapeResult;
   if (
     scrapeResult.body.visibility !== 'private' &&
     isPrivateRequestPayload(params.payload, params.userId ?? 'owner')
@@ -8583,6 +8583,45 @@ export async function executeScrapeCall(params: {
     return { ...scrapeResult, body: { ...scrapeResult.body, visibility: 'private' as const } };
   }
   return scrapeResult;
+}
+
+/** The scrape's inline character budget: explicit `maxChars`, else the caller's `defaultMaxChars` (MCP), else none. */
+export function resolveScrapeMaxChars(payload: Pick<ScrapeRequestPayload, 'maxChars' | 'defaultMaxChars'>): number | undefined {
+  return typeof payload.maxChars === 'number' && Number.isFinite(payload.maxChars)
+    ? Math.min(500_000, Math.max(500, Math.floor(payload.maxChars)))
+    : typeof payload.defaultMaxChars === 'number' && Number.isFinite(payload.defaultMaxChars)
+      ? Math.min(500_000, Math.max(500, Math.floor(payload.defaultMaxChars)))
+      : undefined;
+}
+
+/**
+ * Keeps inline `records[]` (catalog / twin / adapter rows) within the same character budget as `markdown`. A Shopify
+ * collection asked for `maxChars: 600` returned 50 full products (~439 KB) inline, more than an MCP client accepts in
+ * one tool result. Whole records are kept from the front while they fit; the body then says how many were dropped and
+ * where to get the rest. Callers without a budget (REST without `maxChars`) keep the full array.
+ */
+export function capInlineRecordsToBudget(body: Record<string, unknown>, budgetChars: number): Record<string, unknown> {
+  const records = body.records;
+  if (!Array.isArray(records) || records.length === 0) return body;
+  if (JSON.stringify(records).length <= budgetChars) return body;
+  const kept: unknown[] = [];
+  let used = 2; // the enclosing [ ]
+  for (const rec of records) {
+    const len = JSON.stringify(rec).length + (kept.length > 0 ? 1 : 0);
+    if (used + len > budgetChars) break;
+    kept.push(rec);
+    used += len;
+  }
+  return {
+    ...body,
+    records: kept,
+    recordsTruncated: true,
+    recordsReturned: kept.length,
+    recordsTotal: records.length,
+    recordsHint:
+      `records[] trimmed to ${kept.length} of ${records.length} to fit maxChars ${budgetChars}. ` +
+      'Raise maxChars (up to 500000), follow pagination when present, or page the raw response with read_artifact(artifactId).',
+  };
 }
 
 export function extractYouTubeTranscriptFromHtml(rawHtml: string): string {

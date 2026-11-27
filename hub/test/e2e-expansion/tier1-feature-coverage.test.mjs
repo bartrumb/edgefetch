@@ -939,7 +939,8 @@ describe('Tier 1 & Tier 2 — Commerce, Tech Docs & M1 Product Core (F02, F03, F
     assert.equal(res.body.product?.title, 'A Light in the Attic');
     assert.equal(res.body.product?.price, 51.77);
     assert.equal(res.body.product?.currency, 'GBP');
-    assert.equal(res.body.product?.gtin, 'a897fe39b1053632');
+    assert.equal(res.body.product?.gtin, undefined, 'hex store UPC must not be reported as a GS1 gtin');
+    assert.equal(res.body.product?.specs?.upc, 'a897fe39b1053632');
     assert.equal(res.body.product?.availability, 'InStock');
     assert.equal(res.body.json?.price, 51.77);
     assert.equal(res.body.json?.currency, 'GBP');

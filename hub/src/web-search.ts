@@ -817,6 +817,14 @@ function countDomainFilteredHits(
  */
 export const SEARCH_ENRICH_BUDGET_MS = 15_000;
 
+/**
+ * Live pages fetched per host during `include_raw_content` enrichment. Nodes fetch same-host URLs serially behind the
+ * 2 s per-host politeness floor (measured ~2.5-4 s per page), so four results from one docs site consumed the whole
+ * budget and three still came back empty. Further same-host results are served from the 1 h scrape cache when fresh,
+ * and otherwise keep their SERP snippet, leaving the budget for distinct hosts that the nodes fetch in parallel.
+ */
+export const SEARCH_ENRICH_MAX_FETCH_PER_HOST = 2;
+
 export async function executeSearchCall(params: {
   payload: SearchRequestPayload;
   env: SearchBindings;
@@ -1524,6 +1532,7 @@ export async function executeSearchCall(params: {
       executeHubFetch,
       source: `${source}:enrich`,
       budgetMs: SEARCH_ENRICH_BUDGET_MS,
+      maxFetchPerHost: SEARCH_ENRICH_MAX_FETCH_PER_HOST,
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (extractOut.status === 200 && Array.isArray(extractOut.body.results)) {

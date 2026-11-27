@@ -114,7 +114,10 @@ export function inferKindForUrl(url: string): 'page' | 'text' | 'json' {
   if (
     /\.(json|webmanifest|jsonl|ndjson|ipynb)$/.test(pathname) ||
     pathname.startsWith('/.well-known/') ||
-    (!/\.(?:html?|xhtml|php|asp|aspx)$/.test(pathname) && /(?:^|\/)api(?:\/|$)/.test(pathname)) ||
+    // A REST-shaped API path: `/api` as the FIRST segment (`/api/items`) or a versioned `/api/v<N>` anywhere. A bare
+    // `/api/` deeper in the path is usually docs (`/docs/Web/API/fetch`, `/durable-objects/api/sqlite-storage-api/`):
+    // guessing `json` there fails HTML with "not JSON" and, as an `error` on `kind: json`, stops that host's queue.
+    (!/\.(?:html?|xhtml|php|asp|aspx)$/.test(pathname) && /^\/api(?:\/|$)|\/api\/v\d+(?:\/|$)/.test(pathname)) ||
     host === 'registry.npmjs.org' ||
     host === 'api.github.com' ||
     (host === 'pypi.org' && /\/json\/?$/.test(pathname))

@@ -11571,6 +11571,10 @@ test('M1-C-R3 Group 1: src/mcp.ts batch scope enforcement & helpers, src/storage
     assert.equal(inferKindForUrl('https://pypi.org/pypi/edgefetch/json'), 'json');
     assert.equal(inferKindForUrl('https://example.com/api/v1/items'), 'json');
     assert.equal(inferKindForUrl('https://example.com/api/index.html'), 'page');
+    // R12: only REST-shaped API paths infer json; a bare /api/ segment deeper in a docs path stays a page.
+    assert.equal(inferKindForUrl('https://example.com/v2/api/v3/things'), 'json');
+    assert.equal(inferKindForUrl('https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/'), 'page');
+    assert.equal(inferKindForUrl('https://developer.mozilla.org/en-US/docs/Web/API/fetch'), 'page');
     assert.equal(inferKindForUrl('https://example.com/feed/'), 'text');
     assert.equal(inferKindForUrl('https://example.com/atom/'), 'text');
     assert.equal(inferKindForUrl('https://example.com/events.ics'), 'text');

@@ -103,6 +103,7 @@ import {
   extractEdgeMapDomains,
   resetSearchProviderPacingForTests,
   SEARCH_ENRICH_BUDGET_MS,
+  SEARCH_ENRICH_MAX_FETCH_PER_HOST,
 } from '../src/web-search';
 
 function createMockOAuthStore() {
@@ -5579,5 +5580,73 @@ test('R11: search enrichment runs under a wall-clock budget (capped node dispatc
   for (const d of enrichDispatches) {
     assert.ok((d.maxSeconds ?? 99) <= SEARCH_ENRICH_BUDGET_MS / 1_000, `${d.src} maxSeconds ${d.maxSeconds} exceeds budget`);
   }
+});
+
+test('R12: search enrichment caps live fetches per host so one docs site cannot consume the budget', async () => {
+  const fetchedUrls: string[] = [];
+  const hub = async (_t: string, bodyText: string) => {
+    const parsed = JSON.parse(bodyText) as { requests?: Array<{ id?: string; url?: string }> };
+    const reqs = parsed.requests ?? [];
+    for (const r of reqs) fetchedUrls.push(String(r.url));
+    return {
+      status: 200,
+      via: 'cf',
+      bodyText: JSON.stringify({
+        results: reqs.map((r) => ({
+          id: r.id,
+          url: r.url,
+          status: 200,
+          outcome: 'ok',
+          contentType: 'text/html',
+          body: `<html><head><title>${r.url}</title></head><body><main><h1>Durable Objects</h1><p>SQLite storage limits for durable objects explained with enough words to rank well here.</p></main></body></html>`,
+        })),
+      }),
+    };
+  };
+  const docs = (p: string) => `https://docs.example.com/durable-objects/${p}`;
+  const urls = [docs('limits'), 'https://blog.example.org/do-sqlite', docs('overview'), docs('pricing'), docs('sqlite-api')];
+
+  // A. Direct extract with maxFetchPerHost: 2 -> only the first two same-host URLs (in rank order) are fetched.
+  fetchedUrls.length = 0;
+  const a = await executeExtractCall({
+    payload: { urls, allowExternalUrls: true, ephemeral: true, query: 'sqlite storage limits', renderMode: 'off' } as never,
+    env: {},
+    executeHubFetch: hub as never,
+    maxFetchPerHost: 2,
+  });
+  assert.equal(a.status, 200);
+  const docsFetched = fetchedUrls.filter((u) => u.includes('docs.example.com'));
+  assert.equal(docsFetched.length, 2, `fetched ${JSON.stringify(fetchedUrls)}`);
+  assert.ok(docsFetched.some((u) => u.endsWith('/limits')) && docsFetched.some((u) => u.endsWith('/overview')));
+  assert.ok(fetchedUrls.some((u) => u.includes('blog.example.org')), 'other hosts are unaffected');
+  const capped = (a.body.failedResults as Array<Record<string, unknown>>).filter((f) => f.error === 'host_fetch_cap');
+  assert.deepEqual(capped.map((f) => String(f.url).split('/').pop()).sort(), ['pricing', 'sqlite-api']);
+  assert.ok(capped.every((f) => f.retryable === true && typeof f.message === 'string'));
+
+  // B. Without the option, extract still fetches every URL (standalone extract tool unchanged).
+  fetchedUrls.length = 0;
+  await executeExtractCall({
+    payload: { urls, allowExternalUrls: true, ephemeral: true, query: 'sqlite', renderMode: 'off' } as never,
+    env: {},
+    executeHubFetch: hub as never,
+  });
+  assert.equal(fetchedUrls.filter((u) => u.includes('docs.example.com')).length, 4);
+
+  // C. End to end: search include_raw_content applies SEARCH_ENRICH_MAX_FETCH_PER_HOST.
+  assert.equal(SEARCH_ENRICH_MAX_FETCH_PER_HOST, 2);
+  resetSearchProviderPacingForTests();
+  fetchedUrls.length = 0;
+  const s = await executeSearchCall({
+    payload: { query: 'durable objects sqlite storage limits', mode: 'serper', max_results: 5, include_raw_content: true, noCache: true },
+    env: { SERPER_API_KEY: 'serper-host-cap' } as never,
+    executeHubFetch: hub as never,
+    providerFetchFn: async () =>
+      Response.json({ organic: urls.map((link, i) => ({ title: `Result ${i}`, link, snippet: 'Durable Objects SQLite storage limits' })) }),
+  });
+  assert.equal(s.status, 200);
+  assert.ok(fetchedUrls.filter((u) => u.includes('docs.example.com')).length <= SEARCH_ENRICH_MAX_FETCH_PER_HOST);
+  const results = s.body.results as Array<Record<string, unknown>>;
+  assert.equal(results.length, 5, 'capped results are still returned with their SERP snippet');
+  assert.ok(results.filter((r) => typeof r.rawContent === 'string').length >= 3, 'two docs pages + the blog page are enriched');
 });
 

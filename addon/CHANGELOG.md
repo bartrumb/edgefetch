@@ -2,6 +2,11 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.11] - 2026-11-26
+
+### Fixed
+- **Cold scrapes logged false R2 errors:** every cold public scrape first did a blind `bucket.get()` on its options-cache key, and Workers Observability logs an R2 `NoSuchKey` as an error-level `r2_get` span. That was 147 of 148 error events in a 30-minute production window. Writing a cache entry now also upserts a `scrape_cache_index` row in META D1 (created lazily with `CREATE TABLE IF NOT EXISTS`), and lookups read that row first: no row or a stale row is a miss without touching R2, and a failed index query falls back to the R2 read. Existing entries are missed once and rewritten (#99).
+
 ## [2.8.10] - 2026-11-26
 
 ### Changed

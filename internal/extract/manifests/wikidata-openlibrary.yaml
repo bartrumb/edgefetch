@@ -119,10 +119,12 @@ routes:
           limit: 25
           itemWrap: "`"
           join: ", "
-        # Curated claims (first values only, emitted only when present). Item-valued claims are
-        # rendered as Wikidata QIDs because entity JSON carries no labels for referenced items.
-        # P1082 (population) is intentionally omitted: its claim array is historic-first (e.g. the
-        # first Berlin value is from 1200) and the engine cannot select the preferred-rank claim.
+        # Curated claims (emitted only when present). Item-valued claims are rendered as Wikidata
+        # QIDs because entity JSON carries no labels for referenced items. Single-valued claims use
+        # `preferWhere` to pick the preferred-rank statement: claim arrays such as P1082 (population)
+        # are historic-first (e.g. the first Berlin value is from 1200). Without a preferred claim the
+        # population falls back to the last normal-rank value; dates fall back to the first normal one.
+        # Deprecated-rank-only claims are never emitted.
         instanceOf:
           dynamicKeyPath:
             base: entities
@@ -163,7 +165,12 @@ routes:
           dynamicKeyPath:
             base: entities
             keyVar: qid
-            subPath: claims.P569.0.mainsnak.datavalue.value.time
+            subPath: claims.P569
+          preferWhere:
+            path: rank
+            equals: preferred
+            fallbackEquals: normal
+          subField: mainsnak.datavalue.value.time
           stripPrefix: "+"
           stripSuffix: "T00:00:00Z"
           replaceAll:
@@ -174,7 +181,12 @@ routes:
           dynamicKeyPath:
             base: entities
             keyVar: qid
-            subPath: claims.P570.0.mainsnak.datavalue.value.time
+            subPath: claims.P570
+          preferWhere:
+            path: rank
+            equals: preferred
+            fallbackEquals: normal
+          subField: mainsnak.datavalue.value.time
           stripPrefix: "+"
           stripSuffix: "T00:00:00Z"
           replaceAll:
@@ -185,13 +197,30 @@ routes:
           dynamicKeyPath:
             base: entities
             keyVar: qid
-            subPath: claims.P571.0.mainsnak.datavalue.value.time
+            subPath: claims.P571
+          preferWhere:
+            path: rank
+            equals: preferred
+            fallbackEquals: normal
+          subField: mainsnak.datavalue.value.time
           stripPrefix: "+"
           stripSuffix: "T00:00:00Z"
           replaceAll:
             from: "-00"
             to: ""
           sliceMax: 10
+        population:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P1082
+          preferWhere:
+            path: rank
+            equals: preferred
+            fallbackEquals: normal
+            fallbackLast: true
+          subField: mainsnak.datavalue.value.amount
+          format: int_comma
         officialWebsite:
           dynamicKeyPath:
             base: entities
@@ -251,6 +280,9 @@ routes:
         - label: Inception
           template: "{inception}"
           whenVar: inception
+        - label: Population
+          template: "{population}"
+          whenVar: population
         - label: Official Website
           template: "{officialWebsite}"
           whenVar: officialWebsite

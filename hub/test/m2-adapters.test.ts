@@ -836,6 +836,46 @@ test('M2-FIX-1b: non-HTML body keeps the node-supplied Markdown fallback', async
   assert.match(String(res.body.markdown ?? ''), new RegExp(nodeMarker));
 });
 
+test('M2-FIX-4: a rendered app shell with no main content is re-extracted full-page, not returned empty', async () => {
+  resetIsolateBudgetForTests();
+  const marker = 'RENDERED_SHELL_ASIDE_TEXT_5d1e';
+  const shell =
+    '<html lang="en"><head><title>Shell App</title></head><body>' +
+    `<aside class="learn"><header><h3>About</h3></header><blockquote><p>${marker} explains what this small app does in a few sentences of real prose.</p></blockquote></aside>` +
+    '<section class="todoapp" id="root"><header class="header"><h1>todos</h1><input class="new-todo" placeholder="What needs to be done?"></header></section>' +
+    '<footer class="info"><p>Double-click to edit a todo</p></footer>' +
+    '<script>window.LEAK_SCRIPT_TEXT_77 = 1;</script><div style="display:none">HIDDEN_SHELL_TEXT_77</div></body></html>';
+  const fetchShell = (rendered: boolean) => async (_target: unknown, rawBody: string) => {
+    const req = JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> };
+    const r0 = req.requests[0]!;
+    return {
+      status: 200,
+      via: 'agent:test',
+      bodyText: JSON.stringify({
+        results: [{ id: r0.id, url: r0.url, finalUrl: r0.url, status: 200, outcome: 'ok', contentType: 'text/html; charset=utf-8', body: shell, rendered }],
+      }),
+    };
+  };
+  const rendered = await executeScrapeCall({
+    payload: { url: 'https://shell-app.example.com/app/', formats: ['markdown'], renderMode: 'always' },
+    env: {},
+    executeHubFetch: fetchShell(true),
+  });
+  assert.equal(rendered.status, 200, JSON.stringify(rendered.body).slice(0, 600));
+  const md = String(rendered.body.markdown ?? '');
+  assert.match(md, new RegExp(marker), 'rendered shell falls back to full-page hub extraction');
+  assert.doesNotMatch(md, /LEAK_SCRIPT_TEXT_77|HIDDEN_SHELL_TEXT_77/, 'full-page fallback still drops scripts and hidden subtrees');
+
+  // Static (unrendered) HTML keeps the existing behaviour: no full-page chrome fallback.
+  const staticRes = await executeScrapeCall({
+    payload: { url: 'https://shell-app-static.example.com/app/', formats: ['markdown'], renderMode: 'off' },
+    env: {},
+    executeHubFetch: fetchShell(false),
+  });
+  assert.equal(staticRes.status, 200);
+  assert.doesNotMatch(String(staticRes.body.markdown ?? ''), new RegExp(marker));
+});
+
 test('M2-FIX-2: registry-twin adapter output is labelled by the Go content-state classifier, not hardcoded active', async () => {
   resetIsolateBudgetForTests();
   const articleUrl = 'https://acme.zendesk.com/hc/en-us/articles/4408886858139-Missing';

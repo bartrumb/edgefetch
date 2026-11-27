@@ -3,7 +3,7 @@
   "mode": "twin",
   "inputUrl": "https://www.wikidata.org/wiki/Q42",
   "expectedFetchUrl": "https://www.wikidata.org/wiki/Special:EntityData/Q42.json",
-  "mockPayload": "{\"entities\":{\"Q42\":{\"id\":\"Q42\",\"labels\":{\"mul\":{\"language\":\"mul\",\"value\":\"Douglas Adams\"}},\"descriptions\":{\"en\":{\"language\":\"en\",\"value\":\"English writer and humorist\"}},\"modified\":\"2026-02-01T00:00:00Z\",\"claims\":{\"P31\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"entity-type\":\"item\",\"id\":\"Q5\"},\"type\":\"wikibase-entityid\"}},\"rank\":\"normal\"}],\"P106\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"entity-type\":\"item\",\"id\":\"Q214917\"},\"type\":\"wikibase-entityid\"}},\"rank\":\"normal\"},{\"mainsnak\":{\"datavalue\":{\"value\":{\"entity-type\":\"item\",\"id\":\"Q28389\"},\"type\":\"wikibase-entityid\"}},\"rank\":\"normal\"}],\"P569\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"time\":\"+1952-03-11T00:00:00Z\",\"precision\":11},\"type\":\"time\"}},\"rank\":\"normal\"}]},\"sitelinks\":{\"enwiki\":{\"site\":\"enwiki\",\"title\":\"Douglas Adams\"}}}}}",
+  "mockPayload": "{\"entities\":{\"Q42\":{\"id\":\"Q42\",\"labels\":{\"mul\":{\"language\":\"mul\",\"value\":\"Douglas Adams\"}},\"descriptions\":{\"en\":{\"language\":\"en\",\"value\":\"English writer and humorist\"}},\"modified\":\"2026-02-01T00:00:00Z\",\"claims\":{\"P31\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"entity-type\":\"item\",\"id\":\"Q5\"},\"type\":\"wikibase-entityid\"}},\"rank\":\"normal\"}],\"P106\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"entity-type\":\"item\",\"id\":\"Q214917\"},\"type\":\"wikibase-entityid\"}},\"rank\":\"normal\"},{\"mainsnak\":{\"datavalue\":{\"value\":{\"entity-type\":\"item\",\"id\":\"Q28389\"},\"type\":\"wikibase-entityid\"}},\"rank\":\"normal\"}],\"P569\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"time\":\"+1951-01-01T00:00:00Z\",\"precision\":9},\"type\":\"time\"}},\"rank\":\"normal\"},{\"mainsnak\":{\"datavalue\":{\"value\":{\"time\":\"+1952-03-11T00:00:00Z\",\"precision\":11},\"type\":\"time\"}},\"rank\":\"preferred\"}],\"P1082\":[{\"mainsnak\":{\"datavalue\":{\"value\":{\"amount\":\"+1200\",\"unit\":\"1\"},\"type\":\"quantity\"}},\"rank\":\"normal\"},{\"mainsnak\":{\"datavalue\":{\"value\":{\"amount\":\"+3755251\",\"unit\":\"1\"},\"type\":\"quantity\"}},\"rank\":\"preferred\"},{\"mainsnak\":{\"datavalue\":{\"value\":{\"amount\":\"+3600000\",\"unit\":\"1\"},\"type\":\"quantity\"}},\"rank\":\"normal\"}]},\"sitelinks\":{\"enwiki\":{\"site\":\"enwiki\",\"title\":\"Douglas Adams\"}}}}}",
   "expectTitleIncludes": "Douglas Adams (Q42)",
   "expectMarkdownIncludes": [
     "English writer and humorist",
@@ -11,6 +11,7 @@
     "https://en.wikipedia.org/wiki/Douglas_Adams",
     "- **Instance Of**: `Q5`",
     "`Q214917`, `Q28389`",
-    "- **Date of Birth**: 1952-03-11"
+    "- **Date of Birth**: 1952-03-11",
+    "- **Population**: 3,755,251"
   ]
 }

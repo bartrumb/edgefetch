@@ -213,6 +213,11 @@ func DecodeHTMLEntities(input string) string {
 					i = p + 1
 					continue
 				}
+				if mapped, ok := lookupHTML5NamedEntityNonASCIIGo(rawName); ok {
+					sb.WriteString(mapped)
+					i = p + 1
+					continue
+				}
 			}
 		}
 		sb.WriteByte(input[i])

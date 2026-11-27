@@ -50,6 +50,8 @@ import {
   detectWorkdayRedirectStub,
   discoverAtsBoardsFromHtml,
   executeJobsCall,
+  JOBS_ATS_API_HOST_CONCURRENCY,
+  jobsKnownBoardCompanyKey,
   extractJobPostingJsonLd,
   formatJobPostingHeaderMarkdown,
   formatNormalizedPay,
@@ -5810,3 +5812,245 @@ test('R18: broad jobs searches return results in chunks with a continueCursor th
   assert.ok(!scraped.slice(before).some((u) => u.includes('evil.example.com')), 'non-ATS cursor URLs are dropped');
 });
 
+test('R20: company jobs searches probe the company ATS boards directly before any web search', async () => {
+  resetJobsCacheForTests();
+  let searchCalls = 0;
+  const executeSearch = async () => {
+    searchCalls++;
+    return { status: 200, body: { ok: true, results: [] } };
+  };
+  const scraped: string[] = [];
+  const boardJob = { title: 'Solutions Engineer', url: 'https://boards.greenhouse.io/acmeco/jobs/101', company: 'acmeco', locations: ['Remote'] };
+  const executeScrape = async (args: Record<string, unknown>) => {
+    const u = String(args.url);
+    scraped.push(u);
+    if (/boards\.greenhouse\.io\/acmeco\/?$/i.test(u)) {
+      return { status: 200, body: { ok: true, url: u, extractorId: 'greenhouse-board', total: 1, jobs: [boardJob], links: [boardJob.url] } };
+    }
+    return { status: 404, body: { ok: false, status: 404 } };
+  };
+
+  // A. Board found directly: no web search at all, the board is fetched once (the wave reuses the probe), job returned.
+  const hit = await executeJobsCall({
+    payload: { query: 'Solutions Engineer', company: 'acmeco', includeBuiltIn: false, limit: 10 },
+    env: { SERPER_API_KEY: 'k' } as never,
+    executeSearch,
+    executeScrape,
+  });
+  assert.equal(hit.status, 200, JSON.stringify(hit.body).slice(0, 400));
+  assert.equal(searchCalls, 0, 'direct board hit must skip the web search');
+  assert.ok((hit.body.sourcesUsed as string[]).includes('ats_direct'));
+  assert.ok(((hit.body.jobs as Array<{ url: string }>) ?? []).some((j) => j.url === boardJob.url));
+  assert.equal(scraped.filter((u) => /boards\.greenhouse\.io\/acmeco\/?$/i.test(u)).length, 1, 'board fetched once');
+
+  // B. No probeable board (e.g. a Workday-only company): falls through to the web-search discovery as before.
+  resetJobsCacheForTests();
+  searchCalls = 0;
+  const miss = await executeJobsCall({
+    payload: { query: 'Solutions Engineer', company: 'otherco', includeBuiltIn: false, limit: 10 },
+    env: { SERPER_API_KEY: 'k' } as never,
+    executeSearch,
+    executeScrape,
+  });
+  assert.equal(miss.status, 200);
+  assert.ok(searchCalls > 0, 'without a direct board hit the web search still runs');
+  assert.ok(!(miss.body.sourcesUsed as string[]).includes('ats_direct'));
+
+  // C. Broad searches (no company) never probe.
+  resetJobsCacheForTests();
+  const before = scraped.length;
+  await executeJobsCall({ payload: { query: 'Solutions Engineer', includeBuiltIn: false, limit: 10 }, env: { SERPER_API_KEY: 'k' } as never, executeSearch, executeScrape });
+  assert.ok(!scraped.slice(before).some((u) => /greenhouse\.io\/solutions|ashbyhq\.com\/solutions/i.test(u)));
+});
+
+test('R21: the known-boards index learns a company board from a successful search and skips the web search next time', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'ef-known-boards-'));
+  const metaDb = new NodeSqliteD1Database(join(workDir, 'meta.sqlite'), [resolve('migrations/meta/0001_tracking.sql')]);
+  try {
+    const env = { SERPER_API_KEY: 'k', META: metaDb } as never;
+    const board = 'https://acmewd.wd5.myworkdayjobs.com/External';
+    let searchCalls = 0;
+    const executeSearch = async () => {
+      searchCalls++;
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          results: [
+            { url: board, title: 'Careers at AcmeWD' },
+            { url: 'https://jobs.ashbyhq.com/unrelatedco', title: 'Unrelated board' },
+            { url: 'https://evil.example.com/acmewd/jobs', title: 'Not an ATS host' },
+          ],
+        },
+      };
+    };
+    const executeScrape = async (args: Record<string, unknown>) => {
+      const u = String(args.url);
+      if (u.startsWith(board)) {
+        return {
+          status: 200,
+          body: { ok: true, extractorId: 'workday-board', total: 1, returned: 1, truncated: false, jobs: [{ title: 'Platform Engineer', url: `${board}/job/Remote/Platform-Engineer_R1`, company: 'acmewd', locations: ['Remote'] }] },
+        };
+      }
+      if (u.includes('unrelatedco')) {
+        return { status: 200, body: { ok: true, extractorId: 'ashby-board', jobs: [{ title: 'Platform Engineer', url: 'https://jobs.ashbyhq.com/unrelatedco/1' }] } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    };
+    const payload = { query: 'Platform Engineer', company: 'acmewd', includeBuiltIn: false, limit: 5 };
+
+    resetJobsCacheForTests();
+    const first = await executeJobsCall({ payload, env, executeSearch, executeScrape });
+    assert.equal(first.status, 200, JSON.stringify(first.body).slice(0, 400));
+    assert.ok(searchCalls > 0, 'first search discovers the Workday board via web search');
+    const rows = (await metaDb.prepare('SELECT company_key, board_url, platform FROM jobs_known_boards').all<Record<string, string>>()).results;
+    assert.deepEqual(rows.map((r) => r.board_url), [board], 'only the in-scope ATS board is learned');
+    assert.equal(rows[0]!.company_key, jobsKnownBoardCompanyKey('acmewd'));
+
+    resetJobsCacheForTests();
+    searchCalls = 0;
+    const second = await executeJobsCall({ payload, env, executeSearch, executeScrape });
+    assert.equal(second.status, 200);
+    assert.equal(searchCalls, 0, 'known board hit skips the web search');
+    assert.ok((second.body.sourcesUsed as string[]).includes('ats_known_board'));
+    assert.ok(((second.body.jobs as Array<{ title: string }>) ?? []).some((j) => j.title === 'Platform Engineer'));
+
+    const hits = (await metaDb.prepare('SELECT hits FROM jobs_known_boards WHERE board_url = ?').bind(board).first<{ hits: number }>())!;
+    assert.equal(hits.hits, 2, 'a repeat success bumps the board hit count');
+  } finally {
+    metaDb.close();
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('R22: ATS JSON-API fetches go to the Cloudflare edge, fall back to the normal route on failure, and honour a pinned target', async () => {
+  const board = 'https://boards.greenhouse.io/edgeco';
+  const job = { title: 'Platform Engineer', url: 'https://boards.greenhouse.io/edgeco/jobs/1', company: 'edgeco', locations: ['Remote'] };
+  const seen: Array<{ url: string; target: unknown }> = [];
+  const mk = (edgeStatus: number) => async (args: Record<string, unknown>) => {
+    seen.push({ url: String(args.url), target: args.target });
+    if (String(args.url).startsWith(board)) {
+      if (args.target === 'container' && edgeStatus !== 200) return { status: edgeStatus, body: { ok: false, error: 'hub_unavailable' } };
+      return { status: 200, body: { ok: true, extractorId: 'greenhouse-board', total: 1, jobs: [job], links: [job.url] } };
+    }
+    return { status: 404, body: { ok: false, status: 404 } };
+  };
+  const executeSearch = async () => ({ status: 200, body: { ok: true, results: [] } });
+  const payload = { query: 'Platform Engineer', company: 'edgeco', includeBuiltIn: false, limit: 5 };
+
+  resetJobsCacheForTests();
+  seen.length = 0;
+  const ok = await executeJobsCall({ payload, env: {} as never, executeSearch, executeScrape: mk(200) });
+  assert.equal(ok.status, 200);
+  const boardCalls = seen.filter((c) => c.url.startsWith(board));
+  assert.ok(boardCalls.length >= 1 && boardCalls.every((c) => c.target === 'container'), 'ATS board API is fetched from the edge');
+  assert.ok(((ok.body.jobs as Array<{ url: string }>) ?? []).some((j) => j.url === job.url));
+
+  // Edge failure -> one retry through the normal route, and the jobs still come back.
+  resetJobsCacheForTests();
+  seen.length = 0;
+  const fallback = await executeJobsCall({ payload, env: {} as never, executeSearch, executeScrape: mk(503) });
+  assert.equal(fallback.status, 200);
+  const fbCalls = seen.filter((c) => c.url.startsWith(board));
+  assert.deepEqual(fbCalls.map((c) => c.target), ['container', undefined], 'edge 503 retries once via the normal route');
+  assert.ok(((fallback.body.jobs as Array<{ url: string }>) ?? []).some((j) => j.url === job.url));
+
+  // A caller-pinned target is never overridden.
+  resetJobsCacheForTests();
+  seen.length = 0;
+  await executeJobsCall({ payload: { ...payload, target: 'agent' }, env: {} as never, executeSearch, executeScrape: mk(200) });
+  assert.ok(seen.filter((c) => c.url.startsWith(board)).every((c) => c.target === 'agent'));
+});
+
+test('R23: edge-routed ATS API hosts allow JOBS_ATS_API_HOST_CONCURRENCY parallel fetches; other hosts stay serial', async () => {
+  resetJobsCacheForTests();
+  const activeByHost = new Map<string, number>();
+  const maxByHost = new Map<string, number>();
+  const postings = Array.from({ length: 6 }, (_, i) => `https://jobs.lever.co/paraco/${'0000000' + i}-aaaa-bbbb-cccc-dddddddddddd`);
+  const executeSearch = async () => ({
+    status: 200,
+    body: { ok: true, results: postings.map((url) => ({ url, title: 'Platform Engineer at paraco' })) },
+  });
+  const executeScrape = async (args: Record<string, unknown>) => {
+    const host = args.target === 'container' ? 'edge:' + new URL(String(args.url)).hostname : new URL(String(args.url)).hostname;
+    const n = (activeByHost.get(host) ?? 0) + 1;
+    activeByHost.set(host, n);
+    maxByHost.set(host, Math.max(maxByHost.get(host) ?? 0, n));
+    await new Promise((r) => setTimeout(r, 15));
+    activeByHost.set(host, (activeByHost.get(host) ?? 1) - 1);
+    return { status: 404, body: { ok: false, status: 404 } };
+  };
+  await executeJobsCall({
+    payload: { query: 'Platform Engineer', company: 'paraco', includeBuiltIn: false, limit: 10 },
+    env: {} as never,
+    executeSearch,
+    executeScrape,
+  });
+  for (const [host, max] of maxByHost) {
+    if (host.startsWith('edge:')) assert.ok(max <= JOBS_ATS_API_HOST_CONCURRENCY, `${host} ran ${max} > cap`);
+    else assert.equal(max, 1, `${host} must stay serial`);
+  }
+  assert.ok([...maxByHost.entries()].some(([h, m]) => h.startsWith('edge:') && m > 1), 'edge ATS host actually runs in parallel');
+});
+
+test('R24: ATS board responses are cached across calls (R2 + META index) and served without refetching', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'ef-board-cache-'));
+  const metaDb = new NodeSqliteD1Database(join(workDir, 'meta.sqlite'), [resolve('migrations/meta/0001_tracking.sql')]);
+  try {
+    const env = { META: metaDb, ARTIFACTS: new NodeFsR2Bucket(join(workDir, 'r2')) } as never;
+    const board = 'https://boards.greenhouse.io/cacheco';
+    const job = { title: 'Platform Engineer', url: 'https://boards.greenhouse.io/cacheco/jobs/7', company: 'cacheco', locations: ['Remote'] };
+    let boardFetches = 0;
+    const executeScrape = async (args: Record<string, unknown>) => {
+      if (String(args.url).startsWith(board)) {
+        boardFetches++;
+        return { status: 200, body: { ok: true, extractorId: 'greenhouse-board', total: 1, jobs: [job], links: [job.url] } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    };
+    const executeSearch = async () => ({ status: 200, body: { ok: true, results: [] } });
+    const payload = { query: 'Platform Engineer', company: 'cacheco', includeBuiltIn: false, limit: 5 };
+
+    resetJobsCacheForTests();
+    await executeJobsCall({ payload, env, executeSearch, executeScrape });
+    assert.equal(boardFetches, 1);
+    // A new isolate (in-memory cache cleared) reuses the persisted board instead of refetching it.
+    resetJobsCacheForTests();
+    const second = await executeJobsCall({ payload, env, executeSearch, executeScrape });
+    assert.equal(boardFetches, 1, 'second call served from the cross-call board cache');
+    assert.ok(((second.body.jobs as Array<{ url: string }>) ?? []).some((j) => j.url === job.url));
+  } finally {
+    metaDb.close();
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('R25: company searches cap individual posting fetches once the company board was read', async () => {
+  resetJobsCacheForTests();
+  const board = 'https://acmecap.wd5.myworkdayjobs.com/External';
+  const postings = Array.from({ length: 12 }, (_, i) => `${board}/job/Remote/Platform-Engineer_R${100 + i}`);
+  const executeSearch = async () => ({
+    status: 200,
+    body: { ok: true, results: [{ url: board }, ...postings.map((url) => ({ url, title: 'Platform Engineer' }))] },
+  });
+  const scraped: string[] = [];
+  const executeScrape = async (args: Record<string, unknown>) => {
+    const u = String(args.url);
+    scraped.push(u);
+    if (u.startsWith(board) && !u.includes('/job/')) {
+      return {
+        status: 200,
+        body: { ok: true, extractorId: 'workday-board', total: 1, returned: 1, truncated: false, jobs: [{ title: 'Platform Engineer', url: `${board}/job/Remote/Platform-Engineer_R1`, company: 'acmecap', locations: ['Remote'] }] },
+      };
+    }
+    return { status: 404, body: { ok: false, status: 404 } };
+  };
+  await executeJobsCall({
+    payload: { query: 'Platform Engineer', company: 'acmecap', includeBuiltIn: false, limit: 3 },
+    env: {} as never,
+    executeSearch,
+    executeScrape,
+  });
+  const postingFetches = scraped.filter((u) => u.includes('/job/')).length;
+  assert.ok(postingFetches <= 4, `posting fetches capped at 2x remaining slots, got ${postingFetches}`);
+});

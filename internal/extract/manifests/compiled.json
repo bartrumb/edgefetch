@@ -17564,8 +17564,14 @@
                 "dynamicKeyPath": {
                   "base": "entities",
                   "keyVar": "qid",
-                  "subPath": "claims.P569.0.mainsnak.datavalue.value.time"
+                  "subPath": "claims.P569"
                 },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal"
+                },
+                "subField": "mainsnak.datavalue.value.time",
                 "stripPrefix": "+",
                 "stripSuffix": "T00:00:00Z",
                 "replaceAll": {
@@ -17578,8 +17584,14 @@
                 "dynamicKeyPath": {
                   "base": "entities",
                   "keyVar": "qid",
-                  "subPath": "claims.P570.0.mainsnak.datavalue.value.time"
+                  "subPath": "claims.P570"
                 },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal"
+                },
+                "subField": "mainsnak.datavalue.value.time",
                 "stripPrefix": "+",
                 "stripSuffix": "T00:00:00Z",
                 "replaceAll": {
@@ -17592,8 +17604,14 @@
                 "dynamicKeyPath": {
                   "base": "entities",
                   "keyVar": "qid",
-                  "subPath": "claims.P571.0.mainsnak.datavalue.value.time"
+                  "subPath": "claims.P571"
                 },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal"
+                },
+                "subField": "mainsnak.datavalue.value.time",
                 "stripPrefix": "+",
                 "stripSuffix": "T00:00:00Z",
                 "replaceAll": {
@@ -17601,6 +17619,21 @@
                   "to": ""
                 },
                 "sliceMax": 10
+              },
+              "population": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P1082"
+                },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal",
+                  "fallbackLast": true
+                },
+                "subField": "mainsnak.datavalue.value.amount",
+                "format": "int_comma"
               },
               "officialWebsite": {
                 "dynamicKeyPath": {
@@ -17690,6 +17723,11 @@
                 "label": "Inception",
                 "template": "{inception}",
                 "whenVar": "inception"
+              },
+              {
+                "label": "Population",
+                "template": "{population}",
+                "whenVar": "population"
               },
               {
                 "label": "Official Website",

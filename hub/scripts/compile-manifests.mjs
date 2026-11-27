@@ -294,7 +294,7 @@ const SCHEMA_KEYS = {
     'objectLinksPath', 'bodyVar', 'sections', 'linksVars', 'linkTemplates', 'recordFields',
   ]),
   varSpec: new Set([
-    'paths', 'dynamicKeyPath', 'nestedSubValues', 'tocHeading', 'findInArrayLang',
+    'paths', 'dynamicKeyPath', 'nestedSubValues', 'tocHeading', 'findInArrayLang', 'preferWhere',
     'template', 'whenVars', 'whenAnyVars', 'fallbackVar', 'firstNonMatchingKey',
     'subField', 'subFieldsJoin', 'itemWrap', 'join', 'limit', 'format',
     'trueValue', 'falseValue', 'stripFrontmatter', 'stripPrefix', 'stripSuffix',

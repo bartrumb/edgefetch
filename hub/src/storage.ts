@@ -48,7 +48,7 @@ export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings 
   PDF_OCR_TOKEN?: string;
 }
 
-export const SCRAPE_PIPELINE_VERSION = 36;
+export const SCRAPE_PIPELINE_VERSION = 37;
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 export const TRANSIENT_RETENTION_MS = 24 * 60 * 60_000; // 1 day (`tmp/` prefix lifecycle)
 export const STORED_RETENTION_MS = 30 * 24 * 60 * 60_000; // 30 days (`raw/` prefix lifecycle)

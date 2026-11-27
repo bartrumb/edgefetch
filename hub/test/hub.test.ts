@@ -5110,6 +5110,8 @@ test('M1-B Search providers, Agent SSE/async/no-ctx waitUntil, Jobs, Catalog, Ma
     WEBHOOK_SECRET: webhookSecret,
     OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:4318',
     OTEL_SERVICE_NAME: 'edgefetch-hub-m1b-orch',
+    // ATS boards in this suite are mocked on the node (agent) path only; keep jobs off the edge route.
+    JOBS_EDGE_ATS_FETCH: 'off',
     SAFE_FETCH: mockSafeFetch,
     SAFE_PUBLIC_FETCH: mockPublicFetch,
     META: metaDb as unknown as D1Database,

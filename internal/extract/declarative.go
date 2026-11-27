@@ -256,6 +256,41 @@ type DeclarativeFindLangSpec struct {
 	ValueField string `json:"valueField"`
 }
 
+// DeclarativePreferWhereSpec narrows an array value to the single element whose `Path` field equals `Equals`
+// (e.g. a Wikidata claim with `rank: preferred`) before `subField` / `format` are applied. When no element
+// matches, the first element whose `Path` equals `FallbackEquals` is used (the last one when `FallbackLast`);
+// with no fallback match (or no `FallbackEquals`) the var resolves to empty rather than guessing.
+type DeclarativePreferWhereSpec struct {
+	Path           string `json:"path"`
+	Equals         string `json:"equals"`
+	FallbackEquals string `json:"fallbackEquals,omitempty"`
+	FallbackLast   bool   `json:"fallbackLast,omitempty"`
+}
+
+// maxPreferWhereScanItems bounds the per-var array scan for `preferWhere`.
+const maxPreferWhereScanItems = 2000
+
+// selectPreferWhereElement returns the element chosen by `pw` from `arr`, or nil when nothing qualifies.
+func selectPreferWhereElement(arr []any, pw *DeclarativePreferWhereSpec) any {
+	if pw == nil || pw.Path == "" || pw.Equals == "" {
+		return nil
+	}
+	var fallback any
+	for i, el := range arr {
+		if i >= maxPreferWhereScanItems {
+			break
+		}
+		fv := jsonScalarToString(getByDotPath(el, pw.Path))
+		if fv == pw.Equals {
+			return el
+		}
+		if pw.FallbackEquals != "" && fv == pw.FallbackEquals && (fallback == nil || pw.FallbackLast) {
+			fallback = el
+		}
+	}
+	return fallback
+}
+
 // DeclarativeReplaceSpec defines a literal substring replacement.
 type DeclarativeReplaceSpec struct {
 	From string `json:"from"`
@@ -269,6 +304,7 @@ type DeclarativeVarSpec struct {
 	NestedSubValues     *DeclarativeNestedSubValuesSpec `json:"nestedSubValues,omitempty"`
 	TocHeading          string                          `json:"tocHeading,omitempty"`
 	FindInArrayLang     *DeclarativeFindLangSpec        `json:"findInArrayLang,omitempty"`
+	PreferWhere         *DeclarativePreferWhereSpec     `json:"preferWhere,omitempty"`
 	Template            string                          `json:"template,omitempty"`
 	WhenVars            []string                        `json:"whenVars,omitempty"`
 	WhenAnyVars         []string                        `json:"whenAnyVars,omitempty"`
@@ -5936,6 +5972,25 @@ func lookupPubchemTocFieldGo(obj map[string]any, targetHeading string, depth int
 func formatExtractedJSONValue(raw any, spec DeclarativeVarSpec, origURL string) string {
 	if raw == nil {
 		return ""
+	}
+	if spec.PreferWhere != nil {
+		arr, isArr := raw.([]any)
+		if !isArr {
+			return ""
+		}
+		picked := selectPreferWhereElement(arr, spec.PreferWhere)
+		if picked == nil {
+			return ""
+		}
+		raw = picked
+		if spec.SubField != "" {
+			raw = getByDotPath(picked, spec.SubField)
+			spec.SubField = ""
+		}
+		spec.PreferWhere = nil
+		if raw == nil {
+			return ""
+		}
 	}
 	switch spec.Format {
 	case "int_comma":

@@ -1038,8 +1038,10 @@ describe('Tier 3 & Tier 4 — Keyless JSON Twins (F15–F20, F24)', () => {
       (u) => u.hostname === 'search.maven.org' && u.pathname === '/solrsearch/select' && u.search.includes('guava'),
       F17_MAVEN_CENTRAL.guavaSolrJson,
     );
+    // The versioned (GAV) route moved to central.sonatype.com's live Solr endpoint in v2.8.15; unversioned stays on
+    // search.maven.org.
     router.json(
-      (u) => u.hostname === 'search.maven.org' && u.pathname === '/solrsearch/select' && u.search.includes('commons-lang3'),
+      (u) => u.hostname === 'central.sonatype.com' && u.pathname === '/solrsearch/select' && u.search.includes('commons-lang3'),
       F17_MAVEN_CENTRAL.commonsLangGavJson,
     );
 

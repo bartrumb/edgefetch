@@ -399,6 +399,8 @@ export function extractHtmlDocument(
         includeImages?: boolean;
         includeTags?: readonly string[];
         excludeTags?: readonly string[];
+        /** Strip hidden subtrees even with `onlyMainContent: false` (Go `StripHiddenSubtrees`). */
+        stripHiddenSubtrees?: boolean;
       }
     | string = {},
 ): ExtractedDocument {
@@ -415,6 +417,7 @@ export function extractHtmlDocument(
     includeImages = true,
     includeTags,
     excludeTags,
+    stripHiddenSubtrees = false,
   } = optsObj;
 
   const rawDoc = callCoreWasmRaw<{
@@ -452,6 +455,7 @@ export function extractHtmlDocument(
       ...(includeTags && includeTags.length > 0 ? { includeTags: [...includeTags] } : {}),
       ...(excludeTags && excludeTags.length > 0 ? { excludeTags: [...excludeTags] } : {}),
       redactPii: Boolean(redactPii),
+      ...(stripHiddenSubtrees ? { stripHiddenSubtrees: true } : {}),
     },
     String(rawHtml ?? ''),
   ).doc;
@@ -7420,6 +7424,21 @@ export async function executeScrapeCall(params: {
       (!isHtmlBody && typeof item.markdown === 'string' && item.markdown) ||
       extracted?.markdown ||
       (isHtmlBody ? '' : rawBodyStr);
+  // A browser-rendered DOM whose content lives entirely in header/aside/footer (small app shells) yields no main
+  // content. Rather than return nothing, re-extract that rendered DOM with the hub's own extractor without main-content
+  // stripping (scripts and hidden subtrees are still removed). Static HTML keeps the meta-description fallback, since
+  // its non-main content is usually just navigation.
+  if (
+    isHtmlBody &&
+    !markdown.trim() &&
+    (item.rendered === true || renderedViaOut !== undefined) &&
+    onlyMainContent &&
+    includeTags.length === 0 &&
+    excludeTags.length === 0
+  ) {
+    const fullPage = extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: false, stripHiddenSubtrees: true, redactPii, includeImages });
+    if (fullPage.markdown.trim()) markdown = fullPage.markdown;
+  }
   if (cdpJsonDistilled?.markdown && countTextWords(markdown) < 80 && !alternateMarkdownBody && !customShopifyDoc) {
     markdown = [markdown.trim(), cdpJsonDistilled.markdown].filter(Boolean).join('\n\n');
   } else if (
@@ -8595,7 +8614,7 @@ export async function executeScrapeCall(params: {
   const rawScrapeResult = await (activeTracer ? activeTracer.run(runScrape) : runScrape());
   const recordsBudget = resolveScrapeMaxChars(params.payload);
   const scrapeResult =
-    recordsBudget !== undefined && Array.isArray(rawScrapeResult.body.records)
+    recordsBudget !== undefined && (Array.isArray(rawScrapeResult.body.records) || Array.isArray(rawScrapeResult.body.jobs))
       ? { ...rawScrapeResult, body: capInlineRecordsToBudget(rawScrapeResult.body, recordsBudget) }
       : rawScrapeResult;
   if (
@@ -8640,7 +8659,12 @@ export function resolveScrapeMaxChars(payload: Pick<ScrapeRequestPayload, 'maxCh
  * where to get the rest. Callers without a budget (REST without `maxChars`) keep the full array.
  */
 export function capInlineRecordsToBudget(body: Record<string, unknown>, budgetChars: number): Record<string, unknown> {
-  const records = body.records;
+  return capInlineArrayToBudget(capInlineArrayToBudget(body, 'records', budgetChars), 'jobs', budgetChars);
+}
+
+/** `capInlineRecordsToBudget` for one array field (`records` or ATS board `jobs`), adding `<key>Truncated` etc. */
+function capInlineArrayToBudget(body: Record<string, unknown>, key: 'records' | 'jobs', budgetChars: number): Record<string, unknown> {
+  const records = body[key];
   if (!Array.isArray(records) || records.length === 0) return body;
   if (JSON.stringify(records).length <= budgetChars) return body;
   const kept: unknown[] = [];
@@ -8653,12 +8677,12 @@ export function capInlineRecordsToBudget(body: Record<string, unknown>, budgetCh
   }
   return {
     ...body,
-    records: kept,
-    recordsTruncated: true,
-    recordsReturned: kept.length,
-    recordsTotal: records.length,
-    recordsHint:
-      `records[] trimmed to ${kept.length} of ${records.length} to fit maxChars ${budgetChars}. ` +
+    [key]: kept,
+    [`${key}Truncated`]: true,
+    [`${key}Returned`]: kept.length,
+    [`${key}Total`]: records.length,
+    [`${key}Hint`]:
+      `${key}[] trimmed to ${kept.length} of ${records.length} to fit maxChars ${budgetChars}. ` +
       'Raise maxChars (up to 500000), follow pagination when present, or page the raw response with read_artifact(artifactId).',
   };
 }

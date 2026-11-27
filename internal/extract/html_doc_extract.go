@@ -27,6 +27,9 @@ type FullExtractOptions struct {
 	PreserveOriginMD    bool     `json:"preserveOriginMarkdown,omitempty"`
 	IsFragment          bool     `json:"isFragment,omitempty"`
 	MaxScanChars        int      `json:"maxScanChars,omitempty"`
+	// StripHiddenSubtrees removes hidden (hidden attr, display:none, aria-hidden, non-content role) subtrees even when
+	// OnlyMainContent is false. Full-page extraction otherwise keeps them; fragments always strip them.
+	StripHiddenSubtrees bool `json:"stripHiddenSubtrees,omitempty"`
 }
 
 // ExtractedDocumentFull holds the full-fidelity Markdown, metadata, links, images, branding,
@@ -946,6 +949,42 @@ func parseTagAttrsFullDocGo(tag string) map[string]string {
 		}
 	}
 	return out
+}
+
+// faviconRelRankFullDocGo ranks `<link rel>` icon candidates: an explicit `icon` token (`icon`,
+// `shortcut icon`) beats `apple-touch-icon` / `mask-icon` style variants. Lower is better.
+func faviconRelRankFullDocGo(relLower string) int {
+	for _, tok := range strings.Fields(relLower) {
+		if tok == "icon" {
+			return 0
+		}
+	}
+	return 1
+}
+
+// resolveFaviconHrefFullDocGo resolves an icon `href` to an absolute http(s) URL. Protocol-relative
+// hrefs (`//cdn.example.com/favicon.ico`) resolve to https. Candidates that resolve to the bare
+// origin root (path "/" or empty, no query) are rejected: sites commonly emit placeholder
+// `apple-touch-icon href="/"` links that point at the HTML home page, not an image.
+func resolveFaviconHrefFullDocGo(rawHref, baseURL string) string {
+	trimmed := strings.TrimSpace(rawHref)
+	if trimmed == "" {
+		return ""
+	}
+	var res string
+	if strings.HasPrefix(trimmed, "//") && len(trimmed) > 2 && trimmed[2] != '/' && trimmed[2] != '\\' {
+		res = resolveHTTPSHrefFullDocGo("https:"+trimmed, baseURL, false)
+	} else {
+		res = resolveHTTPSHrefFullDocGo(trimmed, baseURL, false)
+	}
+	if res == "" {
+		return ""
+	}
+	u, err := url.Parse(res)
+	if err != nil || u.Host == "" || ((u.Path == "" || u.Path == "/") && u.RawQuery == "") {
+		return ""
+	}
+	return res
 }
 
 func resolveHTTPSHrefFullDocGo(rawHref, baseURL string, preserveHash bool) string {
@@ -4084,6 +4123,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 		markdownAlternateURL string
 		robotsMeta           string
 		favicon              string
+		faviconRank          = 2
 		logo                 string
 		citationAuthors      []string
 		colors               []string
@@ -4189,15 +4229,20 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 					attrs := parseTagAttrsFullDocGo(tag.attrs)
 					rel := strings.ToLower(attrs["rel"])
 					mimeType := strings.ToLower(attrs["type"])
+					if strings.Contains(rel, "icon") && faviconRank > 0 {
+						if iconHref := resolveFaviconHrefFullDocGo(attrs["href"], baseURL); iconHref != "" {
+							if rank := faviconRelRankFullDocGo(rel); rank < faviconRank {
+								favicon = iconHref
+								faviconRank = rank
+							}
+						}
+					}
 					href := resolveHTTPSHrefFullDocGo(attrs["href"], baseURL, false)
 					if href == "" {
 						return true
 					}
 					if strings.Contains(rel, "canonical") && canonicalURL == "" {
 						canonicalURL = href
-					}
-					if strings.Contains(rel, "icon") && favicon == "" {
-						favicon = href
 					}
 					if strings.Contains(rel, "alternate") &&
 						(strings.Contains(mimeType, "text/markdown") || strings.Contains(mimeType, "application/markdown")) &&
@@ -4534,7 +4579,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 	}
 
 	if !onlyMainContent || len(includeTags) > 0 {
-		if opts.IsFragment {
+		if opts.IsFragment || opts.StripHiddenSubtrees {
 			work = stripHiddenAndChromeSubtreesFullDocGo(work)
 		}
 		work = replacePairedHTMLElementsLinearFullDocGo(work, []string{"span", "a", "button"}, func(full, tag, attrStr, inner string) string {

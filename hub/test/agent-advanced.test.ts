@@ -50,6 +50,7 @@ import {
   detectWorkdayRedirectStub,
   discoverAtsBoardsFromHtml,
   executeJobsCall,
+  jobsKnownBoardCompanyKey,
   extractJobPostingJsonLd,
   formatJobPostingHeaderMarkdown,
   formatNormalizedPay,
@@ -5859,4 +5860,64 @@ test('R20: company jobs searches probe the company ATS boards directly before an
   const before = scraped.length;
   await executeJobsCall({ payload: { query: 'Solutions Engineer', includeBuiltIn: false, limit: 10 }, env: { SERPER_API_KEY: 'k' } as never, executeSearch, executeScrape });
   assert.ok(!scraped.slice(before).some((u) => /greenhouse\.io\/solutions|ashbyhq\.com\/solutions/i.test(u)));
+});
+
+test('R21: the known-boards index learns a company board from a successful search and skips the web search next time', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'ef-known-boards-'));
+  const metaDb = new NodeSqliteD1Database(join(workDir, 'meta.sqlite'), [resolve('migrations/meta/0001_tracking.sql')]);
+  try {
+    const env = { SERPER_API_KEY: 'k', META: metaDb } as never;
+    const board = 'https://acmewd.wd5.myworkdayjobs.com/External';
+    let searchCalls = 0;
+    const executeSearch = async () => {
+      searchCalls++;
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          results: [
+            { url: board, title: 'Careers at AcmeWD' },
+            { url: 'https://jobs.ashbyhq.com/unrelatedco', title: 'Unrelated board' },
+            { url: 'https://evil.example.com/acmewd/jobs', title: 'Not an ATS host' },
+          ],
+        },
+      };
+    };
+    const executeScrape = async (args: Record<string, unknown>) => {
+      const u = String(args.url);
+      if (u.startsWith(board)) {
+        return {
+          status: 200,
+          body: { ok: true, extractorId: 'workday-board', total: 1, returned: 1, truncated: false, jobs: [{ title: 'Platform Engineer', url: `${board}/job/Remote/Platform-Engineer_R1`, company: 'acmewd', locations: ['Remote'] }] },
+        };
+      }
+      if (u.includes('unrelatedco')) {
+        return { status: 200, body: { ok: true, extractorId: 'ashby-board', jobs: [{ title: 'Platform Engineer', url: 'https://jobs.ashbyhq.com/unrelatedco/1' }] } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    };
+    const payload = { query: 'Platform Engineer', company: 'acmewd', includeBuiltIn: false, limit: 5 };
+
+    resetJobsCacheForTests();
+    const first = await executeJobsCall({ payload, env, executeSearch, executeScrape });
+    assert.equal(first.status, 200, JSON.stringify(first.body).slice(0, 400));
+    assert.ok(searchCalls > 0, 'first search discovers the Workday board via web search');
+    const rows = (await metaDb.prepare('SELECT company_key, board_url, platform FROM jobs_known_boards').all<Record<string, string>>()).results;
+    assert.deepEqual(rows.map((r) => r.board_url), [board], 'only the in-scope ATS board is learned');
+    assert.equal(rows[0]!.company_key, jobsKnownBoardCompanyKey('acmewd'));
+
+    resetJobsCacheForTests();
+    searchCalls = 0;
+    const second = await executeJobsCall({ payload, env, executeSearch, executeScrape });
+    assert.equal(second.status, 200);
+    assert.equal(searchCalls, 0, 'known board hit skips the web search');
+    assert.ok((second.body.sourcesUsed as string[]).includes('ats_known_board'));
+    assert.ok(((second.body.jobs as Array<{ title: string }>) ?? []).some((j) => j.title === 'Platform Engineer'));
+
+    const hits = (await metaDb.prepare('SELECT hits FROM jobs_known_boards WHERE board_url = ?').bind(board).first<{ hits: number }>())!;
+    assert.equal(hits.hits, 2, 'a repeat success bumps the board hit count');
+  } finally {
+    metaDb.close();
+    rmSync(workDir, { recursive: true, force: true });
+  }
 });

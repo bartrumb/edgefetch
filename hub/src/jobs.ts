@@ -1337,6 +1337,74 @@ async function executeJobsVerifyMode(params: {
   };
 }
 
+/**
+ * Known-boards index (META D1): which ATS board a company actually uses, learned from successful board scrapes. A
+ * company search probes these first, so companies whose tenant cannot be guessed (Workday `<tenant>.wdN`, custom
+ * Greenhouse slugs) skip the web search after their first lookup. Rows are only written for boards that returned jobs,
+ * sit on a known multi-tenant ATS host, and matched the requested company scope.
+ */
+const JOBS_KNOWN_BOARDS_DDL =
+  'CREATE TABLE IF NOT EXISTS jobs_known_boards (company_key TEXT NOT NULL, board_url TEXT NOT NULL, platform TEXT NOT NULL, ' +
+  'hits INTEGER NOT NULL DEFAULT 1, last_ok_at INTEGER NOT NULL, PRIMARY KEY (company_key, board_url))';
+export const JOBS_KNOWN_BOARD_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const JOBS_KNOWN_BOARDS_PER_COMPANY = 3;
+const jobsKnownBoardsReady = new WeakSet<object>();
+async function ensureJobsKnownBoards(metaDb: D1Database): Promise<boolean> {
+  const key = metaDb as unknown as object;
+  if (jobsKnownBoardsReady.has(key)) return true;
+  try {
+    await metaDb.prepare(JOBS_KNOWN_BOARDS_DDL).run();
+    jobsKnownBoardsReady.add(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Normalized index key for a company filter (`"Allstate Insurance"` -> `allstateinsurance`). */
+export function jobsKnownBoardCompanyKey(company: string): string {
+  return normalizeDottedCorporateAbbreviations(company).toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 80);
+}
+
+async function readKnownJobsBoards(metaDb: D1Database | undefined, companyKey: string, now: number): Promise<string[]> {
+  if (!metaDb || !companyKey || !(await ensureJobsKnownBoards(metaDb))) return [];
+  const rows = await metaDb
+    .prepare(
+      'SELECT board_url FROM jobs_known_boards WHERE company_key = ? AND last_ok_at >= ? ORDER BY hits DESC, last_ok_at DESC LIMIT ?',
+    )
+    .bind(companyKey, now - JOBS_KNOWN_BOARD_MAX_AGE_MS, JOBS_KNOWN_BOARDS_PER_COMPANY)
+    .all<{ board_url: string }>()
+    .catch(() => null);
+  return (rows?.results ?? [])
+    .map((r) => r.board_url)
+    .filter((u): u is string => typeof u === 'string' && u.startsWith('https://'))
+    .filter((u) => {
+      try {
+        return isKnownMultiTenantAtsHost(new URL(u).hostname.toLowerCase().replace(/\.+$/, ''));
+      } catch {
+        return false;
+      }
+    });
+}
+
+async function recordKnownJobsBoards(
+  metaDb: D1Database | undefined,
+  companyKey: string,
+  boards: Map<string, string>,
+  now: number,
+): Promise<void> {
+  if (!metaDb || !companyKey || boards.size === 0 || !(await ensureJobsKnownBoards(metaDb))) return;
+  const stmts = [...boards].slice(0, JOBS_KNOWN_BOARDS_PER_COMPANY).map(([boardUrl, platform]) =>
+    metaDb
+      .prepare(
+        `INSERT INTO jobs_known_boards (company_key, board_url, platform, hits, last_ok_at) VALUES (?, ?, ?, 1, ?)
+         ON CONFLICT(company_key, board_url) DO UPDATE SET hits = hits + 1, last_ok_at = excluded.last_ok_at`,
+      )
+      .bind(companyKey, boardUrl, platform, now),
+  );
+  await metaDb.batch(stmts).catch(() => undefined);
+}
+
 export async function executeJobsCall(params: {
   payload: JobsToolPayload;
   env: OptionalStorageBindings & Record<string, unknown>;
@@ -2089,7 +2157,8 @@ export async function executeJobsCall(params: {
     // fall through to the SERP discovery below.
     let directFirstHit = false;
     if (!resumeState && companyFilter && domainsInput.length === 0 && primaryCompanySlug && boardStartOffset === 0) {
-      const probeUrls = buildDirectCompanyProbeUrls();
+      const knownBoardUrls = await readKnownJobsBoards(env?.META, jobsKnownBoardCompanyKey(companyFilter), Date.now());
+      const probeUrls = [...new Set([...knownBoardUrls, ...buildDirectCompanyProbeUrls()])];
       const probeOut = await Promise.all(
         probeUrls.map((u) => executeScrape(boardScrapeArgs(u, u)).catch(() => null)),
       );
@@ -2099,6 +2168,7 @@ export async function executeJobsCall(params: {
         if (Array.isArray(jobsArr) && jobsArr.length > 0) {
           candidateUrls.add(probeUrls[pi]!);
           directFirstHit = true;
+          if (knownBoardUrls.includes(probeUrls[pi]!)) sourcesUsed.add('ats_known_board');
         }
       }
       if (directFirstHit) sourcesUsed.add('ats_direct');
@@ -2311,6 +2381,9 @@ export async function executeJobsCall(params: {
       candidatesInChunk = boardWaveUrls.length + postingWaveUrls.length;
     }
 
+    /** Company boards that returned jobs this call (board URL -> platform), written to the known-boards index. */
+    const learnedCompanyBoards = new Map<string, string>();
+
     const fetchedCompleteBoards = new Set<string>();
     const fetchedQueriedWorkdayBoards = new Map<string, { matchedCount: number; reqIds: Set<string> }>();
     const preWaveNowMs = Date.now();
@@ -2438,6 +2511,24 @@ export async function executeJobsCall(params: {
             const fullInfo = classifyFullBoardKey(origU);
             if (fullInfo && sc.body.truncated !== true && boardStartOffset === 0) {
               fetchedCompleteBoards.add(fullInfo.key);
+            }
+            if (
+              companyFilter &&
+              domainsInput.length === 0 &&
+              sc.body.jobs.length > 0 &&
+              (fullInfo?.isBoard || isSmartRecruitersBoardUrl(origU)) &&
+              matchesScopedAtsCandidateUrl(origU)
+            ) {
+              try {
+                const boardU = new URL(origU);
+                if (isKnownMultiTenantAtsHost(boardU.hostname.toLowerCase().replace(/\.+$/, ''))) {
+                  boardU.search = '';
+                  boardU.hash = '';
+                  learnedCompanyBoards.set(boardU.toString(), fullInfo?.platform ?? 'smartrecruiters');
+                }
+              } catch {
+                // not a URL we can index
+              }
             }
             const boardExtId =
               typeof sc.body.extractorId === 'string' && sc.body.extractorId
@@ -2921,7 +3012,9 @@ export async function executeJobsCall(params: {
     if (timeBudgetExhausted && !notes.some((n) => n.includes('Time budget'))) {
       notes.push(
         `Time budget (${Math.round(wallBudgetMs / 1_000)} s) reached before all candidate boards could be checked; results are partial. ` +
-          'Add `company` or `domains` to narrow the search.',
+          (hasCompanyOrDomainScope
+            ? 'Pass `cursor` (when present) or narrow `query` / `locations` to check the rest.'
+            : 'Add `company` or `domains` to narrow the search.'),
       );
     } else if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
       notes.push(`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all candidate boards could be checked.`);
@@ -2951,6 +3044,9 @@ export async function executeJobsCall(params: {
     activeTracer?.setAttribute('edgefetch.jobs.jobs_returned', finalJobs.length);
     if (resolvedAdapterIds.size > 0) {
       activeTracer?.setAttribute('edgefetch.adapter_id', [...resolvedAdapterIds].join(','));
+    }
+    if (companyFilter && learnedCompanyBoards.size > 0) {
+      await recordKnownJobsBoards(env?.META, jobsKnownBoardCompanyKey(companyFilter), learnedCompanyBoards, Date.now());
     }
 
     return {

@@ -2,6 +2,11 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.17] - 2026-11-27
+
+### Fixed
+- `jobs`: Lever boards are fetched in server-side pages (`skip`/`limit=100`). A large company's full postings list (one live board: 305 postings, 5.9 MB) exceeded the fetch body cap and silently degraded to an HTML scrape with no `jobs[]`, so direct-first company searches fell back to web search. Large boards now return jobs, with `N+` counts and a next cursor. The `scrape` twin requests the first 100 postings (#112).
+
 ## [2.8.16] - 2026-11-27
 
 ### Added

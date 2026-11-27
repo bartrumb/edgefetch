@@ -231,6 +231,8 @@ export interface McpServerDeps {
     args: Record<string, unknown>;
     principal?: string;
     userId?: string;
+    /** The caller's OAuth scopes: search fetches caller-chosen sites only with crawl:fetch (executeSearchCall allowLiveFetch). */
+    scopes?: readonly string[];
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeJobs?: (params: {
     args: Record<string, unknown>;
@@ -2267,7 +2269,7 @@ async function handleToolCallInner(
     if (!deps.executeSearch) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'search_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeSearch({ args, principal, userId });
+    const res = await deps.executeSearch({ args, principal, userId, scopes });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),

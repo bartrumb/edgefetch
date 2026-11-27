@@ -2469,13 +2469,16 @@ export default {
               },
             };
           },
-          executeSearch: async ({ args, principal, userId }) => {
+          executeSearch: async ({ args, principal, userId, scopes }) => {
             const out = await executeSearchCall({
               payload: args as SearchRequestPayload,
               env,
               executeHubFetch,
               source: `mcp-search:${principal ?? 'client'}`,
               userId,
+              // search is a crawl:read tool, but its site crawl and raw-content extraction fetch caller-chosen sites,
+              // which every other route requires crawl:fetch for. Unknown scopes = no live fetch.
+              allowLiveFetch: Array.isArray(scopes) && scopes.includes('crawl:fetch'),
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
@@ -4021,6 +4024,8 @@ export default {
             executeHubFetch,
             source: `search:${auth.principal}`,
             userId: auth.userId,
+            // crawl:read may search; only crawl:fetch may make the hub fetch caller-chosen sites (as /v1/map requires).
+            allowLiveFetch: auth.scopes.includes('crawl:fetch'),
           });
           const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
           return Response.json(

@@ -125,6 +125,7 @@ import {
   getActiveCallerAuthContext,
   handleOAuthRoute,
   OAUTH_SQLITE_SCHEMA,
+  annotateCallerAuthFailure,
   runWithCallerAuthContext,
 } from './oauth';
 import type {
@@ -202,6 +203,8 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   SAFE_FETCH?: typeof fetch;
   SAFE_PUBLIC_FETCH?: typeof fetch;
   CALLER_TOKEN?: string;
+  /** Optional old caller token still accepted during a rotation; uses are logged as `caller_token_previous_used`. */
+  CALLER_TOKEN_PREVIOUS?: string;
   VAULT_MASTER_KEY?: string;
   MCP_TOKEN?: string;
   AGENT_TOKEN?: string;
@@ -4096,7 +4099,7 @@ export default {
           // U1 Security Invariant: Raw `/fetch` and `/fetch/batch` require `CALLER_TOKEN` strictly.
           // OAuth tokens (`efa_*` / `efu_*`) MUST use `/v1/*` or `/mcp` where per-user ownership, header stripping,
           // and robots policy guardrails are enforced.
-          if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
+          if (!isCallerAuthorized(request, env.CALLER_TOKEN, env.CALLER_TOKEN_PREVIOUS)) {
             return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
           }
           const parsedTarget = parseFetchTarget(url);
@@ -4190,7 +4193,7 @@ export default {
         });
       }
 
-      if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
+      if (!isCallerAuthorized(request, env.CALLER_TOKEN, env.CALLER_TOKEN_PREVIOUS)) {
         return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
       if (request.method === 'GET' && url.pathname === '/agents') {
@@ -4212,7 +4215,7 @@ export default {
             },
           },
           async (httpSpan) => {
-            const res = await runWithCallerAuthContext(() => routeRequest(), undefined, env);
+            const res = await runWithCallerAuthContext(async () => annotateCallerAuthFailure(url, await routeRequest()), undefined, env);
             httpSpan.setAttribute('http.response.status_code', res.status);
             httpSpan.setStatus(res.status < 500);
             return res;

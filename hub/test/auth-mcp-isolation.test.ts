@@ -10620,3 +10620,84 @@ test('R11-M5-portable: LocalAgentHubCoordinator preserves grantId and increments
   }
 });
 }
+
+test('R15: /v1/* 401s say why (missing_token / token_rejected), log a fingerprint, and CALLER_TOKEN_PREVIOUS works during rotation', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'ef-r15-auth-'));
+  const coordinator = new LocalAgentHubCoordinator(join(tmpDir, 'hub.sqlite'));
+  const metaDb = new NodeSqliteD1Database(':memory:', [
+    { name: 'meta/0001_tracking.sql', sql: meta0001 },
+    { name: 'meta/0002_multiuser.sql', sql: meta0002 },
+    { name: 'meta/0003_round7_multiuser_hardening.sql', sql: meta0003 },
+  ]);
+  const current = 'r15-current-caller-token-0123456789abcdef';
+  const previous = 'r15-previous-caller-token-0123456789abcdef';
+  const wrong = 'r15-totally-unknown-token-0123456789abcdef';
+  const env: Record<string, unknown> = {
+    AGENT_HUB: coordinator.asNamespace(),
+    META: metaDb,
+    CALLER_TOKEN: current,
+    CALLER_TOKEN_PREVIOUS: previous,
+  };
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  const post = (path: string, token?: string) =>
+    hubWorker.fetch(
+      new Request(`https://hub.example.com${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ url: 'https://example.com/' }),
+      }),
+      env as unknown as Parameters<typeof hubWorker.fetch>[1],
+    );
+  try {
+    const missing = await post('/v1/scrape');
+    assert.equal(missing.status, 401);
+    const missingBody = (await missing.json()) as Record<string, unknown>;
+    assert.equal(missingBody.error, 'unauthorized', 'existing error code is kept for compatibility');
+    assert.equal(missingBody.reason, 'missing_token');
+    assert.match(String(missing.headers.get('www-authenticate')), /resource_metadata=/, 'challenge header preserved');
+
+    warnings.length = 0;
+    const rejected = await post('/v1/scrape', wrong);
+    assert.equal(rejected.status, 401);
+    const rejectedBody = (await rejected.json()) as Record<string, unknown>;
+    assert.equal(rejectedBody.reason, 'token_rejected');
+    assert.match(String(rejectedBody.message), /CALLER_TOKEN/);
+    const line = warnings.find((w) => w.includes('caller_auth_rejected'));
+    assert.ok(line, 'a warn-level caller_auth_rejected line is logged');
+    const logged = JSON.parse(line) as Record<string, unknown>;
+    assert.equal(logged.path, '/v1/scrape');
+    assert.match(String(logged.tokenFp), /^[A-Za-z0-9_-]{10}$/);
+    assert.ok(!warnings.join('\n').includes(wrong), 'the presented token is never logged');
+
+    // The same request with /v1/search gets the same treatment (one central gate).
+    const searchRejected = await post('/v1/search', wrong);
+    assert.equal(searchRejected.status, 401);
+    assert.equal(((await searchRejected.json()) as Record<string, unknown>).reason, 'token_rejected');
+
+    warnings.length = 0;
+    const prevOk = await post('/v1/scrape', previous);
+    assert.notEqual(prevOk.status, 401, 'CALLER_TOKEN_PREVIOUS is accepted during a rotation');
+    assert.ok(warnings.some((w) => w.includes('caller_token_previous_used')), 'use of the previous token is logged');
+    assert.ok(!warnings.join('\n').includes(previous));
+
+    const currentOk = await post('/v1/scrape', current);
+    assert.notEqual(currentOk.status, 401);
+
+    // Outside /v1/*, 401 bodies are unchanged.
+    const mcp = await post('/mcp', wrong);
+    assert.equal(mcp.status, 401);
+    const mcpText = await mcp.text();
+    assert.ok(!mcpText.includes('token_rejected'), '/mcp keeps its existing 401 body');
+  } finally {
+    console.warn = origWarn;
+    try {
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 });
+    } catch {
+      // ignore
+    }
+  }
+});

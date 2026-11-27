@@ -5,10 +5,10 @@ All notable changes to EdgeFetch are documented in this file. This project adher
 ## [2.8.8] - 2026-11-26
 
 ### Fixed
-- check users columns via PRAGMA before ALTER to stop D1 error spans (#92)
+- **Sign-ins logged false D1 errors:** the first GitHub sign-in on a cold Worker isolate ran seven `ALTER TABLE users ADD COLUMN` statements and ignored the expected `duplicate column name` failures, but Workers Observability recorded each failure as an error-level `d1_run` span. The hub now reads `PRAGMA table_info(users)` once, adds only the missing columns, and caches the result per isolate (#92).
 
 ### Changed
-- bound search include_raw_content enrichment to a 15 s budget (#93)
+- **Faster `search` with `include_raw_content`:** page enrichment now runs under a 15 s wall-clock budget. Every node dispatch is capped to the time remaining, and optional follow-ups (HTML retry, Workday stub, browser-auto render, external SPA fallback) are skipped once too little is left. Before, a single search could take 11-79 s. Pages that miss the budget keep their search snippet and just omit `rawContent`. The standalone `extract` tool is unchanged (#93).
 
 ## [2.8.7] - 2026-11-26
 

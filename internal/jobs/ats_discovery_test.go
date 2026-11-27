@@ -86,7 +86,7 @@ func TestATSPreFetchSpecsAndFormatters(t *testing.T) {
 
 	// 4. Lever EU, Workable shortcode merge, Gem, Rippling UUID multi-location merge, Public Feeds, SmartRecruiters
 	levEU := ResolveATSPreFetchSpec("https://jobs.eu.lever.co/spotify")
-	if levEU == nil || levEU.FetchURL != "https://api.eu.lever.co/v0/postings/spotify?mode=json" {
+	if levEU == nil || levEU.FetchURL != "https://api.eu.lever.co/v0/postings/spotify?mode=json&skip=0&limit=100" {
 		t.Fatalf("unexpected Lever EU spec: %+v", levEU)
 	}
 

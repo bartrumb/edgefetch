@@ -266,15 +266,20 @@ func ResolveATSPreFetchSpec(urlStr string) *ATSPreFetchSpec {
 			if host == "jobs.eu.lever.co" {
 				id = "lever-eu-board"
 			}
+			// Page server-side: a large company's full postings list runs to several MB (one live board: 305 postings,
+			// 5.9 MB), over the fetch body cap, which silently degraded the board to an HTML scrape with no jobs.
+			reqOffset := parseNonNegOffset(q.Get("offset"))
 			return &ATSPreFetchSpec{
-				ID:        id,
-				FetchURL:  "https://" + leverAPIHost + "/v0/postings/" + EncodeURIComponent(co) + "?mode=json",
-				Method:    "GET",
-				Kind:      "json",
-				Accept:    "application/json",
-				host:      host,
-				org:       co,
-				reqOffset: parseNonNegOffset(q.Get("offset")),
+				ID: id,
+				FetchURL: "https://" + leverAPIHost + "/v0/postings/" + EncodeURIComponent(co) + "?mode=json&skip=" +
+					strconv.Itoa(reqOffset) + "&limit=" + strconv.Itoa(LeverBoardPageSize),
+				Method:      "GET",
+				Kind:        "json",
+				Accept:      "application/json",
+				host:        host,
+				org:         co,
+				reqOffset:   reqOffset,
+				serverPaged: true,
 			}
 		}
 		if len(parts) >= 2 && reLeverJobID.MatchString(parts[1]) {

@@ -329,7 +329,8 @@ describe('Tier 5 — Iteration 2 Adversarial Hardening (R2-TS-1..R2-TS-8 & R2-GO
   });
 
   test('T5.09 (R2-GO-1): ATS fleet & public feeds sanitize Markdown link injection & HTML tags end-to-end', async () => {
-    router.json('https://api.lever.co/v0/postings/t5evil?mode=json', [
+    // Lever boards are fetched server-paged (`mode=json` + `limit`, optionally `skip`) since v2.8.17.
+    router.json((u) => u.hostname === 'api.lever.co' && u.pathname === '/v0/postings/t5evil' && u.searchParams.get('mode') === 'json', [
       {
         id: '1',
         text: 'Eng](https://evil.com/phish) [x <script>alert(1)</script>',

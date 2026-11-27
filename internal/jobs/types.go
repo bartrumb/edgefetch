@@ -250,6 +250,9 @@ type ATSPreFetchSpec struct {
 	jobID      string
 	reqOffset  int
 	searchText string
+	// serverPaged: the API already applied reqOffset (skip/limit), so the formatter must not slice again and can
+	// only infer "more remain" from a full page (Lever does not report a total).
+	serverPaged bool
 }
 
 // Format parses rawBody into an ATSFormattedResult using htmlToMD (defaulting to DefaultHTMLToMD when nil).

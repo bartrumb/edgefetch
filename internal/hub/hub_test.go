@@ -534,7 +534,7 @@ func TestGoHubTwinSanitizationAndCrossDomainRedirectBlock(t *testing.T) {
 	if strings.Contains(md, "<img src=x") || strings.Contains(md, "javascript:alert") || strings.Contains(md, "# xssgem<script>") {
 		t.Fatalf("expected hostile HTML & javascript: stripped from Go Hub twin markdown, got: %s", md)
 	}
-	if !strings.Contains(md, "# xssgem&lt;script>alert(1)&lt;/script>") || !strings.Contains(md, "[click](#)") {
+	if !strings.Contains(md, "# xssgem&lt;script>alert(1)&lt;/script>") || !strings.Contains(md, `\[click\]\(#)`) {
 		t.Fatalf("expected escaped heading tag and neutralized link in Go Hub twin markdown, got: %s", md)
 	}
 

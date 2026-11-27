@@ -1,0 +1,11 @@
+{
+  "adapterId": "shopware-magento",
+  "mode": "html",
+  "inputUrl": "https://www.shopware.com/en/products/sample",
+  "mockPayload": "<!doctype html><html><body><div class=\"sw-product-detail\"><h1 class=\"product-detail-name\">M99 Mini Pro-25</h1><span class=\"product-detail-ordernumber\">SW-M99-25</span><span class=\"product-detail-price\">€299,00</span><table class=\"product-detail-properties-table\"><tr><th>High Beam</th><td>1150 lm</td></tr></table></div></body></html>",
+  "expectMarkdownIncludes": [
+    "M99 Mini Pro-25",
+    "SW-M99-25",
+    "1150 lm"
+  ]
+}

@@ -4004,7 +4004,17 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       const bodyText = cappedBody.text;
       let body: { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
       try {
-        body = JSON.parse(bodyText) as { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
+        const parsed = JSON.parse(bodyText) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          span.setAttributes({ 'oauth.outcome': 'invalid_client_metadata', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_client_metadata');
+          return oauthJson(
+            { error: 'invalid_client_metadata', error_description: 'Request body must be a JSON object' },
+            400,
+            cors,
+          );
+        }
+        body = parsed as { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
       } catch {
         span.setAttributes({ 'oauth.outcome': 'invalid_client_metadata', 'http.response.status_code': 400 });
         span.setStatus(false, 'invalid_client_metadata');

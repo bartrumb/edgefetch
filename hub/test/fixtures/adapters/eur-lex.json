@@ -1,0 +1,12 @@
+{
+  "adapterId": "eur-lex",
+  "mode": "twin",
+  "inputUrl": "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679",
+  "expectedFetchUrl": "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX%3A32016R0679",
+  "mockPayload": "<!doctype html><html><head><title>Regulation (EU) 2016/679 (GDPR)</title></head><body><main><h1>Article 1 Subject-matter and objectives</h1><p>This Regulation lays down rules relating to the protection of natural persons.</p></main></body></html>",
+  "expectTitleIncludes": "Regulation (EU) 2016/679",
+  "expectMarkdownIncludes": [
+    "Subject-matter and objectives",
+    "protection of natural persons"
+  ]
+}

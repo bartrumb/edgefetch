@@ -750,18 +750,28 @@ func scanHeadMetadata(rawHTML string, base *url.URL) BrandingProfile {
 		}
 	}
 
+	baseStr := ""
+	if base != nil {
+		baseStr = base.String()
+	}
+	faviconRank := 2
 	for _, tag := range reLinkTag.FindAllString(rawHTML, 60) {
 		attrs := parseAttrs(tag)
 		rel := strings.ToLower(attrs["rel"])
+		if strings.Contains(rel, "icon") && faviconRank > 0 {
+			if iconHref := resolveFaviconHrefFullDocGo(attrs["href"], baseStr); iconHref != "" {
+				if rank := faviconRelRankFullDocGo(rel); rank < faviconRank {
+					p.Favicon = iconHref
+					faviconRank = rank
+				}
+			}
+		}
 		href := resolveHref(attrs["href"], base)
 		if href == "" {
 			continue
 		}
 		if strings.Contains(rel, "canonical") && p.CanonicalURL == "" {
 			p.CanonicalURL = href
-		}
-		if strings.Contains(rel, "icon") && p.Favicon == "" {
-			p.Favicon = href
 		}
 	}
 	if p.Favicon == "" && base != nil && base.Scheme == "https" && base.Host != "" {

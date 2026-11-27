@@ -1,0 +1,13 @@
+{
+  "adapterId": "zendesk-hc",
+  "mode": "twin",
+  "inputUrl": "https://support.zendesk.com/hc/en-us/articles/4408886858138-What-is-Zendesk",
+  "expectedFetchUrl": "https://support.zendesk.com/api/v2/help_center/en-us/articles/4408886858138.json?include=sections,categories",
+  "mockPayload": "{\"article\":{\"title\":\"What is Zendesk?\",\"body\":\"<p>Zendesk powers customer support. Download the <a href=\\\"https://support.zendesk.com/hc/article_attachments/100/quickstart.pdf\\\">Quickstart Manual</a>.</p>\",\"updated_at\":\"2026-02-10T09:30:00Z\",\"html_url\":\"https://support.zendesk.com/hc/en-us/articles/4408886858138\",\"label_names\":[\"guide\",\"getting-started\"],\"draft\":false},\"sections\":[{\"name\":\"Getting Started\",\"html_url\":\"https://support.zendesk.com/hc/en-us/sections/10\"}],\"categories\":[{\"name\":\"Documentation\",\"html_url\":\"https://support.zendesk.com/hc/en-us/categories/1\"}]}",
+  "expectTitleIncludes": "What is Zendesk?",
+  "expectMarkdownIncludes": [
+    "Documentation › Getting Started",
+    "quickstart.pdf",
+    "2026-02-10T09:30:00Z"
+  ]
+}

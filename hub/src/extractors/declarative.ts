@@ -12,7 +12,11 @@ import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawMetaPair } from '../wasm-
 import {
   buildDeclarativeCatalogSpec,
   enrichShopifyProductFromJson,
+  formatBigCommerceXmlSitemap,
+  formatMagento2RenderInfoJson,
+  formatSfccProductVariationJson,
   formatShopifyProductsFeedTwin,
+  formatSquarespaceCommerceJson,
   formatWcStoreApiListTwin,
   formatWcStoreApiProductTwin,
   VALID_CATALOG_PLATFORMS,
@@ -47,9 +51,18 @@ export type DeclarativeCharset =
   | 'npm_pkg'
   | 'at_handle'
   | 'url_seg'
-  | 'arxiv_id';
+  | 'arxiv_id'
+  | 'leading_digits_slug'
+  | 'brew_id'
+  | 'cpsc_recall_num';
 
-export type DeclarativeParamTransform = 'lower' | 'upper' | 'pad10_zero' | 'strip_leading_zeros';
+export type DeclarativeParamTransform =
+  | 'lower'
+  | 'upper'
+  | 'pad10_zero'
+  | 'strip_leading_zeros'
+  | 'leading_digits'
+  | 'strip_dashes';
 
 export interface DeclarativeParamSegment {
   param: string;
@@ -188,6 +201,7 @@ export type DeclarativeVarFormat =
   | 'array_len_comma'
   | 'object_keys'
   | 'epoch_sec_date'
+  | 'epoch_ms_date'
   | 'inverted_abstract'
   | 'gitlab_blob_html'
   | 'html_to_md'
@@ -219,12 +233,20 @@ export interface DeclarativeFindInArray {
   valueField: string;
 }
 
+export interface DeclarativePreferWhere {
+  path: string;
+  equals: string;
+  fallbackEquals?: string;
+  fallbackLast?: boolean;
+}
+
 export interface DeclarativeVarSpec {
   paths?: string[];
   dynamicKeyPath?: DeclarativeDynamicKeyPath;
   nestedSubValues?: DeclarativeNestedSubValuesSpec;
   tocHeading?: string;
   findInArrayLang?: DeclarativeFindInArray;
+  preferWhere?: DeclarativePreferWhere;
   template?: string;
   whenVars?: string[];
   whenAnyVars?: string[];
@@ -329,6 +351,8 @@ export interface DeclarativeSectionSpec {
   limit?: number;
   columns?: DeclarativeTableColumn[];
   itemVars?: Record<string, DeclarativeVarSpec>;
+  requireItemVar?: string;
+  collectLinkVars?: string[];
   itemTemplate?: string;
   itemHeadingTemplate?: string;
   itemBodyVar?: string;
@@ -364,7 +388,11 @@ export type DeclarativeCommerceMode =
   | 'shopify_product_js'
   | 'shopify_catalog_page'
   | 'woocommerce_catalog_page'
-  | 'woocommerce_product';
+  | 'woocommerce_product'
+  | 'squarespace_json'
+  | 'bigcommerce_sitemap'
+  | 'sfcc_variation'
+  | 'magento2_render_info';
 
 export interface DeclarativeCodeByPathSpec {
   pathParam: string;
@@ -373,8 +401,9 @@ export interface DeclarativeCodeByPathSpec {
 
 export interface DeclarativeExtractSpec {
   commerceMode?: DeclarativeCommerceMode;
+  jsonMode?: 'nuget_registration' | 'paylocity_feed';
   icimsPortal?: boolean;
-  textMode?: 'yaml_frontmatter_card' | 'ietf_rfc' | 'code_by_path' | 'git_patch' | 'plain_markdown';
+  textMode?: 'yaml_frontmatter_card' | 'ietf_rfc' | 'code_by_path' | 'git_patch' | 'plain_markdown' | 'html_document';
   pathParam?: string;
   codeByPath?: DeclarativeCodeByPathSpec;
   xml?: DeclarativeXmlSpec;
@@ -384,6 +413,9 @@ export interface DeclarativeExtractSpec {
   rootPath?: string;
   rejectIfFieldTruthy?: string;
   requireFieldEquals?: { path: string; value: string };
+  requireFields?: string[];
+  requireAnyFields?: string[];
+  requireVars?: string[];
   requireNonEmptyVars?: string[];
   vars?: Record<string, DeclarativeVarSpec>;
   titleTemplate?: string;
@@ -397,6 +429,7 @@ export interface DeclarativeExtractSpec {
   bodyVar?: string;
   sections?: DeclarativeSectionSpec[];
   linksVars?: string[];
+  recordFields?: Record<string, string>;
 }
 
 export interface DeclarativeRouteSpec {
@@ -438,7 +471,19 @@ export type DeclarativeHtmlMode =
   | 'reddit_shreddit'
   | 'icims_portal'
   | 'shopify_html'
-  | 'woocommerce_html';
+  | 'woocommerce_html'
+  | 'xenforo_html'
+  | 'squarespace_html'
+  | 'bigcommerce_html'
+  | 'sfcc_html'
+  | 'shopware_magento_html'
+  | 'sram_docs_html'
+  | 'bosch_help_html'
+  | 'ukg_pro_html'
+  | 'paylocity_html'
+  | 'dover_html'
+  | 'sitecore_jss_html'
+  | 'giant_liv_html';
 
 export interface DeclarativeHtmlRouteSpec {
   id?: string;
@@ -531,6 +576,7 @@ function formatCommerceTwinDoc(
   rawBody: string,
   origUrl: string,
   htmlToMd: HtmlFragmentConverter = defaultHtmlFragmentToMd,
+  twinFetchUrl?: string,
 ): TwinFormattedDoc | null {
   let commDoc: TwinFormattedDoc | null = null;
   switch (mode) {
@@ -541,13 +587,33 @@ function formatCommerceTwinDoc(
       commDoc = enrichShopifyProductFromJson({ rawJson: rawBody, productUrl: origUrl, htmlToMd, isAjaxJs: true });
       break;
     case 'shopify_catalog_page':
-      commDoc = formatShopifyProductsFeedTwin(rawBody, origUrl);
+      commDoc = formatShopifyProductsFeedTwin(
+        rawBody,
+        origUrl,
+        twinFetchUrl ? { twinUrl: twinFetchUrl } : undefined,
+      );
       break;
     case 'woocommerce_catalog_page':
-      commDoc = formatWcStoreApiListTwin(rawBody, origUrl);
+      commDoc = formatWcStoreApiListTwin(
+        rawBody,
+        origUrl,
+        twinFetchUrl && twinFetchUrl !== origUrl ? twinFetchUrl : undefined,
+      );
       break;
     case 'woocommerce_product':
       commDoc = formatWcStoreApiProductTwin(rawBody, origUrl, htmlToMd);
+      break;
+    case 'squarespace_json':
+      commDoc = formatSquarespaceCommerceJson(rawBody, origUrl);
+      break;
+    case 'bigcommerce_sitemap':
+      commDoc = formatBigCommerceXmlSitemap(rawBody, origUrl);
+      break;
+    case 'sfcc_variation':
+      commDoc = formatSfccProductVariationJson(rawBody, origUrl);
+      break;
+    case 'magento2_render_info':
+      commDoc = formatMagento2RenderInfoJson(rawBody, origUrl);
       break;
   }
   if (!commDoc) return null;
@@ -675,6 +741,7 @@ function buildAdapterFromValidatedManifest(manifest: DeclarativeAdapterManifest,
                     String(rawBody ?? ''),
                     String(originalUrl || reqUrl),
                     htmlToMd,
+                    resolved.fetchUrl,
                   );
                 }
                 const fmt = callCoreWasmRaw<{ ok: boolean; doc?: TwinFormattedDoc }>(

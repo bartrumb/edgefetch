@@ -1,0 +1,10 @@
+{
+  "adapterId": "squarespace-commerce",
+  "mode": "html",
+  "inputUrl": "https://commerce.squarespace.com/shop",
+  "mockPayload": "<!doctype html><html><head><script>Static = {}; Static.SQUARESPACE_CONTEXT = {\"productType\":1};</script></head><body><h1>Studio Shop</h1><div class=\"ProductList\"><div class=\"ProductList-item\" data-item-id=\"sq-1\"><a href=\"/shop/p/poster\"><span class=\"ProductList-title\">Trail Poster</span></a><span class=\"ProductList-price\">$35.00</span></div></div></body></html>",
+  "expectMarkdownIncludes": [
+    "Trail Poster",
+    "USD 35.00"
+  ]
+}

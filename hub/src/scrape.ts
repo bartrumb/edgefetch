@@ -13,17 +13,40 @@ import {
   enrichShopifyProductFromJson,
   enrichWooCommerceProductFromStoreApi,
   extractShopifyCurrencyFromHtml,
-  getRegisteredAdapterById,
+  extractWooCommerceCatalogHtml,
+  findRegisteredAdapterById,
+  formatMagento2RenderInfoJson,
+  formatSfccProductVariationJson,
+  formatShopifyProductsFeedTwin,
+  formatSquarespaceCommerceJson,
+  formatWcStoreApiListTwin,
+  isMagento2HtmlOrHeaders,
+  isSfccDemandwareHtmlOrHeaders,
   isShopifyHtmlOrHeaders,
+  isSquarespaceCommerceHtmlOrHeaders,
   isWooCommerceHtmlOrHeaders,
+  resolveCustomDomainShopifyCollectionTwinUrl,
   resolveCustomDomainShopifyProductTwinUrl,
+  resolveCustomDomainWooCommerceCatalogTwinUrl,
   resolveCustomDomainWooCommerceProductTwinUrl,
+  resolveMagento2RenderInfoTwinUrl,
+  resolveSfccProductVariationTwinUrl,
   resolveSiteExtractorTwin,
+  resolveSquarespaceCommerceTwinUrl,
   type PaginationInfo,
   type PostFetchSiteResult,
   type TwinFormattedDoc,
+  hasHtmlSiteAdapterForHost,
 } from './extractors/registry';
 import { tryFetchCmsAutoTwin, type CmsAutoTwinResult } from './extractors/cms-twins';
+import {
+  checkUnboundedTwinEndpointGuard,
+  enrichCpscRecallFromSaferProducts,
+  enrichDockerHubTags,
+  enrichZendeskArticleAttachments,
+  fetchGovInfoSummaryFallback,
+  type FetchBoundedTwinFn,
+} from './extractors/twin-companions';
 import {
   distillCapturedJsonResponses,
   type HydratedFrameworkStateResult,
@@ -54,7 +77,7 @@ import {
   stripHtmlTagsLinear,
   stripHtmlTagsQuoteAwareLinear,
 } from './safe-input';
-import { isContentVerifiedInMetaD1, sha256HexString } from './ingest';
+import { isContentVerifiedInMetaD1, sha256HexBytes, sha256HexString } from './ingest';
 import {
   analyzeUrlRedirect,
   buildBlockedInfo,
@@ -74,20 +97,28 @@ import {
   isDnsNotFoundError,
   isSsrfBlockedError,
   MARKDOWN_FOR_AGENTS_ACCEPT,
+  resolveValidatedFinalUrl,
   scrubResolverIpFromError,
   SSRF_BLOCKED_INFO,
   validatePublicHttpsTargetUrl,
 } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, setActiveSpanAttribute, type RequestTracer, type TraceContext } from './otel';
 import {
+  capExtractedTitleLength,
   chunkMarkdownForSearch,
   D1FtsSearchIndex,
   rankChunksInMemory,
   resolveUserCollectionId,
+  sanitizeExtractedTitle,
 } from './search-index';
 import {
+  hasAnyCallerCookies,
+  hasAnyCallerHeader,
+  INLINE_HYDRATION_BUDGET_BYTES,
+  isPrivateRequestPayload,
   isValidSha256Hex,
   MAX_ARTIFACT_CONTENT_BYTES,
+  normalizeCallerHeadersRecord,
   normalizeVisibility,
   primeSanitizedMarkdownCache,
   r2ArtifactKey,
@@ -223,6 +254,7 @@ export interface ExtractedDocument {
   favicon?: string;
   extractorId?: string;
   records?: Array<Record<string, unknown>>;
+  preferRecordAvailability?: boolean;
   pagination?: PaginationInfo;
   total?: number;
   returned?: number;
@@ -343,6 +375,14 @@ function boundToSanitizerBudget(s: string): { text: string; cut: boolean } {
   return res.cut ? { text: trimTrailingAsciiWhitespaceLinear(res.text), cut: true } : { text: s, cut: false };
 }
 
+function sanitizeScrapedTextOut(rawText: string): string {
+  if (!rawText) return rawText;
+  return neutralizeAllUnsafeMarkdownLinksLinear(stripInvisibleSmugglingChars(decodeHtmlEntities(rawText))).replace(
+    /<(?=[a-zA-Z!/\?]|[ \t]*(?:javascript|vbscript|data|file|blob):)/gi,
+    '&lt;',
+  );
+}
+
 export function extractLargestUrlFromSrcset(srcset: string | undefined): string | undefined {
   if (!srcset || !srcset.trim()) return undefined;
   const url = callCoreWasm<{ url: string }>('extract_largest_srcset', { srcset }).url;
@@ -359,6 +399,8 @@ export function extractHtmlDocument(
         includeImages?: boolean;
         includeTags?: readonly string[];
         excludeTags?: readonly string[];
+        /** Strip hidden subtrees even with `onlyMainContent: false` (Go `StripHiddenSubtrees`). */
+        stripHiddenSubtrees?: boolean;
       }
     | string = {},
 ): ExtractedDocument {
@@ -375,6 +417,7 @@ export function extractHtmlDocument(
     includeImages = true,
     includeTags,
     excludeTags,
+    stripHiddenSubtrees = false,
   } = optsObj;
 
   const rawDoc = callCoreWasmRaw<{
@@ -412,6 +455,7 @@ export function extractHtmlDocument(
       ...(includeTags && includeTags.length > 0 ? { includeTags: [...includeTags] } : {}),
       ...(excludeTags && excludeTags.length > 0 ? { excludeTags: [...excludeTags] } : {}),
       redactPii: Boolean(redactPii),
+      ...(stripHiddenSubtrees ? { stripHiddenSubtrees: true } : {}),
     },
     String(rawHtml ?? ''),
   ).doc;
@@ -844,7 +888,8 @@ export async function deriveMarkdownDocument(params: {
   let title: string | undefined;
   let language: string | undefined;
 
-  if (ctLower.includes('html') || /^\s*<!doctype\s+html|^\s*<html/i.test(rawText)) {
+  const isHtmlDoc = ctLower.includes('html') || /^\s*<!doctype\s+html|^\s*<html/i.test(rawText);
+  if (isHtmlDoc) {
     const extracted = extractHtmlDocument(rawText, { baseUrl, onlyMainContent: true });
     markdown = extracted.markdown;
     title = extracted.title;
@@ -894,14 +939,21 @@ export async function deriveMarkdownDocument(params: {
       }
     }
   }
+  if (!isHtmlDoc) {
+    markdown = sanitizeInlineHtmlInMarkdown(markdown, baseUrl).trim();
+  }
+  if (title) {
+    title = sanitizeExtractedTitle(title, baseUrl ?? 'https://example.com/', false);
+  }
 
+  const cappedMetaTitle = title ? capExtractedTitleLength(title, 200) : '';
   const mdBytes = new TextEncoder().encode(markdown);
   await bucket.put(r2Key, mdBytes, {
     httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
     customMetadata: {
       contentSha256,
       pipelineVersion: String(pipelineVersion),
-      ...(title ? { title: title.slice(0, 200) } : {}),
+      ...(cappedMetaTitle ? { title: cappedMetaTitle } : {}),
     },
   });
 
@@ -953,17 +1005,21 @@ export async function lookupCachedScrape(params: {
 
   const pageRow = await metaDb
     .prepare(
-      `SELECT latest_status, latest_outcome, latest_content_sha256, last_fetched_at
-       FROM pages
-       WHERE url = ?
+      `SELECT p.id, p.latest_status, p.latest_outcome, p.latest_content_sha256, p.last_fetched_at, p.latest_fetch_id, f.content_sha256 AS fetch_content_sha256
+       FROM pages p
+       LEFT JOIN fetches f ON f.id = p.latest_fetch_id
+       WHERE p.url = ?
        LIMIT 1`,
     )
     .bind(url)
     .first<{
+      id: string;
       latest_status: number | null;
       latest_outcome: string | null;
       latest_content_sha256: string | null;
       last_fetched_at: number | null;
+      latest_fetch_id: string | null;
+      fetch_content_sha256: string | null;
     }>();
 
   if (
@@ -971,9 +1027,26 @@ export async function lookupCachedScrape(params: {
     pageRow.latest_outcome !== 'ok' ||
     !pageRow.latest_content_sha256 ||
     !pageRow.last_fetched_at ||
-    now - pageRow.last_fetched_at > maxAgeMs
+    now - pageRow.last_fetched_at > maxAgeMs ||
+    (pageRow.latest_fetch_id && pageRow.latest_status !== 304 && pageRow.fetch_content_sha256 !== pageRow.latest_content_sha256)
   ) {
     return null;
+  }
+
+  if (pageRow.latest_status === 304 && pageRow.latest_fetch_id) {
+    const latestNon304 = await metaDb
+      .prepare(
+        `SELECT content_sha256
+         FROM fetches
+         WHERE page_id = ? AND status != 304
+         ORDER BY fetched_at DESC, rowid DESC
+         LIMIT 1`,
+      )
+      .bind(pageRow.id)
+      .first<{ content_sha256: string | null }>();
+    if (latestNon304 && latestNon304.content_sha256 !== pageRow.latest_content_sha256) {
+      return null;
+    }
   }
 
   const [verified, docRow] = await Promise.all([
@@ -1011,6 +1084,7 @@ export interface PrivateCachedScrapeRecord {
   finalUrl?: string;
   markdown: string;
   contentSha256: string;
+  rawContentSha256?: string;
   blobSha256?: string;
   documentId: string;
   pipelineVersion: number;
@@ -1031,6 +1105,7 @@ export interface PrivateCachedScrapeRecord {
   lastModified?: string;
   links?: string[];
   images?: ScrapedImage[];
+  pages?: string[];
   status: number;
   lastFetchedAt: number;
   optionsHash?: string;
@@ -1043,6 +1118,24 @@ function defaultFaviconForUrl(urlStr: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function canonicalizeCookiesValue(val: unknown): unknown {
+  if (val === null || val === undefined) return val;
+  if (typeof val === 'string') return val.trim();
+  if (Array.isArray(val)) return val.map((item) => canonicalizeCookiesValue(item));
+  if (typeof val === 'object') {
+    const entries = Object.entries(val as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => [k, canonicalizeCookiesValue(v)] as const);
+    return Object.fromEntries(entries);
+  }
+  return val;
+}
+
+export async function hashCallerCookies(cookies: unknown): Promise<string> {
+  return sha256HexString(JSON.stringify(canonicalizeCookiesValue(cookies)));
 }
 
 function r2PublicOptionsScrapeCacheKey(pipelineVersion: number, cacheKeySha256: string): string {
@@ -1067,7 +1160,7 @@ async function ensureScrapeCacheIndex(metaDb: D1Database): Promise<boolean> {
   }
 }
 
-async function lookupOptionsScrapeCache(params: {
+export async function lookupOptionsScrapeCache(params: {
   bucket: R2Bucket;
   isPrivate: boolean;
   userId: string;
@@ -1110,16 +1203,67 @@ async function lookupOptionsScrapeCache(params: {
     }
     if (!isPrivate && metaDb) {
       const pageRow = await metaDb
-        .prepare('SELECT last_fetched_at, latest_outcome FROM pages WHERE url = ? LIMIT 1')
+        .prepare(
+          `SELECT p.id, p.last_fetched_at, p.latest_outcome, p.latest_status, p.latest_content_sha256, p.latest_fetch_id, f.content_sha256 AS fetch_content_sha256
+           FROM pages p
+           LEFT JOIN fetches f ON f.id = p.latest_fetch_id
+           WHERE p.url = ?
+           LIMIT 1`,
+        )
         .bind(url)
-        .first<{ last_fetched_at: number | null; latest_outcome: string | null }>()
+        .first<{
+          id: string;
+          last_fetched_at: number | null;
+          latest_outcome: string | null;
+          latest_status: number | null;
+          latest_content_sha256: string | null;
+          latest_fetch_id: string | null;
+          fetch_content_sha256: string | null;
+        }>()
         .catch(() => null);
-      if (
-        pageRow &&
-        typeof pageRow.last_fetched_at === 'number' &&
-        pageRow.last_fetched_at > parsed.lastFetchedAt + 50
-      ) {
-        return null;
+      let effectivePageSha =
+        pageRow?.latest_fetch_id && pageRow.latest_status !== 304
+          ? pageRow.fetch_content_sha256
+          : (pageRow?.fetch_content_sha256 ?? pageRow?.latest_content_sha256);
+      if (pageRow && pageRow.latest_status === 304 && pageRow.latest_fetch_id && !pageRow.fetch_content_sha256) {
+        const latestNon304 = await metaDb
+          .prepare(
+            `SELECT content_sha256
+             FROM fetches
+             WHERE page_id = ? AND status != 304
+             ORDER BY fetched_at DESC, rowid DESC
+             LIMIT 1`,
+          )
+          .bind(pageRow.id)
+          .first<{ content_sha256: string | null }>()
+          .catch(() => null);
+        if (latestNon304) {
+          effectivePageSha = latestNon304.content_sha256 ?? null;
+        }
+      }
+      const hasPageSha = typeof effectivePageSha === 'string' && effectivePageSha.length > 0;
+      const hasCachedRawSha =
+        typeof parsed.rawContentSha256 === 'string' && parsed.rawContentSha256.length > 0;
+      if (pageRow) {
+        if (hasPageSha && hasCachedRawSha && effectivePageSha !== parsed.rawContentSha256) {
+          return null;
+        }
+        if (hasCachedRawSha) {
+          if (
+            typeof pageRow.last_fetched_at === 'number' &&
+            pageRow.last_fetched_at >= parsed.lastFetchedAt &&
+            (pageRow.latest_outcome !== 'ok' || !hasPageSha)
+          ) {
+            return null;
+          }
+        } else if (
+          typeof pageRow.last_fetched_at === 'number' &&
+          (pageRow.last_fetched_at > parsed.lastFetchedAt + 50 ||
+            (pageRow.last_fetched_at >= parsed.lastFetchedAt &&
+              (pageRow.latest_outcome !== 'ok' || !hasPageSha)))
+        ) {
+          return null;
+        }
       }
     }
     return parsed;
@@ -1128,7 +1272,7 @@ async function lookupOptionsScrapeCache(params: {
   }
 }
 
-async function writeOptionsScrapeCache(params: {
+export async function writeOptionsScrapeCache(params: {
   bucket: R2Bucket;
   isPrivate: boolean;
   userId: string;
@@ -1162,6 +1306,22 @@ async function writeOptionsScrapeCache(params: {
       .run()
       .catch(() => undefined);
   }
+}
+
+export async function deleteOptionsScrapeCache(params: {
+  bucket: R2Bucket;
+  isPrivate: boolean;
+  userId: string;
+  url: string;
+  optionsHash: string;
+  pipelineVersion: number;
+}): Promise<void> {
+  const { bucket, isPrivate, userId, url, optionsHash, pipelineVersion } = params;
+  const combinedHash = await sha256HexString(`${url}|${optionsHash}`);
+  const r2Key = isPrivate
+    ? r2PrivateScrapeCacheKey(userId, pipelineVersion, combinedHash)
+    : r2PublicOptionsScrapeCacheKey(pipelineVersion, combinedHash);
+  await bucket.delete(r2Key);
 }
 
 export async function lookupPrivateCachedScrape(params: {
@@ -1206,6 +1366,7 @@ export async function writePrivateCachedScrape(params: {
   status?: number;
   pipelineVersion?: number;
   optionsHash?: string;
+  writeUrlCache?: boolean;
   now?: number;
 }): Promise<{ blobSha256?: string; contentSha256: string; markdownSha256: string; documentId: string }> {
   const {
@@ -1219,6 +1380,7 @@ export async function writePrivateCachedScrape(params: {
     status = 200,
     pipelineVersion = SCRAPE_PIPELINE_VERSION,
     optionsHash,
+    writeUrlCache = true,
     now = Date.now(),
   } = params;
   const markdownSha256 = await sha256HexString(markdown);
@@ -1237,6 +1399,7 @@ export async function writePrivateCachedScrape(params: {
   await bucket.put(r2PrivateDerivedKey(userId, pipelineVersion, 'markdown', markdownSha256), markdown, {
     httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
     customMetadata: {
+      pipelineVersion: String(pipelineVersion),
       userId: sanitizeStorageUserId(userId),
       visibility: 'private',
     },
@@ -1245,6 +1408,7 @@ export async function writePrivateCachedScrape(params: {
     await bucket.put(r2PrivateDerivedKey(userId, pipelineVersion, 'markdown', contentSha256), markdown, {
       httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
       customMetadata: {
+        pipelineVersion: String(pipelineVersion),
         userId: sanitizeStorageUserId(userId),
         visibility: 'private',
       },
@@ -1252,27 +1416,29 @@ export async function writePrivateCachedScrape(params: {
   }
   const safeUser = sanitizeStorageUserId(userId);
   const documentId = `pdoc_${(await sha256HexString(`${safeUser}:${contentSha256}:${pipelineVersion}`)).slice(0, 32)}`;
-  const urlSha = await sha256HexString(url);
-  const cacheEntry: PrivateCachedScrapeRecord = {
-    url,
-    markdown,
-    contentSha256,
-    ...(blobSha256 ? { blobSha256 } : {}),
-    documentId,
-    pipelineVersion,
-    ...(title ? { title } : {}),
-    ...(language ? { language } : {}),
-    status,
-    lastFetchedAt: now,
-    ...(optionsHash ? { optionsHash } : {}),
-  };
-  await bucket.put(r2PrivateScrapeCacheKey(userId, pipelineVersion, urlSha), JSON.stringify(cacheEntry), {
-    httpMetadata: { contentType: 'application/json' },
-    customMetadata: {
-      userId: safeUser,
-      visibility: 'private',
-    },
-  });
+  if (writeUrlCache) {
+    const urlSha = await sha256HexString(url);
+    const cacheEntry: PrivateCachedScrapeRecord = {
+      url,
+      markdown,
+      contentSha256,
+      ...(blobSha256 ? { blobSha256 } : {}),
+      documentId,
+      pipelineVersion,
+      ...(title ? { title } : {}),
+      ...(language ? { language } : {}),
+      status,
+      lastFetchedAt: now,
+      ...(optionsHash ? { optionsHash } : {}),
+    };
+    await bucket.put(r2PrivateScrapeCacheKey(userId, pipelineVersion, urlSha), JSON.stringify(cacheEntry), {
+      httpMetadata: { contentType: 'application/json' },
+      customMetadata: {
+        userId: safeUser,
+        visibility: 'private',
+      },
+    });
+  }
   return { ...(blobSha256 ? { blobSha256 } : {}), contentSha256, markdownSha256, documentId };
 }
 
@@ -1299,26 +1465,56 @@ export async function lookupRevalidationCandidate(params: {
   const { bucket, metaDb, url, pipelineVersion = SCRAPE_PIPELINE_VERSION } = params;
   const pageRow = await metaDb
     .prepare(
-      `SELECT latest_outcome, latest_content_sha256, etag, last_modified
-       FROM pages
-       WHERE url = ?
+      `SELECT p.id, p.latest_outcome, p.latest_status, p.latest_content_sha256, p.etag, p.last_modified, p.latest_fetch_id, f.via AS fetch_via, f.content_sha256 AS fetch_content_sha256
+       FROM pages p
+       LEFT JOIN fetches f ON f.id = p.latest_fetch_id
+       WHERE p.url = ?
        LIMIT 1`,
     )
     .bind(url)
     .first<{
+      id: string;
       latest_outcome: string | null;
+      latest_status: number | null;
       latest_content_sha256: string | null;
       etag: string | null;
       last_modified: string | null;
+      latest_fetch_id: string | null;
+      fetch_via: string | null;
+      fetch_content_sha256: string | null;
     }>();
 
   if (
     !pageRow ||
     pageRow.latest_outcome !== 'ok' ||
     !pageRow.latest_content_sha256 ||
-    (!pageRow.etag && !pageRow.last_modified)
+    (!pageRow.etag && !pageRow.last_modified) ||
+    (pageRow.latest_fetch_id &&
+      pageRow.latest_status !== 304 &&
+      pageRow.fetch_via === 'container' &&
+      pageRow.fetch_content_sha256 !== pageRow.latest_content_sha256)
   ) {
     return null;
+  }
+
+  if (pageRow.latest_status === 304 && pageRow.latest_fetch_id) {
+    const latestNon304 = await metaDb
+      .prepare(
+        `SELECT via, content_sha256
+         FROM fetches
+         WHERE page_id = ? AND status != 304
+         ORDER BY fetched_at DESC, rowid DESC
+         LIMIT 1`,
+      )
+      .bind(pageRow.id)
+      .first<{ via: string | null; content_sha256: string | null }>();
+    if (
+      latestNon304 &&
+      latestNon304.via === 'container' &&
+      latestNon304.content_sha256 !== pageRow.latest_content_sha256
+    ) {
+      return null;
+    }
   }
 
   const [verified, docRow] = await Promise.all([
@@ -1564,6 +1760,193 @@ export function sanitizeRecordUrlsDeep<T>(
   } finally {
     stack.delete(obj);
   }
+}
+
+function nonEmptyTrimmedStr(val: unknown): string | undefined {
+  if (typeof val !== 'string') return undefined;
+  const trimmed = val.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function normalizeProductPriceFromRecord(val: unknown): number | string | undefined {
+  if (typeof val === 'number' && Number.isFinite(val) && val > 0) return val;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed) return undefined;
+    if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+      const parsed = Number(trimmed);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return trimmed;
+  }
+  return undefined;
+}
+
+function normalizeProductAvailabilityFromRecord(val: unknown): string | undefined {
+  if (typeof val === 'boolean') return val ? 'InStock' : 'OutOfStock';
+  if (typeof val !== 'string') return undefined;
+  const stripped = val.trim().replace(/^https?:\/\/schema\.org\//i, '');
+  if (!stripped) return undefined;
+  const low = stripped.toLowerCase().replace(/\s+/g, ' ');
+  if (
+    low.includes('not in stock') ||
+    low.includes('not-in-stock') ||
+    low.includes('not instock') ||
+    low.includes('not available') ||
+    low.includes('no longer available') ||
+    low.includes('out of stock') ||
+    low.includes('outofstock') ||
+    low.includes('sold out') ||
+    low.includes('unavailable')
+  ) {
+    return 'OutOfStock';
+  }
+  if (low.includes('preorder') || low.includes('pre-order')) return 'PreOrder';
+  if (low.includes('backorder') || low.includes('back-order')) return 'BackOrder';
+  if (low.includes('in stock') || low.includes('instock') || low === 'available') return 'InStock';
+  return stripped;
+}
+
+function isProductBearingRecord(record: Record<string, unknown>): boolean {
+  if (typeof record.platform === 'string' && record.platform.trim()) return true;
+  if (Array.isArray(record.variants) && record.variants.length > 0) return true;
+  for (const k of ['sku', 'gtin', 'gtin13', 'mpn', 'price', 'availability', 'available', 'priceCurrency', 'currency', 'vendor', 'brand']) {
+    const v = record[k];
+    if (v !== undefined && v !== null && v !== '') return true;
+  }
+  return false;
+}
+
+export function backfillProductFromRecord(
+  productOut: Record<string, unknown> | null,
+  record: Record<string, unknown> | undefined,
+  ctx: {
+    finalUrl: string;
+    fallbackTitle?: string;
+    fallbackDescription?: string;
+    preferRecordAvailability?: boolean;
+  },
+): Record<string, unknown> | null {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return productOut;
+  if (!productOut && !isProductBearingRecord(record)) return null;
+
+  const variantsRaw = Array.isArray(record.variants)
+    ? record.variants.filter((v): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v)))
+    : [];
+  const v0 = variantsRaw[0];
+  const out: Record<string, unknown> = productOut ? { ...productOut } : {};
+
+  if (!nonEmptyTrimmedStr(out.url)) {
+    out.url = sanitizeSchemaHttpsUrl(record.url, ctx.finalUrl) ?? ctx.finalUrl;
+  }
+  if (!nonEmptyTrimmedStr(out.title)) {
+    const t = nonEmptyTrimmedStr(record.title) ?? nonEmptyTrimmedStr(record.name) ?? nonEmptyTrimmedStr(ctx.fallbackTitle);
+    if (t) out.title = t;
+  }
+  if (!nonEmptyTrimmedStr(out.description)) {
+    const d =
+      nonEmptyTrimmedStr(record.descriptionText) ??
+      nonEmptyTrimmedStr(record.description) ??
+      nonEmptyTrimmedStr(ctx.fallbackDescription);
+    if (d) out.description = d;
+  }
+  if (!nonEmptyTrimmedStr(out.brand)) {
+    const b = nonEmptyTrimmedStr(record.brand) ?? nonEmptyTrimmedStr(record.vendor) ?? nonEmptyTrimmedStr(record.manufacturer);
+    if (b) out.brand = b;
+  }
+  if (!nonEmptyTrimmedStr(out.sku)) {
+    const s = nonEmptyTrimmedStr(record.sku) ?? nonEmptyTrimmedStr(v0?.sku);
+    if (s) out.sku = s;
+  }
+  if (!nonEmptyTrimmedStr(out.mpn)) {
+    const m = nonEmptyTrimmedStr(record.mpn);
+    if (m) out.mpn = m;
+  }
+  if (!nonEmptyTrimmedStr(out.gtin)) {
+    const g =
+      nonEmptyTrimmedStr(record.gtin) ??
+      nonEmptyTrimmedStr(record.gtin13) ??
+      nonEmptyTrimmedStr(record.upc) ??
+      nonEmptyTrimmedStr(record.ean) ??
+      nonEmptyTrimmedStr(v0?.barcode);
+    if (g) out.gtin = g;
+  }
+  if (out.price === undefined || out.price === null || out.price === '') {
+    const p = normalizeProductPriceFromRecord(record.price ?? v0?.price);
+    if (p !== undefined) out.price = p;
+  }
+  if (!nonEmptyTrimmedStr(out.currency)) {
+    const c =
+      nonEmptyTrimmedStr(record.currency) ??
+      nonEmptyTrimmedStr(record.priceCurrency) ??
+      nonEmptyTrimmedStr(v0?.currency);
+    if (c) out.currency = c;
+  }
+  const topAvail = normalizeProductAvailabilityFromRecord(record.availability ?? record.available);
+  let variantAggAvail: string | undefined;
+  if (!topAvail && variantsRaw.length > 0) {
+    const normAvails: string[] = [];
+    for (const vr of variantsRaw) {
+      const va = normalizeProductAvailabilityFromRecord(vr.availability ?? vr.available);
+      if (va) normAvails.push(va);
+    }
+    if (normAvails.length === 1) {
+      variantAggAvail = normAvails[0];
+    } else if (normAvails.length > 1) {
+      variantAggAvail =
+        normAvails.find((a) => a === 'InStock') ??
+        normAvails.find((a) => a === 'PreOrder') ??
+        normAvails.find((a) => a === 'BackOrder') ??
+        normAvails[0];
+    }
+  }
+  const recordAvail = topAvail ?? variantAggAvail;
+  const existingAvail = normalizeProductAvailabilityFromRecord(out.availability);
+  if (ctx.preferRecordAvailability && recordAvail) {
+    out.availability = recordAvail;
+  } else if (existingAvail) {
+    out.availability = existingAvail;
+  } else if (recordAvail) {
+    out.availability = recordAvail;
+  }
+  if (!Array.isArray(out.images) || out.images.length === 0) {
+    const imgSet = new Set<string>();
+    const rawCandidates: unknown[] = [];
+    if (Array.isArray(record.images)) rawCandidates.push(...record.images);
+    if (record.image !== undefined) rawCandidates.push(record.image);
+    if (v0?.image !== undefined) rawCandidates.push(v0.image);
+    for (const cand of rawCandidates) {
+      const urlCand =
+        typeof cand === 'string'
+          ? cand
+          : cand && typeof cand === 'object' && !Array.isArray(cand)
+            ? (cand as Record<string, unknown>).url ?? (cand as Record<string, unknown>).src
+            : undefined;
+      const safe = sanitizeSchemaHttpsUrl(urlCand, ctx.finalUrl);
+      if (safe) imgSet.add(safe);
+      if (imgSet.size >= 20) break;
+    }
+    if (imgSet.size > 0) out.images = [...imgSet];
+  }
+  if ((!Array.isArray(out.variants) || out.variants.length === 0) && variantsRaw.length > 0) {
+    const mappedVariants = variantsRaw.slice(0, 30).map((vr) => {
+      const vm: Record<string, unknown> = {};
+      const vn = nonEmptyTrimmedStr(vr.title) ?? nonEmptyTrimmedStr(vr.name);
+      if (vn) vm.name = vn;
+      const vs = nonEmptyTrimmedStr(vr.sku);
+      if (vs) vm.sku = vs;
+      const vp = normalizeProductPriceFromRecord(vr.price);
+      if (vp !== undefined) vm.price = vp;
+      const vc = nonEmptyTrimmedStr(vr.currency) ?? nonEmptyTrimmedStr(vr.priceCurrency);
+      if (vc) vm.currency = vc;
+      const va = normalizeProductAvailabilityFromRecord(vr.availability ?? vr.available);
+      if (va) vm.availability = va;
+      return vm;
+    });
+    if (mappedVariants.length > 0) out.variants = mappedVariants;
+  }
+
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 const MAX_NODE_SUPPLIED_LINKS = 1_000;
@@ -2290,12 +2673,31 @@ export function detectUnsupportedBinaryPayload(params: {
     }
     return `Unsupported binary payload${ct ? ` (${ct})` : ''} for Markdown extraction`;
   }
-  const sample = params.rawBody.slice(0, 2_048);
-  const sampleBytes = new Uint8Array(sample.length);
-  for (let i = 0; i < sample.length; i++) {
-    const code = sample.charCodeAt(i);
-    // Map UTF-8 replacement char U+FFFD (`0xfffd`) to invalid high byte `0xff` so binary magic/ratio checks trigger identically
-    sampleBytes[i] = code === 0xfffd ? 0xff : code & 0xff;
+  let sampleEnd = Math.min(params.rawBody.length, 2_048);
+  if (sampleEnd < params.rawBody.length && sampleEnd > 0) {
+    const lastCode = params.rawBody.charCodeAt(sampleEnd - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      sampleEnd--;
+    }
+  }
+  const sample = params.rawBody.slice(0, sampleEnd);
+  let sampleBytes: Uint8Array;
+  if (!sample.includes('\ufffd')) {
+    sampleBytes = SCRAPE_UTF8_ENCODER.encode(sample);
+  } else {
+    // Map UTF-8 replacement char U+FFFD (`0xfffd`) to invalid high byte `0xff` so binary ratio checks trigger identically
+    const parts = sample.split('\ufffd');
+    const encodedParts = parts.map((p) => SCRAPE_UTF8_ENCODER.encode(p));
+    let totalLen = parts.length - 1;
+    for (const ep of encodedParts) totalLen += ep.byteLength;
+    sampleBytes = new Uint8Array(totalLen);
+    let offset = 0;
+    for (let i = 0; i < encodedParts.length; i++) {
+      if (i > 0) sampleBytes[offset++] = 0xff;
+      const ep = encodedParts[i]!;
+      sampleBytes.set(ep, offset);
+      offset += ep.byteLength;
+    }
   }
   const res = callCoreWasm<{ unsupported: boolean; reason?: string }>('detect_binary', {
     dataBase64: encodeBytesToBase64(sampleBytes),
@@ -2489,7 +2891,7 @@ function buildRobotsAlternativeHint(urlStr: string): string | undefined {
 export function extractYouTubeWatchMetadataFromHtml(
   rawHtml: string,
 ): { title: string; author?: string; description?: string; markdown: string } | null {
-  if (!rawHtml || !rawHtml.includes('"videoDetails":')) return null;
+  if (!rawHtml || !rawHtml.includes('"videoDetails"')) return null;
   const meta = callCoreWasm<{
     meta: { title?: string; author?: string; description?: string; markdown?: string } | null;
   }>('extract_youtube', { rawHtml, url: '', includeTranscript: false }).meta;
@@ -2512,7 +2914,45 @@ function matchesAdapterDomainPattern(hostLower: string, patternRaw: string): boo
   return hostLower === pat;
 }
 
-function isTrustedTwinRedirectUrl(
+const NON_DECLARATIVE_ATS_TRUSTED_HOSTS: Record<string, readonly string[]> = {
+  'greenhouse-board': [
+    'boards-api.greenhouse.io',
+    'boards-api.eu.greenhouse.io',
+    'boards.greenhouse.io',
+    'job-boards.greenhouse.io',
+  ],
+  'greenhouse-eu-board': [
+    'boards-api.eu.greenhouse.io',
+    'boards-api.greenhouse.io',
+    'eu-boards.greenhouse.io',
+    'job-boards.eu.greenhouse.io',
+  ],
+  'greenhouse-job': [
+    'boards-api.greenhouse.io',
+    'boards-api.eu.greenhouse.io',
+    'boards.greenhouse.io',
+    'job-boards.greenhouse.io',
+    'eu-boards.greenhouse.io',
+    'job-boards.eu.greenhouse.io',
+  ],
+  'ashby-board': ['api.ashbyhq.com', 'jobs.ashbyhq.com'],
+  'ashby-job': ['api.ashbyhq.com', 'jobs.ashbyhq.com'],
+  'lever-board': ['api.lever.co', 'api.eu.lever.co', 'jobs.lever.co', 'jobs.eu.lever.co'],
+  'lever-eu-board': ['api.eu.lever.co', 'api.lever.co', 'jobs.eu.lever.co', 'jobs.lever.co'],
+  'lever-job': ['api.lever.co', 'api.eu.lever.co', 'jobs.lever.co', 'jobs.eu.lever.co'],
+  'workable-board': ['apply.workable.com'],
+  'workable-job': ['apply.workable.com'],
+  'gem-board': ['api.gem.com', 'jobs.gem.com'],
+  'rippling-board': ['api.rippling.com', 'ats.rippling.com'],
+  'rippling-job': ['api.rippling.com', 'ats.rippling.com'],
+  'weworkremotely-feed': ['weworkremotely.com', 'www.weworkremotely.com'],
+  'himalayas-feed': ['himalayas.app', 'www.himalayas.app'],
+  'workingnomads-feed': ['workingnomads.com', 'www.workingnomads.com'],
+};
+
+const WORKDAY_HOST_TENANT_RE = /^([a-z0-9-]+)\.(?:wd\d+\.)?(myworkday(?:jobs|site)\.com)$/;
+
+export function isTrustedTwinRedirectUrl(
   twinId: string | undefined,
   initialFetchUrl: string,
   item: Record<string, unknown>,
@@ -2536,7 +2976,16 @@ function isTrustedTwinRedirectUrl(
   }
   if (finalHost === initHost) return true;
   if (!twinId) return false;
-  const adapterMeta = getRegisteredAdapterById(twinId);
+  if (twinId === 'workday-job' || twinId === 'workday-board') {
+    const initM = WORKDAY_HOST_TENANT_RE.exec(initHost);
+    const finalM = WORKDAY_HOST_TENANT_RE.exec(finalHost);
+    return Boolean(initM && finalM && initM[1] === finalM[1] && initM[2] === finalM[2]);
+  }
+  const atsHosts = NON_DECLARATIVE_ATS_TRUSTED_HOSTS[twinId];
+  if (atsHosts) {
+    return atsHosts.includes(finalHost);
+  }
+  const adapterMeta = findRegisteredAdapterById(twinId);
   if (!adapterMeta || !Array.isArray(adapterMeta.domains)) return false;
   return (
     adapterMeta.domains.every((d) => !d.includes('*')) &&
@@ -2570,6 +3019,7 @@ async function runPdfOcrFallback(params: {
   target: 'auto' | 'agent' | 'container';
   site?: string;
   source: string;
+  selfHost?: string;
   isPrivate?: boolean;
   userId?: string;
   ephemeral?: boolean;
@@ -2601,7 +3051,7 @@ async function runPdfOcrFallback(params: {
       error: string;
     }
 > {
-  const { url, ocrParam, maxOcrPages, redactPii, headers, target, site, source, isPrivate, userId, ephemeral, env, executeHubFetch } = params;
+  const { url, ocrParam, maxOcrPages, redactPii, headers, target, site, source, selfHost, isPrivate, userId, ephemeral, env, executeHubFetch } = params;
   const hasService = Boolean(env.PDF_OCR);
   const ocrUrlBase = env.PDF_OCR_URL?.trim().replace(/\/+$/, '') ?? '';
   const ocrToken = env.PDF_OCR_TOKEN?.trim() ?? '';
@@ -2609,6 +3059,7 @@ async function runPdfOcrFallback(params: {
     return { ok: false, error: 'pdf_ocr_unconfigured' };
   }
 
+  const normalizedHeaders = normalizeCallerHeadersRecord(headers);
   const rawFetchCall = {
     maxSeconds: 110,
     options: {
@@ -2623,7 +3074,7 @@ async function runPdfOcrFallback(params: {
         url,
         kind: 'binary',
         accept: 'application/pdf,*/*;q=0.8',
-        ...(headers && typeof headers === 'object' ? { headers } : {}),
+        ...(Object.keys(normalizedHeaders).length > 0 ? { headers: normalizedHeaders } : {}),
       },
     ],
   };
@@ -2782,7 +3233,7 @@ async function runPdfOcrFallback(params: {
   return {
     ok: true,
     via: `${fetchRes.via}+pdf-ocr`,
-    finalUrl: typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : url,
+    finalUrl: resolveValidatedFinalUrl(item.finalUrl, url, selfHost),
     status: typeof item.status === 'number' ? item.status : 200,
     contentSha256: privateContentSha ?? ocrJson.sha256 ?? art?.contentSha256,
     artifactId: privatePdf ? privateBlobSha : art?.blobSha256,
@@ -2823,6 +3274,15 @@ export async function executeScrapeCall(params: {
     now = Date.now(),
     sleepFn = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
   } = params;
+  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
+    cookies: (payload as { cookies?: unknown }).cookies,
+    preferMcp:
+      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
+      (payload as { preferMcp?: unknown }).preferMcp === true,
+    hasAuthContext: Boolean((payload as { auth?: unknown }).auth),
+    userId,
+  });
+  const isPrivateScrape = visibility === 'private' || sanitizeStorageUserId(userId) !== 'owner';
   const urlCheck = validatePublicHttpsTargetUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: urlCheck.message } };
@@ -2835,6 +3295,10 @@ export async function executeScrapeCall(params: {
     parsedUrl = new URL(normalizedUrl);
   }
   const parsedWikiArticle = prelimWikiArticle ? parseWikipediaArticleUrl(normalizedUrl) : null;
+  const unboundedBlocked = checkUnboundedTwinEndpointGuard(parsedUrl, normalizedUrl);
+  if (unboundedBlocked) {
+    return unboundedBlocked;
+  }
 
   const rawFormats = Array.isArray(payload.formats) && payload.formats.length > 0 ? payload.formats : ['markdown'];
   const stringFormats = new Set<string>();
@@ -2907,11 +3371,13 @@ export async function executeScrapeCall(params: {
     : [];
   const acceptLanguageOpt = locationLanguages.length > 0 ? locationLanguages.join(', ') : undefined;
 
+  const normalizedCallerHeaders = normalizeCallerHeadersRecord(payload.headers);
+  const hasCallerAcceptLanguage = Object.keys(normalizedCallerHeaders).some(
+    (k) => k.toLowerCase() === 'accept-language',
+  );
   const mergedHeaders: Record<string, string> = {
-    ...(acceptLanguageOpt ? { 'Accept-Language': acceptLanguageOpt } : {}),
-    ...(payload.headers && typeof payload.headers === 'object' && !Array.isArray(payload.headers)
-      ? (payload.headers as Record<string, string>)
-      : {}),
+    ...(acceptLanguageOpt && !hasCallerAcceptLanguage ? { 'Accept-Language': acceptLanguageOpt } : {}),
+    ...normalizedCallerHeaders,
   };
   let callerExplicitAccept: string | undefined;
   for (const [hk, hv] of Object.entries(mergedHeaders)) {
@@ -2924,6 +3390,10 @@ export async function executeScrapeCall(params: {
     const rawPayloadAccept = String((payload as Record<string, unknown>).accept).trim();
     if (rawPayloadAccept) callerExplicitAccept = rawPayloadAccept;
   }
+  const hasCallerHeaders = hasAnyCallerHeader(payload.headers);
+  const callerCookiesRaw = (payload as { cookies?: unknown }).cookies;
+  const hasCallerCookies = hasAnyCallerCookies(callerCookiesRaw);
+  const hasCallerHeadersOrCookies = hasCallerHeaders || hasCallerCookies;
 
   const onlyMainContent = typeof payload.onlyMainContent === 'boolean' ? payload.onlyMainContent : true;
   const includeImages = typeof payload.includeImages === 'boolean' ? payload.includeImages : true;
@@ -2933,12 +3403,7 @@ export async function executeScrapeCall(params: {
   const excludeTags = Array.isArray(payload.excludeTags)
     ? payload.excludeTags.filter((s): s is string => typeof s === 'string' && s.trim().length > 0).slice(0, 25)
     : [];
-  const maxChars =
-    typeof payload.maxChars === 'number' && Number.isFinite(payload.maxChars)
-      ? Math.min(500_000, Math.max(500, Math.floor(payload.maxChars)))
-      : typeof payload.defaultMaxChars === 'number' && Number.isFinite(payload.defaultMaxChars)
-        ? Math.min(500_000, Math.max(500, Math.floor(payload.defaultMaxChars)))
-        : undefined;
+  const maxChars = resolveScrapeMaxChars(payload);
   const explicitDiscoverLlms = typeof payload.discoverLlmsTxt === 'boolean' ? payload.discoverLlmsTxt : undefined;
   const discoverLlmsTxt = explicitDiscoverLlms ?? true;
   const goDiscoverLlms =
@@ -3035,14 +3500,22 @@ export async function executeScrapeCall(params: {
     blockTrackersOpt === false ||
     Boolean(mobileEmulation) ||
     Boolean(locationCacheKey) ||
+    hasCallerHeadersOrCookies ||
     includeTags.length > 0 ||
     excludeTags.length > 0 ||
     waitForMsOpt !== undefined ||
     Boolean(waitSelectorOpt) ||
     !includeImages ||
     Boolean(jsonFilterForCache) ||
-    sortedFormatsForCache.join(',') !== 'markdown';
+    sortedFormatsForCache.join(',') !== 'markdown' ||
+    ocrMode !== 'auto' ||
+    pdfParserOpts.includePagesArray ||
+    pdfParserOpts.includePageMarkers ||
+    pdfParserOpts.ocrModeOverride !== undefined ||
+    pdfParserOpts.maxPagesOverride !== undefined ||
+    maxPagesCap !== 60;
   const hasNonDefaultCacheOptions = hasNonDefaultCacheOptionsWithoutRedact || Boolean(redactPii);
+  const cookiesCacheHash = hasCallerCookies ? await hashCallerCookies(callerCookiesRaw) : undefined;
   const scrapeOptionsHash = await sha256HexString(
     JSON.stringify({
       v: SCRAPE_PIPELINE_VERSION,
@@ -3060,13 +3533,19 @@ export async function executeScrapeCall(params: {
       preferOriginMarkdown,
       redactPii: Boolean(payload.redactPii),
       ...(parsedWikiArticle ? { mwClean: 2 } : {}),
-      // Only present when set, so the hash of every request without `jsonFilter` is unchanged.
+      // Only present when set, so the hash of every request without `jsonFilter` / `cookies` / PDF/OCR options is unchanged.
       ...(jsonFilterForCache ? { jsonFilter: jsonFilterForCache } : {}),
+      ...(cookiesCacheHash ? { cookies: cookiesCacheHash } : {}),
+      ...(ocrMode !== 'auto' ? { ocrMode } : {}),
+      ...(pdfParserOpts.includePagesArray ? { pdfPages: true } : {}),
+      ...(pdfParserOpts.includePageMarkers ? { pdfPageMarkers: true } : {}),
+      ...(pdfParserOpts.ocrModeOverride ? { pdfMode: pdfParserOpts.ocrModeOverride } : {}),
+      ...(maxPagesCap !== 60 ? { maxPages: maxPagesCap } : {}),
     }),
   );
 
   // Serve from verified META D1 + ARTIFACTS R2 cache when maxAgeMs is satisfied and only markdown/metadata are requested.
-  const needsLiveHtml =
+  const needsLiveHtmlForHashedOptions =
     !preferOriginMarkdown ||
     stringFormats.has('html') ||
     stringFormats.has('rawHtml') ||
@@ -3077,17 +3556,21 @@ export async function executeScrapeCall(params: {
     stringFormats.has('branding') ||
     stringFormats.has('llmsTxt') ||
     stringFormats.has('changes') ||
+    inlineActions.length > 0 ||
+    includeTags.length > 0 ||
+    excludeTags.length > 0;
+
+  const needsLiveHtml =
+    needsLiveHtmlForHashedOptions ||
     checkPromptInjection ||
     Boolean(callerExplicitAccept) ||
-    inlineActions.length > 0 ||
     pdfParserOpts.skipPdfParsing ||
-    includeTags.length > 0 ||
-    excludeTags.length > 0 ||
     Boolean(jsonSchemaSpec) ||
     Boolean(attributesSpec);
 
-  const canUseOptionsR2Cache =
+  const baseOptionsCacheEligible =
     preferOriginMarkdown &&
+    !hasCallerHeaders &&
     !stringFormats.has('html') &&
     !stringFormats.has('rawHtml') &&
     !stringFormats.has('rawBase64') &&
@@ -3097,9 +3580,12 @@ export async function executeScrapeCall(params: {
     !stringFormats.has('llmsTxt') &&
     !stringFormats.has('changes') &&
     !stringFormats.has('summary') &&
+    inlineActions.length === 0;
+
+  const canUseOptionsR2Cache =
+    baseOptionsCacheEligible &&
     !checkPromptInjection &&
     !callerExplicitAccept &&
-    inlineActions.length === 0 &&
     !pdfParserOpts.skipPdfParsing &&
     !jsonSchemaSpec &&
     !attributesSpec;
@@ -3120,14 +3606,22 @@ export async function executeScrapeCall(params: {
     excludeTags.length > 0 ||
     Boolean(attributesSpec);
 
-  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
-    cookies: (payload as { cookies?: unknown }).cookies,
-    preferMcp:
-      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
-      (payload as { preferMcp?: unknown }).preferMcp === true,
-    userId,
-  });
-  const isPrivateScrape = visibility === 'private' || sanitizeStorageUserId(userId) !== 'owner';
+  const deleteOptionsScrapeCacheIfNoCache = async (opts?: { force?: boolean }): Promise<void> => {
+    if (baseOptionsCacheEligible && payload.ephemeral !== true && (Boolean(payload.noCache) || opts?.force === true) && env.ARTIFACTS) {
+      await deleteOptionsScrapeCache({
+        bucket: env.ARTIFACTS,
+        isPrivate: isPrivateScrape,
+        userId,
+        url: normalizedUrl,
+        optionsHash: scrapeOptionsHash,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+      }).catch(() => undefined);
+      if (isPrivateScrape && !hasCallerHeadersOrCookies && !needsLiveHtmlForHashedOptions && !hasNonDefaultCacheOptionsWithoutRedact) {
+        const urlSha = await sha256HexString(normalizedUrl);
+        await env.ARTIFACTS.delete(r2PrivateScrapeCacheKey(userId, SCRAPE_PIPELINE_VERSION, urlSha)).catch(() => undefined);
+      }
+    }
+  };
   const putDerivedMarkdownForScrape = async (mdSha: string, mdContent: string, ver = SCRAPE_PIPELINE_VERSION): Promise<void> => {
     if (!env.ARTIFACTS || payload.ephemeral === true) return;
     await primeSanitizedMarkdownCache(mdSha, mdContent, {
@@ -3155,7 +3649,7 @@ export async function executeScrapeCall(params: {
   };
 
   let prevMarkdownForChanges: string | null = null;
-  if (stringFormats.has('changes') && env.ARTIFACTS && (isPrivateScrape || env.META)) {
+  if (stringFormats.has('changes') && !hasCallerHeaders && !hasCallerCookies && env.ARTIFACTS && (isPrivateScrape || env.META)) {
     const prevHit = isPrivateScrape
       ? await lookupPrivateCachedScrape({
           bucket: env.ARTIFACTS,
@@ -3193,7 +3687,7 @@ export async function executeScrapeCall(params: {
     });
     const hit: (PrivateCachedScrapeRecord | Awaited<ReturnType<typeof lookupCachedScrape>>) =
       optHit ??
-      (!needsLiveHtml && !hasNonDefaultCacheOptionsWithoutRedact
+      (!hasCallerHeadersOrCookies && !needsLiveHtml && !hasNonDefaultCacheOptionsWithoutRedact
         ? isPrivateScrape
           ? await lookupPrivateCachedScrape({
               bucket: env.ARTIFACTS,
@@ -3203,7 +3697,7 @@ export async function executeScrapeCall(params: {
               pipelineVersion: SCRAPE_PIPELINE_VERSION,
               now,
             }).then((privHit) =>
-              privHit && (!privHit.optionsHash || privHit.optionsHash === scrapeOptionsHash) ? privHit : null,
+              privHit && privHit.optionsHash === scrapeOptionsHash ? privHit : null,
             )
           : env.META && !hasNonDefaultCacheOptionsWithoutRedact
             ? await lookupCachedScrape({
@@ -3244,12 +3738,14 @@ export async function executeScrapeCall(params: {
       const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(rawHitMd) : rawHitMd, {
         isPdf: isLikelyPdfUrl(normalizedUrl),
         includeImages,
+        allowPdfPageMarkers: pdfParserOpts.includePageMarkers,
       }).markdown;
       const focused = applyQueryFocus(fullCached);
       const shaped = finalizeScrapedMarkdown(focused.markdown, {
         isPdf: false,
         includeImages,
         maxChars,
+        allowPdfPageMarkers: pdfParserOpts.includePageMarkers,
       });
       let cachedMarkdownArtifactId: string | undefined;
       if (shaped.truncated && fullCached && payload.ephemeral !== true) {
@@ -3311,7 +3807,10 @@ export async function executeScrapeCall(params: {
           ...(cachedFavicon ? { favicon: cachedFavicon } : {}),
           contentType: cachedContentType,
           ...(stringFormats.has('markdown') ? { markdown: shaped.markdown } : {}),
-          ...(stringFormats.has('text') ? { text: shaped.markdown } : {}),
+          ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(shaped.markdown) } : {}),
+          ...(pdfParserOpts.includePagesArray && Array.isArray(richHit.pages)
+            ? { pages: redactPii ? richHit.pages.map((pg) => redactPiiText(pg)) : richHit.pages }
+            : {}),
           ...(stringFormats.has('links') && richHit.links ? { links: richHit.links } : {}),
           ...(stringFormats.has('images') && richHit.images ? { images: richHit.images } : {}),
           ...(focused.queryFiltered ? { queryFiltered: true, chunks: focused.chunks } : {}),
@@ -3353,6 +3852,7 @@ export async function executeScrapeCall(params: {
       target,
       site,
       source,
+      selfHost,
       isPrivate: isPrivateScrape,
       userId,
       ephemeral: Boolean(payload.ephemeral),
@@ -3361,6 +3861,25 @@ export async function executeScrapeCall(params: {
     });
     if (forcedOcr.ok) {
       const fullOcrMd = finalizeScrapedMarkdown(forcedOcr.markdown, { isPdf: true, includeImages }).markdown;
+      if (checkPromptInjection) {
+        const piForcedOcr = detectPromptInjection({ markdown: fullOcrMd });
+        if (piForcedOcr.detected) {
+          await deleteOptionsScrapeCacheIfNoCache({ force: true });
+          return {
+            status: 403,
+            via: forcedOcr.via,
+            body: {
+              ok: false,
+              ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+              url: normalizedUrl,
+              finalUrl: forcedOcr.finalUrl,
+              error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+              message: `Prompt injection guard blocked page content (${piForcedOcr.triggers.join(', ')})`,
+              triggers: piForcedOcr.triggers,
+            },
+          };
+        }
+      }
       const shaped = finalizeScrapedMarkdown(fullOcrMd, { isPdf: false, includeImages, maxChars });
       let ocrMdArtifactId: string | undefined;
       if (env.ARTIFACTS && fullOcrMd && payload.ephemeral !== true && (shaped.truncated || isPrivateScrape)) {
@@ -3368,6 +3887,7 @@ export async function executeScrapeCall(params: {
         await putDerivedMarkdownForScrape(mdSha, fullOcrMd);
         if (shaped.truncated) ocrMdArtifactId = `md:${mdSha}`;
       }
+      await deleteOptionsScrapeCacheIfNoCache();
       return {
         status: 200,
         via: forcedOcr.via,
@@ -3384,7 +3904,7 @@ export async function executeScrapeCall(params: {
           ...(forcedOcr.artifactId ? { artifactId: forcedOcr.artifactId } : {}),
           ...(ocrMdArtifactId ? { markdownArtifactId: ocrMdArtifactId } : {}),
           ...(stringFormats.has('markdown') ? { markdown: shaped.markdown } : {}),
-          ...(stringFormats.has('text') ? { text: shaped.markdown } : {}),
+          ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(shaped.markdown) } : {}),
           ...(shaped.truncated
             ? {
                 truncated: true,
@@ -3401,6 +3921,7 @@ export async function executeScrapeCall(params: {
       };
     }
     if (forcedOcr.originFailure) {
+      await deleteOptionsScrapeCacheIfNoCache();
       return forcedOcr.originFailure;
     }
   }
@@ -3467,10 +3988,11 @@ export async function executeScrapeCall(params: {
   // R5: Look up stored ETag / Last-Modified validators in META D1 (or options-scoped R2 cache on Wikipedia refresh) when a verified derived document already exists.
   const d1RevalCandidate =
     !isPrivateScrape &&
+    !hasCallerHeaders &&
+    !hasCallerCookies &&
     !needsLiveHtml &&
     !hasNonDefaultCacheOptionsWithoutRedact &&
     !Boolean(payload.noCache) &&
-    ocrMode !== 'always' &&
     renderMode !== 'always' &&
     !scopedUserCollectionId &&
     env.ARTIFACTS &&
@@ -3486,6 +4008,7 @@ export async function executeScrapeCall(params: {
     !d1RevalCandidate &&
     parsedWikiArticle !== null &&
     canUseOptionsR2Cache &&
+    !Boolean(payload.noCache) &&
     ocrMode !== 'always' &&
     renderMode !== 'always' &&
     !scopedUserCollectionId &&
@@ -3503,13 +4026,15 @@ export async function executeScrapeCall(params: {
       : null;
   const revalCandidate = d1RevalCandidate ?? optRevalCandidate;
 
+  const rawBase64Explicit = stringFormats.has('rawBase64');
+  const rawBase64Requested = rawBase64Explicit || pdfParserOpts.skipPdfParsing;
   const fetchCall = {
     maxSeconds: Math.max(30, Math.ceil(timeoutMsOpt / 1_000) + 15),
     options: {
       includeBody: true,
       respectRobots: true,
       maxBytes: 16 * 1024 * 1024,
-      maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+      maxInlineBodyBytes: rawBase64Requested ? INLINE_HYDRATION_BUDGET_BYTES : MAX_WASM_INPUT_BYTES,
       timeoutMs: timeoutMsOpt,
       discoverLlms: goDiscoverLlms,
     },
@@ -3522,7 +4047,10 @@ export async function executeScrapeCall(params: {
           ? {
               accept:
                 callerExplicitAccept ??
-                (!preferOriginMarkdown || stringFormats.has('html') || stringFormats.has('rawHtml')
+                (!preferOriginMarkdown ||
+                stringFormats.has('html') ||
+                stringFormats.has('rawHtml') ||
+                hasHtmlSiteAdapterForHost(normalizedUrl)
                   ? 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8'
                   : MARKDOWN_FOR_AGENTS_ACCEPT),
             }
@@ -3565,6 +4093,36 @@ export async function executeScrapeCall(params: {
       includeImages,
     });
     return { markdown: sub.markdown, links: sub.links };
+  };
+
+  const fetchBoundedTwin: FetchBoundedTwinFn = async ({ url: epUrl, tag, kind, accept, trustAdapterId }) => {
+    const epRes = await executeHubFetch(
+      target,
+      JSON.stringify({
+        maxSeconds: 25,
+        options: {
+          includeBody: true,
+          respectRobots: true,
+          maxBytes: MAX_WASM_INPUT_BYTES,
+          maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+        },
+        requests: [{ id: tag, url: epUrl, kind, accept }],
+      }),
+      site,
+      `${source}:${tag}`,
+      retentionMode,
+      true,
+      collectionId,
+    );
+    if (epRes.status !== 200) return null;
+    const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
+    const epItem = epParsed.results?.[0];
+    if (!epItem || epItem.outcome !== 'ok' || !isTrustedTwinRedirectUrl(trustAdapterId, epUrl, epItem, selfHost)) {
+      return null;
+    }
+    const epBody = typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64' ? epItem.body : '';
+    if (!epBody.trim()) return null;
+    return { item: epItem, body: epBody, via: epRes.via };
   };
 
   // Pre-fetch ATS API adapters (`P1` Ashby, `P2` Workday CXS `GET`/`POST`, Greenhouse, Lever) — runs even when
@@ -3662,12 +4220,6 @@ export async function executeScrapeCall(params: {
                   })
                 : atsShapedFull;
             const atsArt = !isPrivateScrape ? (atsItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
-            let atsMdArtifactId: string | undefined;
-            if (atsShaped.truncated && env.ARTIFACTS && atsShapedFull.markdown && payload.ephemeral !== true) {
-              const mdSha = await sha256HexString(atsShapedFull.markdown);
-              await putDerivedMarkdownForScrape(mdSha, atsShapedFull.markdown);
-              atsMdArtifactId = `md:${mdSha}`;
-            }
             const rawAtsTitle = filteredBoard ? filteredBoard.title : formatted!.title;
             const atsTitle = sanitizeScrapedMetadataField(
               rawAtsTitle ? (redactPii ? redactPiiText(rawAtsTitle) : rawAtsTitle) : undefined,
@@ -3693,13 +4245,50 @@ export async function executeScrapeCall(params: {
                 ? redactPiiDeep(filteredBoard.chunks)
                 : filteredBoard.chunks
               : undefined;
+            if (checkPromptInjection) {
+              const piAts = detectPromptInjection({
+                markdown: [
+                  atsTitle ?? '',
+                  atsDesc ?? '',
+                  atsShapedFull.markdown,
+                  atsJobPostingOut ? JSON.stringify(atsJobPostingOut) : '',
+                  atsJobsOut ? JSON.stringify(atsJobsOut) : '',
+                ]
+                  .filter(Boolean)
+                  .join('\n\n'),
+              });
+              if (piAts.detected) {
+                await deleteOptionsScrapeCacheIfNoCache({ force: true });
+                return {
+                  status: 403,
+                  via: atsVia,
+                  body: {
+                    ok: false,
+                    ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+                    url: normalizedUrl,
+                    finalUrl: normalizedUrl,
+                    error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                    message: `Prompt injection guard blocked page content (${piAts.triggers.join(', ')})`,
+                    triggers: piAts.triggers,
+                  },
+                };
+              }
+            }
+            let atsMdArtifactId: string | undefined;
+            if (atsShaped.truncated && env.ARTIFACTS && atsShapedFull.markdown && payload.ephemeral !== true) {
+              const mdSha = await sha256HexString(atsShapedFull.markdown);
+              await putDerivedMarkdownForScrape(mdSha, atsShapedFull.markdown);
+              atsMdArtifactId = `md:${mdSha}`;
+            }
             setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
+            await deleteOptionsScrapeCacheIfNoCache();
             return {
               status: 200,
               via: atsVia,
               body: {
                 ok: true,
                 cached: false,
+                ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
                 pipelineVersion: SCRAPE_PIPELINE_VERSION,
                 url: normalizedUrl,
                 finalUrl: normalizedUrl,
@@ -3725,7 +4314,7 @@ export async function executeScrapeCall(params: {
                     }
                   : {}),
                 ...(stringFormats.has('markdown') ? { markdown: atsShaped.markdown } : {}),
-                ...(stringFormats.has('text') ? { text: atsShaped.markdown } : {}),
+                ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(atsShaped.markdown) } : {}),
                 ...(stringFormats.has('links') && formatted?.links ? { links: formatted.links } : {}),
                 ...(atsFocused.queryFiltered ? { queryFiltered: true, chunks: atsFocused.chunks } : {}),
                 ...(atsShaped.truncated
@@ -3764,12 +4353,12 @@ export async function executeScrapeCall(params: {
           (atsItem.status === 404 ||
             atsItem.status === 410 ||
             // Workday CXS returns structured JSON `{"errorCode":"S22","errorCaseId":"...","httpStatus":403,"message":"permission denied"}`
-            // for closed/unpublished job requisitions and HTTP 422 `{"errorCode":"S...","errorCaseId":"...","httpStatus":422}` when
-            // `{tenant}`/`{site}` does not exist on that `wdN` cluster — verify exact schema so WAF 403/422s never match!
+            // for closed/unpublished job requisitions and HTTP 422 / 500 JSON errors when `{tenant}`/`{site}`
+            // does not exist on that `wdN` cluster — verify exact schema so WAF 403/422 HTML challenges never match!
             (() => {
               if (
                 (atsSpec.id !== 'workday-job' && atsSpec.id !== 'workday-board') ||
-                (atsItem.status !== 403 && atsItem.status !== 422) ||
+                (atsItem.status !== 403 && atsItem.status !== 422 && atsItem.status !== 500) ||
                 atsBody.length > 2048 ||
                 !atsBody.trimStart().startsWith('{')
               ) {
@@ -3780,23 +4369,23 @@ export async function executeScrapeCall(params: {
               }
               try {
                 const parsedErr = JSON.parse(atsBody) as Record<string, unknown>;
-                if (!parsedErr || typeof parsedErr !== 'object' || typeof parsedErr.errorCaseId !== 'string' || !parsedErr.errorCaseId) {
+                if (!parsedErr || typeof parsedErr !== 'object') {
                   return false;
                 }
+                const hasCaseId = typeof parsedErr.errorCaseId === 'string' && parsedErr.errorCaseId.length > 0;
+                const isCxsCode = typeof parsedErr.errorCode === 'string' && /^S\d{1,4}$/.test(parsedErr.errorCode);
                 if (atsSpec.id === 'workday-job' && atsItem.status === 403) {
-                  return parsedErr.errorCode === 'S22' && parsedErr.httpStatus === 403;
+                  return hasCaseId && parsedErr.errorCode === 'S22' && parsedErr.httpStatus === 403;
                 }
-                if (atsSpec.id === 'workday-board' && atsItem.status === 422) {
-                  const hasQueryOrOffset =
-                    parsedUrl.searchParams.has('q') ||
-                    parsedUrl.searchParams.has('searchText') ||
-                    parsedUrl.searchParams.has('search') ||
-                    parsedUrl.searchParams.has('offset');
+                if (atsItem.status === 422) {
+                  return hasCaseId && isCxsCode && parsedErr.httpStatus === 422;
+                }
+                if (atsItem.status === 500) {
                   return (
-                    !hasQueryOrOffset &&
-                    typeof parsedErr.errorCode === 'string' &&
-                    /^S\d{1,4}$/.test(parsedErr.errorCode) &&
-                    parsedErr.httpStatus === 422
+                    (hasCaseId && isCxsCode && parsedErr.httpStatus === 500) ||
+                    (parsedErr.errorCode === 'INTERNAL_SERVER_ERROR' &&
+                      typeof parsedErr.message === 'string' &&
+                      parsedErr.message.length > 0)
                   );
                 }
                 return false;
@@ -3805,13 +4394,14 @@ export async function executeScrapeCall(params: {
               }
             })())
         ) {
-          // Authoritative hosted ATS API returned 404/410 (or Workday CXS structured S22/422): return immediately instead of triple-fetching
+          // Authoritative hosted ATS API returned 404/410 (or Workday CXS structured S22/422/500): return immediately instead of triple-fetching
           // (`ats-*` -> `twin-*` -> HTML `scrape-1` -> 14s headless Chromium `auto-render-1` on `?error=true`)!
           const isSingleJobSpec = atsSpec.id.endsWith('-job');
           const upstreamStatus = Number(atsItem.status);
-          const statusOut = upstreamStatus === 403 || upstreamStatus === 422 ? 404 : upstreamStatus;
+          const statusOut = upstreamStatus === 403 || upstreamStatus === 422 || upstreamStatus === 500 ? 404 : upstreamStatus;
           setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
           setActiveSpanAttribute('edgefetch.outcome', 'not_found', activeTracer ?? undefined);
+          await deleteOptionsScrapeCacheIfNoCache();
           return {
             status: statusOut,
             via: atsRes.via,
@@ -3868,7 +4458,13 @@ export async function executeScrapeCall(params: {
         const ghParsed = JSON.parse(ghDirectRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const ghItem = ghParsed.results?.[0];
         const ghBody = typeof ghItem?.body === 'string' && ghItem.bodyEncoding !== 'base64' ? ghItem.body : '';
-        if (ghItem?.outcome === 'ok' && ghBody.trim().length > 0 && !/^\s*<!doctype\s+html|^\s*<html/i.test(ghBody)) {
+        if (
+          ghItem &&
+          isTrustedTwinRedirectUrl(undefined, directGhBlob.rawUrl, ghItem, selfHost) &&
+          ghItem.outcome === 'ok' &&
+          ghBody.trim().length > 0 &&
+          !/^\s*<!doctype\s+html|^\s*<html/i.test(ghBody)
+        ) {
           const cleanGhBody = redactPii ? redactPiiText(ghBody) : ghBody;
           let ghStructuredTitle: string | undefined;
           let ghStructuredDesc: string | undefined;
@@ -3919,12 +4515,14 @@ export async function executeScrapeCall(params: {
             await putDerivedMarkdownForScrape(mdSha, ghShapedFull.markdown);
             ghMdArtifactId = `md:${mdSha}`;
           }
+          await deleteOptionsScrapeCacheIfNoCache();
           return {
             status: 200,
             via: ghDirectRes.via,
             body: {
               ok: true,
               cached: false,
+              ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
               pipelineVersion: SCRAPE_PIPELINE_VERSION,
               url: normalizedUrl,
               finalUrl: normalizedUrl,
@@ -3934,7 +4532,7 @@ export async function executeScrapeCall(params: {
               ...(ghArt?.blobSha256 ? { artifactId: ghArt.blobSha256 } : {}),
               ...(ghMdArtifactId ? { markdownArtifactId: ghMdArtifactId } : {}),
               ...(stringFormats.has('markdown') ? { markdown: ghShaped.markdown } : {}),
-              ...(stringFormats.has('text') ? { text: cleanGhBody } : {}),
+              ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(cleanGhBody) } : {}),
               ...(ghFocused.queryFiltered ? { queryFiltered: true, chunks: ghFocused.chunks } : {}),
               ...(ghShaped.truncated
                 ? {
@@ -3989,7 +4587,12 @@ export async function executeScrapeCall(params: {
         const ghPatchItem = ghPatchParsed.results?.[0];
         const ghPatchBody =
           typeof ghPatchItem?.body === 'string' && ghPatchItem.bodyEncoding !== 'base64' ? ghPatchItem.body : '';
-        if (ghPatchItem?.outcome === 'ok' && ghPatchBody.trim().length > 0) {
+        if (
+          ghPatchItem &&
+          isTrustedTwinRedirectUrl(undefined, directGhCommit.patchUrl, ghPatchItem, selfHost) &&
+          ghPatchItem.outcome === 'ok' &&
+          ghPatchBody.trim().length > 0
+        ) {
           const cleanPatchRaw = redactPii ? redactPiiText(ghPatchBody) : ghPatchBody;
           const patchDoc = formatGitPatchToMarkdown(cleanPatchRaw, 'text/x-patch', normalizedUrl);
           if (patchDoc) {
@@ -4015,12 +4618,14 @@ export async function executeScrapeCall(params: {
               await putDerivedMarkdownForScrape(mdSha, patchShapedFull.markdown);
               patchMdArtifactId = `md:${mdSha}`;
             }
+            await deleteOptionsScrapeCacheIfNoCache();
             return {
               status: 200,
               via: ghPatchRes.via,
               body: {
                 ok: true,
                 cached: false,
+                ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
                 pipelineVersion: SCRAPE_PIPELINE_VERSION,
                 url: normalizedUrl,
                 finalUrl: normalizedUrl,
@@ -4030,7 +4635,7 @@ export async function executeScrapeCall(params: {
                 ...(ghPatchArt?.blobSha256 ? { artifactId: ghPatchArt.blobSha256 } : {}),
                 ...(patchMdArtifactId ? { markdownArtifactId: patchMdArtifactId } : {}),
                 ...(stringFormats.has('markdown') ? { markdown: patchShaped.markdown } : {}),
-                ...(stringFormats.has('text') ? { text: cleanPatchRaw } : {}),
+                ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(cleanPatchRaw) } : {}),
                 ...(patchFocused.queryFiltered ? { queryFiltered: true, chunks: patchFocused.chunks } : {}),
                 ...(patchShaped.truncated
                   ? {
@@ -4067,6 +4672,7 @@ export async function executeScrapeCall(params: {
     !atsSpec && !isGreenhouseErrorRedirect && !needsDomForTwin && renderMode !== 'always'
       ? resolveSiteExtractorTwin(normalizedUrl)
       : null;
+  let reusedTwinFetchRes: Awaited<ReturnType<typeof executeHubFetch>> | null = null;
   if (registryTwin) {
     try {
       const twinRes = await executeHubFetch(
@@ -4087,234 +4693,322 @@ export async function executeScrapeCall(params: {
         true,
         collectionId,
       );
+      let twinVia = twinRes.via;
+      let twinItem: Record<string, unknown> | undefined;
+      let twinBody = '';
+      let activeFetchUrl = registryTwin.fetchUrl;
+      let activeAccept = registryTwin.accept;
+      let formatted: TwinFormattedDoc | null = null;
+      const companionWarnings: string[] = [];
+
       if (twinRes.status === 200) {
         const twinParsed = JSON.parse(twinRes.bodyText) as { results?: Array<Record<string, unknown>> };
-        const twinItem = twinParsed.results?.[0];
-        const twinBody = typeof twinItem?.body === 'string' && twinItem.bodyEncoding !== 'base64' ? twinItem.body : '';
+        twinItem = twinParsed.results?.[0];
+        twinBody = typeof twinItem?.body === 'string' && twinItem.bodyEncoding !== 'base64' ? twinItem.body : '';
         if (
           twinItem &&
           twinItem.outcome === 'ok' &&
           twinBody.trim().length > 0 &&
-          isTrustedTwinRedirectUrl(registryTwin.id, registryTwin.fetchUrl, twinItem, selfHost)
+          isTrustedTwinRedirectUrl(registryTwin.id, registryTwin.fetchUrl, twinItem, selfHost) &&
+          !isTwinRedirectedToErrorPage(registryTwin.fetchUrl, twinItem)
         ) {
-          const formatted = registryTwin.formatTwin(twinBody, normalizedUrl, (frag, fragBase) => {
-            const sub = extractHtmlDocument(frag, {
-              baseUrl: fragBase,
-              onlyMainContent: false,
-              includeImages,
-            });
-            return { markdown: sub.markdown, links: sub.links };
+          formatted = registryTwin.formatTwin(twinBody, normalizedUrl, htmlFragToMd);
+        } else if (registryTwin.fetchUrl === normalizedUrl && twinItem && twinItem.outcome !== 'ok') {
+          reusedTwinFetchRes = twinRes;
+        }
+      }
+
+      const govPrimaryOversized = twinItem?.bodyOmitted === true || twinItem?.truncated === true;
+      if (
+        registryTwin.id === 'us-cfr-govinfo' &&
+        !registryTwin.fetchUrl.includes('/wssearch/getContentDetail') &&
+        (!formatted || formatted.markdown.trim().length === 0 || govPrimaryOversized)
+      ) {
+        const govFallback = await fetchGovInfoSummaryFallback({
+          normalizedUrl,
+          primaryBodyOmitted: govPrimaryOversized,
+          fetchBoundedTwin,
+          htmlToMd: htmlFragToMd,
+        });
+        if (govFallback) {
+          formatted = govFallback.formatted;
+          twinItem = govFallback.twinItem;
+          twinBody = govFallback.rawBody;
+          activeFetchUrl = govFallback.fetchUrl;
+          activeAccept = govFallback.accept;
+          twinVia = govFallback.via;
+          companionWarnings.push(...govFallback.warnings);
+        } else if (govPrimaryOversized && formatted && formatted.markdown.trim().length > 0) {
+          companionWarnings.push(
+            'govinfo.gov full HTML document exceeded the 4 MiB WASM input budget; returned truncated primary HTML.',
+          );
+        }
+      }
+
+      if (formatted && twinItem && formatted.markdown.trim().length > 0) {
+        if (registryTwin.id === 'zendesk-hc') {
+          formatted = await enrichZendeskArticleAttachments({
+            normalizedUrl,
+            twinFetchUrl: activeFetchUrl,
+            formatted,
+            fetchBoundedTwin,
           });
-          if (formatted && formatted.markdown.trim().length > 0) {
-            setActiveSpanAttribute('edgefetch.adapter_id', registryTwin.id, activeTracer ?? undefined);
-            const rawMd = redactPii ? redactPiiText(formatted.markdown) : formatted.markdown;
-            const twinShapedFull = finalizeScrapedMarkdown(rawMd, {
-              isPdf: false,
-              includeImages,
-              baseUrl: normalizedUrl,
-            });
-            const twinFocused = applyQueryFocus(twinShapedFull.markdown);
-            const twinShaped =
-              twinFocused.queryFiltered || maxChars !== undefined
-                ? finalizeScrapedMarkdown(twinFocused.markdown, {
-                    isPdf: false,
-                    includeImages,
-                    maxChars,
-                    baseUrl: normalizedUrl,
-                  })
-                : twinShapedFull;
-            const twinArt = !isPrivateScrape ? (twinItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
-            let twinMdArtifactId: string | undefined;
-            if (twinShaped.truncated && env.ARTIFACTS && twinShapedFull.markdown && payload.ephemeral !== true) {
-              const mdSha = await sha256HexString(twinShapedFull.markdown);
-              await putDerivedMarkdownForScrape(mdSha, twinShapedFull.markdown);
-              twinMdArtifactId = `md:${mdSha}`;
-            }
-            if (checkPromptInjection) {
-              const piTwin = detectPromptInjection({ markdown: `${formatted.title ?? ''}\n${twinShapedFull.markdown}` });
-              if (piTwin.detected) {
-                return {
-                  status: 403,
-                  via: twinRes.via,
-                  body: {
-                    ok: false,
-                    success: false,
-                    code: 'SCRAPE_PROMPT_INJECTION_DETECTED',
-                    error: 'prompt_injection_detected',
-                    message: `Prompt injection guard triggered (${piTwin.triggers.join(', ')})`,
-                    triggers: piTwin.triggers,
-                    url: normalizedUrl,
-                  },
-                };
-              }
-            }
-            const twinLlmResolved =
-              stringFormats.has('summary') || Boolean(jsonSchemaSpec)
-                ? resolveLlmConfig({
-                    env: env as OptionalStorageBindings & LlmEnvBindings,
-                    requestLlm: payload.llm,
-                    selfHost,
-                  })
-                : { ok: true as const, config: null };
-            const twinLlmCfg = twinLlmResolved.ok ? twinLlmResolved.config : null;
-            let twinSummaryOut: string | undefined;
-            if (stringFormats.has('summary')) {
-              const sumRes = await summarizeMarkdownWithOptionalLlm({
-                markdown: twinShapedFull.markdown,
-                title: formatted.title,
-                llmConfig: twinLlmCfg,
-                ...(activeTracer ? { tracer: activeTracer } : {}),
-              });
-              twinSummaryOut = sumRes.summary;
-            }
-            let twinJsonOut: Record<string, unknown> | undefined;
-            let twinJsonExtractionMode: 'heuristic' | 'llm' | undefined;
-            const twinWarnings: string[] = [];
-            if (jsonSchemaSpec) {
-              const twinDoc: ExtractedDocument = {
-                markdown: twinShapedFull.markdown,
-                text: twinShapedFull.markdown,
-                title: formatted.title,
-                description: formatted.description,
-                canonicalUrl: normalizedUrl,
-                ...(Array.isArray(formatted.records) ? { records: formatted.records } : {}),
-                links: formatted.links ?? [],
-                images: [],
-                branding: { title: formatted.title, description: formatted.description, canonicalUrl: normalizedUrl },
-              };
-              const heuristicDiag = extractStructuredJsonFromPageWithDiagnostics(twinBody, twinDoc, jsonSchemaSpec.schema);
-              if (twinLlmCfg && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
-                const llmJ = await extractJsonWithOptionalLlm({
-                  markdown: twinShapedFull.markdown,
-                  title: formatted.title,
-                  url: normalizedUrl,
-                  prompt: jsonSchemaSpec.prompt,
-                  schema: jsonSchemaSpec.schema,
-                  llmConfig: twinLlmCfg,
-                  heuristicFallback: heuristicDiag.data,
-                  ...(activeTracer ? { tracer: activeTracer } : {}),
-                });
-                twinJsonOut = llmJ.data;
-                twinJsonExtractionMode = llmJ.viaLlm ? 'llm' : 'heuristic';
-                if (!llmJ.viaLlm && heuristicDiag.warnings.length > 0) {
-                  twinWarnings.push(...heuristicDiag.warnings);
-                }
-              } else {
-                twinJsonOut = heuristicDiag.data;
-                twinJsonExtractionMode = 'heuristic';
-                if (heuristicDiag.warnings.length > 0) {
-                  twinWarnings.push(...heuristicDiag.warnings);
-                }
-              }
-            }
-            const twinProductOut = stringFormats.has('product')
-              ? extractStructuredProduct({
-                  rawBody: twinBody,
-                  finalUrl: normalizedUrl,
-                  fallbackTitle: formatted.title,
-                  fallbackDescription: formatted.description,
-                })
-              : null;
-            const twinRawBase64Out = stringFormats.has('rawBase64') ? encodeBodyToRawBase64(twinItem) : undefined;
-            const twinHeaders =
-              twinItem.headers && typeof twinItem.headers === 'object' && !Array.isArray(twinItem.headers)
-                ? (twinItem.headers as Record<string, string | undefined>)
-                : undefined;
-            const twinDetected = detectSiteFrameworkLinear({
-              url: normalizedUrl,
-              ...(twinHeaders ? { headers: twinHeaders } : {}),
-            });
-            const twinDetectedWithAdapter: Record<string, unknown> = {
-              ...twinDetected,
-              adapter: registryTwin.id,
-            };
-            const twinRecordsOut =
-              formatted.records !== undefined
-                ? redactPii
-                  ? redactPiiDeep(sanitizeRecordUrlsDeep(formatted.records))
-                  : sanitizeRecordUrlsDeep(formatted.records)
-                : undefined;
-            const twinPaginationOut =
-              formatted.pagination !== undefined
-                ? redactPii
-                  ? redactPiiDeep(formatted.pagination)
-                  : formatted.pagination
-                : undefined;
-            const twinSafeSummary =
-              twinSummaryOut !== undefined ? (redactPii ? redactPiiText(twinSummaryOut) : twinSummaryOut) : undefined;
-            const twinSafeProduct = twinProductOut ? (redactPii ? redactPiiDeep(twinProductOut) : twinProductOut) : null;
-            const twinSafeJson = twinJsonOut
-              ? sanitizeRecordUrlsDeep(redactPii ? redactPiiDeep(twinJsonOut) : twinJsonOut)
-              : undefined;
-            const twinTitleOut = sanitizeScrapedMetadataField(
-              formatted.title ? (redactPii ? redactPiiText(formatted.title) : formatted.title) : undefined,
-              512,
-            );
-            const twinDescOut = sanitizeScrapedMetadataField(
-              formatted.description ? (redactPii ? redactPiiText(formatted.description) : formatted.description) : undefined,
-              2_000,
-            );
-            const twinAuthorOut = sanitizeScrapedMetadataField(
-              formatted.author ? (redactPii ? redactPiiText(formatted.author) : formatted.author) : undefined,
-              256,
-            );
+        } else if (registryTwin.id === 'docker-hub' && !activeFetchUrl.includes('/tags')) {
+          formatted = await enrichDockerHubTags({
+            normalizedUrl,
+            twinFetchUrl: activeFetchUrl,
+            formatted,
+            fetchBoundedTwin,
+            htmlToMd: htmlFragToMd,
+          });
+        }
+        setActiveSpanAttribute('edgefetch.adapter_id', registryTwin.id, activeTracer ?? undefined);
+        const rawMd = redactPii ? redactPiiText(formatted.markdown) : formatted.markdown;
+        const twinShapedFull = finalizeScrapedMarkdown(rawMd, {
+          isPdf: false,
+          includeImages,
+          baseUrl: normalizedUrl,
+        });
+        const twinFocused = applyQueryFocus(twinShapedFull.markdown);
+        const twinShaped =
+          twinFocused.queryFiltered || maxChars !== undefined
+            ? finalizeScrapedMarkdown(twinFocused.markdown, {
+                isPdf: false,
+                includeImages,
+                maxChars,
+                baseUrl: normalizedUrl,
+              })
+            : twinShapedFull;
+        const twinArt = !isPrivateScrape ? (twinItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
+        let twinMdArtifactId: string | undefined;
+        if (twinShaped.truncated && env.ARTIFACTS && twinShapedFull.markdown && payload.ephemeral !== true) {
+          const mdSha = await sha256HexString(twinShapedFull.markdown);
+          await putDerivedMarkdownForScrape(mdSha, twinShapedFull.markdown);
+          twinMdArtifactId = `md:${mdSha}`;
+        }
+        const twinJobPosting =
+          registryTwin.kind === 'text' && /JobPosting/i.test(twinBody)
+            ? extractJobPostingJsonLd(twinBody, normalizedUrl, twinShapedFull.markdown)
+            : null;
+        if (checkPromptInjection) {
+          const piTwin = detectPromptInjection({
+            markdown: [formatted.title ?? '', twinShapedFull.markdown, twinJobPosting ? JSON.stringify(twinJobPosting) : '']
+              .filter(Boolean)
+              .join('\n'),
+          });
+          if (piTwin.detected) {
+            await deleteOptionsScrapeCacheIfNoCache({ force: true });
             return {
-              status: 200,
-              via: twinRes.via,
+              status: 403,
+              via: twinVia,
               body: {
-                ok: true,
-                cached: false,
-                pipelineVersion: SCRAPE_PIPELINE_VERSION,
+                ok: false,
+                success: false,
+                ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+                code: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                message: `Prompt injection guard triggered (${piTwin.triggers.join(', ')})`,
+                triggers: piTwin.triggers,
                 url: normalizedUrl,
-                finalUrl: normalizedUrl,
-                status: twinItem.status ?? 200,
-                via: twinRes.via,
-                extractorId: registryTwin.id,
-                detected: twinDetectedWithAdapter,
-                rendered: false,
-                contentState: 'active' as const,
-                ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
-                ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
-                ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
-                ...(twinRecordsOut !== undefined ? { records: twinRecordsOut } : {}),
-                ...(twinPaginationOut !== undefined ? { pagination: twinPaginationOut } : {}),
-                ...(formatted.total !== undefined ? { total: formatted.total } : {}),
-                ...(formatted.returned !== undefined ? { returned: formatted.returned } : {}),
-                ...(formatted.nextCursor !== undefined ? { nextCursor: formatted.nextCursor } : {}),
-                ...(stringFormats.has('markdown') ? { markdown: twinShaped.markdown } : {}),
-                ...(stringFormats.has('text') ? { text: twinShaped.markdown } : {}),
-                ...(twinSafeSummary !== undefined ? { summary: twinSafeSummary } : {}),
-                ...(twinSafeProduct ? { product: twinSafeProduct } : {}),
-                ...(twinRawBase64Out ? { rawBase64: twinRawBase64Out } : {}),
-                ...(twinSafeJson ? { json: twinSafeJson } : {}),
-                ...(twinJsonExtractionMode ? { jsonExtractionMode: twinJsonExtractionMode } : {}),
-                ...(twinWarnings.length > 0 ? { warnings: twinWarnings } : {}),
-                ...(stringFormats.has('links') && formatted.links ? { links: formatted.links } : {}),
-                ...(twinFocused.queryFiltered ? { queryFiltered: true, chunks: twinFocused.chunks } : {}),
-                ...(twinShaped.truncated
-                  ? {
-                      truncated: true,
-                      totalChars: twinShaped.totalChars,
-                      nextOffset: twinShaped.nextOffset ?? twinShaped.markdown.length,
-                      remainingChars: twinShaped.remainingChars ?? Math.max(0, (twinShaped.totalChars ?? 0) - (twinShaped.nextOffset ?? twinShaped.markdown.length)),
-                    }
-                  : formatted.truncated !== undefined
-                    ? { truncated: formatted.truncated }
-                    : {}),
-                metadata: {
-                  title: twinTitleOut,
-                  ...(twinDescOut ? { description: twinDescOut } : {}),
-                  ...(twinAuthorOut ? { author: twinAuthorOut } : {}),
-                  ...(sanitizeScrapedTimestampField(formatted.publishedTime, 128)
-                    ? { publishedTime: sanitizeScrapedTimestampField(formatted.publishedTime, 128) }
-                    : {}),
-                  alternateMarkdownUrl: registryTwin.fetchUrl,
-                  contentType: twinItem.contentType ?? registryTwin.accept,
-                },
               },
             };
           }
         }
+        const twinLlmResolved =
+          stringFormats.has('summary') || Boolean(jsonSchemaSpec)
+            ? resolveLlmConfig({
+                env: env as OptionalStorageBindings & LlmEnvBindings,
+                requestLlm: payload.llm,
+                selfHost,
+              })
+            : { ok: true as const, config: null };
+        const twinLlmCfg = twinLlmResolved.ok ? twinLlmResolved.config : null;
+        let twinSummaryOut: string | undefined;
+        if (stringFormats.has('summary')) {
+          const sumRes = await summarizeMarkdownWithOptionalLlm({
+            markdown: twinShapedFull.markdown,
+            title: formatted.title,
+            llmConfig: twinLlmCfg,
+            ...(activeTracer ? { tracer: activeTracer } : {}),
+          });
+          twinSummaryOut = sumRes.summary;
+        }
+        let twinJsonOut: Record<string, unknown> | undefined;
+        let twinJsonExtractionMode: 'heuristic' | 'llm' | undefined;
+        const twinWarnings: string[] = [...companionWarnings];
+        if (jsonSchemaSpec) {
+          const twinDoc: ExtractedDocument = {
+            markdown: twinShapedFull.markdown,
+            text: twinShapedFull.markdown,
+            title: formatted.title,
+            description: formatted.description,
+            canonicalUrl: normalizedUrl,
+            ...(Array.isArray(formatted.records) ? { records: formatted.records } : {}),
+            links: formatted.links ?? [],
+            images: [],
+            branding: { title: formatted.title, description: formatted.description, canonicalUrl: normalizedUrl },
+          };
+          const heuristicDiag = extractStructuredJsonFromPageWithDiagnostics(twinBody, twinDoc, jsonSchemaSpec.schema);
+          if (twinLlmCfg && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
+            const llmJ = await extractJsonWithOptionalLlm({
+              markdown: twinShapedFull.markdown,
+              title: formatted.title,
+              url: normalizedUrl,
+              prompt: jsonSchemaSpec.prompt,
+              schema: jsonSchemaSpec.schema,
+              llmConfig: twinLlmCfg,
+              heuristicFallback: heuristicDiag.data,
+              ...(activeTracer ? { tracer: activeTracer } : {}),
+            });
+            twinJsonOut = llmJ.data;
+            twinJsonExtractionMode = llmJ.viaLlm ? 'llm' : 'heuristic';
+            if (!llmJ.viaLlm && heuristicDiag.warnings.length > 0) {
+              twinWarnings.push(...heuristicDiag.warnings);
+            }
+          } else {
+            twinJsonOut = heuristicDiag.data;
+            twinJsonExtractionMode = 'heuristic';
+            if (heuristicDiag.warnings.length > 0) {
+              twinWarnings.push(...heuristicDiag.warnings);
+            }
+          }
+        }
+        let twinProductOut = stringFormats.has('product')
+          ? extractStructuredProduct({
+              rawBody: twinBody,
+              finalUrl: normalizedUrl,
+              fallbackTitle: formatted.title,
+              fallbackDescription: formatted.description,
+            })
+          : null;
+        if (stringFormats.has('product') && formatted.records?.[0]) {
+          twinProductOut = backfillProductFromRecord(twinProductOut, formatted.records[0], {
+            finalUrl: normalizedUrl,
+            fallbackTitle: formatted.title,
+            fallbackDescription: formatted.description,
+          });
+        }
+        const twinRawBase64Out = stringFormats.has('rawBase64') ? encodeBodyToRawBase64(twinItem) : undefined;
+        const twinHeaders =
+          twinItem.headers && typeof twinItem.headers === 'object' && !Array.isArray(twinItem.headers)
+            ? (twinItem.headers as Record<string, string | undefined>)
+            : undefined;
+        const twinDetected = detectSiteFrameworkLinear({
+          url: normalizedUrl,
+          ...(twinHeaders ? { headers: twinHeaders } : {}),
+        });
+        const twinDetectedWithAdapter: Record<string, unknown> = {
+          ...twinDetected,
+          adapter: registryTwin.id,
+        };
+        const twinRecordsOut =
+          formatted.records !== undefined
+            ? redactPii
+              ? redactPiiDeep(sanitizeRecordUrlsDeep(formatted.records))
+              : sanitizeRecordUrlsDeep(formatted.records)
+            : undefined;
+        const twinPaginationOut =
+          formatted.pagination !== undefined
+            ? redactPii
+              ? redactPiiDeep(formatted.pagination)
+              : formatted.pagination
+            : undefined;
+        const twinSafeSummary =
+          twinSummaryOut !== undefined ? (redactPii ? redactPiiText(twinSummaryOut) : twinSummaryOut) : undefined;
+        const twinSafeProduct = twinProductOut
+          ? sanitizeRecordUrlsDeep(redactPii ? redactPiiDeep(twinProductOut) : twinProductOut)
+          : null;
+        const twinSafeJson = twinJsonOut
+          ? sanitizeRecordUrlsDeep(redactPii ? redactPiiDeep(twinJsonOut) : twinJsonOut)
+          : undefined;
+        const twinTitleOut = sanitizeScrapedMetadataField(
+          formatted.title ? (redactPii ? redactPiiText(formatted.title) : formatted.title) : undefined,
+          512,
+        );
+        const twinDescOut = sanitizeScrapedMetadataField(
+          formatted.description ? (redactPii ? redactPiiText(formatted.description) : formatted.description) : undefined,
+          2_000,
+        );
+        const twinAuthorOut = sanitizeScrapedMetadataField(
+          formatted.author ? (redactPii ? redactPiiText(formatted.author) : formatted.author) : undefined,
+          256,
+        );
+        // Adapter output goes through the same Go content-state classifier as normal scrapes, so an adapter that
+        // formatted a soft-404 / login / closed-posting page is labelled accordingly instead of always `active`.
+        const twinContentState = classifyContentState({
+          status: typeof twinItem.status === 'number' ? twinItem.status : 200,
+          url: normalizedUrl,
+          finalUrl: typeof twinItem.finalUrl === 'string' && twinItem.finalUrl ? twinItem.finalUrl : normalizedUrl,
+          title: formatted.title ?? '',
+          markdown: twinShapedFull.markdown,
+          rendered: false,
+          ...(twinJobPosting?.validThrough ? { validThrough: twinJobPosting.validThrough } : {}),
+          nowMs: Date.now(),
+        });
+        const twinSafeJobPosting = twinJobPosting
+          ? redactPii
+            ? redactPiiDeep(sanitizeRecordUrlsDeep(twinJobPosting))
+            : sanitizeRecordUrlsDeep(twinJobPosting)
+          : null;
+        await deleteOptionsScrapeCacheIfNoCache();
+        return {
+          status: 200,
+          via: twinVia,
+          body: {
+            ok: true,
+            cached: false,
+            ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            url: normalizedUrl,
+            finalUrl: normalizedUrl,
+            status: twinItem.status ?? 200,
+            via: twinVia,
+            extractorId: registryTwin.id,
+            detected: twinDetectedWithAdapter,
+            rendered: false,
+            contentState: twinContentState.state,
+            ...(twinContentState.reason ? { contentStateReason: twinContentState.reason } : {}),
+            ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
+            ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
+            ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
+            ...(twinSafeJobPosting ? { jobPosting: twinSafeJobPosting } : {}),
+            ...(twinRecordsOut !== undefined ? { records: twinRecordsOut } : {}),
+            ...(twinPaginationOut !== undefined ? { pagination: twinPaginationOut } : {}),
+            ...(formatted.total !== undefined ? { total: formatted.total } : {}),
+            ...(formatted.returned !== undefined ? { returned: formatted.returned } : {}),
+            ...(formatted.nextCursor !== undefined ? { nextCursor: formatted.nextCursor } : {}),
+            ...(stringFormats.has('markdown') ? { markdown: twinShaped.markdown } : {}),
+            ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(twinShaped.markdown) } : {}),
+            ...(twinSafeSummary !== undefined ? { summary: twinSafeSummary } : {}),
+            ...(twinSafeProduct ? { product: twinSafeProduct } : {}),
+            ...(twinRawBase64Out ? { rawBase64: twinRawBase64Out } : {}),
+            ...(twinSafeJson ? { json: twinSafeJson } : {}),
+            ...(twinJsonExtractionMode ? { jsonExtractionMode: twinJsonExtractionMode } : {}),
+            ...(twinWarnings.length > 0 ? { warnings: twinWarnings } : {}),
+            ...(stringFormats.has('links') && formatted.links ? { links: formatted.links } : {}),
+            ...(twinFocused.queryFiltered ? { queryFiltered: true, chunks: twinFocused.chunks } : {}),
+            ...(twinShaped.truncated
+              ? {
+                  truncated: true,
+                  totalChars: twinShaped.totalChars,
+                  nextOffset: twinShaped.nextOffset ?? twinShaped.markdown.length,
+                  remainingChars: twinShaped.remainingChars ?? Math.max(0, (twinShaped.totalChars ?? 0) - (twinShaped.nextOffset ?? twinShaped.markdown.length)),
+                }
+              : formatted.truncated !== undefined
+                ? { truncated: formatted.truncated }
+                : {}),
+            metadata: {
+              title: twinTitleOut,
+              ...(twinDescOut ? { description: twinDescOut } : {}),
+              ...(twinAuthorOut ? { author: twinAuthorOut } : {}),
+              ...(sanitizeScrapedTimestampField(formatted.publishedTime, 128)
+                ? { publishedTime: sanitizeScrapedTimestampField(formatted.publishedTime, 128) }
+                : {}),
+              alternateMarkdownUrl: activeFetchUrl,
+              contentType: twinItem.contentType ?? activeAccept,
+            },
+          },
+        };
       }
     } catch {
       // Fall through cleanly to standard HTML fetch when twin endpoint is absent or fails.
@@ -4350,7 +5044,12 @@ export async function executeScrapeCall(params: {
         const compParsed = JSON.parse(compRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const compItem = compParsed.results?.[0];
         const compBody = typeof compItem?.body === 'string' && compItem.bodyEncoding !== 'base64' ? compItem.body : '';
-        if (compItem?.outcome === 'ok' && compBody.trim().length >= 32 && !/^\s*<!doctype\s+html|^\s*<html/i.test(compBody)) {
+        if (
+          compItem?.outcome === 'ok' &&
+          isTrustedTwinRedirectUrl(undefined, cachedCompanionUrl, compItem, selfHost) &&
+          compBody.trim().length >= 32 &&
+          !/^\s*<!doctype\s+html|^\s*<html/i.test(compBody)
+        ) {
           const cleanCompRaw = redactPii ? redactPiiText(compBody) : compBody;
           const compShapedFull = finalizeScrapedMarkdown(cleanCompRaw, {
             isPdf: false,
@@ -4378,12 +5077,14 @@ export async function executeScrapeCall(params: {
           const compTitle = sanitizeScrapedMetadataField(compShapedFull.frontmatterTitle || compAssets.title, 512);
           const compDesc = sanitizeScrapedMetadataField(compShapedFull.frontmatterDescription || compAssets.description, 2_000);
           const compWords = countTextWords(compShapedFull.markdown);
+          await deleteOptionsScrapeCacheIfNoCache();
           return {
             status: 200,
             via: compRes.via,
             body: {
               ok: true,
               cached: false,
+              ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
               pipelineVersion: SCRAPE_PIPELINE_VERSION,
               url: normalizedUrl,
               finalUrl: normalizedUrl,
@@ -4393,7 +5094,7 @@ export async function executeScrapeCall(params: {
               ...(compArt?.blobSha256 ? { artifactId: compArt.blobSha256 } : {}),
               ...(compMdArtifactId ? { markdownArtifactId: compMdArtifactId } : {}),
               ...(stringFormats.has('markdown') ? { markdown: compShaped.markdown } : {}),
-              ...(stringFormats.has('text') ? { text: compShaped.markdown } : {}),
+              ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(compShaped.markdown) } : {}),
               ...(compFocused.queryFiltered ? { queryFiltered: true, chunks: compFocused.chunks } : {}),
               ...(compShaped.truncated
                 ? {
@@ -4424,28 +5125,53 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  const formatExternalSpaResponse = (spa: SpaFallbackSuccess): { status: number; via: string; body: Record<string, unknown> } => {
+  const formatExternalSpaResponse = async (
+    spa: SpaFallbackSuccess,
+  ): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
+    const safeSpaFinalUrl = resolveValidatedFinalUrl(spa.finalUrl, normalizedUrl, selfHost);
     const cleanRaw = redactPii ? redactPiiText(spa.markdown) : spa.markdown;
     const spaFull = finalizeScrapedMarkdown(cleanRaw, {
       isPdf: false,
       includeImages,
-      baseUrl: spa.finalUrl,
+      baseUrl: safeSpaFinalUrl,
     });
+    if (checkPromptInjection) {
+      const piSpa = detectPromptInjection({
+        markdown: [spa.title ?? '', spa.description ?? '', spaFull.markdown, spa.markdown].filter(Boolean).join('\n\n'),
+      });
+      if (piSpa.detected) {
+        await deleteOptionsScrapeCacheIfNoCache({ force: true });
+        return {
+          status: 403,
+          via: spa.via,
+          body: {
+            ok: false,
+            ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+            url: normalizedUrl,
+            finalUrl: safeSpaFinalUrl,
+            error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+            message: `Prompt injection guard blocked page content (${piSpa.triggers.join(', ')})`,
+            triggers: piSpa.triggers,
+          },
+        };
+      }
+    }
     const spaFocused = applyQueryFocus(spaFull.markdown);
     const spaShaped =
       spaFocused.queryFiltered || maxChars !== undefined
-        ? finalizeScrapedMarkdown(spaFocused.markdown, { isPdf: false, includeImages, maxChars, baseUrl: spa.finalUrl })
+        ? finalizeScrapedMarkdown(spaFocused.markdown, { isPdf: false, includeImages, maxChars, baseUrl: safeSpaFinalUrl })
         : spaFull;
-    const redir = analyzeUrlRedirect(normalizedUrl, spa.finalUrl);
+    const redir = analyzeUrlRedirect(normalizedUrl, safeSpaFinalUrl);
     return {
       status: 200,
       via: spa.via,
       body: {
         ok: true,
         cached: false,
+        ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
         pipelineVersion: SCRAPE_PIPELINE_VERSION,
         url: normalizedUrl,
-        finalUrl: spa.finalUrl,
+        finalUrl: safeSpaFinalUrl,
         ...(redir.redirected
           ? {
               redirected: true,
@@ -4458,7 +5184,7 @@ export async function executeScrapeCall(params: {
         renderedVia: spa.provider,
         contentState: 'active' as const,
         ...(stringFormats.has('markdown') ? { markdown: spaShaped.markdown } : {}),
-        ...(stringFormats.has('text') ? { text: spaShaped.markdown } : {}),
+        ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(spaShaped.markdown) } : {}),
         ...(stringFormats.has('links') && spa.links ? { links: spa.links } : {}),
         ...(spaFocused.queryFiltered ? { queryFiltered: true, chunks: spaFocused.chunks } : {}),
         ...(spaShaped.truncated
@@ -4481,8 +5207,10 @@ export async function executeScrapeCall(params: {
     };
   };
 
-  const fetchRes = await executeHubFetch(target, JSON.stringify(fetchCall), site, source, retentionMode, true, collectionId);
+  const fetchRes =
+    reusedTwinFetchRes ?? (await executeHubFetch(target, JSON.stringify(fetchCall), site, source, retentionMode, true, collectionId));
   if (fetchRes.status !== 200) {
+    await deleteOptionsScrapeCacheIfNoCache();
     let errJson: Record<string, unknown> = { ok: false, error: 'scrape_failed' };
     try {
       errJson = { ok: false, ...(JSON.parse(fetchRes.bodyText) as Record<string, unknown>) };
@@ -4506,10 +5234,11 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(selfHost ? { selfHost } : {}),
         ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut) {
-        return formatExternalSpaResponse(spaOut);
+        return await formatExternalSpaResponse(spaOut);
       }
     }
     return {
@@ -4575,13 +5304,15 @@ export async function executeScrapeCall(params: {
       }
     }
   }
+  let postFetchNow = params.now ?? Date.now();
 
   const isPdfResponse =
     typeof item.pdfEngine === 'string' ||
     (typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('application/pdf')) ||
-    isLikelyPdfUrl(typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl);
+    isLikelyPdfUrl(resolveValidatedFinalUrl(item.finalUrl, normalizedUrl, selfHost));
 
   if (item.outcome !== 'ok') {
+    await deleteOptionsScrapeCacheIfNoCache();
     if (ocrMode !== 'off' && hasPdfOcr && item.outcome === 'error' && isPdfResponse) {
       const rescued = await runPdfOcrFallback({
         url: normalizedUrl,
@@ -4592,6 +5323,7 @@ export async function executeScrapeCall(params: {
         target,
         site,
         source,
+        selfHost,
         isPrivate: isPrivateScrape,
         userId,
         ephemeral: Boolean(payload.ephemeral),
@@ -4600,6 +5332,25 @@ export async function executeScrapeCall(params: {
       });
       if (rescued.ok && rescued.markdown.trim().length > 0) {
         const fullRescuedMd = finalizeScrapedMarkdown(rescued.markdown, { isPdf: true, includeImages }).markdown;
+        if (checkPromptInjection) {
+          const piRescuedOcr = detectPromptInjection({ markdown: fullRescuedMd });
+          if (piRescuedOcr.detected) {
+            await deleteOptionsScrapeCacheIfNoCache({ force: true });
+            return {
+              status: 403,
+              via: rescued.via,
+              body: {
+                ok: false,
+                ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+                url: normalizedUrl,
+                finalUrl: rescued.finalUrl,
+                error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                message: `Prompt injection guard blocked page content (${piRescuedOcr.triggers.join(', ')})`,
+                triggers: piRescuedOcr.triggers,
+              },
+            };
+          }
+        }
         const shaped = finalizeScrapedMarkdown(fullRescuedMd, { isPdf: false, includeImages, maxChars });
         let rescuedMdArtifactId: string | undefined;
         if (env.ARTIFACTS && fullRescuedMd && payload.ephemeral !== true && (shaped.truncated || isPrivateScrape)) {
@@ -4623,7 +5374,7 @@ export async function executeScrapeCall(params: {
             ...(rescued.artifactId ? { artifactId: rescued.artifactId } : {}),
             ...(rescuedMdArtifactId ? { markdownArtifactId: rescuedMdArtifactId } : {}),
             ...(stringFormats.has('markdown') ? { markdown: shaped.markdown } : {}),
-            ...(stringFormats.has('text') ? { text: shaped.markdown } : {}),
+            ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(shaped.markdown) } : {}),
             ...(shaped.truncated
               ? { truncated: true, totalChars: shaped.totalChars, nextOffset: shaped.nextOffset ?? shaped.markdown.length }
               : {}),
@@ -4661,10 +5412,11 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(selfHost ? { selfHost } : {}),
         ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut) {
-        return formatExternalSpaResponse(spaOut);
+        return await formatExternalSpaResponse(spaOut);
       }
     }
 
@@ -4683,6 +5435,7 @@ export async function executeScrapeCall(params: {
         target,
         site,
         source,
+        artifactRetention: retentionMode === 'off' ? 'off' : 'transient',
         executeHubFetch,
       });
       if (wb) {
@@ -4700,6 +5453,27 @@ export async function executeScrapeCall(params: {
           includeImages,
           baseUrl: normalizedUrl,
         });
+        if (checkPromptInjection) {
+          const piWb = detectPromptInjection({
+            markdown: [wbDoc.title ?? '', wbDoc.description ?? '', cleanWbMd].filter(Boolean).join('\n\n'),
+            rawHtml: wb.rawBody,
+          });
+          if (piWb.detected) {
+            await deleteOptionsScrapeCacheIfNoCache({ force: true });
+            return {
+              status: 403,
+              via: wb.via,
+              body: {
+                ok: false,
+                url: normalizedUrl,
+                finalUrl: normalizedUrl,
+                error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                message: `Prompt injection guard blocked page content (${piWb.triggers.join(', ')})`,
+                triggers: piWb.triggers,
+              },
+            };
+          }
+        }
         const wbFocused = applyQueryFocus(wbFull.markdown);
         const wbShaped =
           wbFocused.queryFiltered || maxChars !== undefined
@@ -4711,6 +5485,7 @@ export async function executeScrapeCall(params: {
           body: {
             ok: true,
             cached: false,
+            ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
             pipelineVersion: SCRAPE_PIPELINE_VERSION,
             url: normalizedUrl,
             finalUrl: normalizedUrl,
@@ -4720,7 +5495,7 @@ export async function executeScrapeCall(params: {
             waybackSnapshotUrl: wb.snapshotUrl,
             waybackTimestamp: wb.timestamp,
             ...(stringFormats.has('markdown') ? { markdown: wbShaped.markdown } : {}),
-            ...(stringFormats.has('text') ? { text: wbDoc.text || wbShaped.markdown } : {}),
+            ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(wbDoc.text || wbShaped.markdown) } : {}),
             ...(stringFormats.has('links') ? { links: wbDoc.links } : {}),
             ...(wbFocused.queryFiltered ? { queryFiltered: true, chunks: wbFocused.chunks } : {}),
             metadata: {
@@ -4794,14 +5569,42 @@ export async function executeScrapeCall(params: {
       headers: itemPaymentHeaders,
       rawBody: rawErrBody,
     });
+    const itemHeadersObj =
+      item.headers && typeof item.headers === 'object' && !Array.isArray(item.headers)
+        ? (item.headers as Record<string, unknown>)
+        : undefined;
+    const itemHeaderRetryAfter =
+      typeof itemHeadersObj?.['retry-after'] === 'string' && itemHeadersObj['retry-after'].trim()
+        ? itemHeadersObj['retry-after'].trim()
+        : typeof itemHeadersObj?.['Retry-After'] === 'string' && itemHeadersObj['Retry-After'].trim()
+          ? itemHeadersObj['Retry-After'].trim()
+          : undefined;
+    const rawRetryAfter =
+      typeof item.retryAfter === 'string' && item.retryAfter.trim()
+        ? item.retryAfter.trim()
+        : (itemHeaderRetryAfter ??
+          (typeof fetchResUsed.retryAfter === 'string' && fetchResUsed.retryAfter.trim()
+            ? fetchResUsed.retryAfter.trim()
+            : undefined));
     const blockedInfo = refineBlockedInfo({
       url: normalizedUrl,
       outcome: effectiveOutcome,
       problem: effectiveProb,
       status: item.status,
-      retryAfter: typeof item.retryAfter === 'string' ? item.retryAfter : fetchResUsed.retryAfter,
+      retryAfter: rawRetryAfter,
       baseBlocked: rawBlockedInfo,
     });
+    const retryAfterOut =
+      item.status === 429
+        ? rawRetryAfter ??
+          (typeof (blockedInfo as { retryAfterSeconds?: unknown } | undefined)?.retryAfterSeconds === 'number' &&
+          Number.isFinite((blockedInfo as { retryAfterSeconds: number }).retryAfterSeconds)
+            ? String(Math.max(0, Math.floor((blockedInfo as { retryAfterSeconds: number }).retryAfterSeconds)))
+            : typeof (blockedInfo as { retryAfter?: unknown } | undefined)?.retryAfter === 'string' &&
+                (blockedInfo as { retryAfter: string }).retryAfter.trim()
+              ? (blockedInfo as { retryAfter: string }).retryAfter.trim()
+              : undefined)
+        : undefined;
     return {
       status: isPaymentRequiredErr
         ? 402
@@ -4811,8 +5614,10 @@ export async function executeScrapeCall(params: {
             ? 403
             : 422,
       via: fetchResUsed.via,
+      ...(retryAfterOut ? { retryAfter: retryAfterOut } : {}),
       body: {
         ok: false,
+        ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
         url: normalizedUrl,
         outcome: effectiveOutcome,
         status: item.status ?? (isPaymentRequiredErr ? 402 : 0),
@@ -4827,8 +5632,9 @@ export async function executeScrapeCall(params: {
   // R5: `304 Not Modified` conditional revalidation hit — refresh `pages.last_fetched_at` in META D1 (or options R2 cache) and serve verified R2 Markdown!
   if (item.status === 304 && revalCandidate && (env.META || optRevalCandidate)) {
     const touchReval = async (): Promise<void> => {
+      const revalNow = params.now ?? Date.now();
       if (d1RevalCandidate && env.META) {
-        await touchRevalidatedPage(env.META, normalizedUrl, now);
+        await touchRevalidatedPage(env.META, normalizedUrl, revalNow);
       }
       if (optRevalCandidate && env.ARTIFACTS && payload.ephemeral !== true) {
         await writeOptionsScrapeCache({
@@ -4837,7 +5643,7 @@ export async function executeScrapeCall(params: {
           userId,
           optionsHash: scrapeOptionsHash,
           ...(env.META ? { metaDb: env.META } : {}),
-          record: { ...optRevalCandidate, lastFetchedAt: now },
+          record: { ...optRevalCandidate, lastFetchedAt: revalNow },
         }).catch(() => undefined);
       } else if (d1RevalCandidate && parsedWikiArticle && env.ARTIFACTS && payload.ephemeral !== true) {
         await writeOptionsScrapeCache({
@@ -4851,6 +5657,7 @@ export async function executeScrapeCall(params: {
             finalUrl: normalizedUrl,
             markdown: cleanMediaWikiMarkdownLinear(d1RevalCandidate.markdown),
             contentSha256: d1RevalCandidate.contentSha256,
+            rawContentSha256: d1RevalCandidate.contentSha256,
             documentId: d1RevalCandidate.documentId,
             pipelineVersion: d1RevalCandidate.pipelineVersion,
             ...(d1RevalCandidate.title ? { title: d1RevalCandidate.title } : {}),
@@ -4860,7 +5667,7 @@ export async function executeScrapeCall(params: {
             extractorId: 'mediawiki',
             detected: { generators: ['MediaWiki'], adapter: 'mediawiki' },
             status: 200,
-            lastFetchedAt: now,
+            lastFetchedAt: revalNow,
           },
         }).catch(() => undefined);
       }
@@ -4915,6 +5722,7 @@ export async function executeScrapeCall(params: {
         ok: true,
         cached: true,
         revalidated: true,
+        ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
         originStatus: 304,
         pipelineVersion: revalCandidate.pipelineVersion,
         documentId: revalCandidate.documentId,
@@ -4936,7 +5744,7 @@ export async function executeScrapeCall(params: {
         ...(revalFavicon ? { favicon: revalFavicon } : {}),
         contentType: revalContentType,
         ...(stringFormats.has('markdown') ? { markdown: revalShaped.markdown } : {}),
-        ...(stringFormats.has('text') ? { text: revalShaped.markdown } : {}),
+        ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(revalShaped.markdown) } : {}),
         ...(revalFocused.queryFiltered ? { queryFiltered: true, chunks: revalFocused.chunks } : {}),
         ...(revalShaped.truncated
           ? {
@@ -4961,13 +5769,14 @@ export async function executeScrapeCall(params: {
   }
 
   let rawBodyStr = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
-  let finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+  let finalUrl = resolveValidatedFinalUrl(item.finalUrl, normalizedUrl, selfHost);
 
   const buildOverBudgetEdgeResponse = async (
     rawForArtifact: string,
     curItem: Record<string, unknown>,
     viaUsed: string,
   ): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
+    await deleteOptionsScrapeCacheIfNoCache();
     let overArt = !isPrivateScrape
       ? (curItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined)
       : undefined;
@@ -4997,7 +5806,7 @@ export async function executeScrapeCall(params: {
         // Non-fatal if R2 artifact storage fails.
       }
     }
-    const overFinalUrl = typeof curItem.finalUrl === 'string' && curItem.finalUrl ? curItem.finalUrl : normalizedUrl;
+    const overFinalUrl = resolveValidatedFinalUrl(curItem.finalUrl, normalizedUrl, selfHost);
     const overTitle =
       typeof curItem.title === 'string' && curItem.title.trim()
         ? sanitizeScrapedMetadataField(redactPii ? redactPiiText(curItem.title) : curItem.title, 512)
@@ -5047,7 +5856,7 @@ export async function executeScrapeCall(params: {
           ...(overArt?.contentSha256 ? { contentSha256: overArt.contentSha256 } : {}),
           ...(overArt?.blobSha256 ? { artifactId: overArt.blobSha256 } : {}),
           ...(stringFormats.has('markdown') ? { markdown: cutSanitized.markdown } : {}),
-          ...(stringFormats.has('text') ? { text: cutSanitized.markdown } : {}),
+          ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(cutSanitized.markdown) } : {}),
           metadata: {
             ...(overTitle ? { title: overTitle } : {}),
             ...(overCt ? { contentType: overCt } : {}),
@@ -5089,7 +5898,7 @@ export async function executeScrapeCall(params: {
   // Offload to a connected Go node (`target: 'agent'`) when available, or store the raw artifact and return a clear warning.
   const rawBodyOverBudget =
     !isPdfResponse &&
-    !(stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing) &&
+    !rawBase64Explicit &&
     rawBodyStr.length > 0 &&
     exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES;
   // The Go node's over-budget extractor produces sanitized markdown only: it does not receive or apply
@@ -5151,7 +5960,8 @@ export async function executeScrapeCall(params: {
           rawBodyStr = '';
           fetchResUsed = nodeRes;
           item = nodeItem;
-          finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+          postFetchNow = params.now ?? Date.now();
+          finalUrl = resolveValidatedFinalUrl(item.finalUrl, normalizedUrl, selfHost);
           if (nodeOffloadMissingFormats.length > 0) {
             nodeOffloadWarnings.push(
               `Document over the 4 MiB edge budget was extracted on a Go node; ${nodeOffloadMissingFormats.join(', ')} ` +
@@ -5185,8 +5995,9 @@ export async function executeScrapeCall(params: {
   if (
     item.markdownOverBudget === true ||
     (!isPdfResponse &&
-      !(stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing) &&
-      ((rawBodyStr.length > 0 && exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES) ||
+      !rawBase64Explicit &&
+      ((item.bodyOmitted === true && item.extractedOnNode !== true) ||
+        (rawBodyStr.length > 0 && exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES) ||
         (nodeMdStr.length > 0 && exactUtf8ByteLen(nodeMdStr) > MAX_WASM_INPUT_BYTES)))
   ) {
     const rawToStore = rawBodyStr;
@@ -5202,6 +6013,7 @@ export async function executeScrapeCall(params: {
   );
   const isolateLease = await acquireIsolateByteBudget(estWorkBytes, 200);
   if (!isolateLease) {
+    await deleteOptionsScrapeCacheIfNoCache();
     // Same constraint as the over-budget offload: the node markdown ignores include/exclude tags and carries no raw
     // body, so requests that need those get the retryable 429 below instead of a silently different response.
     if (
@@ -5236,7 +6048,7 @@ export async function executeScrapeCall(params: {
               rawBodyStr = '';
               fetchResUsed = busyOffloadRes;
               item = busyItem;
-              finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+              finalUrl = resolveValidatedFinalUrl(item.finalUrl, normalizedUrl, selfHost);
               try {
                 // The busy shortcut must apply the same guards as the main pipeline before returning node
                 // content: WAF/challenge interstitials, the prompt-injection gate, and content-state classification.
@@ -5263,6 +6075,7 @@ export async function executeScrapeCall(params: {
                 if (checkPromptInjection) {
                   const piBusy = detectPromptInjection({ markdown: `${busyRawTitle}\n${busyItem.markdown}` });
                   if (piBusy.detected) {
+                    await deleteOptionsScrapeCacheIfNoCache({ force: true });
                     return {
                       status: 403,
                       via: busyOffloadRes.via,
@@ -5303,6 +6116,7 @@ export async function executeScrapeCall(params: {
                   body: {
                     ok: true,
                     cached: false,
+                    ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
                     pipelineVersion: SCRAPE_PIPELINE_VERSION,
                     url: normalizedUrl,
                     finalUrl,
@@ -5316,7 +6130,7 @@ export async function executeScrapeCall(params: {
                     ...(nodeArt?.contentSha256 ? { contentSha256: nodeArt.contentSha256 } : {}),
                     ...(nodeArt?.blobSha256 ? { artifactId: nodeArt.blobSha256 } : {}),
                     ...(stringFormats.has('markdown') ? { markdown: safeNodeMd.markdown } : {}),
-                    ...(stringFormats.has('text') ? { text: safeNodeMd.markdown } : {}),
+                    ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(safeNodeMd.markdown) } : {}),
                     metadata: {
                       ...(nodeTitle ? { title: nodeTitle } : {}),
                       ...(typeof busyItem.contentType === 'string' ? { contentType: busyItem.contentType } : {}),
@@ -5385,6 +6199,7 @@ export async function executeScrapeCall(params: {
       ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: wafSourceStr })
       : null);
   if (okWafMatch) {
+    await deleteOptionsScrapeCacheIfNoCache();
     setActiveSpanAttribute('edgefetch.waf.vendor', okWafMatch.vendor, activeTracer ?? undefined);
     setActiveSpanAttribute('edgefetch.outcome', 'challenge', activeTracer ?? undefined);
     const blockedInfo = refineBlockedInfo({
@@ -5446,14 +6261,21 @@ export async function executeScrapeCall(params: {
           const stubItem = stubParsed.results?.[0];
           const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
           const stubFormatted =
-            (stubItem?.outcome === 'ok' || (stubItem?.truncated === true && stubItem?.status === 200)) && stubBody
+            stubItem &&
+            isTrustedTwinRedirectUrl(stubAts.id, stubAts.fetchUrl, stubItem, selfHost) &&
+            (stubItem.outcome === 'ok' || (stubItem.truncated === true && stubItem.status === 200)) &&
+            stubBody
               ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
               : null;
           if (stubFormatted && stubFormatted.markdown.trim().length > 0 && !hasCustomContentScoping) {
             setActiveSpanAttribute('edgefetch.adapter_id', stubAts.id, activeTracer ?? undefined);
             const stubRedirect = analyzeUrlRedirect(normalizedUrl, wdStub.redirectUrl);
             const cleanStubMd = redactPii ? redactPiiText(stubFormatted.markdown) : stubFormatted.markdown;
-            const stubShaped = finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, maxChars, baseUrl: wdStub.redirectUrl });
+            const stubShapedFull = finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, baseUrl: wdStub.redirectUrl });
+            const stubShaped =
+              maxChars !== undefined
+                ? finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, maxChars, baseUrl: wdStub.redirectUrl })
+                : stubShapedFull;
             const stubJobPostingOut = stubFormatted.jobPosting
               ? redactPii
                 ? redactPiiDeep(sanitizeRecordUrlsDeep(stubFormatted.jobPosting))
@@ -5468,12 +6290,42 @@ export async function executeScrapeCall(params: {
               stubFormatted.title ? (redactPii ? redactPiiText(stubFormatted.title) : stubFormatted.title) : undefined,
               512,
             );
+            if (checkPromptInjection) {
+              const piStub = detectPromptInjection({
+                markdown: [
+                  stubTitleOut ?? '',
+                  stubShapedFull.markdown,
+                  stubJobPostingOut ? JSON.stringify(stubJobPostingOut) : '',
+                  stubJobsOut ? JSON.stringify(stubJobsOut) : '',
+                ]
+                  .filter(Boolean)
+                  .join('\n\n'),
+              });
+              if (piStub.detected) {
+                await deleteOptionsScrapeCacheIfNoCache({ force: true });
+                return {
+                  status: 403,
+                  via: stubRes.via,
+                  body: {
+                    ok: false,
+                    ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+                    url: normalizedUrl,
+                    finalUrl: wdStub.redirectUrl,
+                    error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                    message: `Prompt injection guard blocked page content (${piStub.triggers.join(', ')})`,
+                    triggers: piStub.triggers,
+                  },
+                };
+              }
+            }
+            await deleteOptionsScrapeCacheIfNoCache();
             return {
               status: 200,
               via: stubRes.via,
               body: {
                 ok: true,
                 cached: false,
+                ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
                 pipelineVersion: SCRAPE_PIPELINE_VERSION,
                 url: normalizedUrl,
                 finalUrl: wdStub.redirectUrl,
@@ -5488,7 +6340,7 @@ export async function executeScrapeCall(params: {
                 ...(stubFormatted.returned !== undefined ? { returned: stubFormatted.returned } : {}),
                 ...(stubFormatted.nextCursor !== undefined ? { nextCursor: stubFormatted.nextCursor } : {}),
                 ...(stringFormats.has('markdown') ? { markdown: stubShaped.markdown } : {}),
-                ...(stringFormats.has('text') ? { text: stubShaped.markdown } : {}),
+                ...(stringFormats.has('text') ? { text: sanitizeScrapedTextOut(stubShaped.markdown) } : {}),
                 ...(stringFormats.has('links') && stubFormatted.links ? { links: stubFormatted.links } : {}),
                 ...(stubShaped.truncated
                   ? {
@@ -5520,7 +6372,13 @@ export async function executeScrapeCall(params: {
           'agent',
           JSON.stringify({
             maxSeconds: 45,
-            options: { includeBody: true, respectRobots: true, maxBytes: 16 * 1024 * 1024, timeoutMs: 40_000 },
+            options: {
+              includeBody: true,
+              respectRobots: true,
+              maxBytes: 16 * 1024 * 1024,
+              maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+              timeoutMs: 40_000,
+            },
             requests: [
               {
                 id: 'wd-stub-render-1',
@@ -5528,6 +6386,8 @@ export async function executeScrapeCall(params: {
                 kind: 'render',
                 renderMode: 'always',
                 ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
+                ...(acceptLanguageOpt ? { acceptLanguage: acceptLanguageOpt } : {}),
+                ...(Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : {}),
                 formats: agentFormats,
                 onlyMainContent,
                 waitSelector: '[data-automation-id="jobTitle"], [data-automation-id="jobFoundText"]',
@@ -5549,8 +6409,9 @@ export async function executeScrapeCall(params: {
           if (wdBrowserItem?.outcome === 'ok' && wdBrowserBody) {
             fetchResUsed = wdBrowserRes;
             item = wdBrowserItem;
+            postFetchNow = params.now ?? Date.now();
             rawBodyStr = wdBrowserBody;
-            finalUrl = typeof wdBrowserItem.finalUrl === 'string' && wdBrowserItem.finalUrl ? wdBrowserItem.finalUrl : wdStub.redirectUrl;
+            finalUrl = resolveValidatedFinalUrl(wdBrowserItem.finalUrl, wdStub.redirectUrl, selfHost);
             renderedViaOut = 'browser-auto';
           }
         }
@@ -5560,11 +6421,36 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  const rawBase64Requested = stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing;
-  if (rawBase64Requested && pdfParserOpts.skipPdfParsing) {
+  const rawBodyOverWasmBudgetForRawBase64 =
+    rawBase64Explicit && !isPdfResponse && rawBodyStr.length > 0 && exactUtf8ByteLen(rawBodyStr) > MAX_WASM_INPUT_BYTES;
+  const rawBase64OnlyRequest =
+    stringFormats.size === 1 && stringFormats.has('rawBase64') && !jsonSchemaSpec && !attributesSpec;
+  const shouldSkipPdfEarlyReturn = isPdfResponse && pdfParserOpts.skipPdfParsing;
+  if (shouldSkipPdfEarlyReturn || (rawBase64Explicit && rawBase64OnlyRequest && rawBodyOverWasmBudgetForRawBase64)) {
+    if (!isPdfResponse && checkPromptInjection && rawBodyStr.length > 0) {
+      const piRawCheck = detectPromptInjection({ markdown: '', rawHtml: rawBodyStr });
+      if (piRawCheck.detected) {
+        await deleteOptionsScrapeCacheIfNoCache({ force: true });
+        return {
+          status: 403,
+          via: fetchResUsed.via,
+          body: {
+            ok: false,
+            ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+            url: normalizedUrl,
+            finalUrl,
+            error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+            message: `Prompt injection guard blocked page content (${piRawCheck.triggers.join(', ')})`,
+            triggers: piRawCheck.triggers,
+          },
+        };
+      }
+    }
+    await deleteOptionsScrapeCacheIfNoCache();
     const rawB64 = encodeBodyToRawBase64(item);
-    // `parsers: []` returns early, so it needs its own artifact reference and omission warning: without them a body
-    // too large to return inline produced `ok: true` with neither `rawBase64` nor any way to fetch the bytes.
+    // `parsers: []` (and rawBase64-only >4 MiB responses) return early, so they need their own artifact reference and
+    // omission warning: without them a body too large to return inline produced `ok: true` with neither `rawBase64`
+    // nor any way to fetch the bytes.
     const skipArt = !isPrivateScrape
       ? (item.artifact as { blobSha256?: string; contentSha256?: string } | undefined)
       : undefined;
@@ -5575,6 +6461,7 @@ export async function executeScrapeCall(params: {
       body: {
         ok: true,
         cached: false,
+        ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
         pipelineVersion: SCRAPE_PIPELINE_VERSION,
         url: normalizedUrl,
         finalUrl,
@@ -5597,11 +6484,38 @@ export async function executeScrapeCall(params: {
       },
     };
   }
+  let precomputedRawBase64: string | undefined;
+  if (rawBodyOverWasmBudgetForRawBase64) {
+    if (checkPromptInjection && rawBodyStr.length > 0) {
+      const piRawCheck = detectPromptInjection({ markdown: '', rawHtml: rawBodyStr });
+      if (piRawCheck.detected) {
+        await deleteOptionsScrapeCacheIfNoCache({ force: true });
+        return {
+          status: 403,
+          via: fetchResUsed.via,
+          body: {
+            ok: false,
+            ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
+            url: normalizedUrl,
+            finalUrl,
+            error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+            message: `Prompt injection guard blocked page content (${piRawCheck.triggers.join(', ')})`,
+            triggers: piRawCheck.triggers,
+          },
+        };
+      }
+    }
+    precomputedRawBase64 = encodeBodyToRawBase64(item);
+    rawBodyStr = '';
+    nodeOffloadWarnings.push(
+      'Document over the 4 MiB edge budget; edge WASM formats could not be processed and rawBase64 was returned directly.',
+    );
+  }
 
   if (!isOriginMarkdown && rawBodyStr && /^\s*(?:<!doctype\s+html|<html\b)/i.test(rawBodyStr)) {
     item.contentType = 'text/html; charset=utf-8';
   }
-  const binaryScrapeProblem = rawBase64Requested
+  const binaryScrapeProblem = rawBase64Explicit
     ? null
     : detectUnsupportedBinaryPayload({
         rawBody: rawBodyStr,
@@ -5611,11 +6525,13 @@ export async function executeScrapeCall(params: {
         isPdf: isPdfResponse,
       });
   if (binaryScrapeProblem) {
+    await deleteOptionsScrapeCacheIfNoCache();
     return {
       status: 422,
       via: fetchResUsed.via,
       body: {
         ok: false,
+        ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
         url: normalizedUrl,
         finalUrl,
         outcome: 'skip',
@@ -5668,23 +6584,55 @@ export async function executeScrapeCall(params: {
       ? (item.headers as Record<string, string | undefined>)
       : undefined;
 
-  // Custom-Domain Commerce Product Enrichment (Shopify + WooCommerce): when an HTML page on a custom domain matches
-  // Shopify (`/products/<handle>`) or WooCommerce (`/product/<slug>/`), politely fetch the public JSON/Store API endpoint
-  // via `executeHubFetch` and merge its rich GFM variant table + normalized `CatalogRecord`.
+  // Custom-Domain Commerce Enrichment (Shopify, WooCommerce, Squarespace, SFCC/Demandware, Magento 2):
+  // when an HTML page matches platform structural markers, politely fetch bounded same-origin JSON/Store API
+  // companions via `executeHubFetch` (respectRobots + MAX_WASM_INPUT_BYTES + strict redirect trust), failing open to HTML.
   let customShopifyDoc: TwinFormattedDoc | null = null;
-  let customCommerceId: 'shopify' | 'woocommerce' | null = null;
+  let customCommerceLiveTwin = false;
+  let customCommerceId: string | null = null;
   let prelimHostLower = '';
+  let prelimUrlObj: URL | null = null;
   try {
-    prelimHostLower = new URL(finalUrl).hostname.toLowerCase();
+    prelimUrlObj = new URL(finalUrl);
+    prelimHostLower = prelimUrlObj.hostname.toLowerCase();
   } catch {
+    prelimUrlObj = null;
     prelimHostLower = '';
   }
-  const fetchCommerceTwinBody = async (epUrl: string, tag: string, adapterId: 'shopify' | 'woocommerce'): Promise<string> => {
+  const ytWatchStaticMeta =
+    isHtmlBody &&
+    !isPdfResponse &&
+    (prelimHostLower === 'youtube.com' || prelimHostLower === 'www.youtube.com' || prelimHostLower === 'm.youtube.com') &&
+    prelimUrlObj?.pathname === '/watch' &&
+    rawBodyStr.includes('"videoDetails"')
+      ? extractYouTubeWatchMetadataFromHtml(rawBodyStr)
+      : null;
+  if (
+    ytWatchStaticMeta &&
+    ytWatchStaticMeta.markdown.trim() &&
+    (!extracted || !extracted.extractorId) &&
+    countTextWords(extracted?.markdown ?? '') < countTextWords(ytWatchStaticMeta.markdown)
+  ) {
+    extracted = {
+      ...(extracted ?? { markdown: '', text: '', links: [], images: [], branding: { canonicalUrl: finalUrl } }),
+      title: ytWatchStaticMeta.title,
+      ...(ytWatchStaticMeta.author ? { author: ytWatchStaticMeta.author } : {}),
+      ...(ytWatchStaticMeta.description ? { description: ytWatchStaticMeta.description } : {}),
+      markdown: ytWatchStaticMeta.markdown,
+      text: ytWatchStaticMeta.markdown,
+    };
+  }
+  const fetchCommerceTwinBody = async (epUrl: string, tag: string, trustAdapterId?: string): Promise<string> => {
     const epRes = await executeHubFetch(
       target,
       JSON.stringify({
         maxSeconds: 25,
-        options: { includeBody: true, respectRobots: true, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
+        options: {
+          includeBody: true,
+          respectRobots: true,
+          maxBytes: MAX_WASM_INPUT_BYTES,
+          maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+        },
         requests: [{ id: tag, url: epUrl, kind: 'json', accept: 'application/json' }],
       }),
       site,
@@ -5696,7 +6644,7 @@ export async function executeScrapeCall(params: {
     if (epRes.status !== 200) return '';
     const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
     const epItem = epParsed.results?.[0];
-    if (!epItem || !isTrustedTwinRedirectUrl(adapterId, epUrl, epItem, selfHost)) return '';
+    if (!epItem || !isTrustedTwinRedirectUrl(trustAdapterId, epUrl, epItem, selfHost)) return '';
     return epItem.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
       ? epItem.body
       : '';
@@ -5710,11 +6658,11 @@ export async function executeScrapeCall(params: {
     !prelimHostLower.endsWith('.myshopify.com') &&
     isShopifyHtmlOrHeaders(rawBodyStr, readItemHeaders())
   ) {
+    const htmlCurrency = extractShopifyCurrencyFromHtml(rawBodyStr);
     const shopTwin = resolveCustomDomainShopifyProductTwinUrl(finalUrl);
     if (shopTwin) {
       try {
-        const htmlCurrency = extractShopifyCurrencyFromHtml(rawBodyStr);
-        const jsonBody = await fetchCommerceTwinBody(shopTwin.jsonUrl, 'shopify-product-json', 'shopify');
+        const jsonBody = await fetchCommerceTwinBody(shopTwin.jsonUrl, 'shopify-product-json', undefined);
         if (jsonBody.trim()) {
           let needsJsEnrich = true;
           try {
@@ -5730,7 +6678,7 @@ export async function executeScrapeCall(params: {
             needsJsEnrich = false;
           }
           const jsBody = needsJsEnrich
-            ? await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js', 'shopify').catch(() => '')
+            ? await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js', undefined).catch(() => '')
             : '';
           customShopifyDoc = enrichShopifyProductFromJson({
             rawJson: jsonBody,
@@ -5739,9 +6687,12 @@ export async function executeScrapeCall(params: {
             currency: htmlCurrency,
             ...(jsBody.trim() ? { ajaxJsBody: jsBody } : {}),
           });
-          if (customShopifyDoc) customCommerceId = 'shopify';
+          if (customShopifyDoc) {
+            customCommerceId = 'shopify';
+            customCommerceLiveTwin = true;
+          }
         } else {
-          const jsBody = await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js', 'shopify').catch(() => '');
+          const jsBody = await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js', undefined).catch(() => '');
           if (jsBody.trim()) {
             customShopifyDoc = enrichShopifyProductFromJson({
               rawJson: jsBody,
@@ -5750,11 +6701,34 @@ export async function executeScrapeCall(params: {
               currency: htmlCurrency,
               isAjaxJs: true,
             });
-            if (customShopifyDoc) customCommerceId = 'shopify';
+            if (customShopifyDoc) {
+              customCommerceId = 'shopify';
+              customCommerceLiveTwin = true;
+            }
           }
         }
       } catch {
         // Gracefully keep standard HTML / JSON-LD extraction if .json / .js endpoints fail.
+      }
+    } else {
+      const shopColTwin = resolveCustomDomainShopifyCollectionTwinUrl(finalUrl);
+      if (shopColTwin) {
+        try {
+          const jsonBody = await fetchCommerceTwinBody(shopColTwin.jsonUrl, 'shopify-collection-json', undefined);
+          if (jsonBody.trim()) {
+            const formattedCol = formatShopifyProductsFeedTwin(jsonBody, finalUrl, {
+              twinUrl: shopColTwin.jsonUrl,
+              currency: htmlCurrency,
+            });
+            if (formattedCol && Array.isArray(formattedCol.records) && formattedCol.records.length > 0) {
+              customShopifyDoc = formattedCol;
+              customCommerceId = 'shopify';
+              customCommerceLiveTwin = true;
+            }
+          }
+        } catch {
+          // Fail open to standard HTML extraction on 404/robots/empty.
+        }
       }
     }
   } else if (
@@ -5762,13 +6736,12 @@ export async function executeScrapeCall(params: {
     isHtmlBody &&
     !isPdfResponse &&
     prelimHostLower &&
-    !extracted?.records &&
     isWooCommerceHtmlOrHeaders(rawBodyStr, readItemHeaders())
   ) {
     const wooTwin = resolveCustomDomainWooCommerceProductTwinUrl(finalUrl);
     if (wooTwin) {
       try {
-        const wcJsonBody = await fetchCommerceTwinBody(wooTwin.storeApiUrl, 'woocommerce-product-json', 'woocommerce');
+        const wcJsonBody = await fetchCommerceTwinBody(wooTwin.storeApiUrl, 'woocommerce-product-json', undefined);
         if (wcJsonBody.trim()) {
           customShopifyDoc = enrichWooCommerceProductFromStoreApi({
             rawJson: wcJsonBody,
@@ -5777,10 +6750,131 @@ export async function executeScrapeCall(params: {
             htmlToMd: htmlFragToMd,
             ...(extracted?.markdown ? { fallbackBodyMd: extracted.markdown } : {}),
           });
-          if (customShopifyDoc) customCommerceId = 'woocommerce';
+          if (customShopifyDoc) {
+            customCommerceId = 'woocommerce';
+            customCommerceLiveTwin = true;
+          }
         }
       } catch {
         // Gracefully keep standard HTML extraction if WooCommerce Store API is disabled or unreachable.
+      }
+    } else {
+      const wooCatTwin = resolveCustomDomainWooCommerceCatalogTwinUrl(finalUrl);
+      if (wooCatTwin) {
+        try {
+          const wcListBody = await fetchCommerceTwinBody(wooCatTwin.storeApiUrl, 'woocommerce-catalog-json', undefined);
+          if (wcListBody.trim()) {
+            const formattedList = formatWcStoreApiListTwin(wcListBody, finalUrl, wooCatTwin.storeApiUrl);
+            if (formattedList && Array.isArray(formattedList.records) && formattedList.records.length > 0) {
+              customShopifyDoc = formattedList;
+              customCommerceId = 'woocommerce';
+              customCommerceLiveTwin = true;
+            }
+          }
+        } catch {
+          // Fail open to HTML catalog fallback below.
+        }
+        if (!customShopifyDoc && prelimUrlObj) {
+          const catHtmlRes = extractWooCommerceCatalogHtml(
+            {
+              url: prelimUrlObj,
+              baseUrl: finalUrl,
+              host: prelimHostLower,
+              path: prelimUrlObj.pathname,
+              parts: prelimUrlObj.pathname.split('/').filter(Boolean),
+              rawHtml: rawBodyStr,
+              currentMd: extracted?.markdown ?? '',
+              htmlToMd: htmlFragToMd,
+            },
+            'woocommerce',
+          );
+          if (catHtmlRes && catHtmlRes.markdown.trim()) {
+            customShopifyDoc = {
+              title: catHtmlRes.title ?? '',
+              ...(catHtmlRes.description ? { description: catHtmlRes.description } : {}),
+              markdown: catHtmlRes.markdown,
+              ...(catHtmlRes.links ? { links: catHtmlRes.links } : {}),
+              ...(catHtmlRes.records ? { records: catHtmlRes.records } : {}),
+            };
+            customCommerceId = 'woocommerce';
+          }
+        }
+      }
+    }
+  } else if (
+    !hasCustomContentScoping &&
+    isHtmlBody &&
+    !isPdfResponse &&
+    prelimHostLower &&
+    isSquarespaceCommerceHtmlOrHeaders(rawBodyStr, readItemHeaders())
+  ) {
+    const sqTwinUrl = resolveSquarespaceCommerceTwinUrl(finalUrl);
+    if (sqTwinUrl) {
+      try {
+        const sqJsonBody = await fetchCommerceTwinBody(sqTwinUrl, 'squarespace-json', undefined);
+        if (sqJsonBody.trim()) {
+          const sqDoc = formatSquarespaceCommerceJson(sqJsonBody, finalUrl);
+          if (sqDoc && sqDoc.markdown.trim()) {
+            customShopifyDoc = sqDoc;
+            customCommerceId = 'squarespace-commerce';
+            customCommerceLiveTwin = true;
+          }
+        }
+      } catch {
+        // Fail open cleanly to squarespace_html / SSR hydration.
+      }
+    }
+  } else if (
+    !hasCustomContentScoping &&
+    isHtmlBody &&
+    !isPdfResponse &&
+    prelimHostLower &&
+    isSfccDemandwareHtmlOrHeaders(rawBodyStr, readItemHeaders())
+  ) {
+    const sfccTwin = resolveSfccProductVariationTwinUrl(finalUrl, rawBodyStr);
+    if (sfccTwin) {
+      try {
+        const sfccJsonBody = await fetchCommerceTwinBody(sfccTwin.variationUrl, 'sfcc-variation-json', undefined);
+        if (sfccJsonBody.trim()) {
+          const sfccDoc = formatSfccProductVariationJson(sfccJsonBody, finalUrl, rawBodyStr, extracted?.markdown ?? '');
+          if (sfccDoc && sfccDoc.markdown.trim()) {
+            customShopifyDoc = sfccDoc;
+            customCommerceId = 'sfcc-demandware';
+            customCommerceLiveTwin = true;
+          }
+        }
+      } catch {
+        // Fail open cleanly to sfcc_html geometry/JSON-LD extraction.
+      }
+    }
+  } else if (
+    !hasCustomContentScoping &&
+    isHtmlBody &&
+    !isPdfResponse &&
+    prelimHostLower &&
+    isMagento2HtmlOrHeaders(rawBodyStr, readItemHeaders())
+  ) {
+    const firstRec = extracted?.records?.[0] as Record<string, unknown> | undefined;
+    const firstVars = Array.isArray(firstRec?.variants) ? (firstRec.variants as Array<Record<string, unknown>>) : [];
+    const hasRichInlineSwatches =
+      extracted?.extractorId === 'shopware-magento' &&
+      (firstVars.length > 1 || (firstVars.length === 1 && typeof firstVars[0]?.price === 'number'));
+    if (!hasRichInlineSwatches) {
+      const magTwinUrl = resolveMagento2RenderInfoTwinUrl(finalUrl, rawBodyStr);
+      if (magTwinUrl) {
+        try {
+          const magJsonBody = await fetchCommerceTwinBody(magTwinUrl, 'magento2-render-info', undefined);
+          if (magJsonBody.trim()) {
+            const magDoc = formatMagento2RenderInfoJson(magJsonBody, finalUrl, rawBodyStr);
+            if (magDoc && magDoc.markdown.trim()) {
+              customShopifyDoc = magDoc;
+              customCommerceId = 'shopware-magento';
+              customCommerceLiveTwin = true;
+            }
+          }
+        } catch {
+          // Fail open cleanly to shopware_magento_html.
+        }
       }
     }
   }
@@ -5848,6 +6942,27 @@ export async function executeScrapeCall(params: {
           ? epItem.body
           : '';
       },
+    });
+  }
+
+  let cpscRecallDoc: Awaited<ReturnType<typeof enrichCpscRecallFromSaferProducts>> = null;
+  if (
+    !hasCustomContentScoping &&
+    isHtmlBody &&
+    !isPdfResponse &&
+    !customShopifyDoc &&
+    !cmsTwinDoc &&
+    effectiveRenderMode !== 'always' &&
+    !needsDomForTwin &&
+    (extracted?.extractorId === 'cpsc-recalls' ||
+      ((prelimHostLower === 'www.cpsc.gov' || prelimHostLower === 'cpsc.gov') && /^\/recalls\/\d{4}\//i.test(parsedUrl.pathname)))
+  ) {
+    cpscRecallDoc = await enrichCpscRecallFromSaferProducts({
+      finalUrl,
+      rawHtml: rawBodyStr,
+      extractedMarkdown: extracted?.markdown,
+      fetchBoundedTwin,
+      htmlToMd: htmlFragToMd,
     });
   }
 
@@ -5977,9 +7092,12 @@ export async function executeScrapeCall(params: {
     isHtmlBody &&
     !customShopifyDoc &&
     !cmsTwinDoc &&
+    !cpscRecallDoc &&
     !hydratedFromUniversalSchema &&
     !ssrHydrated &&
     !hydratedFromJobPostingJsonLd &&
+    !ytWatchStaticMeta &&
+    extracted?.extractorId !== 'nfpa' &&
     !isDeadWorkdayJobShell &&
     preRenderClosedCheck?.state !== 'closed_posting' &&
     effectiveRenderMode === 'auto' &&
@@ -5992,7 +7110,13 @@ export async function executeScrapeCall(params: {
         'agent',
         JSON.stringify({
           maxSeconds: 45,
-          options: { includeBody: true, respectRobots: true, maxBytes: 16 * 1024 * 1024, timeoutMs: 40_000 },
+          options: {
+            includeBody: true,
+            respectRobots: true,
+            maxBytes: 16 * 1024 * 1024,
+            maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
+            timeoutMs: 40_000,
+          },
           requests: [
             {
               id: 'auto-render-1',
@@ -6000,6 +7124,8 @@ export async function executeScrapeCall(params: {
               kind: 'render',
               renderMode: 'always',
               ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
+              ...(acceptLanguageOpt ? { acceptLanguage: acceptLanguageOpt } : {}),
+              ...(Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : {}),
               formats: agentFormats,
               onlyMainContent,
               redactPii,
@@ -6019,12 +7145,13 @@ export async function executeScrapeCall(params: {
         true,
         collectionId,
       );
+      const autoBrowserFetchNow = params.now ?? Date.now();
       if (autoBrowserRes.status === 200) {
         const autoParsed = JSON.parse(autoBrowserRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const autoItem = autoParsed.results?.[0];
         const autoHtml = typeof autoItem?.body === 'string' && autoItem.bodyEncoding !== 'base64' ? autoItem.body : '';
         if (autoItem?.outcome === 'ok' && autoHtml) {
-          const autoFinalUrl = typeof autoItem.finalUrl === 'string' && autoItem.finalUrl ? autoItem.finalUrl : finalUrl;
+          const autoFinalUrl = resolveValidatedFinalUrl(autoItem.finalUrl, finalUrl, selfHost);
           const autoExtracted = extractHtmlDocument(autoHtml, {
             baseUrl: autoFinalUrl,
             onlyMainContent,
@@ -6036,7 +7163,8 @@ export async function executeScrapeCall(params: {
           const hasAutoCapturedJson = Array.isArray(autoItem.capturedJson) && autoItem.capturedJson.length > 0;
           if (countTextWords(autoExtracted.markdown) > countTextWords(extracted?.markdown ?? '') || hasAutoCapturedJson) {
             fetchResUsed = autoBrowserRes;
-            item = { ...autoItem, contentType: 'text/html; charset=utf-8' };
+            item = sanitizeNodeSuppliedUrls({ ...autoItem, contentType: 'text/html; charset=utf-8' }, autoFinalUrl);
+            postFetchNow = autoBrowserFetchNow;
             rawBodyStr = autoHtml;
             finalUrl = autoFinalUrl;
             isHtmlBody = true;
@@ -6127,7 +7255,13 @@ export async function executeScrapeCall(params: {
         const ghParsed = JSON.parse(ghRawRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const ghItem = ghParsed.results?.[0];
         const ghBody = typeof ghItem?.body === 'string' && ghItem.bodyEncoding !== 'base64' ? ghItem.body : '';
-        if (ghItem?.outcome === 'ok' && ghBody.trim().length > 0 && !/^\s*<!doctype\s+html|^\s*<html/i.test(ghBody)) {
+        if (
+          ghItem &&
+          isTrustedTwinRedirectUrl(undefined, ghBlobTarget.rawUrl, ghItem, selfHost) &&
+          ghItem.outcome === 'ok' &&
+          ghBody.trim().length > 0 &&
+          !/^\s*<!doctype\s+html|^\s*<html/i.test(ghBody)
+        ) {
           alternateMarkdownUrl = ghBlobTarget.rawUrl;
           const cleanGhBody = redactPii ? redactPiiText(ghBody) : ghBody;
           alternateMarkdownBody = ghBlobTarget.isMarkdown
@@ -6159,7 +7293,13 @@ export async function executeScrapeCall(params: {
           const altParsed = JSON.parse(altRes.bodyText) as { results?: Array<Record<string, unknown>> };
           const altItem = altParsed.results?.[0];
           const altText = typeof altItem?.body === 'string' && altItem.bodyEncoding !== 'base64' ? altItem.body.trim() : '';
-          if (altItem?.outcome === 'ok' && altText.length >= 32 && !/^\s*<!doctype\s+html|^\s*<html/i.test(altText)) {
+          if (
+            altItem &&
+            isTrustedTwinRedirectUrl(undefined, altUrl.toString(), altItem, selfHost) &&
+            altItem.outcome === 'ok' &&
+            altText.length >= 32 &&
+            !/^\s*<!doctype\s+html|^\s*<html/i.test(altText)
+          ) {
             alternateMarkdownUrl = altUrl.toString();
             alternateMarkdownBody = redactPii ? redactPiiText(altText) : altText;
           }
@@ -6259,6 +7399,8 @@ export async function executeScrapeCall(params: {
 
   if (cmsTwinDoc && !alternateMarkdownUrl) {
     alternateMarkdownUrl = cmsTwinDoc.twinUrl;
+  } else if (cpscRecallDoc && !alternateMarkdownUrl) {
+    alternateMarkdownUrl = cpscRecallDoc.twinUrl;
   }
 
   // P4: Extract structured schema.org `JobPosting` JSON-LD on HTML pages and surface key facts (pay, workplace, location) at the top.
@@ -6272,13 +7414,31 @@ export async function executeScrapeCall(params: {
     : alternateMarkdownBody ||
       customShopifyDoc?.markdown ||
       cmsTwinDoc?.markdown ||
+      cpscRecallDoc?.doc.markdown ||
       ssrHydrated?.markdown ||
       (hydratedFromUniversalSchema ? universalSchemaDoc?.markdown : undefined) ||
       structuredTextFormatted?.markdown ||
       (isHtmlBody ? extracted?.markdown : undefined) ||
-      (typeof item.markdown === 'string' && item.markdown) ||
+      // Node-supplied Markdown for an HTML body comes from a legacy extractor that can leak script text and hidden
+      // (display:none) content; when the hub's own HTML extraction is empty, never fall back to it for HTML bodies.
+      (!isHtmlBody && typeof item.markdown === 'string' && item.markdown) ||
       extracted?.markdown ||
       (isHtmlBody ? '' : rawBodyStr);
+  // A browser-rendered DOM whose content lives entirely in header/aside/footer (small app shells) yields no main
+  // content. Rather than return nothing, re-extract that rendered DOM with the hub's own extractor without main-content
+  // stripping (scripts and hidden subtrees are still removed). Static HTML keeps the meta-description fallback, since
+  // its non-main content is usually just navigation.
+  if (
+    isHtmlBody &&
+    !markdown.trim() &&
+    (item.rendered === true || renderedViaOut !== undefined) &&
+    onlyMainContent &&
+    includeTags.length === 0 &&
+    excludeTags.length === 0
+  ) {
+    const fullPage = extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: false, stripHiddenSubtrees: true, redactPii, includeImages });
+    if (fullPage.markdown.trim()) markdown = fullPage.markdown;
+  }
   if (cdpJsonDistilled?.markdown && countTextWords(markdown) < 80 && !alternateMarkdownBody && !customShopifyDoc) {
     markdown = [markdown.trim(), cdpJsonDistilled.markdown].filter(Boolean).join('\n\n');
   } else if (
@@ -6312,6 +7472,7 @@ export async function executeScrapeCall(params: {
     : alternateMarkdownBody ||
       customShopifyDoc?.markdown ||
       cmsTwinDoc?.markdown ||
+      cpscRecallDoc?.doc.markdown ||
       ssrHydrated?.markdown ||
       (hydratedFromUniversalSchema ? universalSchemaDoc?.markdown : undefined) ||
       (cdpJsonDistilled?.markdown && countTextWords(extracted?.text ?? '') < 80 ? markdown : undefined) ||
@@ -6344,6 +7505,7 @@ export async function executeScrapeCall(params: {
       target,
       site,
       source,
+      selfHost,
       isPrivate: isPrivateScrape,
       userId,
       ephemeral: Boolean(payload.ephemeral),
@@ -6442,6 +7604,8 @@ export async function executeScrapeCall(params: {
     !isPdfResponse &&
     !customShopifyDoc &&
     !ssrHydrated &&
+    !ytWatchStaticMeta &&
+    extracted?.extractorId !== 'nfpa' &&
     effectiveRenderMode !== 'off' &&
     countTextWords(rawCleanMarkdown) < 50 &&
     (isThinScriptedPage(rawBodyStr, rawCleanMarkdown) || isThinIframeShellAfterLocal)
@@ -6473,19 +7637,21 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(selfHost ? { selfHost } : {}),
         ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut && countTextWords(spaOut.markdown) > countTextWords(rawCleanMarkdown)) {
+        const safeSpaFinalUrl = resolveValidatedFinalUrl(spaOut.finalUrl, finalUrl, selfHost);
         const cleanSpaMd = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
         fullShaped = finalizeScrapedMarkdown(cleanSpaMd, {
           isPdf: false,
           includeImages,
           maxChars: undefined,
-          baseUrl: spaOut.finalUrl,
+          baseUrl: safeSpaFinalUrl,
         });
         rawCleanMarkdown = fullShaped.markdown;
         textOut = rawCleanMarkdown;
-        finalUrl = spaOut.finalUrl;
+        finalUrl = safeSpaFinalUrl;
         viaOut = spaOut.via;
         renderedViaOut = spaOut.provider;
         contentSourceOut = undefined;
@@ -6543,13 +7709,9 @@ export async function executeScrapeCall(params: {
     textOut = boundedText.text;
     textOutBudgetCut = textOutBudgetCut || boundedText.cut;
   }
-  textOut =
-    !stringFormats.has('text') || isOriginMarkdown || hydratedFromJobPostingJsonLd
-      ? markdown
-      : neutralizeAllUnsafeMarkdownLinksLinear(stripInvisibleSmugglingChars(decodeHtmlEntities(textOut))).replace(
-          /<(?=[ \t]*(?:javascript|vbscript|data|file|blob):)/gi,
-          '&lt;',
-        );
+  textOut = !stringFormats.has('text')
+    ? markdown
+    : sanitizeScrapedTextOut(isOriginMarkdown || hydratedFromJobPostingJsonLd ? markdown : textOut);
 
   let llmsPayload: unknown = item.llms;
   if (llmsPayload && typeof llmsPayload === 'object') {
@@ -6626,8 +7788,8 @@ export async function executeScrapeCall(params: {
 
   const baseHtmlLinks = extracted?.links ?? (Array.isArray(item.links) ? item.links : []);
   const cmsOrHydratedLinks =
-    isHtmlBody && (cmsTwinDoc || ssrHydrated || hydratedFromUniversalSchema) && stringFormats.has('links')
-      ? extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, false).links
+    isHtmlBody && (cmsTwinDoc || cpscRecallDoc || ssrHydrated || hydratedFromUniversalSchema) && stringFormats.has('links')
+      ? [...extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, false).links, ...(cpscRecallDoc?.doc.links ?? [])]
       : [];
   const resolvedLinks = isHtmlBody
     ? cmsOrHydratedLinks.length > 0
@@ -6649,6 +7811,7 @@ export async function executeScrapeCall(params: {
   const rawResolvedTitle =
     customShopifyDoc?.title ||
     cmsTwinDoc?.title ||
+    cpscRecallDoc?.doc.title ||
     ssrHydrated?.title ||
     extracted?.title ||
     universalSchemaDoc?.title ||
@@ -6663,6 +7826,7 @@ export async function executeScrapeCall(params: {
   const rawResolvedDescription =
     customShopifyDoc?.description ||
     cmsTwinDoc?.description ||
+    cpscRecallDoc?.doc.description ||
     ssrHydrated?.description ||
     extracted?.description ||
     universalSchemaDoc?.description ||
@@ -6707,6 +7871,16 @@ export async function executeScrapeCall(params: {
     cdpJsonDistilled?.structured ??
     universalSchemaDoc?.structured;
 
+  // Same precedence as the response's `records` output below: custom-domain Shopify / adapter records first, so
+  // `product` and `json` schema fields such as `sku` can be filled from them.
+  const recordsForJson = [customShopifyDoc?.records, extracted?.records, nonEmptyUniversalRecords].find(
+    (r): r is NonNullable<typeof r> => Array.isArray(r) && r.length > 0,
+  );
+  const recordsFromLiveTwin =
+    recordsForJson !== undefined &&
+    ((customCommerceLiveTwin && recordsForJson === customShopifyDoc?.records) ||
+      (Boolean(cmsTwinDoc?.records?.length) && recordsForJson === cmsTwinDoc?.records));
+
   let productOut: Record<string, unknown> | null = null;
   if (stringFormats.has('product')) {
     productOut = extractStructuredProduct({
@@ -6715,16 +7889,18 @@ export async function executeScrapeCall(params: {
       fallbackTitle: resolvedTitle,
       fallbackDescription: resolvedDescription,
     });
+    if (recordsForJson?.[0]) {
+      productOut = backfillProductFromRecord(productOut, recordsForJson[0], {
+        finalUrl,
+        fallbackTitle: resolvedTitle,
+        fallbackDescription: resolvedDescription,
+        preferRecordAvailability: recordsFromLiveTwin,
+      });
+    }
   }
 
   const attributesOut =
     attributesSpec && isHtmlBody ? extractHtmlAttributesBySelectors(rawBodyStr, attributesSpec) : undefined;
-
-  // Same precedence as the response's `records` output below: custom-domain Shopify / adapter records first, so
-  // `json` schema fields such as `sku` can be filled from them (they were previously only used for `records`).
-  const recordsForJson = [customShopifyDoc?.records, extracted?.records, nonEmptyUniversalRecords].find(
-    (r): r is NonNullable<typeof r> => Array.isArray(r) && r.length > 0,
-  );
   const docForJson: ExtractedDocument | undefined = jsonSchemaSpec
     ? {
         markdown: rawCleanMarkdown,
@@ -6735,6 +7911,7 @@ export async function executeScrapeCall(params: {
         canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
         favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
         ...(recordsForJson ? { records: recordsForJson } : {}),
+        ...(recordsFromLiveTwin ? { preferRecordAvailability: true } : {}),
         links: resolvedLinks as string[],
         images: resolvedImages as ScrapedImage[],
         branding: extracted?.branding ?? {
@@ -6771,6 +7948,8 @@ export async function executeScrapeCall(params: {
 
   if (checkPromptInjection) {
     const serializedJobPosting = htmlJobPosting ? JSON.stringify(htmlJobPosting) : '';
+    const serializedCommerceRecords = customShopifyDoc?.records ? JSON.stringify(customShopifyDoc.records) : '';
+    const serializedExtractedRecords = extracted?.records ? JSON.stringify(extracted.records) : '';
     const serializedUniversalRecords = nonEmptyUniversalRecords ? JSON.stringify(nonEmptyUniversalRecords) : '';
     const serializedUniversalStructured = universalStructuredOut ? JSON.stringify(universalStructuredOut) : '';
     const serializedProduct = productOut ? JSON.stringify(productOut) : '';
@@ -6786,6 +7965,8 @@ export async function executeScrapeCall(params: {
       ssrHydrated?.rawDecodedStringsForPiCheck,
       cdpJsonDistilled?.rawDecodedStringsForPiCheck,
       serializedJobPosting,
+      serializedCommerceRecords,
+      serializedExtractedRecords,
       serializedUniversalRecords,
       serializedUniversalStructured,
       serializedProduct,
@@ -6799,6 +7980,7 @@ export async function executeScrapeCall(params: {
       ...(isHtmlBody || isOriginMarkdown ? { rawHtml: rawBodyStr } : {}),
     });
     if (piCheck.detected) {
+      await deleteOptionsScrapeCacheIfNoCache({ force: true });
       return {
         status: 403,
         via: viaOut,
@@ -6815,6 +7997,7 @@ export async function executeScrapeCall(params: {
   }
 
   let pdfPagesArray: string[] | undefined;
+  let fullMarkedPdfMarkdown: string | undefined;
   if (isPdfResponse && (pdfParserOpts.includePagesArray || pdfParserOpts.includePageMarkers)) {
     const rawPdfSource = typeof item.markdown === 'string' && item.markdown ? item.markdown : rawCleanMarkdown;
     const splitPdf = splitPdfPagesAndMarkers(rawPdfSource, pdfParserOpts.includePageMarkers);
@@ -6822,6 +8005,13 @@ export async function executeScrapeCall(params: {
       pdfPagesArray = splitPdf.pages;
     }
     if (pdfParserOpts.includePageMarkers && splitPdf.markedMarkdown) {
+      const markedFull = finalizeScrapedMarkdown(splitPdf.markedMarkdown, {
+        isPdf: true,
+        includeImages,
+        baseUrl: finalUrl,
+        allowPdfPageMarkers: true,
+      });
+      fullMarkedPdfMarkdown = markedFull.markdown;
       markdown = finalizeScrapedMarkdown(splitPdf.markedMarkdown, {
         isPdf: true,
         includeImages,
@@ -6853,11 +8043,12 @@ export async function executeScrapeCall(params: {
     summaryOut = sumRes.summary;
   }
 
-  const rawBase64Out = rawBase64Requested ? encodeBodyToRawBase64(item) : undefined;
+  const wantRawBase64Out = rawBase64Explicit || (isPdfResponse && pdfParserOpts.skipPdfParsing);
+  const rawBase64Out = precomputedRawBase64 ?? (wantRawBase64Out ? encodeBodyToRawBase64(item) : undefined);
 
   let jsonExtractionModeOut: 'heuristic' | 'llm' | undefined;
   const scrapeWarnings: string[] = [...(extracted?.warnings ?? []), ...nodeOffloadWarnings];
-  if (rawBase64Requested && rawBase64Out === undefined && (item.bodyBase64Omitted === true || item.bodyOmitted === true)) {
+  if (wantRawBase64Out && rawBase64Out === undefined && (item.bodyBase64Omitted === true || item.bodyOmitted === true)) {
     scrapeWarnings.push(
       'rawBase64 was requested but the body was too large to return inline (batch body budget); fetch the stored artifact instead.',
     );
@@ -6896,10 +8087,11 @@ export async function executeScrapeCall(params: {
     }
   }
 
+  const writeNow = params.now ?? Date.now();
   let art = !isPrivateScrape ? (item.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
   let markdownArtifactId: string | undefined;
   if (isPrivateScrape && payload.ephemeral !== true && rawCleanMarkdown) {
-    if (env.ARTIFACTS) {
+    if (env.ARTIFACTS && !Boolean(payload.noCache) && item.truncated !== true) {
       try {
         const rawBytesForPrivate =
           typeof item.bodyBase64 === 'string' && item.bodyBase64.length > 0
@@ -6920,7 +8112,8 @@ export async function executeScrapeCall(params: {
           status: typeof item.status === 'number' ? item.status : 200,
           pipelineVersion: SCRAPE_PIPELINE_VERSION,
           optionsHash: scrapeOptionsHash,
-          now,
+          writeUrlCache: canUseOptionsR2Cache && !needsLiveHtml && !hasNonDefaultCacheOptionsWithoutRedact,
+          now: postFetchNow,
         });
         art = {
           ...(privStored.blobSha256 ? { blobSha256: privStored.blobSha256 } : {}),
@@ -6931,6 +8124,30 @@ export async function executeScrapeCall(params: {
         }
       } catch {
         // Non-fatal if private R2 write fails
+      }
+    } else if (env.ARTIFACTS && shaped.truncated) {
+      try {
+        const mdContentSha = await sha256HexString(rawCleanMarkdown);
+        await primeSanitizedMarkdownCache(mdContentSha, rawCleanMarkdown, {
+          userId,
+          privateOnly: true,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        });
+        await env.ARTIFACTS.put(
+          r2PrivateDerivedKey(userId, SCRAPE_PIPELINE_VERSION, 'markdown', mdContentSha),
+          rawCleanMarkdown,
+          {
+            httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+            customMetadata: {
+              pipelineVersion: String(SCRAPE_PIPELINE_VERSION),
+              userId: sanitizeStorageUserId(userId),
+              visibility: 'private',
+            },
+          },
+        );
+        markdownArtifactId = `md:${mdContentSha}`;
+      } catch {
+        // Non-fatal if private derived R2 write fails
       }
     }
     if (scopedUserCollectionId && env.SEARCH) {
@@ -6945,7 +8162,7 @@ export async function executeScrapeCall(params: {
           url: normalizedUrl,
           title: resolvedTitle || normalizedUrl,
           markdown: rawCleanMarkdown,
-          fetchedAt: now,
+          fetchedAt: writeNow,
         });
       } catch {
         // Non-fatal if FTS5 indexing fails
@@ -6958,7 +8175,9 @@ export async function executeScrapeCall(params: {
         structuredTextFormatted ||
         contentSourceOut ||
         htmlJobPosting ||
+        customShopifyDoc ||
         cmsTwinDoc ||
+        cpscRecallDoc ||
         hydratedFromUniversalSchema ||
         universalSchemaDoc?.headerMarkdown ||
         cdpJsonDistilled?.markdown,
@@ -7032,6 +8251,7 @@ export async function executeScrapeCall(params: {
   const extractorIdOut =
     customCommerceId ??
     cmsTwinDoc?.extractorId ??
+    cpscRecallDoc?.extractorId ??
     extracted?.extractorId ??
     (parsedFinalWiki ? 'mediawiki' : undefined);
   const detectedWithAdapter: Record<string, unknown> | null = detectedStack
@@ -7070,7 +8290,9 @@ export async function executeScrapeCall(params: {
       ? redactPiiDeep(sanitizeRecordUrlsDeep(htmlJobPosting))
       : sanitizeRecordUrlsDeep(htmlJobPosting)
     : null;
-  const safeProductOut = productOut ? (redactPii ? redactPiiDeep(productOut) : productOut) : null;
+  const safeProductOut = productOut
+    ? sanitizeRecordUrlsDeep(redactPii ? redactPiiDeep(productOut) : productOut)
+    : null;
   const safeAttributesOut = attributesOut ? (redactPii ? redactPiiDeep(attributesOut) : attributesOut) : undefined;
   const safeStructuredJsonOut = structuredJsonOut
     ? redactPii
@@ -7112,6 +8334,7 @@ export async function executeScrapeCall(params: {
   const resolvedPublishedTime = sanitizeScrapedTimestampField(
     customShopifyDoc?.publishedTime ??
       cmsTwinDoc?.publishedTime ??
+      cpscRecallDoc?.doc.publishedTime ??
       extracted?.publishedTime ??
       htmlJobPosting?.datePosted ??
       universalSchemaDoc?.publishedTime,
@@ -7132,10 +8355,42 @@ export async function executeScrapeCall(params: {
   const resolvedWordCount = rawCleanMarkdown ? countTextWords(rawCleanMarkdown) : undefined;
   const resolvedRendered = Boolean(renderMode === 'always' || renderedViaOut !== undefined);
 
-  if (canUseOptionsR2Cache && payload.ephemeral !== true && !Boolean(payload.noCache) && env.ARTIFACTS && rawCleanMarkdown) {
-    const contentShaForCache = art?.contentSha256 && isValidSha256Hex(art.contentSha256)
-      ? art.contentSha256
-      : await sha256HexString(rawCleanMarkdown);
+  if (baseOptionsCacheEligible && payload.ephemeral !== true && Boolean(payload.noCache) && env.ARTIFACTS) {
+    await deleteOptionsScrapeCacheIfNoCache();
+  } else if (
+    canUseOptionsR2Cache &&
+    payload.ephemeral !== true &&
+    !Boolean(payload.noCache) &&
+    item.truncated !== true &&
+    // Transient "temporarily unavailable" pages (maintenance / "try again later") are never cached as content.
+    contentStateCheck.state !== 'temporarily_unavailable' &&
+    env.ARTIFACTS &&
+    rawCleanMarkdown
+  ) {
+    let rawBodyShaForCache: string | undefined =
+      art?.contentSha256 && isValidSha256Hex(art.contentSha256)
+        ? art.contentSha256
+        : typeof item.contentSha256 === 'string' && isValidSha256Hex(item.contentSha256)
+          ? item.contentSha256
+          : typeof rawBodyStr === 'string' && rawBodyStr.length > 0
+            ? await sha256HexString(rawBodyStr)
+            : undefined;
+    if (!rawBodyShaForCache) {
+      const b64 =
+        typeof item.bodyBase64 === 'string' && item.bodyBase64.length > 0
+          ? item.bodyBase64
+          : typeof item.body === 'string' && item.bodyEncoding === 'base64' && item.body.length > 0
+            ? item.body
+            : '';
+      if (b64) {
+        try {
+          rawBodyShaForCache = await sha256HexBytes(decodeBase64ToBytes(b64));
+        } catch {
+          rawBodyShaForCache = undefined;
+        }
+      }
+    }
+    const contentShaForCache = rawBodyShaForCache ?? (await sha256HexString(rawCleanMarkdown));
     const docIdForCache = `doc_${(await sha256HexString(`${contentShaForCache}:${SCRAPE_PIPELINE_VERSION}:${scrapeOptionsHash}`)).slice(0, 32)}`;
     await writeOptionsScrapeCache({
       bucket: env.ARTIFACTS,
@@ -7146,8 +8401,10 @@ export async function executeScrapeCall(params: {
       record: {
         url: normalizedUrl,
         finalUrl,
-        markdown: rawCleanMarkdown,
+        markdown: fullMarkedPdfMarkdown ?? rawCleanMarkdown,
+        ...(pdfPagesArray ? { pages: pdfPagesArray } : {}),
         contentSha256: contentShaForCache,
+        ...(rawBodyShaForCache ? { rawContentSha256: rawBodyShaForCache } : {}),
         ...(art?.blobSha256 ? { blobSha256: art.blobSha256 } : {}),
         documentId: docIdForCache,
         pipelineVersion: SCRAPE_PIPELINE_VERSION,
@@ -7171,7 +8428,7 @@ export async function executeScrapeCall(params: {
         ...(stringFormats.has('links') ? { links: resolvedLinks } : {}),
         ...(stringFormats.has('images') ? { images: resolvedImages } : {}),
         status: typeof item.status === 'number' ? item.status : 200,
-        lastFetchedAt: now,
+        lastFetchedAt: postFetchNow,
       },
     }).catch(() => undefined);
   }
@@ -7354,7 +8611,80 @@ export async function executeScrapeCall(params: {
     isolateLease.release();
   }
   };
-  return activeTracer ? activeTracer.run(runScrape) : runScrape();
+  const rawScrapeResult = await (activeTracer ? activeTracer.run(runScrape) : runScrape());
+  const recordsBudget = resolveScrapeMaxChars(params.payload);
+  const scrapeResult =
+    recordsBudget !== undefined && (Array.isArray(rawScrapeResult.body.records) || Array.isArray(rawScrapeResult.body.jobs))
+      ? { ...rawScrapeResult, body: capInlineRecordsToBudget(rawScrapeResult.body, recordsBudget) }
+      : rawScrapeResult;
+  if (
+    scrapeResult.body.visibility !== 'private' &&
+    isPrivateRequestPayload(params.payload, params.userId ?? 'owner')
+  ) {
+    return { ...scrapeResult, body: { ...scrapeResult.body, visibility: 'private' as const } };
+  }
+  return scrapeResult;
+}
+
+/**
+ * True when a twin fetch was redirected to the origin's error page (`/error`, `/404`, `/not-found`, ...), which many
+ * sites serve with HTTP 200. Such a body must never be formatted as the requested document: GovInfo redirects a
+ * missing `/content/pkg/.../html/*.htm` to `/error`, and the "Page Not Found" text came back as `ok: true`.
+ */
+export function isTwinRedirectedToErrorPage(fetchUrl: string, item: Record<string, unknown> | undefined): boolean {
+  const finalUrl = typeof item?.finalUrl === 'string' ? item.finalUrl : '';
+  if (!finalUrl || finalUrl === fetchUrl) return false;
+  try {
+    const finalPath = new URL(finalUrl).pathname;
+    if (finalPath === new URL(fetchUrl).pathname) return false;
+    return /^\/(?:[a-z]{2}(?:[-_][a-z]{2})?\/)?(?:errors?|40[34]|not-?found|page-?not-?found|notfound)(?:[/.]|$)/i.test(finalPath);
+  } catch {
+    return false;
+  }
+}
+
+/** The scrape's inline character budget: explicit `maxChars`, else the caller's `defaultMaxChars` (MCP), else none. */
+export function resolveScrapeMaxChars(payload: Pick<ScrapeRequestPayload, 'maxChars' | 'defaultMaxChars'>): number | undefined {
+  return typeof payload.maxChars === 'number' && Number.isFinite(payload.maxChars)
+    ? Math.min(500_000, Math.max(500, Math.floor(payload.maxChars)))
+    : typeof payload.defaultMaxChars === 'number' && Number.isFinite(payload.defaultMaxChars)
+      ? Math.min(500_000, Math.max(500, Math.floor(payload.defaultMaxChars)))
+      : undefined;
+}
+
+/**
+ * Keeps inline `records[]` (catalog / twin / adapter rows) within the same character budget as `markdown`. A Shopify
+ * collection asked for `maxChars: 600` returned 50 full products (~439 KB) inline, more than an MCP client accepts in
+ * one tool result. Whole records are kept from the front while they fit; the body then says how many were dropped and
+ * where to get the rest. Callers without a budget (REST without `maxChars`) keep the full array.
+ */
+export function capInlineRecordsToBudget(body: Record<string, unknown>, budgetChars: number): Record<string, unknown> {
+  return capInlineArrayToBudget(capInlineArrayToBudget(body, 'records', budgetChars), 'jobs', budgetChars);
+}
+
+/** `capInlineRecordsToBudget` for one array field (`records` or ATS board `jobs`), adding `<key>Truncated` etc. */
+function capInlineArrayToBudget(body: Record<string, unknown>, key: 'records' | 'jobs', budgetChars: number): Record<string, unknown> {
+  const records = body[key];
+  if (!Array.isArray(records) || records.length === 0) return body;
+  if (JSON.stringify(records).length <= budgetChars) return body;
+  const kept: unknown[] = [];
+  let used = 2; // the enclosing [ ]
+  for (const rec of records) {
+    const len = JSON.stringify(rec).length + (kept.length > 0 ? 1 : 0);
+    if (used + len > budgetChars) break;
+    kept.push(rec);
+    used += len;
+  }
+  return {
+    ...body,
+    [key]: kept,
+    [`${key}Truncated`]: true,
+    [`${key}Returned`]: kept.length,
+    [`${key}Total`]: records.length,
+    [`${key}Hint`]:
+      `${key}[] trimmed to ${kept.length} of ${records.length} to fit maxChars ${budgetChars}. ` +
+      'Raise maxChars (up to 500000), follow pagination when present, or page the raw response with read_artifact(artifactId).',
+  };
 }
 
 export function extractYouTubeTranscriptFromHtml(rawHtml: string): string {
@@ -7379,6 +8709,7 @@ export interface InteractRequestPayload {
   maxChars?: unknown;
   offset?: unknown;
   site?: unknown;
+  visibility?: unknown;
 }
 
 const interactSessionSnapshotCache = new Map<string, { url: string; markdownSha: string; updatedAt: number }>();
@@ -7524,6 +8855,14 @@ export async function executeInteractCall(params: {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runInteract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, userId = 'owner', sessionSigningSecret } = params;
+  const isPrivateInteract = normalizeVisibility(payload.visibility) === 'private' || sanitizeStorageUserId(userId) !== 'owner';
+  const interactRetention: ArtifactRetention | 'off' | undefined = isPrivateInteract
+    ? 'off'
+    : env.ARTIFACTS
+      ? 'transient'
+      : undefined;
+  const interactShouldIngest = !isPrivateInteract;
+  const privInteractField = isPrivateInteract ? { visibility: 'private' as const } : {};
   const effectivePrincipal = normalizeInteractPrincipal(principal, source);
   const signingSecret =
     typeof sessionSigningSecret === 'string' && sessionSigningSecret.trim()
@@ -7531,14 +8870,14 @@ export async function executeInteractCall(params: {
       : DEFAULT_INTERACT_HMAC_KEY_FALLBACK;
   const parsedSession = splitCompositeSessionId(payload.sessionId);
   if (parsedSession.malformed) {
-    return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_session_id', message: 'malformed interact sessionId' } };
+    return { status: 400, via: 'hub', body: { ok: false, ...privInteractField, error: 'invalid_session_id', message: 'malformed interact sessionId' } };
   }
   if (parsedSession.agentSessionId) {
     if (!parsedSession.siteId || !parsedSession.sigHex) {
       return {
         status: 403,
         via: 'hub',
-        body: { ok: false, error: 'session_principal_mismatch', message: 'interact sessionId is missing caller ownership signature' },
+        body: { ok: false, ...privInteractField, error: 'session_principal_mismatch', message: 'interact sessionId is missing caller ownership signature' },
       };
     }
     const expectedSig = await computeInteractSessionMacHex(
@@ -7552,7 +8891,7 @@ export async function executeInteractCall(params: {
       return {
         status: 403,
         via: 'hub',
-        body: { ok: false, error: 'session_principal_mismatch', message: 'interact sessionId belongs to a different caller principal' },
+        body: { ok: false, ...privInteractField, error: 'session_principal_mismatch', message: 'interact sessionId belongs to a different caller principal' },
       };
     }
     const resumedSessionHash = await sha256HexString(`${parsedSession.siteId.toLowerCase()}:${parsedSession.agentSessionId}`);
@@ -7564,14 +8903,14 @@ export async function executeInteractCall(params: {
   if (rawUrl) {
     const urlCheck = validatePublicHttpsTargetUrl(rawUrl, selfHost);
     if (!urlCheck.ok) {
-      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: urlCheck.message } };
+      return { status: 400, via: 'hub', body: { ok: false, ...privInteractField, error: 'invalid_url', message: urlCheck.message } };
     }
     normalizedUrl = urlCheck.normalized;
   } else if (!parsedSession.agentSessionId) {
     return {
       status: 400,
       via: 'hub',
-      body: { ok: false, error: 'missing_url_or_session', message: 'provide url (new session) or sessionId (resume/close session)' },
+      body: { ok: false, ...privInteractField, error: 'missing_url_or_session', message: 'provide url (new session) or sessionId (resume/close session)' },
     };
   }
 
@@ -7580,7 +8919,7 @@ export async function executeInteractCall(params: {
     return {
       status: 400,
       via: 'hub',
-      body: { ok: false, error: parsedInteractActions.message.includes('maximum') ? 'too_many_actions' : 'invalid_action', message: parsedInteractActions.message },
+      body: { ok: false, ...privInteractField, error: parsedInteractActions.message.includes('maximum') ? 'too_many_actions' : 'invalid_action', message: parsedInteractActions.message },
     };
   }
   const actions: Array<Record<string, unknown>> = parsedInteractActions.actions;
@@ -7653,7 +8992,7 @@ export async function executeInteractCall(params: {
     ],
   };
 
-  const fetchRes = await executeHubFetch('agent', JSON.stringify(call), pinnedSite, source, env.ARTIFACTS ? 'transient' : undefined, true);
+  const fetchRes = await executeHubFetch('agent', JSON.stringify(call), pinnedSite, source, interactRetention, interactShouldIngest);
   if (fetchRes.status !== 200) {
     let errJson: Record<string, unknown> = { ok: false, error: 'interact_failed' };
     try {
@@ -7661,7 +9000,7 @@ export async function executeInteractCall(params: {
     } catch {
       // ignore
     }
-    return { status: fetchRes.status, via: fetchRes.via, body: errJson };
+    return { status: fetchRes.status, via: fetchRes.via, body: { ...errJson, ...privInteractField } };
   }
 
   const parsed = JSON.parse(fetchRes.bodyText) as { results?: Array<Record<string, unknown>> };
@@ -7698,8 +9037,8 @@ export async function executeInteractCall(params: {
         }),
         pinnedSite,
         `${source}:youtube-fallback`,
-        env.ARTIFACTS ? 'transient' : undefined,
-        true,
+        interactRetention,
+        interactShouldIngest,
       );
       if (ytFallback.status === 200) {
         const ytParsed = JSON.parse(ytFallback.bodyText) as { results?: Array<Record<string, unknown>> };
@@ -7716,6 +9055,7 @@ export async function executeInteractCall(params: {
             via: ytFallback.via,
             body: {
               ok: true,
+              ...privInteractField,
               via: ytFallback.via,
               finalUrl: normalizedUrl,
               status: ytItem.status ?? 200,
@@ -7755,6 +9095,7 @@ export async function executeInteractCall(params: {
         via: fetchRes.via,
         body: {
           ok: false,
+          ...privInteractField,
           ...(normalizedUrl ? { url: normalizedUrl } : {}),
           outcome: 'dns_not_found',
           error: 'dns_not_found',
@@ -7771,6 +9112,7 @@ export async function executeInteractCall(params: {
         via: fetchRes.via,
         body: {
           ok: false,
+          ...privInteractField,
           ...(normalizedUrl ? { url: normalizedUrl } : {}),
           outcome: 'blocked',
           error: 'blocked',
@@ -7797,7 +9139,7 @@ export async function executeInteractCall(params: {
 
     // P8 & P10: Surface any partial rendered DOM/Markdown/transcript captured before the failed action + structured `blocked` guidance!
     const partialHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
-    const partialFinalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+    const partialFinalUrl = resolveValidatedFinalUrl(item.finalUrl, normalizedUrl, selfHost);
     const partialDoc = partialHtml ? extractHtmlDocument(partialHtml, { baseUrl: partialFinalUrl || undefined, onlyMainContent: true }) : undefined;
     const partialTranscript = partialHtml ? extractYouTubeTranscriptFromHtml(partialHtml) : '';
     const partialMd = partialDoc?.markdown ? partialDoc.markdown.trim() : '';
@@ -7826,6 +9168,7 @@ export async function executeInteractCall(params: {
       via: fetchRes.via,
       body: {
         ok: false,
+        ...privInteractField,
         outcome: item.outcome ?? 'error',
         status: item.status ?? 0,
         problem: prob,
@@ -7861,7 +9204,7 @@ export async function executeInteractCall(params: {
   const publicSessionId = returnedAgentSid && sessionSig ? `${actualSite}.${returnedAgentSid}.${sessionSig}` : returnedAgentSid;
 
   const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
-  const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+  const finalUrl = resolveValidatedFinalUrl(item.finalUrl, normalizedUrl, selfHost);
   const interactRedirect = normalizedUrl ? analyzeUrlRedirect(normalizedUrl, finalUrl) : { redirected: false };
   const wantMarkdown = formats.includes('markdown');
   const requestedTranscript = formats.includes('transcript');
@@ -7907,8 +9250,14 @@ export async function executeInteractCall(params: {
     if (goAct && typeof goAct === 'object') {
       if (typeof goAct.urlChanged === 'boolean') base.urlChanged = goAct.urlChanged;
       if (typeof goAct.domChanged === 'boolean') base.domChanged = goAct.domChanged;
-      if (typeof goAct.beforeUrl === 'string') base.beforeUrl = goAct.beforeUrl;
-      if (typeof goAct.afterUrl === 'string') base.afterUrl = goAct.afterUrl;
+      if (typeof goAct.beforeUrl === 'string' && goAct.beforeUrl.trim()) {
+        const beforeCheck = validatePublicHttpsTargetUrl(goAct.beforeUrl, selfHost);
+        if (beforeCheck.ok) base.beforeUrl = beforeCheck.normalized;
+      }
+      if (typeof goAct.afterUrl === 'string' && goAct.afterUrl.trim()) {
+        const afterCheck = validatePublicHttpsTargetUrl(goAct.afterUrl, selfHost);
+        if (afterCheck.ok) base.afterUrl = afterCheck.normalized;
+      }
       if (typeof goAct.effect === 'string') base.effect = goAct.effect;
       if (typeof goAct.warning === 'string' && goAct.warning.trim()) interactWarnings.push(goAct.warning.trim());
     }
@@ -7996,6 +9345,7 @@ export async function executeInteractCall(params: {
     via: fetchRes.via,
     body: {
       ok: true,
+      ...privInteractField,
       via: fetchRes.via,
       ...(finalUrl ? { finalUrl } : {}),
       ...(interactRedirect.redirected ? interactRedirect : {}),

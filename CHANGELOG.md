@@ -2,6 +2,92 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.18] - 2026-11-27
+
+### Fixed
+- Re-release of the 2.8.17 changes. The `v2.8.17` tag was pushed at the wrong commit, its release jobs were cancelled, and it has no binaries or images, so use 2.8.18 instead. Includes: `jobs` Lever boards are fetched in server-side pages (`skip`/`limit=100`), so large boards (one live board: 305 postings, 5.9 MB) return jobs instead of degrading to an HTML scrape (#112).
+
+## [2.8.17] - 2026-11-27 (not released — superseded by 2.8.18)
+
+### Fixed
+- `jobs`: Lever boards are fetched in server-side pages (`skip`/`limit=100`). A large company's full postings list (one live board: 305 postings, 5.9 MB) exceeded the fetch body cap and silently degraded to an HTML scrape with no `jobs[]`, so direct-first company searches fell back to web search. Large boards now return jobs, with `N+` counts and a next cursor. The `scrape` twin requests the first 100 postings (#112).
+
+## [2.8.16] - 2026-11-27
+
+### Added
+- `jobs`: direct-first company search. The company's Greenhouse, Ashby, Lever and SmartRecruiters boards are probed before any web search, and a board that lists jobs skips the search step (#110).
+- `jobs`: known-boards index (META D1 `jobs_known_boards`). Boards that returned jobs for a company in an earlier search are probed first for 30 days, so Workday companies skip the web search after their first lookup (#110).
+- `jobs`: ATS JSON APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday) are fetched from the Cloudflare edge instead of home nodes. Up to 3 fetches run at once per ATS API host. A failed edge fetch retries once via the nodes, and `JOBS_EDGE_ATS_FETCH=off` disables edge fetching (#110).
+- `jobs`: ATS board responses are cached for 10 minutes across calls (R2 behind a D1 index) (#110).
+- Declarative adapters: new `preferWhere` option, which picks an array element by field value. Wikidata population and dates use the preferred-rank claim (#110).
+
+### Fixed
+- `jobs`: once a company search has read the board, posting detail fetches are capped at 2× the remaining result slots. The time-budget note no longer tells company-scoped callers to add `company` (#110).
+- Titles and descriptions decode the full HTML5 named-entity set (`&Eacute;` → `É`) without unescaping `<` or `>` (#110).
+- Favicons prefer `rel=icon`, ignore `apple-touch-icon href="/"` and other origin-root candidates, and resolve protocol-relative URLs (#110).
+- A browser-rendered app shell with no main content is re-extracted full-page, with hidden subtrees stripped, instead of returning empty Markdown (#110).
+- Inline `jobs[]` respects `maxChars`, the same as `records[]` (#110).
+
+### Changed
+- `SCRAPE_PIPELINE_VERSION` is now 37 (#110).
+
+## [2.8.15] - 2026-11-27
+
+### Added
+- New content state `temporarily_unavailable` for maintenance and "try again later" pages: 2xx, under 250 words, a present-tense maintenance notice plus a retry phrase, and no rich JSON-LD. Such pages are returned with that label but are never cached or indexed. `jobs` verify reports them as `unknown`, and a jobs search skips them without marking the board closed (#108).
+
+### Fixed
+- Node and CLI scrapes use the full-document extractor, so `display:none` text and `<script>` content no longer leak into Markdown. The hub never falls back to node-supplied Markdown for HTML bodies. **Update your nodes** to get the node half of this fix (#108).
+- Next.js RSC hydration: `T` rows are framed by their byte length, so a text row with no newline no longer swallows the rows after it. `TableSpecContents` spec tables (models and attributes) are now extracted, which fixes empty Shimano spec tables (#108).
+- `<html lang>` accepts only BCP 47 shaped tags, so route parameters like `{lang}` no longer appear as the page language (#108).
+- Registry-twin adapter output goes through the content-state classifier instead of always being reported as `active` (#108).
+- Adapters (#108):
+  - NuGet shows the newest stable version first, plus a "Latest Prerelease" bullet.
+  - Maven's versioned route uses `central.sonatype.com`.
+  - Wikidata has curated claims (instance of, gender, citizenship, occupation, birth, death, inception, website).
+  - Open Library takes the author from `by_statement`, falling back to `contributions`.
+  - iCIMS skips generic headings as job titles and has a company fallback.
+  - Federal Register warns when the publication date doesn't match the date in the URL.
+
+### Changed
+- CLI and node Markdown now escape `<` inside inline code spans (`Promise&lt;void>`), the same as the hub's sanitizer (#108).
+- `SCRAPE_PIPELINE_VERSION` is now 36, so cached scrapes that may contain leaked node Markdown are refreshed (#108).
+
+## [2.8.14] - 2026-11-27
+
+### Fixed
+- Inline `records[]` (catalog, twin and adapter rows) now respect the `maxChars` budget. Whole records are kept, and the body reports `recordsTruncated`, `recordsReturned`, `recordsTotal` and `recordsHint` (#106).
+- `jobs`: a 40 s wall-clock budget. Broad searches check at most 6 candidate boards per call and return a query-bound `continueCursor` plus `remainingCandidates` for the next chunk. The "configure SERPER_API_KEY" note appears only when no search provider is configured (#106).
+- `gtin` is set only for plausible GTIN-8/12/13/14 codes, so store IDs no longer appear as `gtin` (#106).
+- Hosts with a host-specific HTML adapter are fetched as `text/html`, so Markdown-for-agents responses no longer bypass the adapter (#106).
+- Registry twins whose final URL is an error or 404 page on a different path are rejected (#106).
+- Budgeted extract/search dispatches round the remaining budget to the nearest second. Flooring cut a 5 s budget to a 4 s batch after a few ms of setup.
+- Adapter routes: sram-models service pages, tq-ebike `e-bike-system`, zendesk-hc on `support.sram.com`, and osv-ghsa severity labels (#106).
+
+### Changed
+- `SCRAPE_PIPELINE_VERSION` is now 35, so cached scrapes from earlier pipelines are refreshed (#106).
+
+## [2.8.13] - 2026-11-27
+
+### Added
+- **Adapter expansion (85 declarative manifests: 29 new, 5 updated):**
+  - Keyless twins: Zendesk help centers, Federal Register, CPSC recalls (bounded saferproducts.gov), eCFR via govinfo, EUR-Lex, Terraform Registry, Docker Hub, Maven Central, NuGet, Homebrew, OSV/GHSA, Wikidata/Open Library.
+  - Commerce: Shopify collection and WooCommerce category upgrades, plus new Squarespace, BigCommerce, SFCC/Demandware and Shopware/Magento engines.
+  - Forums and docs: XenForo threads, SRAM docs, Bosch eBike help (HTML/SSR only).
+  - ATS and public APIs: Workday CXS and iCIMS hardening, UKG/Paylocity/Dover, NHTSA vPIC/recalls, FCC ID.
+  - Log-mined adapters: NFPA (Sitecore JSS), Giant/Liv, bumm.de, Bicycle Retailer, Cornell LII, SRAM models, TQ eBike, a YouTube watch fast-path, and a Next.js RSC spec-table parser. Hosts behind robots rules, paywalls or WAFs fail closed and are documented in `docs/LOG-MINING-2026-11.md` (#104).
+- **Go core:** microdata/spec-table product fallback for pages without JSON-LD, relative `product.url` resolution, bounded companion and HTML modes, and sanitizer hardening (#104).
+
+### Fixed
+- **L-01..L-05 audit follow-ups:**
+  - the `jsonFilter` cache key;
+  - `edgeBudgetExceeded`;
+  - `>4 MiB` `rawBase64` / `parsers: []` inline hydration up to the wire budget, with an `artifactId` fallback;
+  - product-record backfill;
+  - `maxInlineBodyBytes` on renders.
+
+  Robots, SSRF, `isTrustedTwinRedirectUrl` and `MAX_WASM_INPUT_BYTES` guards apply to every new adapter (#104).
+
 ## [2.8.12] - 2026-11-26
 
 ### Added

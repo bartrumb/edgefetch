@@ -50,6 +50,7 @@ routes:
           format: html_to_md
         bodyPlain:
           paths: [content_plain]
+          format: plain_text
           trim: true
         body:
           template: "{bodyHtml}"

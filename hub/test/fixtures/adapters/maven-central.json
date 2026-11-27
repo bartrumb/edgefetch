@@ -1,0 +1,13 @@
+{
+  "adapterId": "maven-central",
+  "mode": "twin",
+  "inputUrl": "https://central.sonatype.com/artifact/com.fasterxml.jackson.core/jackson-databind/2.18.2",
+  "expectedFetchUrl": "https://central.sonatype.com/solrsearch/select?q=g:com.fasterxml.jackson.core+AND+a:jackson-databind+AND+v:2.18.2&core=gav&rows=20&wt=json",
+  "mockPayload": "{\"response\":{\"numFound\":1,\"docs\":[{\"id\":\"com.fasterxml.jackson.core:jackson-databind:2.18.2\",\"g\":\"com.fasterxml.jackson.core\",\"a\":\"jackson-databind\",\"v\":\"2.18.2\",\"p\":\"jar\",\"timestamp\":1744651522422,\"ec\":[\".jar\",\"-sources.jar\"]}]}}",
+  "expectTitleIncludes": "com.fasterxml.jackson.core:jackson-databind:2.18.2 (Maven Central)",
+  "expectMarkdownIncludes": [
+    "2025-04-14",
+    "implementation(\"com.fasterxml.jackson.core:jackson-databind:2.18.2\")",
+    "-sources.jar"
+  ]
+}

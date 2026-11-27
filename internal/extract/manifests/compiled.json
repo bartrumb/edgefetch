@@ -1146,6 +1146,129 @@
       ]
     },
     {
+      "id": "bicycleretailer",
+      "name": "Bicycle Retailer & Industry News",
+      "category": "commerce-social",
+      "description": "Extracts Drupal .node-article body, .view-content listings, and author/publishedTime metadata from bicycleretailer.com while stripping sidebar ads and leaving /rss.xml to feed XML parsing.",
+      "domains": [
+        "www.bicycleretailer.com",
+        "bicycleretailer.com"
+      ],
+      "exampleUrls": [
+        "https://www.bicycleretailer.com/industry-news/2026/11/01/ebike-battery-rules",
+        "https://www.bicycleretailer.com/industry-news"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "bicycleretailer",
+          "mode": "dom",
+          "match": {
+            "exactSegments": false,
+            "reservedFirstSegment": [
+              "admin",
+              "user"
+            ],
+            "excludeSegmentSuffixes": [
+              ".xml",
+              ".rss",
+              ".atom"
+            ]
+          },
+          "vars": {
+            "title": {
+              "cssText": [
+                "article.node-article h1",
+                "main h1",
+                "h1",
+                "title"
+              ],
+              "metaKeys": [
+                "og:title"
+              ],
+              "trim": true
+            },
+            "author": {
+              "metaKeys": [
+                "author",
+                "article:author"
+              ],
+              "trim": true
+            },
+            "publishedTime": {
+              "metaKeys": [
+                "article:published_time"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "article.node-article .field-name-body",
+                ".node-article .field-name-body",
+                ".field-name-body",
+                ".view-content",
+                "article.node-article",
+                "main"
+              ],
+              "format": "strip_leading_h1",
+              "trim": true
+            }
+          },
+          "requireVars": [
+            "title"
+          ],
+          "titleTemplate": "{title}",
+          "authorVar": "author",
+          "publishedTimeVar": "publishedTime",
+          "bodyVar": "body",
+          "preserveBodyLinksFromVar": "body"
+        }
+      ]
+    },
+    {
+      "id": "bigcommerce-store",
+      "name": "BigCommerce Stencil Storefronts",
+      "category": "commerce-social",
+      "description": "Extracts BigCommerce Stencil BCData, JSON-LD, Microdata, cart-form options, product specs, category grids, and bounded /xmlsitemap.php product sitemaps.",
+      "domains": [
+        "*.mybigcommerce.com",
+        "www.bigcommerce.com"
+      ],
+      "universalEngine": true,
+      "exampleUrls": [
+        "https://demo.mybigcommerce.com/xmlsitemap.php",
+        "https://demo.mybigcommerce.com/sample-product/"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": true,
+            "pathEquals": [
+              "/xmlsitemap.php"
+            ]
+          },
+          "twin": {
+            "id": "bigcommerce-store",
+            "fetchUrl": "{requestUrl}",
+            "kind": "text",
+            "accept": "application/xml",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "commerceMode": "bigcommerce_sitemap"
+          }
+        }
+      ],
+      "htmlRoutes": [
+        {
+          "id": "bigcommerce-store",
+          "match": {
+            "exactSegments": false
+          },
+          "mode": "bigcommerce_html"
+        }
+      ]
+    },
+    {
       "id": "bluesky-thread",
       "name": "Bluesky ATProto Post Threads",
       "category": "commerce-social",
@@ -1200,6 +1323,7 @@
             "paths": [
               "post.record.text"
             ],
+            "format": "plain_text",
             "trim": true
           },
           "desc": {
@@ -1324,6 +1448,154 @@
           }
         ]
       }
+    },
+    {
+      "id": "bosch-ebike-help",
+      "name": "Bosch eBike Systems Help Center",
+      "category": "developer",
+      "description": "Extracts bounded SSR HTML help articles from help.bosch-ebike.com (strictly respecting robots.txt /api/* disallow), stripping data:image base64 blobs and dodo-service-include__error chrome while preserving Suspense slots, breadcrumbs, model codes, and PDF links.",
+      "domains": [
+        "help.bosch-ebike.com"
+      ],
+      "exampleUrls": [
+        "https://help.bosch-ebike.com/us/help-center/ebw-error-codes?models=bdu37yy"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "bosch-ebike-help",
+          "match": {
+            "exactSegments": false
+          },
+          "mode": "bosch_help_html"
+        }
+      ]
+    },
+    {
+      "id": "bumm-de",
+      "name": "Busch & Mueller (bumm.de)",
+      "category": "commerce-social",
+      "description": "Extracts TYPO3 JSON-LD Product metadata, table.attributes-table technical specs, and PDF mounting manual links from bumm.de product pages.",
+      "domains": [
+        "bumm.de",
+        "www.bumm.de"
+      ],
+      "exampleUrls": [
+        "https://bumm.de/en/product-detail/iq-x.html",
+        "https://bumm.de/de/product-detail/iq-x.html"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "bumm-de",
+          "mode": "dom",
+          "match": {
+            "optionalLeadingLocale": true,
+            "exactSegments": false,
+            "reservedFirstSegment": [
+              "typo3"
+            ],
+            "anyOf": [
+              {
+                "pathSegments": [
+                  "product-detail",
+                  {
+                    "param": "slug",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 160
+                  }
+                ]
+              },
+              {
+                "pathSegments": [
+                  "products",
+                  "detail",
+                  {
+                    "param": "slug",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 160
+                  }
+                ]
+              }
+            ]
+          },
+          "jsonLdTypes": [
+            "Product"
+          ],
+          "vars": {
+            "title": {
+              "jsonLdPaths": [
+                "name"
+              ],
+              "cssText": [
+                "main h1",
+                "h1",
+                "title"
+              ],
+              "trim": true
+            },
+            "brand": {
+              "jsonLdPaths": [
+                "brand.name",
+                "brand"
+              ],
+              "trim": true
+            },
+            "sku": {
+              "jsonLdPaths": [
+                "sku"
+              ],
+              "trim": true
+            },
+            "price": {
+              "jsonLdPaths": [
+                "offers.price",
+                "offers.0.price"
+              ],
+              "trim": true
+            },
+            "currency": {
+              "jsonLdPaths": [
+                "offers.priceCurrency",
+                "offers.0.priceCurrency"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "main",
+                ".product-detail",
+                "body"
+              ],
+              "format": "strip_leading_h1",
+              "trim": true
+            }
+          },
+          "requireVars": [
+            "title"
+          ],
+          "titleTemplate": "{title}",
+          "bullets": [
+            {
+              "label": "Brand",
+              "template": "{brand}",
+              "whenVar": "brand"
+            },
+            {
+              "label": "SKU",
+              "template": "`{sku}`",
+              "whenVar": "sku"
+            },
+            {
+              "label": "Price",
+              "template": "{price} {currency}",
+              "whenVar": "price"
+            }
+          ],
+          "bodyVar": "body",
+          "preserveBodyLinksFromVar": "body"
+        }
+      ]
     },
     {
       "id": "ckan",
@@ -2187,6 +2459,478 @@
       ]
     },
     {
+      "id": "cornell-lii",
+      "name": "Cornell Law LII (CFR & US Code)",
+      "category": "public-records",
+      "description": "Extracts clean statutory and CFR regulatory text from www.law.cornell.edu/cfr/* and /uscode/* while stripping navigation and donation sidebars.",
+      "domains": [
+        "www.law.cornell.edu",
+        "law.cornell.edu"
+      ],
+      "exampleUrls": [
+        "https://www.law.cornell.edu/cfr/text/16/part-1512",
+        "https://www.law.cornell.edu/uscode/text/15/2051"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "cornell-lii",
+          "mode": "dom",
+          "match": {
+            "anyOf": [
+              {
+                "exactSegments": false,
+                "pathSegments": [
+                  "cfr",
+                  {
+                    "param": "rest",
+                    "charset": "safe_subpath",
+                    "greedy": true,
+                    "minLen": 1,
+                    "maxLen": 200
+                  }
+                ]
+              },
+              {
+                "exactSegments": false,
+                "pathSegments": [
+                  "uscode",
+                  {
+                    "param": "rest",
+                    "charset": "safe_subpath",
+                    "greedy": true,
+                    "minLen": 1,
+                    "maxLen": 200
+                  }
+                ]
+              }
+            ]
+          },
+          "vars": {
+            "title": {
+              "cssText": [
+                "#page-title",
+                "main#content h1",
+                "#content h1",
+                "h1",
+                "title"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "#content .tab-pane.active",
+                "main#content",
+                "#content",
+                "main",
+                "article"
+              ],
+              "format": "strip_leading_h1",
+              "trim": true
+            }
+          },
+          "requireVars": [
+            "title",
+            "body"
+          ],
+          "titleTemplate": "{title}",
+          "bodyVar": "body",
+          "preserveBodyLinksFromVar": "body"
+        }
+      ]
+    },
+    {
+      "id": "cpsc-recalls",
+      "name": "CPSC Recalls & SaferProducts.gov",
+      "category": "public-records",
+      "description": "Formats bounded saferproducts.gov RecallNumber queries via JSON twin and extracts structured recall details and RecallNumber from cpsc.gov/Recalls pages (never fetching the unfiltered 25 MiB SaferProducts dump).",
+      "domains": [
+        "www.saferproducts.gov",
+        "saferproducts.gov",
+        "www.cpsc.gov",
+        "cpsc.gov"
+      ],
+      "exampleUrls": [
+        "https://www.saferproducts.gov/RestWebServices/Recall?format=json&RecallNumber=24123",
+        "https://www.cpsc.gov/Recalls/2024/Example-Recall-Notice"
+      ],
+      "routes": [
+        {
+          "match": {
+            "hosts": [
+              "www.saferproducts.gov",
+              "saferproducts.gov"
+            ],
+            "pathEquals": [
+              "/RestWebServices/Recall",
+              "/RestWebServices/Recall/"
+            ],
+            "queryParams": [
+              {
+                "names": [
+                  "RecallNumber",
+                  "recallnumber",
+                  "recallNumber",
+                  "RECALLNUMBER"
+                ],
+                "param": "recallNum",
+                "charset": "cpsc_recall_num",
+                "minLen": 2,
+                "maxLen": 24,
+                "transform": "strip_dashes"
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://www.saferproducts.gov/RestWebServices/Recall?format=json&RecallNumber={recallNum}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "unwrapFirstArrayElement": true,
+            "requireFields": [
+              "RecallNumber",
+              "Title"
+            ],
+            "vars": {
+              "title": {
+                "paths": [
+                  "Title"
+                ],
+                "trim": true
+              },
+              "recallNumber": {
+                "paths": [
+                  "RecallNumber"
+                ],
+                "trim": true
+              },
+              "recallDate": {
+                "paths": [
+                  "RecallDate"
+                ],
+                "sliceMax": 10
+              },
+              "lastPublishDate": {
+                "paths": [
+                  "LastPublishDate"
+                ],
+                "sliceMax": 10
+              },
+              "description": {
+                "paths": [
+                  "Description"
+                ],
+                "trim": true
+              },
+              "descShort": {
+                "paths": [
+                  "Description"
+                ],
+                "trim": true,
+                "sliceMax": 260
+              },
+              "consumerContact": {
+                "paths": [
+                  "ConsumerContact"
+                ],
+                "trim": true
+              },
+              "recallUrl": {
+                "paths": [
+                  "URL"
+                ],
+                "requireHttps": true
+              },
+              "hazards": {
+                "paths": [
+                  "Hazards"
+                ],
+                "subField": "Name",
+                "join": "; ",
+                "limit": 10
+              },
+              "remedies": {
+                "paths": [
+                  "Remedies"
+                ],
+                "subField": "Name",
+                "join": "; ",
+                "limit": 10
+              },
+              "manufacturers": {
+                "paths": [
+                  "Manufacturers"
+                ],
+                "subField": "Name",
+                "join": ", ",
+                "limit": 10
+              },
+              "retailers": {
+                "paths": [
+                  "Retailers"
+                ],
+                "subField": "Name",
+                "join": ", ",
+                "limit": 10
+              },
+              "injuries": {
+                "paths": [
+                  "Injuries"
+                ],
+                "subField": "Name",
+                "join": "; ",
+                "limit": 10
+              }
+            },
+            "titleTemplate": "{title} (Recall #{recallNumber})",
+            "descriptionVar": "descShort",
+            "publishedTimeVar": "recallDate",
+            "bullets": [
+              {
+                "label": "Recall Number",
+                "template": "`{recallNumber}`"
+              },
+              {
+                "label": "Recall Date",
+                "template": "{recallDate}",
+                "whenVar": "recallDate"
+              },
+              {
+                "label": "Last Published",
+                "template": "{lastPublishDate}",
+                "whenVar": "lastPublishDate"
+              },
+              {
+                "label": "Hazards",
+                "template": "{hazards}",
+                "whenVar": "hazards"
+              },
+              {
+                "label": "Remedies",
+                "template": "{remedies}",
+                "whenVar": "remedies"
+              },
+              {
+                "label": "Injuries / Incidents",
+                "template": "{injuries}",
+                "whenVar": "injuries"
+              },
+              {
+                "label": "Manufacturers",
+                "template": "{manufacturers}",
+                "whenVar": "manufacturers"
+              },
+              {
+                "label": "Retailers",
+                "template": "{retailers}",
+                "whenVar": "retailers"
+              },
+              {
+                "label": "Consumer Contact",
+                "template": "{consumerContact}",
+                "whenVar": "consumerContact"
+              },
+              {
+                "label": "CPSC URL",
+                "template": "{recallUrl}",
+                "whenVar": "recallUrl"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Description",
+                "textVar": "description"
+              },
+              {
+                "heading": "Products",
+                "arrayPath": "Products",
+                "limit": 25,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "Name"
+                    ]
+                  },
+                  {
+                    "header": "Model",
+                    "paths": [
+                      "Model"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Units",
+                    "paths": [
+                      "NumberOfUnits"
+                    ]
+                  },
+                  {
+                    "header": "Type",
+                    "paths": [
+                      "Type"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Images",
+                "arrayPath": "Images",
+                "limit": 10,
+                "requireItemVar": "imgUrl",
+                "collectLinkVars": [
+                  "imgUrl"
+                ],
+                "itemVars": {
+                  "imgUrl": {
+                    "paths": [
+                      "URL"
+                    ],
+                    "requireHttps": true
+                  },
+                  "imgCap": {
+                    "paths": [
+                      "Caption"
+                    ],
+                    "default": "Recall product image"
+                  }
+                },
+                "itemTemplate": "[{imgCap}]({imgUrl})"
+              }
+            ],
+            "linksVars": [
+              "recallUrl"
+            ],
+            "recordFields": {
+              "recallNumber": "{recallNumber}",
+              "title": "{title}",
+              "recallDate": "{recallDate}",
+              "url": "{recallUrl}",
+              "hazards": "{hazards}",
+              "remedies": "{remedies}",
+              "manufacturers": "{manufacturers}"
+            }
+          }
+        }
+      ],
+      "htmlRoutes": [
+        {
+          "match": {
+            "anyOf": [
+              {
+                "hosts": [
+                  "www.cpsc.gov",
+                  "cpsc.gov"
+                ],
+                "exactSegments": false,
+                "pathSegments": [
+                  "Recalls",
+                  {
+                    "param": "year",
+                    "charset": "digits",
+                    "minLen": 4,
+                    "maxLen": 4
+                  },
+                  {
+                    "param": "slug",
+                    "charset": "url_seg"
+                  }
+                ]
+              },
+              {
+                "hosts": [
+                  "www.cpsc.gov",
+                  "cpsc.gov"
+                ],
+                "exactSegments": false,
+                "pathSegments": [
+                  "recalls",
+                  {
+                    "param": "year",
+                    "charset": "digits",
+                    "minLen": 4,
+                    "maxLen": 4
+                  },
+                  {
+                    "param": "slug",
+                    "charset": "url_seg"
+                  }
+                ]
+              }
+            ]
+          },
+          "mode": "dom",
+          "vars": {
+            "title": {
+              "cssText": [
+                "h1"
+              ],
+              "metaKeys": [
+                "og:title"
+              ],
+              "trim": true
+            },
+            "recallNumber": {
+              "regexExtract": {
+                "source": "doc_text_and_img_alts",
+                "pattern": "(?i)Recall\\s*(?:Number|No\\.?|#)\\s*:?\\s*([0-9]{2}-?[0-9]{2,5})",
+                "group": 1
+              },
+              "trim": true
+            },
+            "recallDate": {
+              "metaKeys": [
+                "article:published_time"
+              ],
+              "cssText": [
+                "time",
+                ".recall-detail__date"
+              ],
+              "trim": true
+            },
+            "summary": {
+              "metaKeys": [
+                "description",
+                "og:description"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "main article",
+                ".recall-detail",
+                ".node--type-recall",
+                "main",
+                "article"
+              ],
+              "format": "strip_leading_h1"
+            }
+          },
+          "requireVars": [
+            "title",
+            "body"
+          ],
+          "titleTemplate": "{title}",
+          "descriptionVar": "summary",
+          "publishedTimeVar": "recallDate",
+          "bullets": [
+            {
+              "label": "Recall Number",
+              "template": "`{recallNumber}`",
+              "whenVar": "recallNumber"
+            },
+            {
+              "label": "Recall Date",
+              "template": "{recallDate}",
+              "whenVar": "recallDate"
+            }
+          ],
+          "bodyVar": "body"
+        }
+      ]
+    },
+    {
       "id": "crates-io",
       "name": "Rust Crates.io",
       "category": "developer",
@@ -2632,6 +3376,431 @@
           }
         ]
       }
+    },
+    {
+      "id": "docker-hub",
+      "name": "Docker Hub",
+      "category": "developer",
+      "description": "Upgrades hub.docker.com repository and /tags pages (both /_/<repo> official library and /r/<ns>/<repo>) to the keyless Docker Hub v2 JSON API.",
+      "domains": [
+        "hub.docker.com"
+      ],
+      "exampleUrls": [
+        "https://hub.docker.com/_/alpine",
+        "https://hub.docker.com/_/alpine/tags",
+        "https://hub.docker.com/r/library/nginx",
+        "https://hub.docker.com/r/library/nginx/tags"
+      ],
+      "routes": [
+        {
+          "match": {
+            "defaults": {
+              "ns": "library"
+            },
+            "exactSegments": false,
+            "pathSegments": [
+              "_",
+              {
+                "param": "repo",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128
+              },
+              "tags"
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://hub.docker.com/v2/repositories/library/{repo}/tags?page_size=25",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "results"
+            ],
+            "vars": {
+              "totalCount": {
+                "paths": [
+                  "count"
+                ],
+                "format": "int_comma"
+              }
+            },
+            "titleTemplate": "{ns}/{repo} — Docker Tags ({totalCount} total)",
+            "titleWhenVar": "totalCount",
+            "titleFallbackTemplate": "{ns}/{repo} — Docker Tags",
+            "sections": [
+              {
+                "heading": "Recent Tags",
+                "arrayPath": "results",
+                "limit": 25,
+                "itemVars": {
+                  "platforms": {
+                    "paths": [
+                      "images"
+                    ],
+                    "subFieldsJoin": {
+                      "fields": [
+                        "os",
+                        "architecture"
+                      ],
+                      "sep": "/"
+                    },
+                    "join": ", ",
+                    "limit": 8
+                  },
+                  "sizeHuman": {
+                    "paths": [
+                      "full_size"
+                    ],
+                    "format": "bytes_human"
+                  }
+                },
+                "columns": [
+                  {
+                    "header": "Tag",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Size",
+                    "template": "{sizeHuman}"
+                  },
+                  {
+                    "header": "Architectures",
+                    "template": "{platforms}"
+                  },
+                  {
+                    "header": "Last Updated",
+                    "paths": [
+                      "last_updated"
+                    ],
+                    "sliceMax": 10
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": false,
+            "pathSegments": [
+              "r",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128
+              },
+              {
+                "param": "repo",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128
+              },
+              "tags"
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://hub.docker.com/v2/repositories/{ns}/{repo}/tags?page_size=25",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "results"
+            ],
+            "vars": {
+              "totalCount": {
+                "paths": [
+                  "count"
+                ],
+                "format": "int_comma"
+              }
+            },
+            "titleTemplate": "{ns}/{repo} — Docker Tags ({totalCount} total)",
+            "titleWhenVar": "totalCount",
+            "titleFallbackTemplate": "{ns}/{repo} — Docker Tags",
+            "sections": [
+              {
+                "heading": "Recent Tags",
+                "arrayPath": "results",
+                "limit": 25,
+                "itemVars": {
+                  "platforms": {
+                    "paths": [
+                      "images"
+                    ],
+                    "subFieldsJoin": {
+                      "fields": [
+                        "os",
+                        "architecture"
+                      ],
+                      "sep": "/"
+                    },
+                    "join": ", ",
+                    "limit": 8
+                  },
+                  "sizeHuman": {
+                    "paths": [
+                      "full_size"
+                    ],
+                    "format": "bytes_human"
+                  }
+                },
+                "columns": [
+                  {
+                    "header": "Tag",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Size",
+                    "template": "{sizeHuman}"
+                  },
+                  {
+                    "header": "Architectures",
+                    "template": "{platforms}"
+                  },
+                  {
+                    "header": "Last Updated",
+                    "paths": [
+                      "last_updated"
+                    ],
+                    "sliceMax": 10
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "match": {
+            "defaults": {
+              "ns": "library"
+            },
+            "exactSegments": false,
+            "pathSegments": [
+              "_",
+              {
+                "param": "repo",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://hub.docker.com/v2/repositories/library/{repo}/",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "name",
+              "namespace"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "pulls": {
+                "paths": [
+                  "pull_count"
+                ],
+                "format": "int_comma"
+              },
+              "stars": {
+                "paths": [
+                  "star_count"
+                ],
+                "format": "int_comma"
+              },
+              "statusDesc": {
+                "paths": [
+                  "status_description"
+                ]
+              },
+              "lastUpdated": {
+                "paths": [
+                  "last_updated"
+                ],
+                "sliceMax": 10
+              },
+              "fullDesc": {
+                "paths": [
+                  "full_description"
+                ],
+                "format": "demote_h1",
+                "trim": true
+              }
+            },
+            "titleTemplate": "{namespace}/{name} (Docker Hub)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "lastUpdated",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Pull Command",
+                "template": "`docker pull {name}`"
+              },
+              {
+                "label": "Pulls",
+                "template": "{pulls}",
+                "whenVar": "pulls"
+              },
+              {
+                "label": "Stars",
+                "template": "{stars}",
+                "whenVar": "stars"
+              },
+              {
+                "label": "Status",
+                "template": "{statusDesc}",
+                "whenVar": "statusDesc"
+              },
+              {
+                "label": "Last Updated",
+                "template": "{lastUpdated}",
+                "whenVar": "lastUpdated"
+              }
+            ],
+            "bodyVar": "fullDesc"
+          }
+        },
+        {
+          "match": {
+            "exactSegments": false,
+            "pathSegments": [
+              "r",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128
+              },
+              {
+                "param": "repo",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://hub.docker.com/v2/repositories/{ns}/{repo}/",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "name",
+              "namespace"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "pulls": {
+                "paths": [
+                  "pull_count"
+                ],
+                "format": "int_comma"
+              },
+              "stars": {
+                "paths": [
+                  "star_count"
+                ],
+                "format": "int_comma"
+              },
+              "statusDesc": {
+                "paths": [
+                  "status_description"
+                ]
+              },
+              "lastUpdated": {
+                "paths": [
+                  "last_updated"
+                ],
+                "sliceMax": 10
+              },
+              "fullDesc": {
+                "paths": [
+                  "full_description"
+                ],
+                "format": "demote_h1",
+                "trim": true
+              }
+            },
+            "titleTemplate": "{namespace}/{name} (Docker Hub)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "lastUpdated",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Pull Command",
+                "template": "`docker pull {namespace}/{name}`"
+              },
+              {
+                "label": "Pulls",
+                "template": "{pulls}",
+                "whenVar": "pulls"
+              },
+              {
+                "label": "Stars",
+                "template": "{stars}",
+                "whenVar": "stars"
+              },
+              {
+                "label": "Status",
+                "template": "{statusDesc}",
+                "whenVar": "statusDesc"
+              },
+              {
+                "label": "Last Updated",
+                "template": "{lastUpdated}",
+                "whenVar": "lastUpdated"
+              }
+            ],
+            "bodyVar": "fullDesc"
+          }
+        }
+      ]
     },
     {
       "id": "doi-crossref",
@@ -3314,6 +4483,417 @@
       ]
     },
     {
+      "id": "eur-lex",
+      "name": "EUR-Lex",
+      "category": "public-records",
+      "description": "Upgrades eur-lex.europa.eu/legal-content/<LANG>/TXT/?uri=* pages to the static /TXT/HTML/?uri=* twin while respecting robots.txt Crawl-delay and never touching disallowed /TXT/DOC/.",
+      "domains": [
+        "eur-lex.europa.eu"
+      ],
+      "exampleUrls": [
+        "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679"
+      ],
+      "match": {
+        "exactSegments": true,
+        "pathSegments": [
+          "legal-content",
+          {
+            "param": "lang",
+            "charset": "alnum",
+            "minLen": 2,
+            "maxLen": 3,
+            "transform": "upper"
+          },
+          "TXT"
+        ],
+        "queryParams": [
+          {
+            "name": "uri",
+            "param": "uri",
+            "charset": "safe_subpath",
+            "minLen": 3,
+            "maxLen": 200
+          }
+        ]
+      },
+      "twin": {
+        "fetchUrl": "https://eur-lex.europa.eu/legal-content/{lang}/TXT/HTML/?uri={uri}",
+        "kind": "text",
+        "accept": "text/html",
+        "maxBytes": 4194304
+      },
+      "extract": {
+        "textMode": "html_document",
+        "titleTemplate": "EUR-Lex {uri} ({lang})"
+      }
+    },
+    {
+      "id": "fcc-id",
+      "name": "FCC ID Equipment Authorization",
+      "category": "public-records",
+      "description": "Extracts FCC ID grant metadata, technical frequency/power tables, and exhibit PDF links from fccid.io public HTML pages while respecting robots.txt disallows.",
+      "domains": [
+        "fccid.io",
+        "www.fccid.io"
+      ],
+      "exampleUrls": [
+        "https://fccid.io/BCG-E3542A"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "fcc-id",
+          "mode": "dom",
+          "match": {
+            "exactSegments": false,
+            "reservedFirstSegment": [
+              "ViewExhibitReport.cfm",
+              "subscribe.php",
+              "frequency",
+              "search",
+              "api"
+            ],
+            "pathSegments": [
+              {
+                "param": "grantee",
+                "charset": "url_seg",
+                "minLen": 2,
+                "maxLen": 64
+              },
+              {
+                "param": "product",
+                "charset": "url_seg",
+                "optional": true,
+                "minLen": 1,
+                "maxLen": 120
+              }
+            ]
+          },
+          "vars": {
+            "title": {
+              "cssText": [
+                "h1",
+                "title"
+              ],
+              "metaKeys": [
+                "og:title"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "main",
+                "article",
+                "body"
+              ],
+              "format": "strip_leading_h1",
+              "trim": true
+            }
+          },
+          "requireVars": [
+            "title"
+          ],
+          "titleTemplate": "{title}",
+          "bullets": [
+            {
+              "label": "FCC ID",
+              "template": "`{grantee}`"
+            }
+          ],
+          "bodyVar": "body",
+          "preserveBodyLinksFromVar": "body"
+        }
+      ]
+    },
+    {
+      "id": "federal-register",
+      "name": "Federal Register",
+      "category": "public-records",
+      "description": "Upgrades federalregister.gov/documents/<yyyy>/<mm>/<dd>/<doc_number>/* pages to the official /api/v1/documents/<doc_number>.json twin (strictly excluding disallowed /documents/current).",
+      "domains": [
+        "www.federalregister.gov",
+        "federalregister.gov"
+      ],
+      "exampleUrls": [
+        "https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule"
+      ],
+      "match": {
+        "exactSegments": false,
+        "pathSegments": [
+          "documents",
+          {
+            "param": "yyyy",
+            "charset": "digits",
+            "minLen": 4,
+            "maxLen": 4
+          },
+          {
+            "param": "mm",
+            "charset": "digits",
+            "minLen": 2,
+            "maxLen": 2
+          },
+          {
+            "param": "dd",
+            "charset": "digits",
+            "minLen": 2,
+            "maxLen": 2
+          },
+          {
+            "param": "docNumber",
+            "charset": "alnum_dash",
+            "minLen": 3,
+            "maxLen": 64
+          }
+        ]
+      },
+      "twin": {
+        "fetchUrl": "https://www.federalregister.gov/api/v1/documents/{docNumber}.json",
+        "kind": "json",
+        "accept": "application/json",
+        "maxBytes": 4194304
+      },
+      "extract": {
+        "requireFields": [
+          "title",
+          "document_number"
+        ],
+        "vars": {
+          "title": {
+            "paths": [
+              "title"
+            ],
+            "trim": true
+          },
+          "docNumber": {
+            "paths": [
+              "document_number"
+            ]
+          },
+          "docType": {
+            "paths": [
+              "type"
+            ]
+          },
+          "citation": {
+            "paths": [
+              "citation"
+            ]
+          },
+          "pubDate": {
+            "paths": [
+              "publication_date"
+            ]
+          },
+          "urlDate": {
+            "template": "{yyyy}-{mm}-{dd}"
+          },
+          "pubDateMatchesUrl": {
+            "paths": [
+              "publication_date"
+            ],
+            "equalsVar": "urlDate"
+          },
+          "effectiveOn": {
+            "paths": [
+              "effective_on"
+            ]
+          },
+          "dates": {
+            "paths": [
+              "dates"
+            ],
+            "trim": true
+          },
+          "action": {
+            "paths": [
+              "action"
+            ],
+            "trim": true
+          },
+          "agencies": {
+            "paths": [
+              "agencies"
+            ],
+            "subField": "name",
+            "join": ", ",
+            "limit": 12
+          },
+          "cfrRefs": {
+            "paths": [
+              "cfr_references"
+            ],
+            "subFieldsJoin": {
+              "fields": [
+                "title",
+                "part"
+              ],
+              "sep": " CFR Part ",
+              "fallbackField": "title"
+            },
+            "join": "; ",
+            "limit": 20
+          },
+          "dockets": {
+            "paths": [
+              "docket_ids"
+            ],
+            "join": ", ",
+            "limit": 12
+          },
+          "abstract": {
+            "paths": [
+              "abstract"
+            ],
+            "trim": true
+          },
+          "abstractShort": {
+            "paths": [
+              "abstract"
+            ],
+            "trim": true,
+            "sliceMax": 260
+          },
+          "pdfUrl": {
+            "paths": [
+              "pdf_url"
+            ],
+            "requireHttps": true
+          },
+          "bodyHtmlUrl": {
+            "paths": [
+              "body_html_url"
+            ],
+            "requireHttps": true
+          },
+          "xmlUrl": {
+            "paths": [
+              "full_text_xml_url"
+            ],
+            "requireHttps": true
+          },
+          "htmlUrl": {
+            "paths": [
+              "html_url"
+            ],
+            "requireHttps": true
+          }
+        },
+        "titleTemplate": "{title}",
+        "descriptionVar": "abstractShort",
+        "authorVar": "agencies",
+        "publishedTimeVar": "pubDate",
+        "bullets": [
+          {
+            "label": "Document Number",
+            "template": "`{docNumber}`"
+          },
+          {
+            "label": "Type",
+            "template": "{docType}",
+            "whenVar": "docType"
+          },
+          {
+            "label": "Citation",
+            "template": "{citation}",
+            "whenVar": "citation"
+          },
+          {
+            "label": "Agencies",
+            "template": "{agencies}",
+            "whenVar": "agencies"
+          },
+          {
+            "label": "Published",
+            "template": "{pubDate}",
+            "whenVar": "pubDate"
+          },
+          {
+            "label": "Warning",
+            "template": "Publication date {pubDate} does not match the URL date {urlDate}; the URL may point to a different document than its date suggests.",
+            "whenVar": "pubDate",
+            "unlessVar": "pubDateMatchesUrl"
+          },
+          {
+            "label": "Effective On",
+            "template": "{effectiveOn}",
+            "whenVar": "effectiveOn"
+          },
+          {
+            "label": "Dates",
+            "template": "{dates}",
+            "whenVar": "dates"
+          },
+          {
+            "label": "Action",
+            "template": "{action}",
+            "whenVar": "action"
+          },
+          {
+            "label": "CFR References",
+            "template": "{cfrRefs}",
+            "whenVar": "cfrRefs"
+          },
+          {
+            "label": "Docket IDs",
+            "template": "{dockets}",
+            "whenVar": "dockets"
+          },
+          {
+            "label": "PDF",
+            "template": "{pdfUrl}",
+            "whenVar": "pdfUrl"
+          },
+          {
+            "label": "Body HTML",
+            "template": "{bodyHtmlUrl}",
+            "whenVar": "bodyHtmlUrl"
+          },
+          {
+            "label": "Full Text XML",
+            "template": "{xmlUrl}",
+            "whenVar": "xmlUrl"
+          }
+        ],
+        "sections": [
+          {
+            "heading": "Abstract",
+            "textVar": "abstract"
+          },
+          {
+            "heading": "CFR References",
+            "arrayPath": "cfr_references",
+            "limit": 25,
+            "columns": [
+              {
+                "header": "Title",
+                "paths": [
+                  "title"
+                ]
+              },
+              {
+                "header": "Part",
+                "paths": [
+                  "part"
+                ]
+              },
+              {
+                "header": "Chapter",
+                "paths": [
+                  "chapter"
+                ]
+              }
+            ]
+          }
+        ],
+        "linksVars": [
+          "pdfUrl",
+          "htmlUrl",
+          "bodyHtmlUrl",
+          "xmlUrl"
+        ]
+      }
+    },
+    {
       "id": "gem-ats",
       "name": "Gem Job Boards",
       "category": "jobs",
@@ -3390,6 +4970,7 @@
                 "paths": [
                   "content_plain"
                 ],
+                "format": "plain_text",
                 "trim": true
               },
               "body": {
@@ -3619,6 +5200,76 @@
                   {
                     "header": "Published",
                     "template": "{created}"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "giant-liv-bikes",
+      "name": "Giant & Liv Bicycles Specs & Manuals",
+      "category": "commerce-social",
+      "description": "Extracts bike specifications, geometry GFM tables, and owner manual PDF links from Giant and Liv regional HTML pages while respecting Crawl-delay and never hitting /shop*, /comparison*, /account*, or /apiproxy/*.",
+      "domains": [
+        "www.giant-bicycles.com",
+        "*.giant-bicycles.com",
+        "giant-bicycles.com",
+        "www.liv-cycling.com",
+        "*.liv-cycling.com",
+        "liv-cycling.com"
+      ],
+      "exampleUrls": [
+        "https://www.giant-bicycles.com/us/defy-advanced-pro-0",
+        "https://www.liv-cycling.com/us/avail-advanced-pro-0",
+        "https://www.giant-bicycles.com/us/manuals"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "giant-liv-bikes",
+          "mode": "giant_liv_html",
+          "match": {
+            "exactSegments": false,
+            "excludeSegmentSuffixes": [
+              ".xml",
+              ".json"
+            ],
+            "anyOf": [
+              {
+                "exactSegments": false,
+                "optionalLeadingLocale": true,
+                "reservedFirstSegment": [
+                  "shop",
+                  "comparison",
+                  "account",
+                  "apiproxy",
+                  "int",
+                  "global"
+                ]
+              },
+              {
+                "exactSegments": false,
+                "pathSegments": [
+                  {
+                    "param": "locale3",
+                    "allowValues": [
+                      "int",
+                      "global"
+                    ]
+                  },
+                  {
+                    "param": "seg1",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 160,
+                    "reserved": [
+                      "shop",
+                      "comparison",
+                      "account",
+                      "apiproxy"
+                    ]
                   }
                 ]
               }
@@ -4279,7 +5930,7 @@
           },
           "twin": {
             "id": "lever-board",
-            "fetchUrl": "https://api.lever.co/v0/postings/{org}?mode=json",
+            "fetchUrl": "https://api.lever.co/v0/postings/{org}?mode=json&limit=100",
             "kind": "json",
             "accept": "application/json"
           },
@@ -4405,7 +6056,7 @@
           },
           "twin": {
             "id": "lever-eu-board",
-            "fetchUrl": "https://api.eu.lever.co/v0/postings/{org}?mode=json",
+            "fetchUrl": "https://api.eu.lever.co/v0/postings/{org}?mode=json&limit=100",
             "kind": "json",
             "accept": "application/json"
           },
@@ -4720,6 +6371,464 @@
         ],
         "objectLinksPath": "meta.links"
       }
+    },
+    {
+      "id": "homebrew-formulae",
+      "name": "Homebrew Formulae & Casks",
+      "category": "developer",
+      "description": "Upgrades formulae.brew.sh/formula/<id> and /cask/<id> pages to the official Homebrew JSON API with install commands, dependencies, deprecation/disable notices, and 30-day install analytics.",
+      "domains": [
+        "formulae.brew.sh"
+      ],
+      "exampleUrls": [
+        "https://formulae.brew.sh/formula/jq",
+        "https://formulae.brew.sh/cask/iterm2"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": true,
+            "excludeSegmentSuffixes": [
+              ".json"
+            ],
+            "pathSegments": [
+              "formula",
+              {
+                "param": "id",
+                "charset": "brew_id",
+                "minLen": 1,
+                "maxLen": 128
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://formulae.brew.sh/api/formula/{id}.json",
+            "rawPathParams": [
+              "id"
+            ],
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "name"
+            ],
+            "vars": {
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "fullName": {
+                "paths": [
+                  "full_name",
+                  "name"
+                ]
+              },
+              "desc": {
+                "paths": [
+                  "desc"
+                ],
+                "trim": true
+              },
+              "version": {
+                "paths": [
+                  "versions.stable",
+                  "versions.head"
+                ]
+              },
+              "license": {
+                "paths": [
+                  "license"
+                ]
+              },
+              "homepage": {
+                "paths": [
+                  "homepage"
+                ],
+                "requireHttps": true
+              },
+              "deps": {
+                "paths": [
+                  "dependencies"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 20
+              },
+              "buildDeps": {
+                "paths": [
+                  "build_dependencies"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 15
+              },
+              "caveats": {
+                "paths": [
+                  "caveats"
+                ],
+                "trim": true
+              },
+              "installs30d": {
+                "dynamicKeyPath": {
+                  "base": "analytics.install.30d",
+                  "keyVar": "id"
+                },
+                "format": "int_comma"
+              },
+              "disabledFlag": {
+                "paths": [
+                  "disabled"
+                ],
+                "format": "bool_map",
+                "trueValue": "Disabled",
+                "falseValue": ""
+              },
+              "disabledReason": {
+                "paths": [
+                  "disable_reason"
+                ]
+              },
+              "disabledDate": {
+                "paths": [
+                  "disable_date"
+                ]
+              },
+              "deprecatedFlag": {
+                "paths": [
+                  "deprecated"
+                ],
+                "format": "bool_map",
+                "trueValue": "Deprecated",
+                "falseValue": ""
+              },
+              "deprecationReason": {
+                "paths": [
+                  "deprecation_reason"
+                ]
+              },
+              "deprecationDate": {
+                "paths": [
+                  "deprecation_date"
+                ]
+              },
+              "replacement": {
+                "paths": [
+                  "disable_replacement_formula",
+                  "disable_replacement_cask",
+                  "deprecation_replacement_formula",
+                  "deprecation_replacement_cask"
+                ]
+              },
+              "disabledSummary": {
+                "template": "Disabled ({disabledReason}, {disabledDate})",
+                "whenVars": [
+                  "disabledFlag",
+                  "disabledReason",
+                  "disabledDate"
+                ],
+                "fallbackVar": "disabledFlag"
+              },
+              "deprecatedSummary": {
+                "template": "Deprecated ({deprecationReason}, {deprecationDate})",
+                "whenVars": [
+                  "deprecatedFlag",
+                  "deprecationReason",
+                  "deprecationDate"
+                ],
+                "fallbackVar": "deprecatedFlag"
+              },
+              "statusNotice": {
+                "template": "{disabledSummary}",
+                "whenVars": [
+                  "disabledSummary"
+                ],
+                "fallbackVar": "deprecatedSummary"
+              }
+            },
+            "titleTemplate": "{fullName} (Homebrew Formula)",
+            "descriptionVar": "desc",
+            "blockquoteTemplate": "> **Notice**: {statusNotice}",
+            "blockquoteWhenVar": "statusNotice",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Install",
+                "template": "`brew install {name}`"
+              },
+              {
+                "label": "Stable Version",
+                "template": "`{version}`",
+                "whenVar": "version"
+              },
+              {
+                "label": "License",
+                "template": "{license}",
+                "whenVar": "license"
+              },
+              {
+                "label": "Replacement",
+                "template": "`{replacement}`",
+                "whenVar": "replacement"
+              },
+              {
+                "label": "30d Installs",
+                "template": "{installs30d}",
+                "whenVar": "installs30d"
+              },
+              {
+                "label": "Homepage",
+                "template": "{homepage}",
+                "whenVar": "homepage"
+              },
+              {
+                "label": "Dependencies",
+                "template": "{deps}",
+                "whenVar": "deps"
+              },
+              {
+                "label": "Build Dependencies",
+                "template": "{buildDeps}",
+                "whenVar": "buildDeps"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Caveats",
+                "textVar": "caveats"
+              }
+            ],
+            "linksVars": [
+              "homepage"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "excludeSegmentSuffixes": [
+              ".json"
+            ],
+            "pathSegments": [
+              "cask",
+              {
+                "param": "id",
+                "charset": "brew_id",
+                "minLen": 1,
+                "maxLen": 128
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://formulae.brew.sh/api/cask/{id}.json",
+            "rawPathParams": [
+              "id"
+            ],
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "token"
+            ],
+            "vars": {
+              "token": {
+                "paths": [
+                  "token"
+                ]
+              },
+              "displayName": {
+                "paths": [
+                  "name.0",
+                  "full_token",
+                  "token"
+                ]
+              },
+              "desc": {
+                "paths": [
+                  "desc"
+                ],
+                "trim": true
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "homepage": {
+                "paths": [
+                  "homepage"
+                ],
+                "requireHttps": true
+              },
+              "downloadUrl": {
+                "paths": [
+                  "url"
+                ],
+                "requireHttps": true
+              },
+              "sha256": {
+                "paths": [
+                  "sha256"
+                ]
+              },
+              "autoUpdates": {
+                "paths": [
+                  "auto_updates"
+                ],
+                "format": "bool_map",
+                "trueValue": "Yes",
+                "falseValue": "No"
+              },
+              "caveats": {
+                "paths": [
+                  "caveats"
+                ],
+                "trim": true
+              },
+              "installs30d": {
+                "dynamicKeyPath": {
+                  "base": "analytics.install.30d",
+                  "keyVar": "id"
+                },
+                "format": "int_comma"
+              },
+              "disabledFlag": {
+                "paths": [
+                  "disabled"
+                ],
+                "format": "bool_map",
+                "trueValue": "Disabled",
+                "falseValue": ""
+              },
+              "disabledReason": {
+                "paths": [
+                  "disable_reason"
+                ]
+              },
+              "disabledDate": {
+                "paths": [
+                  "disable_date"
+                ]
+              },
+              "deprecatedFlag": {
+                "paths": [
+                  "deprecated"
+                ],
+                "format": "bool_map",
+                "trueValue": "Deprecated",
+                "falseValue": ""
+              },
+              "deprecationReason": {
+                "paths": [
+                  "deprecation_reason"
+                ]
+              },
+              "deprecationDate": {
+                "paths": [
+                  "deprecation_date"
+                ]
+              },
+              "replacement": {
+                "paths": [
+                  "disable_replacement_cask",
+                  "disable_replacement_formula",
+                  "deprecation_replacement_cask",
+                  "deprecation_replacement_formula"
+                ]
+              },
+              "disabledSummary": {
+                "template": "Disabled ({disabledReason}, {disabledDate})",
+                "whenVars": [
+                  "disabledFlag",
+                  "disabledReason",
+                  "disabledDate"
+                ],
+                "fallbackVar": "disabledFlag"
+              },
+              "deprecatedSummary": {
+                "template": "Deprecated ({deprecationReason}, {deprecationDate})",
+                "whenVars": [
+                  "deprecatedFlag",
+                  "deprecationReason",
+                  "deprecationDate"
+                ],
+                "fallbackVar": "deprecatedFlag"
+              },
+              "statusNotice": {
+                "template": "{disabledSummary}",
+                "whenVars": [
+                  "disabledSummary"
+                ],
+                "fallbackVar": "deprecatedSummary"
+              }
+            },
+            "titleTemplate": "{displayName} (Homebrew Cask)",
+            "descriptionVar": "desc",
+            "blockquoteTemplate": "> **Notice**: {statusNotice}",
+            "blockquoteWhenVar": "statusNotice",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Install",
+                "template": "`brew install --cask {token}`"
+              },
+              {
+                "label": "Token",
+                "template": "`{token}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`",
+                "whenVar": "version"
+              },
+              {
+                "label": "Auto Updates",
+                "template": "{autoUpdates}",
+                "whenVar": "autoUpdates"
+              },
+              {
+                "label": "Replacement",
+                "template": "`{replacement}`",
+                "whenVar": "replacement"
+              },
+              {
+                "label": "30d Installs",
+                "template": "{installs30d}",
+                "whenVar": "installs30d"
+              },
+              {
+                "label": "Homepage",
+                "template": "{homepage}",
+                "whenVar": "homepage"
+              },
+              {
+                "label": "Download URL",
+                "template": "{downloadUrl}",
+                "whenVar": "downloadUrl"
+              },
+              {
+                "label": "SHA-256",
+                "template": "`{sha256}`",
+                "whenVar": "sha256"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Caveats",
+                "textVar": "caveats"
+              }
+            ],
+            "linksVars": [
+              "homepage",
+              "downloadUrl"
+            ]
+          }
+        }
+      ]
     },
     {
       "id": "huggingface",
@@ -5048,9 +7157,27 @@
                 "login"
               ]
             },
-            "exactSegments": false,
-            "pathSegments": [
-              "jobs"
+            "anyOf": [
+              {
+                "exactSegments": true,
+                "pathSegments": [
+                  "jobs"
+                ]
+              },
+              {
+                "exactSegments": true,
+                "pathSegments": [
+                  "jobs",
+                  "intro"
+                ]
+              },
+              {
+                "exactSegments": true,
+                "pathSegments": [
+                  "jobs",
+                  "search"
+                ]
+              }
             ]
           },
           "twin": {
@@ -5067,6 +7194,39 @@
             "defaultQueryParams": {
               "ss": "1"
             },
+            "setQueryParams": {
+              "in_iframe": "1"
+            },
+            "kind": "text",
+            "accept": "text/html"
+          },
+          "extract": {
+            "icimsPortal": true
+          }
+        },
+        {
+          "match": {
+            "hostSubdomain": {
+              "suffix": ".icims.com",
+              "param": "org",
+              "reserved": [
+                "www",
+                "status",
+                "support",
+                "community",
+                "developer",
+                "developers",
+                "login"
+              ]
+            },
+            "exactSegments": false,
+            "pathSegments": [
+              "jobs"
+            ]
+          },
+          "twin": {
+            "id": "icims",
+            "fetchUrl": "{requestUrl}",
             "setQueryParams": {
               "in_iframe": "1"
             },
@@ -5890,6 +8050,259 @@
       }
     },
     {
+      "id": "maven-central",
+      "name": "Maven Central",
+      "category": "developer",
+      "description": "Upgrades central.sonatype.com/artifact/<group>/<artifact>[/<version>] pages to the keyless Maven Central Solr JSON API (central.sonatype.com for versioned artifacts, search.maven.org for artifact summaries) with Maven/Gradle coordinates and artifact metadata.",
+      "domains": [
+        "central.sonatype.com"
+      ],
+      "exampleUrls": [
+        "https://central.sonatype.com/artifact/com.fasterxml.jackson.core/jackson-databind",
+        "https://central.sonatype.com/artifact/com.fasterxml.jackson.core/jackson-databind/2.18.2"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "artifact",
+              {
+                "param": "g",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 160
+              },
+              {
+                "param": "a",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 160
+              },
+              {
+                "param": "v",
+                "charset": "pkg",
+                "reserved": [
+                  "versions",
+                  "overview",
+                  "dependencies",
+                  "dependents",
+                  "jar"
+                ],
+                "minLen": 1,
+                "maxLen": 80
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://central.sonatype.com/solrsearch/select?q=g:{g}+AND+a:{a}+AND+v:{v}&core=gav&rows=20&wt=json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "rootPath": "response.docs.0",
+            "requireFields": [
+              "id",
+              "g",
+              "a"
+            ],
+            "vars": {
+              "groupId": {
+                "paths": [
+                  "g"
+                ]
+              },
+              "artifactId": {
+                "paths": [
+                  "a"
+                ]
+              },
+              "ver": {
+                "paths": [
+                  "v",
+                  "latestVersion"
+                ]
+              },
+              "packaging": {
+                "paths": [
+                  "p"
+                ]
+              },
+              "published": {
+                "paths": [
+                  "timestamp"
+                ],
+                "format": "epoch_ms_date"
+              },
+              "artifacts": {
+                "paths": [
+                  "ec"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 12
+              },
+              "centralUrl": {
+                "template": "https://central.sonatype.com/artifact/{groupId}/{artifactId}/{ver}",
+                "requireHttps": true
+              }
+            },
+            "titleTemplate": "{groupId}:{artifactId}:{ver} (Maven Central)",
+            "publishedTimeVar": "published",
+            "bullets": [
+              {
+                "label": "Maven Coordinate",
+                "template": "`{groupId}:{artifactId}:{ver}`"
+              },
+              {
+                "label": "Gradle",
+                "template": "`implementation(\"{groupId}:{artifactId}:{ver}\")`"
+              },
+              {
+                "label": "Packaging",
+                "template": "{packaging}",
+                "whenVar": "packaging"
+              },
+              {
+                "label": "Published",
+                "template": "{published}",
+                "whenVar": "published"
+              },
+              {
+                "label": "Classifiers / Files",
+                "template": "{artifacts}",
+                "whenVar": "artifacts"
+              }
+            ],
+            "linksVars": [
+              "centralUrl"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "artifact",
+              {
+                "param": "g",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 160
+              },
+              {
+                "param": "a",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 160
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://search.maven.org/solrsearch/select?q=g:{g}+AND+a:{a}&rows=20&wt=json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "rootPath": "response.docs.0",
+            "requireFields": [
+              "id",
+              "g",
+              "a"
+            ],
+            "vars": {
+              "groupId": {
+                "paths": [
+                  "g"
+                ]
+              },
+              "artifactId": {
+                "paths": [
+                  "a"
+                ]
+              },
+              "ver": {
+                "paths": [
+                  "latestVersion",
+                  "v"
+                ]
+              },
+              "packaging": {
+                "paths": [
+                  "p"
+                ]
+              },
+              "versionCount": {
+                "paths": [
+                  "versionCount"
+                ],
+                "format": "int_comma"
+              },
+              "published": {
+                "paths": [
+                  "timestamp"
+                ],
+                "format": "epoch_ms_date"
+              },
+              "artifacts": {
+                "paths": [
+                  "ec"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 12
+              },
+              "centralUrl": {
+                "template": "https://central.sonatype.com/artifact/{groupId}/{artifactId}",
+                "requireHttps": true
+              }
+            },
+            "titleTemplate": "{groupId}:{artifactId}:{ver} (Maven Central)",
+            "titleWhenVar": "ver",
+            "titleFallbackTemplate": "{groupId}:{artifactId} (Maven Central)",
+            "publishedTimeVar": "published",
+            "bullets": [
+              {
+                "label": "Maven Coordinate",
+                "template": "`{groupId}:{artifactId}:{ver}`",
+                "whenVar": "ver"
+              },
+              {
+                "label": "Gradle",
+                "template": "`implementation(\"{groupId}:{artifactId}:{ver}\")`",
+                "whenVar": "ver"
+              },
+              {
+                "label": "Packaging",
+                "template": "{packaging}",
+                "whenVar": "packaging"
+              },
+              {
+                "label": "Published",
+                "template": "{published}",
+                "whenVar": "published"
+              },
+              {
+                "label": "Versions",
+                "template": "{versionCount}",
+                "whenVar": "versionCount"
+              },
+              {
+                "label": "Classifiers / Files",
+                "template": "{artifacts}",
+                "whenVar": "artifacts"
+              }
+            ],
+            "linksVars": [
+              "centralUrl"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "id": "mediawiki",
       "name": "Wikipedia & MediaWiki Encyclopedias",
       "category": "commerce-social",
@@ -5910,6 +8323,419 @@
           },
           "mode": "markdown_clean",
           "cleanPreset": "mediawiki"
+        }
+      ]
+    },
+    {
+      "id": "nfpa",
+      "name": "NFPA Standards & Codes (www.nfpa.org)",
+      "category": "public-records",
+      "description": "Unpacks Sitecore JSS __NEXT_DATA__ storefront-main placeholders (PageTitle, ContentBlock, SplitScreenCalloutComponent, Accordion, TwoColumnVideo) on www.nfpa.org without headless browser rendering, never touching link.nfpa.org or robots-disallowed /en/ and /-/media/.",
+      "domains": [
+        "www.nfpa.org"
+      ],
+      "exampleUrls": [
+        "https://www.nfpa.org/codes-and-standards/nfpa-70-standard-development/70",
+        "https://www.nfpa.org/education-and-research/electrical/nfpa-70"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "nfpa",
+          "mode": "sitecore_jss_html",
+          "match": {
+            "exactSegments": false,
+            "reservedFirstSegment": [
+              "-",
+              "ar",
+              "en",
+              "data",
+              "standard_items"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "nhtsa-vpic-recalls",
+      "name": "NHTSA vPIC & Safety Recalls API",
+      "category": "public-records",
+      "description": "Formats keyless vpic.nhtsa.dot.gov VIN decode and api.nhtsa.gov vehicle recalls & complaints JSON endpoints into structured Markdown tables (respecting HTTP 403/robots.txt without bypass).",
+      "domains": [
+        "vpic.nhtsa.dot.gov",
+        "api.nhtsa.gov"
+      ],
+      "exampleUrls": [
+        "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/1HGCM82633A004352?format=json",
+        "https://api.nhtsa.gov/recalls/recallsByVehicle?make=honda&model=accord&modelYear=2020"
+      ],
+      "routes": [
+        {
+          "match": {
+            "hosts": [
+              "vpic.nhtsa.dot.gov"
+            ],
+            "exactSegments": true,
+            "pathSegments": [
+              "api",
+              "vehicles",
+              {
+                "param": "endpoint",
+                "allowValues": [
+                  "decodevinvalues",
+                  "decodevinvaluesextended"
+                ]
+              },
+              {
+                "param": "vin",
+                "charset": "alnum",
+                "minLen": 3,
+                "maxLen": 32
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://vpic.nhtsa.dot.gov/api/vehicles/{endpoint}/{vin}?format=json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "Results",
+              "Message"
+            ],
+            "vars": {
+              "vinOut": {
+                "paths": [
+                  "Results.0.VIN"
+                ],
+                "fallbackTemplate": "{vin}"
+              },
+              "make": {
+                "paths": [
+                  "Results.0.Make"
+                ],
+                "trim": true
+              },
+              "model": {
+                "paths": [
+                  "Results.0.Model"
+                ],
+                "trim": true
+              },
+              "modelYear": {
+                "paths": [
+                  "Results.0.ModelYear"
+                ],
+                "trim": true
+              },
+              "vehicleType": {
+                "paths": [
+                  "Results.0.VehicleType"
+                ],
+                "trim": true
+              },
+              "bodyClass": {
+                "paths": [
+                  "Results.0.BodyClass"
+                ],
+                "trim": true
+              },
+              "plantCountry": {
+                "paths": [
+                  "Results.0.PlantCountry"
+                ],
+                "trim": true
+              },
+              "engineCylinders": {
+                "paths": [
+                  "Results.0.EngineCylinders"
+                ],
+                "trim": true
+              },
+              "displacementL": {
+                "paths": [
+                  "Results.0.DisplacementL"
+                ],
+                "trim": true
+              },
+              "fuelType": {
+                "paths": [
+                  "Results.0.FuelTypePrimary"
+                ],
+                "trim": true
+              },
+              "errorCode": {
+                "paths": [
+                  "Results.0.ErrorCode"
+                ],
+                "trim": true
+              },
+              "errorText": {
+                "paths": [
+                  "Results.0.ErrorText"
+                ],
+                "trim": true
+              },
+              "message": {
+                "paths": [
+                  "Message"
+                ],
+                "trim": true
+              }
+            },
+            "titleTemplate": "{modelYear} {make} {model} — VIN {vinOut}",
+            "titleWhenVar": "make",
+            "titleFallbackTemplate": "NHTSA vPIC VIN Decode ({vinOut})",
+            "bullets": [
+              {
+                "label": "VIN",
+                "template": "`{vinOut}`"
+              },
+              {
+                "label": "Make",
+                "template": "{make}",
+                "whenVar": "make"
+              },
+              {
+                "label": "Model",
+                "template": "{model}",
+                "whenVar": "model"
+              },
+              {
+                "label": "Model Year",
+                "template": "{modelYear}",
+                "whenVar": "modelYear"
+              },
+              {
+                "label": "Vehicle Type",
+                "template": "{vehicleType}",
+                "whenVar": "vehicleType"
+              },
+              {
+                "label": "Body Class",
+                "template": "{bodyClass}",
+                "whenVar": "bodyClass"
+              },
+              {
+                "label": "Plant Country",
+                "template": "{plantCountry}",
+                "whenVar": "plantCountry"
+              },
+              {
+                "label": "Engine Cylinders",
+                "template": "{engineCylinders}",
+                "whenVar": "engineCylinders"
+              },
+              {
+                "label": "Displacement (L)",
+                "template": "{displacementL}",
+                "whenVar": "displacementL"
+              },
+              {
+                "label": "Fuel Type",
+                "template": "{fuelType}",
+                "whenVar": "fuelType"
+              },
+              {
+                "label": "Error Code",
+                "template": "`{errorCode}`",
+                "whenVar": "errorCode"
+              },
+              {
+                "label": "Error Text",
+                "template": "{errorText}",
+                "whenVar": "errorText"
+              },
+              {
+                "label": "Message",
+                "template": "{message}",
+                "whenVar": "message"
+              }
+            ]
+          }
+        },
+        {
+          "match": {
+            "hosts": [
+              "api.nhtsa.gov"
+            ],
+            "pathEquals": [
+              "/recalls/recallsByVehicle",
+              "/recalls/recallsByVehicle/"
+            ]
+          },
+          "twin": {
+            "fetchUrl": "{requestUrl}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "results",
+              "Results"
+            ],
+            "vars": {
+              "count": {
+                "paths": [
+                  "Count",
+                  "count"
+                ],
+                "format": "int_comma",
+                "default": "0"
+              },
+              "message": {
+                "paths": [
+                  "Message",
+                  "message"
+                ],
+                "trim": true
+              }
+            },
+            "titleTemplate": "NHTSA Vehicle Recalls ({count} found)",
+            "introVar": "message",
+            "sections": [
+              {
+                "heading": "Recalls",
+                "arrayPath": "results",
+                "limit": 50,
+                "emptyText": "No recalls found.",
+                "columns": [
+                  {
+                    "header": "Campaign",
+                    "paths": [
+                      "NHTSACampaignNumber"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Date",
+                    "paths": [
+                      "ReportReceivedDate"
+                    ]
+                  },
+                  {
+                    "header": "Component",
+                    "paths": [
+                      "Component"
+                    ]
+                  },
+                  {
+                    "header": "Summary",
+                    "paths": [
+                      "Summary"
+                    ],
+                    "sliceMax": 240
+                  },
+                  {
+                    "header": "Consequence",
+                    "paths": [
+                      "Consequence"
+                    ],
+                    "sliceMax": 240
+                  },
+                  {
+                    "header": "Remedy",
+                    "paths": [
+                      "Remedy"
+                    ],
+                    "sliceMax": 240
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "match": {
+            "hosts": [
+              "api.nhtsa.gov"
+            ],
+            "pathEquals": [
+              "/complaints/complaintsByVehicle",
+              "/complaints/complaintsByVehicle/"
+            ]
+          },
+          "twin": {
+            "fetchUrl": "{requestUrl}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "results",
+              "Results"
+            ],
+            "vars": {
+              "count": {
+                "paths": [
+                  "count",
+                  "Count"
+                ],
+                "format": "int_comma",
+                "default": "0"
+              },
+              "message": {
+                "paths": [
+                  "message",
+                  "Message"
+                ],
+                "trim": true
+              }
+            },
+            "titleTemplate": "NHTSA Vehicle Complaints ({count} found)",
+            "introVar": "message",
+            "sections": [
+              {
+                "heading": "Complaints",
+                "arrayPath": "results",
+                "limit": 50,
+                "emptyText": "No complaints found.",
+                "columns": [
+                  {
+                    "header": "ODI Number",
+                    "paths": [
+                      "odiNumber"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Date",
+                    "paths": [
+                      "dateOfIncident"
+                    ]
+                  },
+                  {
+                    "header": "Components",
+                    "paths": [
+                      "components"
+                    ]
+                  },
+                  {
+                    "header": "Summary",
+                    "paths": [
+                      "summary"
+                    ],
+                    "sliceMax": 240
+                  },
+                  {
+                    "header": "Crash",
+                    "paths": [
+                      "crash"
+                    ]
+                  },
+                  {
+                    "header": "Fire",
+                    "paths": [
+                      "fire"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
         }
       ]
     },
@@ -6654,6 +9480,81 @@
       ]
     },
     {
+      "id": "nuget-gallery",
+      "name": "NuGet Gallery",
+      "category": "developer",
+      "description": "Upgrades nuget.org/packages/<id>[/<version>] pages to the official api.nuget.org v3 registration JSON API (supporting both inlined catalogEntry pages and un-inlined CatalogPage stubs).",
+      "domains": [
+        "www.nuget.org",
+        "nuget.org"
+      ],
+      "exampleUrls": [
+        "https://www.nuget.org/packages/Newtonsoft.Json",
+        "https://www.nuget.org/packages/Newtonsoft.Json/13.0.3"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "packages",
+              {
+                "param": "pkgId",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128,
+                "transform": "lower"
+              },
+              {
+                "param": "ver",
+                "charset": "url_seg",
+                "reserved": [
+                  "ReportAbuse",
+                  "ContactOwners",
+                  "versions"
+                ],
+                "minLen": 1,
+                "maxLen": 64
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://api.nuget.org/v3/registration5-gz-semver2/{pkgId}/index.json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "jsonMode": "nuget_registration"
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "packages",
+              {
+                "param": "pkgId",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 128,
+                "transform": "lower"
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://api.nuget.org/v3/registration5-gz-semver2/{pkgId}/index.json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "jsonMode": "nuget_registration"
+          }
+        }
+      ]
+    },
+    {
       "id": "openalex",
       "name": "OpenAlex Scholarly Works",
       "category": "research-health",
@@ -7263,6 +10164,474 @@
           }
         ]
       }
+    },
+    {
+      "id": "osv-ghsa",
+      "name": "OSV & GitHub Security Advisories",
+      "category": "developer",
+      "description": "Upgrades osv.dev/vulnerability/<id> and github.com/advisories/GHSA-* pages to the keyless api.osv.dev/v1/vulns JSON API with canonical lowercase GHSA IDs and bounded affected-version slices.",
+      "domains": [
+        "osv.dev",
+        "www.osv.dev",
+        "github.com"
+      ],
+      "exampleUrls": [
+        "https://osv.dev/vulnerability/GHSA-jfh8-c2jp-5v3q",
+        "https://github.com/advisories/GHSA-jfh8-c2jp-5v3q"
+      ],
+      "routes": [
+        {
+          "match": {
+            "hosts": [
+              "osv.dev",
+              "www.osv.dev"
+            ],
+            "exactSegments": false,
+            "pathSegments": [
+              "vulnerability",
+              {
+                "param": "vulnId",
+                "charset": "url_seg",
+                "minLen": 4,
+                "maxLen": 80
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://api.osv.dev/v1/vulns/{vulnId}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "id"
+            ],
+            "vars": {
+              "id": {
+                "paths": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "paths": [
+                  "summary"
+                ],
+                "trim": true
+              },
+              "details": {
+                "paths": [
+                  "details"
+                ],
+                "trim": true
+              },
+              "summaryShort": {
+                "paths": [
+                  "summary",
+                  "details"
+                ],
+                "trim": true,
+                "sliceMax": 260
+              },
+              "aliases": {
+                "paths": [
+                  "aliases"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 12
+              },
+              "severityScore": {
+                "paths": [
+                  "severity.0.score"
+                ]
+              },
+              "severityType": {
+                "paths": [
+                  "severity.0.type"
+                ]
+              },
+              "published": {
+                "paths": [
+                  "published"
+                ],
+                "sliceMax": 10
+              },
+              "modified": {
+                "paths": [
+                  "modified"
+                ],
+                "sliceMax": 10
+              },
+              "osvUrl": {
+                "template": "https://osv.dev/vulnerability/{id}",
+                "requireHttps": true
+              }
+            },
+            "titleTemplate": "{id} — {summary}",
+            "titleWhenVar": "summary",
+            "titleFallbackTemplate": "{id} (OSV Advisory)",
+            "descriptionVar": "summaryShort",
+            "publishedTimeVar": "published",
+            "introVar": "summary",
+            "bullets": [
+              {
+                "label": "Advisory ID",
+                "template": "`{id}`"
+              },
+              {
+                "label": "Aliases",
+                "template": "{aliases}",
+                "whenVar": "aliases"
+              },
+              {
+                "label": "Severity",
+                "template": "`{severityScore}` ({severityType})",
+                "whenVar": "severityScore"
+              },
+              {
+                "label": "Published",
+                "template": "{published}",
+                "whenVar": "published"
+              },
+              {
+                "label": "Modified",
+                "template": "{modified}",
+                "whenVar": "modified"
+              },
+              {
+                "label": "OSV URL",
+                "template": "{osvUrl}",
+                "whenVar": "osvUrl"
+              }
+            ],
+            "bodyVar": "details",
+            "sections": [
+              {
+                "heading": "Affected Packages",
+                "arrayPath": "affected",
+                "limit": 20,
+                "itemVars": {
+                  "versionsCount": {
+                    "paths": [
+                      "versions"
+                    ],
+                    "format": "array_len_comma"
+                  },
+                  "versionsSample": {
+                    "paths": [
+                      "versions"
+                    ],
+                    "limit": 12,
+                    "itemWrap": "`",
+                    "join": ", "
+                  },
+                  "fixedVersions": {
+                    "nestedSubValues": {
+                      "arrayPath": "ranges",
+                      "subArrayField": "events",
+                      "valueField": "fixed",
+                      "limit": 12,
+                      "join": ", "
+                    }
+                  }
+                },
+                "columns": [
+                  {
+                    "header": "Ecosystem",
+                    "paths": [
+                      "package.ecosystem"
+                    ]
+                  },
+                  {
+                    "header": "Package",
+                    "paths": [
+                      "package.name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Affected Count",
+                    "template": "{versionsCount}"
+                  },
+                  {
+                    "header": "Sample Versions",
+                    "template": "{versionsSample}"
+                  },
+                  {
+                    "header": "Fixed",
+                    "template": "{fixedVersions}"
+                  }
+                ]
+              },
+              {
+                "heading": "References",
+                "arrayPath": "references",
+                "limit": 20,
+                "requireItemVar": "refUrl",
+                "collectLinkVars": [
+                  "refUrl"
+                ],
+                "itemVars": {
+                  "refUrl": {
+                    "paths": [
+                      "url"
+                    ],
+                    "requireHttps": true
+                  },
+                  "refType": {
+                    "paths": [
+                      "type"
+                    ]
+                  }
+                },
+                "columns": [
+                  {
+                    "header": "Type",
+                    "template": "{refType}"
+                  },
+                  {
+                    "header": "URL",
+                    "template": "{refUrl}"
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "osvUrl"
+            ]
+          }
+        },
+        {
+          "match": {
+            "hosts": [
+              "github.com"
+            ],
+            "exactSegments": true,
+            "pathPrefix": "/advisories/GHSA-",
+            "pathSegments": [
+              "advisories",
+              {
+                "param": "ghsaBody",
+                "stripPrefix": "GHSA-",
+                "charset": "alnum_dash",
+                "minLen": 14,
+                "maxLen": 14,
+                "transform": "lower"
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://api.osv.dev/v1/vulns/GHSA-{ghsaBody}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "id"
+            ],
+            "vars": {
+              "id": {
+                "paths": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "paths": [
+                  "summary"
+                ],
+                "trim": true
+              },
+              "details": {
+                "paths": [
+                  "details"
+                ],
+                "trim": true
+              },
+              "summaryShort": {
+                "paths": [
+                  "summary",
+                  "details"
+                ],
+                "trim": true,
+                "sliceMax": 260
+              },
+              "aliases": {
+                "paths": [
+                  "aliases"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 12
+              },
+              "severityScore": {
+                "paths": [
+                  "severity.0.score"
+                ]
+              },
+              "severityType": {
+                "paths": [
+                  "severity.0.type"
+                ]
+              },
+              "published": {
+                "paths": [
+                  "published"
+                ],
+                "sliceMax": 10
+              },
+              "modified": {
+                "paths": [
+                  "modified"
+                ],
+                "sliceMax": 10
+              },
+              "ghsaUrl": {
+                "template": "https://github.com/advisories/GHSA-{ghsaBody}",
+                "requireHttps": true
+              },
+              "osvUrl": {
+                "template": "https://osv.dev/vulnerability/{id}",
+                "requireHttps": true
+              }
+            },
+            "titleTemplate": "{id} — {summary}",
+            "titleWhenVar": "summary",
+            "titleFallbackTemplate": "{id} (GitHub Advisory)",
+            "descriptionVar": "summaryShort",
+            "publishedTimeVar": "published",
+            "introVar": "summary",
+            "bullets": [
+              {
+                "label": "Advisory ID",
+                "template": "`{id}`"
+              },
+              {
+                "label": "Aliases",
+                "template": "{aliases}",
+                "whenVar": "aliases"
+              },
+              {
+                "label": "Severity",
+                "template": "`{severityScore}` ({severityType})",
+                "whenVar": "severityScore"
+              },
+              {
+                "label": "Published",
+                "template": "{published}",
+                "whenVar": "published"
+              },
+              {
+                "label": "Modified",
+                "template": "{modified}",
+                "whenVar": "modified"
+              },
+              {
+                "label": "OSV URL",
+                "template": "{osvUrl}",
+                "whenVar": "osvUrl"
+              }
+            ],
+            "bodyVar": "details",
+            "sections": [
+              {
+                "heading": "Affected Packages",
+                "arrayPath": "affected",
+                "limit": 20,
+                "itemVars": {
+                  "versionsCount": {
+                    "paths": [
+                      "versions"
+                    ],
+                    "format": "array_len_comma"
+                  },
+                  "versionsSample": {
+                    "paths": [
+                      "versions"
+                    ],
+                    "limit": 12,
+                    "itemWrap": "`",
+                    "join": ", "
+                  },
+                  "fixedVersions": {
+                    "nestedSubValues": {
+                      "arrayPath": "ranges",
+                      "subArrayField": "events",
+                      "valueField": "fixed",
+                      "limit": 12,
+                      "join": ", "
+                    }
+                  }
+                },
+                "columns": [
+                  {
+                    "header": "Ecosystem",
+                    "paths": [
+                      "package.ecosystem"
+                    ]
+                  },
+                  {
+                    "header": "Package",
+                    "paths": [
+                      "package.name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Affected Count",
+                    "template": "{versionsCount}"
+                  },
+                  {
+                    "header": "Sample Versions",
+                    "template": "{versionsSample}"
+                  },
+                  {
+                    "header": "Fixed",
+                    "template": "{fixedVersions}"
+                  }
+                ]
+              },
+              {
+                "heading": "References",
+                "arrayPath": "references",
+                "limit": 20,
+                "requireItemVar": "refUrl",
+                "collectLinkVars": [
+                  "refUrl"
+                ],
+                "itemVars": {
+                  "refUrl": {
+                    "paths": [
+                      "url"
+                    ],
+                    "requireHttps": true
+                  },
+                  "refType": {
+                    "paths": [
+                      "type"
+                    ]
+                  }
+                },
+                "columns": [
+                  {
+                    "header": "Type",
+                    "template": "{refType}"
+                  },
+                  {
+                    "header": "URL",
+                    "template": "{refUrl}"
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "osvUrl",
+              "ghsaUrl"
+            ]
+          }
+        }
+      ]
     },
     {
       "id": "packagist",
@@ -10620,6 +13989,11 @@
           "match": {
             "pathEquals": [
               "/api/jobs"
+            ],
+            "excludeHosts": [
+              "jobs.dover.com",
+              "app.dover.com",
+              "*.dover.com"
             ]
           },
           "twin": {
@@ -10850,7 +14224,12 @@
           "id": "sap-rmk",
           "mode": "xml_items_table",
           "match": {
-            "pathSuffix": "sitemap.xml"
+            "pathSuffix": "sitemap.xml",
+            "excludeHosts": [
+              "jobs.dover.com",
+              "app.dover.com",
+              "*.dover.com"
+            ]
           },
           "xml": {
             "mode": "items_table",
@@ -11267,6 +14646,28 @@
       }
     },
     {
+      "id": "sfcc-demandware",
+      "name": "Salesforce Commerce Cloud (Demandware) Storefronts",
+      "category": "commerce-social",
+      "description": "Structurally detects Salesforce Commerce Cloud storefronts and extracts Product-Variation twins, JSON-LD, variation options, and product geometry/specification tables.",
+      "domains": [
+        "www.demandware.com"
+      ],
+      "universalEngine": true,
+      "exampleUrls": [
+        "https://www.demandware.com/product/sample"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "sfcc-demandware",
+          "match": {
+            "exactSegments": false
+          },
+          "mode": "sfcc_html"
+        }
+      ]
+    },
+    {
       "id": "shopify",
       "name": "Shopify Universal Storefront & Catalogs",
       "category": "commerce-social",
@@ -11379,6 +14780,33 @@
           "extract": {
             "commerceMode": "shopify_product"
           }
+        },
+        {
+          "match": {
+            "hosts": [
+              "*.myshopify.com"
+            ],
+            "optionalLeadingLocale": true,
+            "exactSegments": true,
+            "pathSegments": [
+              "collections",
+              {
+                "param": "handle",
+                "charset": "slug",
+                "maxLen": 160
+              }
+            ]
+          },
+          "twin": {
+            "id": "shopify",
+            "fetchUrl": "https://{host}/collections/{handle}/products.json?limit=50",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "commerceMode": "shopify_catalog_page"
+          }
         }
       ],
       "htmlRoutes": [
@@ -11388,6 +14816,29 @@
             "pathContainsSegment": "products"
           },
           "mode": "shopify_html"
+        }
+      ]
+    },
+    {
+      "id": "shopware-magento",
+      "name": "Magento 2 & Shopware 6 Storefronts",
+      "category": "commerce-social",
+      "description": "Structurally detects Magento 2 (text/x-magento-init swatches and bounded products-render-info) and Shopware 6 (sw-product-detail and property tables) storefronts.",
+      "domains": [
+        "www.shopware.com",
+        "business.adobe.com"
+      ],
+      "universalEngine": true,
+      "exampleUrls": [
+        "https://www.shopware.com/en/products/sample"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "shopware-magento",
+          "match": {
+            "exactSegments": false
+          },
+          "mode": "shopware_magento_html"
         }
       ]
     },
@@ -11590,6 +15041,156 @@
           "csvExportUrl"
         ]
       }
+    },
+    {
+      "id": "squarespace-commerce",
+      "name": "Squarespace Commerce Storefronts",
+      "category": "commerce-social",
+      "description": "Detects Squarespace Commerce storefronts structurally and formats ?format=json-pretty product/collection payloads and HTML fallback into GFM tables and normalized CatalogRecord arrays.",
+      "domains": [
+        "commerce.squarespace.com"
+      ],
+      "universalEngine": true,
+      "exampleUrls": [
+        "https://commerce.squarespace.com/shop"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "squarespace-commerce",
+          "match": {
+            "exactSegments": false
+          },
+          "mode": "squarespace_html"
+        }
+      ]
+    },
+    {
+      "id": "sram-docs",
+      "name": "SRAM Technical Documentation (Fluid Topics)",
+      "category": "developer",
+      "description": "Extracts bounded Fluid Topics SSR HTML documentation from docs.sram.com, stripping inline data:image base64 blobs and error chrome while preserving breadcrumbs, model codes, and PDF manual links.",
+      "domains": [
+        "docs.sram.com"
+      ],
+      "exampleUrls": [
+        "https://docs.sram.com/en-US/publications/7E6x3h233022a92169062b0b32331510?models=fc-red-d1"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "sram-docs",
+          "match": {
+            "exactSegments": false
+          },
+          "mode": "sram_docs_html"
+        }
+      ]
+    },
+    {
+      "id": "sram-models",
+      "name": "SRAM Component Models (www.sram.com)",
+      "category": "commerce-social",
+      "description": "Extracts structured Product JSON-LD and technical component specification tables from www.sram.com/*/sram/models/* pages.",
+      "domains": [
+        "www.sram.com",
+        "sram.com"
+      ],
+      "exampleUrls": [
+        "https://www.sram.com/en/sram/models/rd-xx-e-b1",
+        "https://www.sram.com/en/service/models/rd-gx-1-b1"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "sram-models",
+          "mode": "dom",
+          "match": {
+            "optionalLeadingLocale": true,
+            "exactSegments": false,
+            "anyOf": [
+              {
+                "pathSegments": [
+                  "sram",
+                  "models",
+                  {
+                    "param": "modelSlug",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 140
+                  }
+                ]
+              },
+              {
+                "pathSegments": [
+                  "service",
+                  "models",
+                  {
+                    "param": "modelSlug",
+                    "charset": "url_seg",
+                    "minLen": 1,
+                    "maxLen": 140
+                  }
+                ]
+              }
+            ]
+          },
+          "jsonLdTypes": [
+            "Product"
+          ],
+          "vars": {
+            "title": {
+              "jsonLdPaths": [
+                "name"
+              ],
+              "cssText": [
+                ".product-detail h1",
+                "h1",
+                "title"
+              ],
+              "trim": true
+            },
+            "sku": {
+              "jsonLdPaths": [
+                "sku"
+              ],
+              "trim": true
+            },
+            "brand": {
+              "jsonLdPaths": [
+                "brand.name",
+                "brand"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "main.product-detail",
+                ".product-detail",
+                "main"
+              ],
+              "format": "strip_leading_h1",
+              "trim": true
+            }
+          },
+          "requireVars": [
+            "title",
+            "body"
+          ],
+          "titleTemplate": "{title}",
+          "bullets": [
+            {
+              "label": "Brand",
+              "template": "{brand}",
+              "whenVar": "brand"
+            },
+            {
+              "label": "SKU",
+              "template": "`{sku}`",
+              "whenVar": "sku"
+            }
+          ],
+          "bodyVar": "body",
+          "preserveBodyLinksFromVar": "body"
+        }
+      ]
     },
     {
       "id": "stackexchange-qa",
@@ -11908,6 +15509,1706 @@
       }
     },
     {
+      "id": "terraform-registry",
+      "name": "Terraform Registry",
+      "category": "developer",
+      "description": "Upgrades registry.terraform.io provider and module pages to the official keyless /v1/ JSON API with versions, documentation entries, inputs, outputs, and README.",
+      "domains": [
+        "registry.terraform.io"
+      ],
+      "exampleUrls": [
+        "https://registry.terraform.io/providers/hashicorp/random",
+        "https://registry.terraform.io/providers/hashicorp/random/3.8.1",
+        "https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws",
+        "https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/5.1.0"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "providers",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "name",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "ver",
+                "charset": "url_seg",
+                "reserved": [
+                  "latest",
+                  "docs"
+                ],
+                "minLen": 1,
+                "maxLen": 64
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://registry.terraform.io/v1/providers/{ns}/{name}/{ver}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "namespace",
+              "name",
+              "version"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "tier": {
+                "paths": [
+                  "tier"
+                ]
+              },
+              "downloads": {
+                "paths": [
+                  "downloads"
+                ],
+                "format": "int_comma"
+              },
+              "publishedAt": {
+                "paths": [
+                  "published_at"
+                ],
+                "sliceMax": 10
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "source": {
+                "paths": [
+                  "source"
+                ],
+                "requireHttps": true
+              },
+              "versionCount": {
+                "paths": [
+                  "versions"
+                ],
+                "format": "array_len_comma"
+              }
+            },
+            "titleTemplate": "{namespace}/{name} v{version} (Terraform Provider)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "publishedAt",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Provider",
+                "template": "`{namespace}/{name}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`"
+              },
+              {
+                "label": "Tier",
+                "template": "{tier}",
+                "whenVar": "tier"
+              },
+              {
+                "label": "Downloads",
+                "template": "{downloads}",
+                "whenVar": "downloads"
+              },
+              {
+                "label": "Published",
+                "template": "{publishedAt}",
+                "whenVar": "publishedAt"
+              },
+              {
+                "label": "Available Versions",
+                "template": "{versionCount}",
+                "whenVar": "versionCount"
+              },
+              {
+                "label": "Source",
+                "template": "{source}",
+                "whenVar": "source"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Documentation Entries",
+                "arrayPath": "docs",
+                "limit": 40,
+                "columns": [
+                  {
+                    "header": "Title",
+                    "paths": [
+                      "title"
+                    ]
+                  },
+                  {
+                    "header": "Category",
+                    "paths": [
+                      "category"
+                    ]
+                  },
+                  {
+                    "header": "Language",
+                    "paths": [
+                      "language"
+                    ]
+                  },
+                  {
+                    "header": "Path",
+                    "paths": [
+                      "path"
+                    ],
+                    "code": true
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "source"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "providers",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "name",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "ver",
+                "charset": "alnum",
+                "allowValues": [
+                  "latest"
+                ],
+                "minLen": 6,
+                "maxLen": 6
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://registry.terraform.io/v1/providers/{ns}/{name}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "namespace",
+              "name",
+              "version"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "tier": {
+                "paths": [
+                  "tier"
+                ]
+              },
+              "downloads": {
+                "paths": [
+                  "downloads"
+                ],
+                "format": "int_comma"
+              },
+              "publishedAt": {
+                "paths": [
+                  "published_at"
+                ],
+                "sliceMax": 10
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "source": {
+                "paths": [
+                  "source"
+                ],
+                "requireHttps": true
+              },
+              "versionCount": {
+                "paths": [
+                  "versions"
+                ],
+                "format": "array_len_comma"
+              }
+            },
+            "titleTemplate": "{namespace}/{name} v{version} (Terraform Provider)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "publishedAt",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Provider",
+                "template": "`{namespace}/{name}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`"
+              },
+              {
+                "label": "Tier",
+                "template": "{tier}",
+                "whenVar": "tier"
+              },
+              {
+                "label": "Downloads",
+                "template": "{downloads}",
+                "whenVar": "downloads"
+              },
+              {
+                "label": "Published",
+                "template": "{publishedAt}",
+                "whenVar": "publishedAt"
+              },
+              {
+                "label": "Available Versions",
+                "template": "{versionCount}",
+                "whenVar": "versionCount"
+              },
+              {
+                "label": "Source",
+                "template": "{source}",
+                "whenVar": "source"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Documentation Entries",
+                "arrayPath": "docs",
+                "limit": 40,
+                "columns": [
+                  {
+                    "header": "Title",
+                    "paths": [
+                      "title"
+                    ]
+                  },
+                  {
+                    "header": "Category",
+                    "paths": [
+                      "category"
+                    ]
+                  },
+                  {
+                    "header": "Language",
+                    "paths": [
+                      "language"
+                    ]
+                  },
+                  {
+                    "header": "Path",
+                    "paths": [
+                      "path"
+                    ],
+                    "code": true
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "source"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "providers",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "name",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://registry.terraform.io/v1/providers/{ns}/{name}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "namespace",
+              "name",
+              "version"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "tier": {
+                "paths": [
+                  "tier"
+                ]
+              },
+              "downloads": {
+                "paths": [
+                  "downloads"
+                ],
+                "format": "int_comma"
+              },
+              "publishedAt": {
+                "paths": [
+                  "published_at"
+                ],
+                "sliceMax": 10
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "source": {
+                "paths": [
+                  "source"
+                ],
+                "requireHttps": true
+              },
+              "versionCount": {
+                "paths": [
+                  "versions"
+                ],
+                "format": "array_len_comma"
+              }
+            },
+            "titleTemplate": "{namespace}/{name} v{version} (Terraform Provider)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "publishedAt",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Provider",
+                "template": "`{namespace}/{name}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`"
+              },
+              {
+                "label": "Tier",
+                "template": "{tier}",
+                "whenVar": "tier"
+              },
+              {
+                "label": "Downloads",
+                "template": "{downloads}",
+                "whenVar": "downloads"
+              },
+              {
+                "label": "Published",
+                "template": "{publishedAt}",
+                "whenVar": "publishedAt"
+              },
+              {
+                "label": "Available Versions",
+                "template": "{versionCount}",
+                "whenVar": "versionCount"
+              },
+              {
+                "label": "Source",
+                "template": "{source}",
+                "whenVar": "source"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Documentation Entries",
+                "arrayPath": "docs",
+                "limit": 40,
+                "columns": [
+                  {
+                    "header": "Title",
+                    "paths": [
+                      "title"
+                    ]
+                  },
+                  {
+                    "header": "Category",
+                    "paths": [
+                      "category"
+                    ]
+                  },
+                  {
+                    "header": "Language",
+                    "paths": [
+                      "language"
+                    ]
+                  },
+                  {
+                    "header": "Path",
+                    "paths": [
+                      "path"
+                    ],
+                    "code": true
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "source"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "modules",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "name",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "provider",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "ver",
+                "charset": "url_seg",
+                "reserved": [
+                  "latest",
+                  "submodules",
+                  "examples"
+                ],
+                "minLen": 1,
+                "maxLen": 64
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://registry.terraform.io/v1/modules/{ns}/{name}/{provider}/{ver}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "namespace",
+              "name",
+              "provider",
+              "version"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "provider": {
+                "paths": [
+                  "provider"
+                ]
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "verified": {
+                "paths": [
+                  "verified"
+                ],
+                "format": "bool_map",
+                "trueValue": "Verified",
+                "falseValue": "Unverified"
+              },
+              "downloads": {
+                "paths": [
+                  "downloads"
+                ],
+                "format": "int_comma"
+              },
+              "publishedAt": {
+                "paths": [
+                  "published_at"
+                ],
+                "sliceMax": 10
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "source": {
+                "paths": [
+                  "source"
+                ],
+                "requireHttps": true
+              },
+              "readme": {
+                "paths": [
+                  "root.readme"
+                ],
+                "format": "demote_h1",
+                "trim": true
+              }
+            },
+            "titleTemplate": "{namespace}/{name}/{provider} v{version} (Terraform Module)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "publishedAt",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Module",
+                "template": "`{namespace}/{name}/{provider}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`"
+              },
+              {
+                "label": "Status",
+                "template": "{verified}",
+                "whenVar": "verified"
+              },
+              {
+                "label": "Downloads",
+                "template": "{downloads}",
+                "whenVar": "downloads"
+              },
+              {
+                "label": "Published",
+                "template": "{publishedAt}",
+                "whenVar": "publishedAt"
+              },
+              {
+                "label": "Source",
+                "template": "{source}",
+                "whenVar": "source"
+              }
+            ],
+            "bodyVar": "readme",
+            "sections": [
+              {
+                "heading": "Inputs",
+                "arrayPath": "root.inputs",
+                "limit": 60,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Type",
+                    "paths": [
+                      "type"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Required",
+                    "paths": [
+                      "required"
+                    ]
+                  },
+                  {
+                    "header": "Description",
+                    "paths": [
+                      "description"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Outputs",
+                "arrayPath": "root.outputs",
+                "limit": 40,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Description",
+                    "paths": [
+                      "description"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Submodules",
+                "arrayPath": "submodules",
+                "limit": 30,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Path",
+                    "paths": [
+                      "path"
+                    ],
+                    "code": true
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "source"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "modules",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "name",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "provider",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "ver",
+                "charset": "alnum",
+                "allowValues": [
+                  "latest"
+                ],
+                "minLen": 6,
+                "maxLen": 6
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://registry.terraform.io/v1/modules/{ns}/{name}/{provider}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "namespace",
+              "name",
+              "provider",
+              "version"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "provider": {
+                "paths": [
+                  "provider"
+                ]
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "verified": {
+                "paths": [
+                  "verified"
+                ],
+                "format": "bool_map",
+                "trueValue": "Verified",
+                "falseValue": "Unverified"
+              },
+              "downloads": {
+                "paths": [
+                  "downloads"
+                ],
+                "format": "int_comma"
+              },
+              "publishedAt": {
+                "paths": [
+                  "published_at"
+                ],
+                "sliceMax": 10
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "source": {
+                "paths": [
+                  "source"
+                ],
+                "requireHttps": true
+              },
+              "readme": {
+                "paths": [
+                  "root.readme"
+                ],
+                "format": "demote_h1",
+                "trim": true
+              }
+            },
+            "titleTemplate": "{namespace}/{name}/{provider} v{version} (Terraform Module)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "publishedAt",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Module",
+                "template": "`{namespace}/{name}/{provider}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`"
+              },
+              {
+                "label": "Status",
+                "template": "{verified}",
+                "whenVar": "verified"
+              },
+              {
+                "label": "Downloads",
+                "template": "{downloads}",
+                "whenVar": "downloads"
+              },
+              {
+                "label": "Published",
+                "template": "{publishedAt}",
+                "whenVar": "publishedAt"
+              },
+              {
+                "label": "Source",
+                "template": "{source}",
+                "whenVar": "source"
+              }
+            ],
+            "bodyVar": "readme",
+            "sections": [
+              {
+                "heading": "Inputs",
+                "arrayPath": "root.inputs",
+                "limit": 60,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Type",
+                    "paths": [
+                      "type"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Required",
+                    "paths": [
+                      "required"
+                    ]
+                  },
+                  {
+                    "header": "Description",
+                    "paths": [
+                      "description"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Outputs",
+                "arrayPath": "root.outputs",
+                "limit": 40,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Description",
+                    "paths": [
+                      "description"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Submodules",
+                "arrayPath": "submodules",
+                "limit": 30,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Path",
+                    "paths": [
+                      "path"
+                    ],
+                    "code": true
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "source"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "modules",
+              {
+                "param": "ns",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "name",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              },
+              {
+                "param": "provider",
+                "charset": "pkg",
+                "minLen": 1,
+                "maxLen": 80
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://registry.terraform.io/v1/modules/{ns}/{name}/{provider}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "namespace",
+              "name",
+              "provider",
+              "version"
+            ],
+            "vars": {
+              "namespace": {
+                "paths": [
+                  "namespace"
+                ]
+              },
+              "name": {
+                "paths": [
+                  "name"
+                ]
+              },
+              "provider": {
+                "paths": [
+                  "provider"
+                ]
+              },
+              "version": {
+                "paths": [
+                  "version"
+                ]
+              },
+              "verified": {
+                "paths": [
+                  "verified"
+                ],
+                "format": "bool_map",
+                "trueValue": "Verified",
+                "falseValue": "Unverified"
+              },
+              "downloads": {
+                "paths": [
+                  "downloads"
+                ],
+                "format": "int_comma"
+              },
+              "publishedAt": {
+                "paths": [
+                  "published_at"
+                ],
+                "sliceMax": 10
+              },
+              "desc": {
+                "paths": [
+                  "description"
+                ],
+                "trim": true
+              },
+              "source": {
+                "paths": [
+                  "source"
+                ],
+                "requireHttps": true
+              },
+              "readme": {
+                "paths": [
+                  "root.readme"
+                ],
+                "format": "demote_h1",
+                "trim": true
+              }
+            },
+            "titleTemplate": "{namespace}/{name}/{provider} v{version} (Terraform Module)",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "publishedAt",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Module",
+                "template": "`{namespace}/{name}/{provider}`"
+              },
+              {
+                "label": "Version",
+                "template": "`{version}`"
+              },
+              {
+                "label": "Status",
+                "template": "{verified}",
+                "whenVar": "verified"
+              },
+              {
+                "label": "Downloads",
+                "template": "{downloads}",
+                "whenVar": "downloads"
+              },
+              {
+                "label": "Published",
+                "template": "{publishedAt}",
+                "whenVar": "publishedAt"
+              },
+              {
+                "label": "Source",
+                "template": "{source}",
+                "whenVar": "source"
+              }
+            ],
+            "bodyVar": "readme",
+            "sections": [
+              {
+                "heading": "Inputs",
+                "arrayPath": "root.inputs",
+                "limit": 60,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Type",
+                    "paths": [
+                      "type"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Required",
+                    "paths": [
+                      "required"
+                    ]
+                  },
+                  {
+                    "header": "Description",
+                    "paths": [
+                      "description"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Outputs",
+                "arrayPath": "root.outputs",
+                "limit": 40,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Description",
+                    "paths": [
+                      "description"
+                    ]
+                  }
+                ]
+              },
+              {
+                "heading": "Submodules",
+                "arrayPath": "submodules",
+                "limit": 30,
+                "columns": [
+                  {
+                    "header": "Name",
+                    "paths": [
+                      "name"
+                    ],
+                    "code": true
+                  },
+                  {
+                    "header": "Path",
+                    "paths": [
+                      "path"
+                    ],
+                    "code": true
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "source"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "tq-ebike",
+      "name": "TQ e-Mobility Products & Support",
+      "category": "commerce-social",
+      "description": "Extracts Product JSON-LD, drive system technical specs, and support documentation from www.tq-ebike.com product and help-support pages.",
+      "domains": [
+        "www.tq-ebike.com",
+        "tq-ebike.com"
+      ],
+      "exampleUrls": [
+        "https://www.tq-ebike.com/en/e-bike-system/hpr50/"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "tq-ebike",
+          "mode": "dom",
+          "match": {
+            "optionalLeadingLocale": true,
+            "exactSegments": false,
+            "anyOf": [
+              {
+                "pathSegments": [
+                  "products",
+                  {
+                    "param": "slug",
+                    "charset": "safe_subpath",
+                    "greedy": true,
+                    "minLen": 1,
+                    "maxLen": 160
+                  }
+                ]
+              },
+              {
+                "pathSegments": [
+                  "e-bike-system",
+                  {
+                    "param": "slug",
+                    "charset": "safe_subpath",
+                    "greedy": true,
+                    "minLen": 1,
+                    "maxLen": 160
+                  }
+                ]
+              },
+              {
+                "pathSegments": [
+                  "help-support",
+                  {
+                    "param": "slug",
+                    "charset": "safe_subpath",
+                    "greedy": true,
+                    "minLen": 1,
+                    "maxLen": 160
+                  }
+                ]
+              }
+            ]
+          },
+          "jsonLdTypes": [
+            "Product"
+          ],
+          "vars": {
+            "title": {
+              "jsonLdPaths": [
+                "name"
+              ],
+              "cssText": [
+                "main h1",
+                "h1",
+                "title"
+              ],
+              "trim": true
+            },
+            "sku": {
+              "jsonLdPaths": [
+                "sku"
+              ],
+              "trim": true
+            },
+            "brand": {
+              "jsonLdPaths": [
+                "brand.name",
+                "brand"
+              ],
+              "trim": true
+            },
+            "body": {
+              "cssHtmlToMd": [
+                "main",
+                "article",
+                ".tx-specs",
+                "body"
+              ],
+              "format": "strip_leading_h1",
+              "trim": true
+            }
+          },
+          "requireVars": [
+            "title",
+            "body"
+          ],
+          "titleTemplate": "{title}",
+          "bullets": [
+            {
+              "label": "Brand",
+              "template": "{brand}",
+              "whenVar": "brand"
+            },
+            {
+              "label": "SKU",
+              "template": "`{sku}`",
+              "whenVar": "sku"
+            }
+          ],
+          "bodyVar": "body",
+          "preserveBodyLinksFromVar": "body"
+        }
+      ]
+    },
+    {
+      "id": "ukg-paylocity-dover",
+      "name": "UKG Pro, Paylocity & Dover Job Boards",
+      "category": "jobs",
+      "description": "Extracts structured open roles from Paylocity (/recruiting/api/feed/jobs & window.pageData), UKG Pro (*/JobBoard/* only, never / or */JobBoardView), and Dover HTML/SSR __NEXT_DATA__ (never /api/).",
+      "domains": [
+        "recruiting.ultipro.com",
+        "recruiting.paylocity.com",
+        "app.dover.com",
+        "jobs.dover.com"
+      ],
+      "exampleUrls": [
+        "https://recruiting.ultipro.com/ACM1001/JobBoard/11111111-2222-3333-4444-555555555555/",
+        "https://recruiting.paylocity.com/Recruiting/Jobs/All/aaaa-bbbb-cccc",
+        "https://app.dover.com/jobs/acme"
+      ],
+      "routes": [
+        {
+          "match": {
+            "hosts": [
+              "recruiting.paylocity.com"
+            ],
+            "pathPrefix": "/recruiting/jobs/all/",
+            "scanSegment": {
+              "afterLiteral": "all",
+              "param": "guid",
+              "charset": "slug",
+              "minLen": 4,
+              "maxLen": 80
+            }
+          },
+          "twin": {
+            "fetchUrl": "https://recruiting.paylocity.com/recruiting/api/feed/jobs/{guid}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "jsonMode": "paylocity_feed"
+          }
+        },
+        {
+          "match": {
+            "hosts": [
+              "recruiting.paylocity.com"
+            ],
+            "pathPrefix": "/recruiting/api/feed/jobs/",
+            "scanSegment": {
+              "afterLiteral": "jobs",
+              "param": "guid",
+              "charset": "slug",
+              "minLen": 4,
+              "maxLen": 80
+            }
+          },
+          "twin": {
+            "fetchUrl": "{requestUrl}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "jsonMode": "paylocity_feed"
+          }
+        }
+      ],
+      "htmlRoutes": [
+        {
+          "id": "ukg-paylocity-dover",
+          "mode": "ukg_pro_html",
+          "match": {
+            "hosts": [
+              "recruiting.ultipro.com"
+            ],
+            "pathContainsSegment": "JobBoard",
+            "minSegments": 3
+          }
+        },
+        {
+          "id": "ukg-paylocity-dover",
+          "mode": "paylocity_html",
+          "match": {
+            "hosts": [
+              "recruiting.paylocity.com"
+            ],
+            "pathPrefix": "/recruiting/jobs/"
+          }
+        },
+        {
+          "id": "ukg-paylocity-dover",
+          "mode": "dover_html",
+          "match": {
+            "anyOf": [
+              {
+                "hosts": [
+                  "app.dover.com"
+                ],
+                "exactSegments": false,
+                "pathSegments": [
+                  "jobs",
+                  {
+                    "param": "org",
+                    "charset": "slug",
+                    "minLen": 1,
+                    "maxLen": 120
+                  }
+                ]
+              },
+              {
+                "hosts": [
+                  "jobs.dover.com"
+                ],
+                "minSegments": 1,
+                "reservedFirstSegment": [
+                  "api",
+                  "apply",
+                  "static",
+                  "assets",
+                  "_next",
+                  "login"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "us-cfr-govinfo",
+      "name": "U.S. CFR & GovInfo",
+      "category": "public-records",
+      "description": "Bypasses the empty Angular /app/details/ SPA on govinfo.gov by fetching static /content/pkg/<PKGID>/html/*.htm documents or /wssearch/getContentDetail summary JSON.",
+      "domains": [
+        "www.govinfo.gov",
+        "govinfo.gov"
+      ],
+      "exampleUrls": [
+        "https://www.govinfo.gov/app/details/CFR-2023-title16-vol2/CFR-2023-title16-vol2-part1500",
+        "https://www.govinfo.gov/app/details/CFR-2023-title16-vol2",
+        "https://www.govinfo.gov/wssearch/getContentDetail?packageId=CFR-2023-title16-vol2"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "app",
+              "details",
+              {
+                "param": "pkgId",
+                "charset": "pkg",
+                "minLen": 4,
+                "maxLen": 120
+              },
+              {
+                "param": "granuleId",
+                "charset": "pkg",
+                "minLen": 4,
+                "maxLen": 160
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://www.govinfo.gov/content/pkg/{pkgId}/html/{granuleId}.htm",
+            "kind": "text",
+            "accept": "text/html",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "textMode": "html_document",
+            "titleTemplate": "{granuleId} ({pkgId})"
+          }
+        },
+        {
+          "match": {
+            "exactSegments": true,
+            "pathSegments": [
+              "app",
+              "details",
+              {
+                "param": "pkgId",
+                "charset": "pkg",
+                "minLen": 4,
+                "maxLen": 120
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://www.govinfo.gov/content/pkg/{pkgId}/html/{pkgId}.htm",
+            "kind": "text",
+            "accept": "text/html",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "textMode": "html_document",
+            "titleTemplate": "{pkgId}"
+          }
+        },
+        {
+          "match": {
+            "pathEquals": [
+              "/wssearch/getContentDetail"
+            ],
+            "queryParams": [
+              {
+                "name": "packageId",
+                "param": "pkgId",
+                "charset": "pkg",
+                "minLen": 4,
+                "maxLen": 120
+              },
+              {
+                "name": "granuleId",
+                "param": "granuleId",
+                "charset": "pkg",
+                "optional": true,
+                "maxLen": 160
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "{requestUrl}",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "title",
+              "packageId"
+            ],
+            "vars": {
+              "title": {
+                "paths": [
+                  "title"
+                ],
+                "fallbackTemplate": "{pkgId}",
+                "trim": true
+              },
+              "packageId": {
+                "paths": [
+                  "packageId"
+                ],
+                "fallbackTemplate": "{pkgId}"
+              },
+              "collection": {
+                "paths": [
+                  "collectionName",
+                  "collection",
+                  "collectionCode"
+                ]
+              },
+              "category": {
+                "paths": [
+                  "category"
+                ]
+              },
+              "dateIssued": {
+                "paths": [
+                  "dateIssued"
+                ]
+              },
+              "lastModified": {
+                "paths": [
+                  "lastModified"
+                ],
+                "sliceMax": 10
+              },
+              "authors": {
+                "paths": [
+                  "governmentAuthor",
+                  "metadata.agency"
+                ],
+                "join": ", ",
+                "limit": 10
+              },
+              "granuleCount": {
+                "paths": [
+                  "granuleCount"
+                ],
+                "format": "int_comma"
+              },
+              "pdfLink": {
+                "paths": [
+                  "download.pdfLink"
+                ],
+                "requireHttps": true
+              },
+              "htmlLink": {
+                "paths": [
+                  "download.htmlLink",
+                  "download.htmLink"
+                ],
+                "requireHttps": true
+              },
+              "xmlLink": {
+                "paths": [
+                  "download.xmlLink"
+                ],
+                "requireHttps": true
+              },
+              "txtLink": {
+                "paths": [
+                  "download.txtLink"
+                ],
+                "requireHttps": true
+              },
+              "zipLink": {
+                "paths": [
+                  "download.zipLink"
+                ],
+                "requireHttps": true
+              },
+              "modsLink": {
+                "paths": [
+                  "download.modsLink"
+                ],
+                "requireHttps": true
+              }
+            },
+            "titleTemplate": "{title}",
+            "authorVar": "authors",
+            "publishedTimeVar": "dateIssued",
+            "bullets": [
+              {
+                "label": "Package ID",
+                "template": "`{packageId}`",
+                "whenVar": "packageId"
+              },
+              {
+                "label": "Collection",
+                "template": "{collection}",
+                "whenVar": "collection"
+              },
+              {
+                "label": "Category",
+                "template": "{category}",
+                "whenVar": "category"
+              },
+              {
+                "label": "Date Issued",
+                "template": "{dateIssued}",
+                "whenVar": "dateIssued"
+              },
+              {
+                "label": "Last Modified",
+                "template": "{lastModified}",
+                "whenVar": "lastModified"
+              },
+              {
+                "label": "Government Author",
+                "template": "{authors}",
+                "whenVar": "authors"
+              },
+              {
+                "label": "Granules",
+                "template": "{granuleCount}",
+                "whenVar": "granuleCount"
+              },
+              {
+                "label": "PDF Download",
+                "template": "{pdfLink}",
+                "whenVar": "pdfLink"
+              },
+              {
+                "label": "HTML Download",
+                "template": "{htmlLink}",
+                "whenVar": "htmlLink"
+              },
+              {
+                "label": "XML Download",
+                "template": "{xmlLink}",
+                "whenVar": "xmlLink"
+              },
+              {
+                "label": "Text Download",
+                "template": "{txtLink}",
+                "whenVar": "txtLink"
+              },
+              {
+                "label": "ZIP Archive",
+                "template": "{zipLink}",
+                "whenVar": "zipLink"
+              }
+            ],
+            "linksVars": [
+              "pdfLink",
+              "htmlLink",
+              "xmlLink",
+              "txtLink",
+              "zipLink",
+              "modsLink"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "id": "usaspending",
       "name": "USAspending.gov Federal Awards",
       "category": "public-records",
@@ -12058,6 +17359,620 @@
           }
         ]
       }
+    },
+    {
+      "id": "wikidata-openlibrary",
+      "name": "Wikidata & Open Library",
+      "category": "research-health",
+      "description": "Upgrades wikidata.org/wiki/Q* to Special:EntityData/Q*.json (handling labels.en, labels.mul, and sitelinks.enwiki fallbacks) and openlibrary.org/isbn/* to /isbn/*.json (never calling disallowed /api/*).",
+      "domains": [
+        "www.wikidata.org",
+        "wikidata.org",
+        "openlibrary.org",
+        "www.openlibrary.org"
+      ],
+      "exampleUrls": [
+        "https://www.wikidata.org/wiki/Q42",
+        "https://openlibrary.org/isbn/9780140328721"
+      ],
+      "routes": [
+        {
+          "match": {
+            "hosts": [
+              "www.wikidata.org",
+              "wikidata.org"
+            ],
+            "exactSegments": true,
+            "pathPrefix": "/wiki/Q",
+            "pathSegments": [
+              "wiki",
+              {
+                "param": "qidNum",
+                "stripPrefix": "Q",
+                "charset": "digits",
+                "minLen": 1,
+                "maxLen": 15
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://www.wikidata.org/wiki/Special:EntityData/Q{qidNum}.json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "entities"
+            ],
+            "vars": {
+              "qid": {
+                "template": "Q{qidNum}"
+              },
+              "labelEn": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "labels.en.value"
+                },
+                "trim": true
+              },
+              "labelMul": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "labels.mul.value"
+                },
+                "trim": true
+              },
+              "labelEnwiki": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "sitelinks.enwiki.title"
+                },
+                "trim": true
+              },
+              "labelMulOrEnwiki": {
+                "template": "{labelMul}",
+                "whenVars": [
+                  "labelMul"
+                ],
+                "fallbackVar": "labelEnwiki"
+              },
+              "label": {
+                "template": "{labelEn}",
+                "whenVars": [
+                  "labelEn"
+                ],
+                "fallbackVar": "labelMulOrEnwiki"
+              },
+              "descEn": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "descriptions.en.value"
+                },
+                "trim": true
+              },
+              "descMul": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "descriptions.mul.value"
+                },
+                "trim": true
+              },
+              "desc": {
+                "template": "{descEn}",
+                "whenVars": [
+                  "descEn"
+                ],
+                "fallbackVar": "descMul"
+              },
+              "aliasesEn": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "aliases.en"
+                },
+                "subField": "value",
+                "join": ", ",
+                "limit": 10
+              },
+              "aliasesMul": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "aliases.mul"
+                },
+                "subField": "value",
+                "join": ", ",
+                "limit": 10
+              },
+              "aliases": {
+                "template": "{aliasesEn}",
+                "whenVars": [
+                  "aliasesEn"
+                ],
+                "fallbackVar": "aliasesMul"
+              },
+              "modified": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "modified"
+                },
+                "sliceMax": 10
+              },
+              "claimProps": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims"
+                },
+                "format": "object_keys",
+                "limit": 25,
+                "itemWrap": "`",
+                "join": ", "
+              },
+              "instanceOf": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P31"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 8
+              },
+              "sexOrGender": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P21"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 3
+              },
+              "citizenship": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P27"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 5
+              },
+              "occupation": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P106"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 8
+              },
+              "birthDate": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P569"
+                },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal"
+                },
+                "subField": "mainsnak.datavalue.value.time",
+                "stripPrefix": "+",
+                "stripSuffix": "T00:00:00Z",
+                "replaceAll": {
+                  "from": "-00",
+                  "to": ""
+                },
+                "sliceMax": 10
+              },
+              "deathDate": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P570"
+                },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal"
+                },
+                "subField": "mainsnak.datavalue.value.time",
+                "stripPrefix": "+",
+                "stripSuffix": "T00:00:00Z",
+                "replaceAll": {
+                  "from": "-00",
+                  "to": ""
+                },
+                "sliceMax": 10
+              },
+              "inception": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P571"
+                },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal"
+                },
+                "subField": "mainsnak.datavalue.value.time",
+                "stripPrefix": "+",
+                "stripSuffix": "T00:00:00Z",
+                "replaceAll": {
+                  "from": "-00",
+                  "to": ""
+                },
+                "sliceMax": 10
+              },
+              "population": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P1082"
+                },
+                "preferWhere": {
+                  "path": "rank",
+                  "equals": "preferred",
+                  "fallbackEquals": "normal",
+                  "fallbackLast": true
+                },
+                "subField": "mainsnak.datavalue.value.amount",
+                "format": "int_comma"
+              },
+              "officialWebsite": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P856.0.mainsnak.datavalue.value"
+                },
+                "trim": true,
+                "requireHttpPrefix": true
+              },
+              "enwikiSlug": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "sitelinks.enwiki.title"
+                },
+                "replaceAll": {
+                  "from": " ",
+                  "to": "_"
+                }
+              },
+              "enwikiUrl": {
+                "template": "https://en.wikipedia.org/wiki/{enwikiSlug}",
+                "whenVars": [
+                  "enwikiSlug"
+                ],
+                "requireHttps": true
+              },
+              "wikidataUrl": {
+                "template": "https://www.wikidata.org/wiki/{qid}",
+                "requireHttps": true
+              }
+            },
+            "requireVars": [
+              "label"
+            ],
+            "titleTemplate": "{label} ({qid})",
+            "descriptionVar": "desc",
+            "publishedTimeVar": "modified",
+            "introVar": "desc",
+            "bullets": [
+              {
+                "label": "Wikidata ID",
+                "template": "`{qid}`"
+              },
+              {
+                "label": "Also Known As",
+                "template": "{aliases}",
+                "whenVar": "aliases"
+              },
+              {
+                "label": "Modified",
+                "template": "{modified}",
+                "whenVar": "modified"
+              },
+              {
+                "label": "Instance Of",
+                "template": "{instanceOf}",
+                "whenVar": "instanceOf"
+              },
+              {
+                "label": "Sex or Gender",
+                "template": "{sexOrGender}",
+                "whenVar": "sexOrGender"
+              },
+              {
+                "label": "Country of Citizenship",
+                "template": "{citizenship}",
+                "whenVar": "citizenship"
+              },
+              {
+                "label": "Occupation",
+                "template": "{occupation}",
+                "whenVar": "occupation"
+              },
+              {
+                "label": "Date of Birth",
+                "template": "{birthDate}",
+                "whenVar": "birthDate"
+              },
+              {
+                "label": "Date of Death",
+                "template": "{deathDate}",
+                "whenVar": "deathDate"
+              },
+              {
+                "label": "Inception",
+                "template": "{inception}",
+                "whenVar": "inception"
+              },
+              {
+                "label": "Population",
+                "template": "{population}",
+                "whenVar": "population"
+              },
+              {
+                "label": "Official Website",
+                "template": "{officialWebsite}",
+                "whenVar": "officialWebsite"
+              },
+              {
+                "label": "Claim Properties",
+                "template": "{claimProps}",
+                "whenVar": "claimProps"
+              },
+              {
+                "label": "English Wikipedia",
+                "template": "{enwikiUrl}",
+                "whenVar": "enwikiUrl"
+              },
+              {
+                "label": "Wikidata URL",
+                "template": "{wikidataUrl}",
+                "whenVar": "wikidataUrl"
+              }
+            ],
+            "linksVars": [
+              "wikidataUrl",
+              "enwikiUrl",
+              "officialWebsite"
+            ]
+          }
+        },
+        {
+          "match": {
+            "hosts": [
+              "openlibrary.org",
+              "www.openlibrary.org"
+            ],
+            "exactSegments": true,
+            "pathSegments": [
+              "isbn",
+              {
+                "param": "isbn",
+                "stripSuffix": ".json",
+                "charset": "alnum_dash",
+                "minLen": 10,
+                "maxLen": 17
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://openlibrary.org/isbn/{isbn}.json",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireFields": [
+              "title"
+            ],
+            "vars": {
+              "title": {
+                "paths": [
+                  "title"
+                ],
+                "trim": true
+              },
+              "subtitle": {
+                "paths": [
+                  "subtitle"
+                ],
+                "trim": true
+              },
+              "isbn13": {
+                "paths": [
+                  "isbn_13"
+                ],
+                "itemWrap": "`",
+                "join": ", "
+              },
+              "isbn10": {
+                "paths": [
+                  "isbn_10"
+                ],
+                "itemWrap": "`",
+                "join": ", "
+              },
+              "publishers": {
+                "paths": [
+                  "publishers"
+                ],
+                "join": ", ",
+                "limit": 8
+              },
+              "publishDate": {
+                "paths": [
+                  "publish_date"
+                ],
+                "trim": true
+              },
+              "pages": {
+                "paths": [
+                  "number_of_pages"
+                ],
+                "format": "int_comma"
+              },
+              "contributions": {
+                "paths": [
+                  "contributions"
+                ],
+                "join": ", ",
+                "limit": 8
+              },
+              "byStatement": {
+                "paths": [
+                  "by_statement"
+                ],
+                "trim": true,
+                "sliceMax": 200
+              },
+              "authorLine": {
+                "template": "{byStatement}",
+                "whenVars": [
+                  "byStatement"
+                ],
+                "fallbackVar": "contributions"
+              },
+              "authors": {
+                "paths": [
+                  "authors"
+                ],
+                "subField": "key",
+                "join": ", ",
+                "limit": 8
+              },
+              "works": {
+                "paths": [
+                  "works"
+                ],
+                "subField": "key",
+                "join": ", ",
+                "limit": 5
+              },
+              "olKey": {
+                "paths": [
+                  "key"
+                ]
+              },
+              "olUrl": {
+                "template": "https://openlibrary.org{olKey}",
+                "whenVars": [
+                  "olKey"
+                ],
+                "requireHttps": true
+              },
+              "desc": {
+                "paths": [
+                  "description.value",
+                  "description",
+                  "first_sentence.value",
+                  "first_sentence"
+                ],
+                "trim": true
+              },
+              "descShort": {
+                "paths": [
+                  "description.value",
+                  "description",
+                  "first_sentence.value",
+                  "first_sentence"
+                ],
+                "trim": true,
+                "sliceMax": 260
+              }
+            },
+            "titleTemplate": "{title}",
+            "descriptionVar": "descShort",
+            "authorVar": "authorLine",
+            "publishedTimeVar": "publishDate",
+            "bullets": [
+              {
+                "label": "Subtitle",
+                "template": "{subtitle}",
+                "whenVar": "subtitle"
+              },
+              {
+                "label": "ISBN-13",
+                "template": "{isbn13}",
+                "whenVar": "isbn13"
+              },
+              {
+                "label": "ISBN-10",
+                "template": "{isbn10}",
+                "whenVar": "isbn10"
+              },
+              {
+                "label": "Publishers",
+                "template": "{publishers}",
+                "whenVar": "publishers"
+              },
+              {
+                "label": "Published",
+                "template": "{publishDate}",
+                "whenVar": "publishDate"
+              },
+              {
+                "label": "Pages",
+                "template": "{pages}",
+                "whenVar": "pages"
+              },
+              {
+                "label": "By",
+                "template": "{byStatement}",
+                "whenVar": "byStatement"
+              },
+              {
+                "label": "Contributors",
+                "template": "{contributions}",
+                "whenVar": "contributions"
+              },
+              {
+                "label": "Author Keys",
+                "template": "{authors}",
+                "whenVar": "authors"
+              },
+              {
+                "label": "Work Keys",
+                "template": "{works}",
+                "whenVar": "works"
+              },
+              {
+                "label": "Open Library URL",
+                "template": "{olUrl}",
+                "whenVar": "olUrl"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Description",
+                "textVar": "desc"
+              }
+            ],
+            "linksVars": [
+              "olUrl"
+            ]
+          }
+        }
+      ]
     },
     {
       "id": "woocommerce",
@@ -12608,6 +18523,33 @@
               }
             ]
           }
+        }
+      ]
+    },
+    {
+      "id": "xenforo-thread",
+      "name": "XenForo 2 Forum Threads",
+      "category": "commerce-social",
+      "description": "Extracts structured forum posts, authors, timestamps, and clean quote blocks from XenForo 2 thread HTML (article.message--post) while stripping signatures and sidebar chrome.",
+      "domains": [
+        "forums.electricbikereview.com",
+        "mtbr.com",
+        "www.mtbr.com",
+        "endless-sphere.com"
+      ],
+      "universalEngine": true,
+      "exampleUrls": [
+        "https://forums.electricbikereview.com/threads/example-thread.12345/",
+        "https://www.mtbr.com/threads/example-thread.67890/",
+        "https://endless-sphere.com/sphere/threads/example-thread.54321/"
+      ],
+      "htmlRoutes": [
+        {
+          "id": "xenforo-thread",
+          "match": {
+            "pathContainsSegment": "threads"
+          },
+          "mode": "xenforo_html"
         }
       ]
     },
@@ -13354,6 +19296,461 @@
             ],
             "linksVars": [
               "websiteHttps"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "zendesk-hc",
+      "name": "Zendesk Help Center",
+      "category": "developer",
+      "description": "Upgrades *.zendesk.com Help Center article, section, and category pages to the official Help Center v2 JSON API with breadcrumbs, updated timestamps, and Markdown conversion.",
+      "domains": [
+        "*.zendesk.com",
+        "support.sram.com"
+      ],
+      "exampleUrls": [
+        "https://support.zendesk.com/hc/en-us/articles/4408886858138-What-is-Zendesk",
+        "https://support.zendesk.com/hc/en-us/sections/4408886858138",
+        "https://support.zendesk.com/hc/en-us/categories/4408886858138"
+      ],
+      "routes": [
+        {
+          "match": {
+            "exactSegments": false,
+            "pathSegments": [
+              "hc",
+              {
+                "param": "locale",
+                "charset": "alnum_dash",
+                "minLen": 2,
+                "maxLen": 16,
+                "transform": "lower"
+              },
+              "articles",
+              {
+                "param": "articleId",
+                "charset": "leading_digits_slug",
+                "minLen": 1,
+                "maxLen": 160,
+                "transform": "leading_digits"
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://{host}/api/v2/help_center/{locale}/articles/{articleId}.json?include=sections,categories",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "rejectIfFieldTruthy": "article.draft",
+            "requireFields": [
+              "article.title",
+              "article.body"
+            ],
+            "vars": {
+              "title": {
+                "paths": [
+                  "article.title"
+                ],
+                "format": "strip_tags",
+                "trim": true
+              },
+              "updatedAt": {
+                "paths": [
+                  "article.updated_at",
+                  "article.edited_at"
+                ]
+              },
+              "htmlUrl": {
+                "paths": [
+                  "article.html_url"
+                ],
+                "requireHttps": true
+              },
+              "sectionName": {
+                "paths": [
+                  "sections.0.name"
+                ],
+                "format": "strip_tags",
+                "trim": true
+              },
+              "sectionUrl": {
+                "paths": [
+                  "sections.0.html_url"
+                ],
+                "requireHttps": true
+              },
+              "categoryName": {
+                "paths": [
+                  "categories.0.name"
+                ],
+                "format": "strip_tags",
+                "trim": true
+              },
+              "categoryUrl": {
+                "paths": [
+                  "categories.0.html_url"
+                ],
+                "requireHttps": true
+              },
+              "catAndSec": {
+                "template": "{categoryName} › {sectionName}",
+                "whenVars": [
+                  "categoryName",
+                  "sectionName"
+                ],
+                "fallbackVar": "sectionName"
+              },
+              "breadcrumbs": {
+                "template": "{catAndSec}",
+                "whenVars": [
+                  "catAndSec"
+                ],
+                "fallbackVar": "categoryName"
+              },
+              "labels": {
+                "paths": [
+                  "article.label_names"
+                ],
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 12
+              },
+              "bodyMd": {
+                "paths": [
+                  "article.body"
+                ],
+                "format": "html_to_md",
+                "trim": true
+              }
+            },
+            "requireVars": [
+              "title",
+              "bodyMd"
+            ],
+            "titleTemplate": "{title}",
+            "publishedTimeVar": "updatedAt",
+            "bullets": [
+              {
+                "label": "Breadcrumbs",
+                "template": "{breadcrumbs}",
+                "whenVar": "breadcrumbs"
+              },
+              {
+                "label": "Updated",
+                "template": "{updatedAt}",
+                "whenVar": "updatedAt"
+              },
+              {
+                "label": "Labels",
+                "template": "{labels}",
+                "whenVar": "labels"
+              },
+              {
+                "label": "Canonical URL",
+                "template": "{htmlUrl}",
+                "whenVar": "htmlUrl"
+              }
+            ],
+            "bodyVar": "bodyMd",
+            "linksVars": [
+              "htmlUrl",
+              "sectionUrl",
+              "categoryUrl"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": false,
+            "pathSegments": [
+              "hc",
+              {
+                "param": "locale",
+                "charset": "alnum_dash",
+                "minLen": 2,
+                "maxLen": 16,
+                "transform": "lower"
+              },
+              "sections",
+              {
+                "param": "sectionId",
+                "charset": "leading_digits_slug",
+                "minLen": 1,
+                "maxLen": 160,
+                "transform": "leading_digits"
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://{host}/api/v2/help_center/{locale}/sections/{sectionId}/articles.json?per_page=50&include=sections,categories",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "articles",
+              "sections"
+            ],
+            "vars": {
+              "sectionTitle": {
+                "paths": [
+                  "sections.0.name"
+                ],
+                "format": "strip_tags",
+                "trim": true,
+                "fallbackTemplate": "Help Center Section #{sectionId}"
+              },
+              "categoryName": {
+                "paths": [
+                  "categories.0.name"
+                ],
+                "format": "strip_tags",
+                "trim": true
+              },
+              "sectionUrl": {
+                "paths": [
+                  "sections.0.html_url"
+                ],
+                "requireHttps": true
+              },
+              "categoryUrl": {
+                "paths": [
+                  "categories.0.html_url"
+                ],
+                "requireHttps": true
+              },
+              "articleCount": {
+                "paths": [
+                  "articles"
+                ],
+                "format": "array_len_comma"
+              }
+            },
+            "titleTemplate": "{sectionTitle}",
+            "bullets": [
+              {
+                "label": "Category",
+                "template": "{categoryName}",
+                "whenVar": "categoryName"
+              },
+              {
+                "label": "Articles",
+                "template": "{articleCount}",
+                "whenVar": "articleCount"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Articles",
+                "arrayPath": "articles",
+                "limit": 50,
+                "emptyText": "No published articles found in this section.",
+                "requireItemVar": "artTitle",
+                "collectLinkVars": [
+                  "artUrl"
+                ],
+                "itemVars": {
+                  "artTitle": {
+                    "paths": [
+                      "title"
+                    ],
+                    "format": "strip_tags",
+                    "trim": true
+                  },
+                  "artUrl": {
+                    "paths": [
+                      "html_url"
+                    ],
+                    "requireHttps": true
+                  },
+                  "artLabels": {
+                    "paths": [
+                      "label_names"
+                    ],
+                    "join": ", ",
+                    "limit": 8
+                  },
+                  "artUpdated": {
+                    "paths": [
+                      "updated_at"
+                    ],
+                    "sliceMax": 10
+                  }
+                },
+                "recordFields": {
+                  "title": "{artTitle}",
+                  "url": "{artUrl}",
+                  "updatedAt": "{artUpdated}",
+                  "labels": "{artLabels}"
+                },
+                "columns": [
+                  {
+                    "header": "Article",
+                    "template": "[{artTitle}]({artUrl})"
+                  },
+                  {
+                    "header": "Updated",
+                    "paths": [
+                      "updated_at"
+                    ],
+                    "sliceMax": 10
+                  },
+                  {
+                    "header": "Labels",
+                    "template": "{artLabels}"
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "sectionUrl",
+              "categoryUrl"
+            ]
+          }
+        },
+        {
+          "match": {
+            "exactSegments": false,
+            "pathSegments": [
+              "hc",
+              {
+                "param": "locale",
+                "charset": "alnum_dash",
+                "minLen": 2,
+                "maxLen": 16,
+                "transform": "lower"
+              },
+              "categories",
+              {
+                "param": "categoryId",
+                "charset": "leading_digits_slug",
+                "minLen": 1,
+                "maxLen": 160,
+                "transform": "leading_digits"
+              }
+            ]
+          },
+          "twin": {
+            "fetchUrl": "https://{host}/api/v2/help_center/{locale}/categories/{categoryId}/sections.json?per_page=50&include=categories",
+            "kind": "json",
+            "accept": "application/json",
+            "maxBytes": 4194304
+          },
+          "extract": {
+            "requireAnyFields": [
+              "sections",
+              "categories"
+            ],
+            "vars": {
+              "categoryTitle": {
+                "paths": [
+                  "categories.0.name"
+                ],
+                "format": "strip_tags",
+                "trim": true,
+                "fallbackTemplate": "Help Center Category #{categoryId}"
+              },
+              "categoryDesc": {
+                "paths": [
+                  "categories.0.description"
+                ],
+                "format": "strip_tags",
+                "trim": true
+              },
+              "categoryUrl": {
+                "paths": [
+                  "categories.0.html_url"
+                ],
+                "requireHttps": true
+              },
+              "sectionCount": {
+                "paths": [
+                  "sections"
+                ],
+                "format": "array_len_comma"
+              }
+            },
+            "titleTemplate": "{categoryTitle}",
+            "descriptionVar": "categoryDesc",
+            "introVar": "categoryDesc",
+            "bullets": [
+              {
+                "label": "Sections",
+                "template": "{sectionCount}",
+                "whenVar": "sectionCount"
+              }
+            ],
+            "sections": [
+              {
+                "heading": "Sections",
+                "arrayPath": "sections",
+                "limit": 50,
+                "emptyText": "No sections found in this category.",
+                "requireItemVar": "secName",
+                "collectLinkVars": [
+                  "secUrl"
+                ],
+                "itemVars": {
+                  "secName": {
+                    "paths": [
+                      "name"
+                    ],
+                    "format": "strip_tags",
+                    "trim": true
+                  },
+                  "secUrl": {
+                    "paths": [
+                      "html_url"
+                    ],
+                    "requireHttps": true
+                  },
+                  "secDesc": {
+                    "paths": [
+                      "description"
+                    ],
+                    "format": "strip_tags",
+                    "trim": true,
+                    "sliceMax": 160
+                  },
+                  "secUpdated": {
+                    "paths": [
+                      "updated_at"
+                    ],
+                    "sliceMax": 10
+                  }
+                },
+                "recordFields": {
+                  "title": "{secName}",
+                  "url": "{secUrl}",
+                  "description": "{secDesc}",
+                  "updatedAt": "{secUpdated}"
+                },
+                "columns": [
+                  {
+                    "header": "Section",
+                    "template": "[{secName}]({secUrl})"
+                  },
+                  {
+                    "header": "Description",
+                    "template": "{secDesc}"
+                  },
+                  {
+                    "header": "Updated",
+                    "paths": [
+                      "updated_at"
+                    ],
+                    "sliceMax": 10
+                  }
+                ]
+              }
+            ],
+            "linksVars": [
+              "categoryUrl"
             ]
           }
         }

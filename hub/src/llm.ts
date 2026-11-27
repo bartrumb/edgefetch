@@ -46,6 +46,8 @@ export interface LlmEnvBindings {
   SAFE_PUBLIC_FETCH?: typeof fetch;
   AI?: {
     run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
+    /** Cloudflare Web Search API on the Workers AI binding (used by `web-search.ts`). */
+    websearch?: (opts: Record<string, unknown>) => Promise<Response>;
   };
 }
 

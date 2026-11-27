@@ -10,6 +10,7 @@
  */
 
 import { resolveSiteExtractorTwin } from './extractors/registry';
+import { checkUnboundedTwinEndpointGuard } from './extractors/twin-companions';
 import {
   acquireIsolateByteBudget,
   isWasmInputBudgetExceededError,
@@ -37,6 +38,7 @@ import {
   isDnsNotFoundError,
   isSchemeDowngradeError,
   isSsrfBlockedError,
+  resolveValidatedFinalUrl,
   SCHEME_DOWNGRADE_BLOCKED_INFO,
   scrubResolverIpFromError,
   SSRF_BLOCKED_INFO,
@@ -50,10 +52,12 @@ import {
   type RequestTracer,
   type TraceContext,
 } from './otel';
+import { sha256HexString } from './ingest';
 import {
   cleanPdfMarkdown,
   decodeHtmlEntities,
   decodeMarkdownEntities,
+  deleteOptionsScrapeCache,
   detectUnsupportedBinaryPayload,
   extractHtmlDocument,
   extractPdfTitle,
@@ -63,16 +67,21 @@ import {
   formatIcalendarToMarkdown,
   formatSourceCodeUrlToMarkdown,
   formatVcardToMarkdown,
+  hashCallerCookies,
+  isTrustedTwinRedirectUrl,
   lookupCachedScrape,
-  lookupPrivateCachedScrape,
   lookupCompanionMdUrl,
+  lookupOptionsScrapeCache,
   redactPiiText,
   sanitizeInlineHtmlInMarkdown,
   SCRAPE_PIPELINE_VERSION,
   tryParseJsonPayloadForScrape,
-  writePrivateCachedScrape,
+  writeOptionsScrapeCache,
 } from './scrape';
 import {
+  hasAnyCallerCookies,
+  hasAnyCallerHeader,
+  normalizeCallerHeadersRecord,
   normalizeVisibility,
   sanitizeFtsQuery,
   sanitizeStorageUserId,
@@ -210,19 +219,56 @@ export interface SearchIndex {
  * Strips YAML frontmatter (`---\n...\n---`) from origin-served `text/markdown` documents (e.g. Cloudflare "Markdown for
  * Agents") so extracted chunks don't waste tokens on metadata blocks, while preserving `title:` if present.
  */
+const MAX_EXTRACTED_TITLE_CHARS = 1_024;
+const MAX_EXTRACTED_TITLE_RAW_CHARS = 4_096;
+
+export function capExtractedTitleLength(title: string, maxChars = MAX_EXTRACTED_TITLE_CHARS): string {
+  if (title.length <= maxChars) return title;
+  let cut = maxChars;
+  if (cut > 0) {
+    const prevCode = title.charCodeAt(cut - 1);
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      cut--;
+    }
+  }
+  const sliced = title
+    .slice(0, cut)
+    .replace(/&(?:#x[0-9a-fA-F]*|#\d*|[A-Za-z][A-Za-z0-9]*)?$/, '');
+  return sliced.trim();
+}
+
 export function sanitizeExtractedTitle(rawTitle: string | undefined, finalUrl: string, redactPii: boolean): string | undefined {
   if (!rawTitle) return undefined;
-  const bounded = rawTitle.length > 1_024 ? rawTitle.slice(0, 1_024) : rawTitle;
-  const decoded = decodeHtmlEntities(bounded);
-  const redacted = redactPii ? redactPiiText(decoded) : decoded;
-  const mdSanitized = sanitizeInlineHtmlInMarkdown(redacted, finalUrl)
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/<(?=[A-Za-z/!?])/g, '&lt;')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const finalTitle = redactPii ? redactPiiText(mdSanitized) : mdSanitized;
-  return finalTitle || undefined;
+  const stripTitleLinks = (s: string) =>
+    s.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+  const sanitizePass = (input: string): string => {
+    const decoded = decodeHtmlEntities(input);
+    const redacted = redactPii ? redactPiiText(decoded) : decoded;
+    const stripped = stripTitleLinks(redacted);
+    const cleaned = sanitizeInlineHtmlInMarkdown(stripped, finalUrl)
+      .replace(/<(?=[A-Za-z/!?])/g, '&lt;')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return redactPii ? redactPiiText(cleaned) : cleaned;
+  };
+  let current =
+    rawTitle.length > MAX_EXTRACTED_TITLE_RAW_CHARS ? rawTitle.slice(0, MAX_EXTRACTED_TITLE_RAW_CHARS) : rawTitle;
+  for (let i = 0; i < 4; i++) {
+    const next = sanitizePass(current);
+    if (next === current) break;
+    current = next;
+  }
+  const capped = capExtractedTitleLength(current, MAX_EXTRACTED_TITLE_CHARS);
+  if (capped !== current) {
+    current = capped;
+    for (let i = 0; i < 2; i++) {
+      const next = sanitizePass(current);
+      if (next === current) break;
+      current = next;
+    }
+    current = capExtractedTitleLength(current, MAX_EXTRACTED_TITLE_CHARS);
+  }
+  return current || undefined;
 }
 
 function sanitizeAndRedactExtractMarkdown(rawMd: string, finalUrl: string, redactPii: boolean): string {
@@ -808,7 +854,7 @@ export class D1FtsSearchIndex implements SearchIndex {
     }
 
     const chunks = chunkMarkdownForSearch(markdown);
-    const safeTitle = title.slice(0, 300);
+    const safeTitle = capExtractedTitleLength(title, 300);
 
     // Batch 0 ALWAYS starts with `DELETE FROM chunks WHERE collection_id = ? AND page_id = ?` so old FTS tokens are purged atomically.
     const firstSlice = chunks.slice(0, SEARCH_BATCH_INSERT_LIMIT);
@@ -1196,25 +1242,39 @@ export async function executeExtractCall(params: {
    * cache when fresh and otherwise returned as `failedResults` with `error: "host_fetch_cap"` without being fetched.
    */
   maxFetchPerHost?: number;
-}): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
+}): Promise<{ status: number; via: string; body: Record<string, unknown>; retryAfter?: string }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
-  const runExtract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
+  const runExtract = async (): Promise<{ status: number; via: string; body: Record<string, unknown>; retryAfter?: string }> => {
   const { payload, env, executeHubFetch, source = 'extract', selfHost, userId = 'owner', now = Date.now() } = params;
   const budgetDeadlineAt =
     typeof params.budgetMs === 'number' && Number.isFinite(params.budgetMs) && params.budgetMs > 0
       ? Date.now() + params.budgetMs
       : null;
-  /** `capSecs` clamped to the whole seconds left in the budget (never below 1), or `capSecs` when unbudgeted. */
+  /** `capSecs` clamped to the budget left, rounded to the nearest whole second (never below 1; flooring dropped ~1 s after a few ms of setup), or `capSecs` when unbudgeted. */
   const budgetSecs = (capSecs: number): number =>
-    budgetDeadlineAt === null ? capSecs : Math.max(1, Math.min(capSecs, Math.floor((budgetDeadlineAt - Date.now()) / 1_000)));
+    budgetDeadlineAt === null ? capSecs : Math.max(1, Math.min(capSecs, Math.round((budgetDeadlineAt - Date.now()) / 1_000)));
   /** True when unbudgeted, or when at least `minSecs` of the budget remain for an optional follow-up fetch. */
   const hasBudgetFor = (minSecs: number): boolean =>
     budgetDeadlineAt === null || budgetDeadlineAt - Date.now() >= minSecs * 1_000;
+  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
+    cookies: (payload as { cookies?: unknown }).cookies,
+    preferMcp:
+      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
+      (payload as { preferMcp?: unknown }).preferMcp === true,
+    hasAuthContext: Boolean((payload as { auth?: unknown }).auth),
+    userId,
+  });
+  const isPrivateExtract = visibility === 'private' || sanitizeStorageUserId(userId) !== 'owner';
   if (!Array.isArray(payload.urls) || payload.urls.length === 0 || payload.urls.length > 20) {
     return {
       status: 400,
       via: 'hub',
-      body: { ok: false, error: 'invalid_urls', message: 'urls must be an array of 1..20 public https:// URLs' },
+      body: {
+        ok: false,
+        ...(isPrivateExtract ? { visibility: 'private' as const } : {}),
+        error: 'invalid_urls',
+        message: 'urls must be an array of 1..20 public https:// URLs',
+      },
     };
   }
 
@@ -1223,7 +1283,26 @@ export async function executeExtractCall(params: {
   for (const raw of payload.urls) {
     const check = validatePublicHttpsTargetUrl(raw, selfHost);
     if (!check.ok) {
-      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_urls', message: check.message } };
+      return {
+        status: 400,
+        via: 'hub',
+        body: {
+          ok: false,
+          ...(isPrivateExtract ? { visibility: 'private' as const } : {}),
+          error: 'invalid_urls',
+          message: check.message,
+        },
+      };
+    }
+    const unboundedBlocked = checkUnboundedTwinEndpointGuard(check.url, check.normalized);
+    if (unboundedBlocked) {
+      return {
+        ...unboundedBlocked,
+        body: {
+          ...unboundedBlocked.body,
+          ...(isPrivateExtract ? { visibility: 'private' as const } : {}),
+        },
+      };
     }
     if (!seenNormalizedUrls.has(check.normalized)) {
       seenNormalizedUrls.add(check.normalized);
@@ -1251,14 +1330,23 @@ export async function executeExtractCall(params: {
   const redactPii = Boolean(payload.redactPii);
   const waybackFallback = Boolean(payload.waybackFallback);
   const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
-  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
-    cookies: (payload as { cookies?: unknown }).cookies,
-    preferMcp:
-      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
-      (payload as { preferMcp?: unknown }).preferMcp === true,
-    userId,
-  });
-  const isPrivateExtract = visibility === 'private';
+  const normalizedCallerHeaders = normalizeCallerHeadersRecord(payload.headers);
+  const hasNormalizedCallerHeaders = Object.keys(normalizedCallerHeaders).length > 0;
+  const hasCallerHeaders = hasNormalizedCallerHeaders || hasAnyCallerHeader(payload.headers);
+  const callerCookiesRaw = (payload as { cookies?: unknown }).cookies;
+  const hasCallerCookies = hasAnyCallerCookies(callerCookiesRaw);
+  const cookiesCacheHash = hasCallerCookies ? await hashCallerCookies(callerCookiesRaw) : undefined;
+  const extractOptionsHash = await sha256HexString(
+    JSON.stringify({
+      v: SCRAPE_PIPELINE_VERSION,
+      mode: 'extract',
+      renderMode: rawRenderModeStr || effectiveRenderMode,
+      ...(blockTrackersOpt === false ? { blockTrackers: false } : {}),
+      redactPii,
+      ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
+      ...(cookiesCacheHash ? { cookies: cookiesCacheHash } : {}),
+    }),
+  );
   let collectionId: string | undefined;
   if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
     const resolvedColl = resolveUserCollectionId(payload.collectionId, userId, visibility);
@@ -1266,7 +1354,12 @@ export async function executeExtractCall(params: {
       return {
         status: resolvedColl.status,
         via: 'hub',
-        body: { ok: false, error: resolvedColl.error, message: 'Invalid or unauthorized collectionId' },
+        body: {
+          ok: false,
+          ...(isPrivateExtract ? { visibility: 'private' as const } : {}),
+          error: resolvedColl.error,
+          message: 'Invalid or unauthorized collectionId',
+        },
       };
     }
     collectionId = resolvedColl.scopedId;
@@ -1304,6 +1397,8 @@ export async function executeExtractCall(params: {
       errorMessage?: string;
       waf?: WafClassification;
       blocked?: BlockedSuggestion | Record<string, unknown>;
+      truncated?: boolean;
+      fetchCompletedAt?: number;
     }
   >();
 
@@ -1315,32 +1410,34 @@ export async function executeExtractCall(params: {
   const fetchesQueuedByHost = new Map<string, number>();
   for (let i = 0; i < normalizedUrls.length; i++) {
     const u = normalizedUrls[i]!;
+    if (isPrivateExtract && Boolean(payload.noCache) && payload.ephemeral !== true && env.ARTIFACTS && !hasCallerHeaders) {
+      await deleteOptionsScrapeCache({
+        bucket: env.ARTIFACTS,
+        isPrivate: true,
+        userId,
+        url: u,
+        optionsHash: extractOptionsHash,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+      }).catch(() => undefined);
+    }
     if (
+      isPrivateExtract &&
       maxAgeMs > 0 &&
       !payload.noCache &&
-      blockTrackersOpt !== false &&
-      env.ARTIFACTS &&
-      (isPrivateExtract || env.META) &&
-      !jsonFilterStr
+      !hasCallerHeaders &&
+      env.ARTIFACTS
     ) {
       const cacheStartMs = Date.now();
-      const hit = isPrivateExtract
-        ? await lookupPrivateCachedScrape({
-            bucket: env.ARTIFACTS,
-            userId,
-            url: u,
-            maxAgeMs,
-            pipelineVersion: SCRAPE_PIPELINE_VERSION,
-            now,
-          })
-        : await lookupCachedScrape({
-            bucket: env.ARTIFACTS,
-            metaDb: env.META!,
-            url: u,
-            maxAgeMs,
-            pipelineVersion: SCRAPE_PIPELINE_VERSION,
-            now,
-          });
+      const hit = await lookupOptionsScrapeCache({
+        bucket: env.ARTIFACTS,
+        isPrivate: true,
+        userId,
+        url: u,
+        optionsHash: extractOptionsHash,
+        maxAgeMs,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        now,
+      });
       if (hit) {
         if (activeTracer) {
           const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
@@ -1348,7 +1445,77 @@ export async function executeExtractCall(params: {
             startTimeMs: cacheStartMs,
             attributes: {
               'cache.hit': true,
-              'cache.tier': isPrivateExtract ? 'private-r2' : 'r2-d1',
+              'cache.tier': 'private-r2',
+              'cache.revalidated': false,
+              'url.full': sanitizeUrlForSpan(u),
+              'http.response.status_code': hit.status,
+              'edgefetch.pipeline_version': hit.pipelineVersion,
+            },
+          });
+          cacheSpan.setStatus(true);
+          cacheSpan.end();
+        }
+        const effectiveHitBase = hit.finalUrl || u;
+        const strippedCached = stripYamlFrontmatter(hit.markdown);
+        const cleanCachedMd = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(strippedCached.body), effectiveHitBase);
+        const validContentState: ContentState | undefined =
+          hit.contentState === 'active' ||
+          hit.contentState === 'closed_posting' ||
+          hit.contentState === 'soft_404' ||
+          hit.contentState === 'login_wall' ||
+          hit.contentState === 'empty_shell' ||
+          hit.contentState === 'temporarily_unavailable'
+            ? hit.contentState
+            : undefined;
+        const validRenderedVia: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
+          hit.renderedVia === 'browser' ||
+          hit.renderedVia === 'browser-auto' ||
+          hit.renderedVia === 'crawl4ai' ||
+          hit.renderedVia === 'firecrawl'
+            ? hit.renderedVia
+            : undefined;
+        byUrl.set(u, {
+          url: u,
+          ...(hit.finalUrl ? { finalUrl: hit.finalUrl } : {}),
+          ...(hit.finalUrl && hit.finalUrl !== u ? { redirectInfo: analyzeUrlRedirect(u, hit.finalUrl) } : {}),
+          status: hit.status,
+          cached: true,
+          ...(hit.title || strippedCached.title ? { title: hit.title || strippedCached.title } : {}),
+          ...(validContentState ? { contentState: validContentState } : {}),
+          ...(validRenderedVia ? { renderedVia: validRenderedVia } : {}),
+          markdown: redactPii ? redactPiiText(cleanCachedMd) : cleanCachedMd,
+        });
+        continue;
+      }
+    } else if (
+      !isPrivateExtract &&
+      maxAgeMs > 0 &&
+      !payload.noCache &&
+      blockTrackersOpt !== false &&
+      (!explicitRenderMode || explicitRenderMode === 'auto') &&
+      !jsonFilterStr &&
+      !hasCallerHeaders &&
+      !hasCallerCookies &&
+      env.ARTIFACTS &&
+      env.META
+    ) {
+      const cacheStartMs = Date.now();
+      const hit = await lookupCachedScrape({
+        bucket: env.ARTIFACTS,
+        metaDb: env.META,
+        url: u,
+        maxAgeMs,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        now,
+      });
+      if (hit) {
+        if (activeTracer) {
+          const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
+            kind: 1,
+            startTimeMs: cacheStartMs,
+            attributes: {
+              'cache.hit': true,
+              'cache.tier': 'r2-d1',
               'cache.revalidated': false,
               'url.full': sanitizeUrlForSpan(u),
               'http.response.status_code': hit.status,
@@ -1412,6 +1579,7 @@ export async function executeExtractCall(params: {
 
     const atsByIdx = new Map<number, NonNullable<ReturnType<typeof resolveAtsPreFetchSpec>>>();
     const twinByIdx = new Map<number, NonNullable<ReturnType<typeof resolveSiteExtractorTwin>>>();
+    const companionByIdx = new Map<number, string>();
 
     const call = {
       maxSeconds: budgetSecs(isEphemeral ? 35 : 60),
@@ -1453,11 +1621,13 @@ export async function executeExtractCall(params: {
         }
         const companionMd = effectiveRenderMode !== 'always' ? lookupCompanionMdUrl(item.url, now) : undefined;
         if (companionMd) {
+          companionByIdx.set(item.idx, companionMd);
           return {
             id: `ext-${item.idx + 1}`,
             url: companionMd,
             kind: 'text',
             accept: 'text/markdown',
+            ...(hasNormalizedCallerHeaders ? { headers: normalizedCallerHeaders } : {}),
           };
         }
         return {
@@ -1466,6 +1636,7 @@ export async function executeExtractCall(params: {
           kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
           renderMode: explicitRenderMode === 'always' ? 'always' : 'off',
           ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
+          ...(hasNormalizedCallerHeaders ? { headers: normalizedCallerHeaders } : {}),
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -1482,6 +1653,7 @@ export async function executeExtractCall(params: {
       isPrivateExtract ? true : !isEphemeral,
       isPrivateExtract ? undefined : collectionId,
     );
+    const mainFetchCompletedAt = params.now ?? Date.now();
     via = fetchOut.via;
     let batchHubErrCode: unknown;
     const resMap = new Map<string, Record<string, unknown>>();
@@ -1502,7 +1674,12 @@ export async function executeExtractCall(params: {
           problem: typeof errBody.message === 'string' ? errBody.message : '',
         });
       if (!canSpaRescue) {
-        return { status: fetchOut.status, via, body: errBody };
+        return {
+          status: fetchOut.status,
+          via,
+          ...(fetchOut.status === 429 && fetchOut.retryAfter ? { retryAfter: fetchOut.retryAfter } : {}),
+          body: { ...errBody, ...(isPrivateExtract ? { visibility: 'private' as const } : {}) },
+        };
       }
     } else {
       const parsed = JSON.parse(fetchOut.bodyText) as { results?: Array<Record<string, unknown>> };
@@ -1512,22 +1689,33 @@ export async function executeExtractCall(params: {
     }
 
     const fallbackHtmlItems = toFetch.filter((item) => {
-      const hadTwinOrComp =
-        atsByIdx.has(item.idx) || twinByIdx.has(item.idx) || Boolean(lookupCompanionMdUrl(item.url, now));
+      const atsSpec = atsByIdx.get(item.idx);
+      const twinSpec = twinByIdx.get(item.idx);
+      const compUrl = companionByIdx.get(item.idx);
+      const hadTwinOrComp = Boolean(atsSpec || twinSpec || compUrl);
       if (!hadTwinOrComp) return false;
       const r = resMap.get(`ext-${item.idx + 1}`);
-      return !r || r.outcome !== 'ok';
+      if (!r || r.outcome !== 'ok') return true;
+      if (atsSpec && !isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, r, selfHost)) return true;
+      if (twinSpec && !isTrustedTwinRedirectUrl(twinSpec.id, twinSpec.fetchUrl, r, selfHost)) return true;
+      if (compUrl && !isTrustedTwinRedirectUrl(undefined, compUrl, r, selfHost)) return true;
+      return false;
     });
+    const retryUrls = new Set(fallbackHtmlItems.map((f) => f.url));
+    let retryFetchCompletedAt = mainFetchCompletedAt;
     if (fallbackHtmlItems.length > 0 && hasBudgetFor(3)) {
       for (const fItem of fallbackHtmlItems) {
         atsByIdx.delete(fItem.idx);
         twinByIdx.delete(fItem.idx);
+        companionByIdx.delete(fItem.idx);
+        resMap.delete(`ext-${fItem.idx + 1}`);
       }
       const retryCall = {
         maxSeconds: budgetSecs(isEphemeral ? 25 : 45),
         options: {
           includeBody: true,
           respectRobots: true,
+          maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
           discoverLlms: false,
           concurrency: 4,
           pauseMs: isEphemeral ? 500 : 800,
@@ -1539,6 +1727,7 @@ export async function executeExtractCall(params: {
           kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
           ...(explicitRenderMode ? { renderMode: explicitRenderMode } : {}),
           ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
+          ...(hasNormalizedCallerHeaders ? { headers: normalizedCallerHeaders } : {}),
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -1554,6 +1743,7 @@ export async function executeExtractCall(params: {
         isPrivateExtract ? true : !isEphemeral,
         isPrivateExtract ? undefined : collectionId,
       );
+      retryFetchCompletedAt = params.now ?? Date.now();
       if (retryOut.status === 200) {
         const retryParsed = JSON.parse(retryOut.bodyText) as { results?: Array<Record<string, unknown>> };
         for (const r of retryParsed.results ?? []) {
@@ -1563,6 +1753,7 @@ export async function executeExtractCall(params: {
     }
 
     for (const item of toFetch) {
+      let itemFetchCompletedAt = retryUrls.has(item.url) ? retryFetchCompletedAt : mainFetchCompletedAt;
       let r = resMap.get(`ext-${item.idx + 1}`);
       if (!r || r.outcome !== 'ok') {
         const rawProb = typeof r?.problem === 'string' && r.problem ? r.problem : String(r?.outcome ?? 'error');
@@ -1622,21 +1813,24 @@ export async function executeExtractCall(params: {
             robotsAlreadyVerified: false,
             onlyMainContent: true,
             noCache: Boolean(payload.noCache),
+            ...(selfHost ? { selfHost } : {}),
             ...(activeTracer ? { tracer: activeTracer } : {}),
           });
           if (spaOut) {
             via = spaOut.via;
-            const cleanSpaMd = sanitizeInlineHtmlInMarkdown(spaOut.markdown, spaOut.finalUrl || item.url).trim();
+            const safeSpaFinalUrl = resolveValidatedFinalUrl(spaOut.finalUrl, item.url, selfHost);
+            const cleanSpaMd = sanitizeInlineHtmlInMarkdown(spaOut.markdown, safeSpaFinalUrl).trim();
             byUrl.set(item.url, {
               url: item.url,
-              finalUrl: spaOut.finalUrl,
-              redirectInfo: analyzeUrlRedirect(item.url, spaOut.finalUrl),
+              finalUrl: safeSpaFinalUrl,
+              redirectInfo: analyzeUrlRedirect(item.url, safeSpaFinalUrl),
               status: spaOut.status,
               cached: false,
               ...(spaOut.title ? { title: spaOut.title } : {}),
               contentState: 'active',
               renderedVia: spaOut.provider,
               markdown: redactPii ? redactPiiText(cleanSpaMd) : cleanSpaMd,
+              fetchCompletedAt: params.now ?? Date.now(),
             });
             continue;
           }
@@ -1656,6 +1850,7 @@ export async function executeExtractCall(params: {
             target,
             site,
             source,
+            artifactRetention: retentionMode === 'off' ? 'off' : 'transient',
             executeHubFetch,
           });
           if (wb) {
@@ -1698,7 +1893,7 @@ export async function executeExtractCall(params: {
       }
 
       let rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
-      let finalUrl = typeof r.finalUrl === 'string' && r.finalUrl ? r.finalUrl : item.url;
+      let finalUrl = resolveValidatedFinalUrl(r.finalUrl, item.url, selfHost);
       if (
         r.markdownOverBudget === true ||
         (rawBodyStr.length > MAX_WASM_INPUT_BYTES) ||
@@ -1758,7 +1953,7 @@ export async function executeExtractCall(params: {
 
       // Handle ATS pre-fetch adapter response (`P1` Ashby, `P2` Workday CXS, Greenhouse, Lever)
       const atsSpec = atsByIdx.get(item.idx);
-      if (atsSpec && rawBodyStr) {
+      if (atsSpec && rawBodyStr && isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, r, selfHost)) {
         const filteredBoard =
           jsonFilterStr || atsSpec.id.endsWith('-board')
             ? chunkJsonRecords({
@@ -1784,6 +1979,8 @@ export async function executeExtractCall(params: {
             cached: false,
             title: (jsonFilterStr && filteredBoard ? filteredBoard.title : formatted?.title) || undefined,
             markdown: cleanMd,
+            truncated: r.truncated === true || (r.bodyOmitted === true && r.extractedOnNode !== true),
+            fetchCompletedAt: itemFetchCompletedAt,
             ...(formatted?.jobPosting ? { jobPosting: formatted.jobPosting } : {}),
             ...(filteredBoard && (jsonFilterStr || atsSpec.id.endsWith('-board'))
               ? {
@@ -1809,7 +2006,7 @@ export async function executeExtractCall(params: {
 
       // Handle Site Extractor Twin response
       const twinSpec = twinByIdx.get(item.idx);
-      if (twinSpec && rawBodyStr) {
+      if (twinSpec && rawBodyStr && isTrustedTwinRedirectUrl(twinSpec.id, twinSpec.fetchUrl, r, selfHost)) {
         const twinOut = twinSpec.formatTwin(rawBodyStr, item.url, htmlFragToMd);
         if (twinOut && twinOut.markdown.trim()) {
           setActiveSpanAttribute('edgefetch.adapter_id', twinSpec.id, activeTracer ?? undefined);
@@ -1821,6 +2018,8 @@ export async function executeExtractCall(params: {
             cached: false,
             title: twinOut.title,
             markdown: redactPii ? redactPiiText(sanitizedTwin) : sanitizedTwin,
+            truncated: r.truncated === true || (r.bodyOmitted === true && r.extractedOnNode !== true),
+            fetchCompletedAt: itemFetchCompletedAt,
           });
           continue;
         }
@@ -1836,7 +2035,7 @@ export async function executeExtractCall(params: {
               target,
               JSON.stringify({
                 maxSeconds: budgetSecs(25),
-                options: { includeBody: true, respectRobots: true },
+                options: { includeBody: true, respectRobots: true, maxInlineBodyBytes: MAX_WASM_INPUT_BYTES },
                 requests: [
                   {
                     id: 'wd-stub-1',
@@ -1852,14 +2051,20 @@ export async function executeExtractCall(params: {
               site,
               `${source}:workday-stub`,
               retentionMode,
-              !isEphemeral,
-              collectionId,
+              isPrivateExtract ? true : !isEphemeral,
+              isPrivateExtract ? undefined : collectionId,
             );
+            const stubFetchNow = params.now ?? Date.now();
             if (stubOut.status === 200) {
               const stubParsed = JSON.parse(stubOut.bodyText) as { results?: Array<Record<string, unknown>> };
               const stubItem = stubParsed.results?.[0];
               const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
-              const stubFmt = stubItem?.outcome === 'ok' && stubBody ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd) : null;
+              const stubFmt =
+                stubItem?.outcome === 'ok' &&
+                stubBody &&
+                isTrustedTwinRedirectUrl(stubAts.id, stubAts.fetchUrl, stubItem, selfHost)
+                  ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
+                  : null;
               if (stubFmt && stubFmt.markdown.trim()) {
                 setActiveSpanAttribute('edgefetch.adapter_id', stubAts.id, activeTracer ?? undefined);
                 const sanitizedStub = sanitizeInlineHtmlInMarkdown(stubFmt.markdown, wdStub.redirectUrl).trim();
@@ -1871,6 +2076,8 @@ export async function executeExtractCall(params: {
                   cached: false,
                   title: stubFmt.title,
                   markdown: redactPii ? redactPiiText(sanitizedStub) : sanitizedStub,
+                  truncated: stubItem?.truncated === true || (stubItem?.bodyOmitted === true && stubItem?.extractedOnNode !== true),
+                  fetchCompletedAt: stubFetchNow,
                   ...(stubFmt.jobPosting ? { jobPosting: stubFmt.jobPosting } : {}),
                 });
                 continue;
@@ -1949,6 +2156,8 @@ export async function executeExtractCall(params: {
           cached: false,
           title: jsonRecordsDoc.title,
           markdown: cleanJsonMd,
+          truncated: r.truncated === true || (r.bodyOmitted === true && r.extractedOnNode !== true),
+          fetchCompletedAt: itemFetchCompletedAt,
           preChunkedRecords: jsonRecordsDoc.chunks.map((c) => {
             const sanitizedChunk = sanitizeInlineHtmlInMarkdown(c.text, finalUrl).trim();
             const sanitizedHeading = c.heading
@@ -2050,6 +2259,7 @@ export async function executeExtractCall(params: {
                   includeBody: true,
                   respectRobots: true,
                   maxBytes: 16 * 1024 * 1024,
+                  maxInlineBodyBytes: MAX_WASM_INPUT_BYTES,
                   timeoutMs: Math.max(1_000, Math.min(35_000, (budgetSecs(40) - 1) * 1_000)),
                 },
                 requests: [
@@ -2059,6 +2269,7 @@ export async function executeExtractCall(params: {
                     kind: 'render',
                     renderMode: 'always',
                     ...(blockTrackersOpt !== undefined ? { blockTrackers: blockTrackersOpt } : {}),
+                    ...(hasNormalizedCallerHeaders ? { headers: normalizedCallerHeaders } : {}),
                     formats: ['markdown'],
                     onlyMainContent: true,
                     redactPii,
@@ -2069,19 +2280,21 @@ export async function executeExtractCall(params: {
               site,
               `${source}:browser-auto`,
               retentionMode,
-              !isEphemeral,
-              collectionId,
+              isPrivateExtract ? true : !isEphemeral,
+              isPrivateExtract ? undefined : collectionId,
             );
+            const autoFetchNow = params.now ?? Date.now();
             if (autoRes.status === 200) {
               const autoParsed = JSON.parse(autoRes.bodyText) as { results?: Array<Record<string, unknown>> };
               const autoItem = autoParsed.results?.[0];
               const autoHtml = typeof autoItem?.body === 'string' && autoItem.bodyEncoding !== 'base64' ? autoItem.body : '';
               if (autoItem?.outcome === 'ok' && autoHtml) {
-                const autoFinal = typeof autoItem.finalUrl === 'string' && autoItem.finalUrl ? autoItem.finalUrl : finalUrl;
+                const autoFinal = resolveValidatedFinalUrl(autoItem.finalUrl, finalUrl, selfHost);
                 const autoExt = extractHtmlDocument(autoHtml, { baseUrl: autoFinal, onlyMainContent: true, redactPii });
                 const hasAutoJson = Array.isArray(autoItem.capturedJson) && autoItem.capturedJson.length > 0;
                 if (countExtractWords(autoExt.markdown) > countExtractWords(extracted?.markdown ?? '') || hasAutoJson) {
                   r = autoItem;
+                  itemFetchCompletedAt = autoFetchNow;
                   rawBodyStr = autoHtml;
                   finalUrl = autoFinal;
                   isHtml = true;
@@ -2185,17 +2398,20 @@ export async function executeExtractCall(params: {
           robotsAlreadyVerified: true,
           onlyMainContent: true,
           noCache: Boolean(payload.noCache),
+          ...(selfHost ? { selfHost } : {}),
           ...(activeTracer ? { tracer: activeTracer } : {}),
         });
         if (spaOut && countExtractWords(spaOut.markdown) > countExtractWords(md)) {
-          const sanitizedSpaMd = sanitizeInlineHtmlInMarkdown(spaOut.markdown, spaOut.finalUrl || finalUrl).trim();
+          const safeSpaFinalUrl = resolveValidatedFinalUrl(spaOut.finalUrl, finalUrl, selfHost);
+          const sanitizedSpaMd = sanitizeInlineHtmlInMarkdown(spaOut.markdown, safeSpaFinalUrl).trim();
           md = redactPii ? redactPiiText(sanitizedSpaMd) : sanitizedSpaMd;
-          finalUrl = spaOut.finalUrl;
+          finalUrl = safeSpaFinalUrl;
           if (spaOut.title) title = spaOut.title;
           via = spaOut.via;
           renderedVia = spaOut.provider;
           contentSource = undefined;
           stateRes = { state: 'active' };
+          itemFetchCompletedAt = params.now ?? Date.now();
         }
       }
 
@@ -2211,6 +2427,8 @@ export async function executeExtractCall(params: {
         ...(contentSource ? { contentSource } : {}),
         ...(renderedVia ? { renderedVia } : {}),
         markdown: md,
+        truncated: r.truncated === true || (r.bodyOmitted === true && r.extractedOnNode !== true),
+        fetchCompletedAt: itemFetchCompletedAt,
       });
       } catch (extWasmErr) {
         if (isWasmInputBudgetExceededError(extWasmErr)) {
@@ -2251,37 +2469,74 @@ export async function executeExtractCall(params: {
       });
       continue;
     }
-    if (isPrivateExtract && !entry.cached && entry.markdown && payload.ephemeral !== true) {
+    const effectiveBase = entry.finalUrl || u;
+    const safeFinalTitle = entry.title ? sanitizeExtractedTitle(entry.title, effectiveBase, redactPii) : undefined;
+    const safeIndexMarkdown = entry.markdown
+      ? sanitizeAndRedactExtractMarkdown(entry.markdown, effectiveBase, redactPii)
+      : '';
+    if (
+      isPrivateExtract &&
+      !entry.cached &&
+      !Boolean(payload.noCache) &&
+      !hasCallerHeaders &&
+      entry.truncated !== true &&
+      entry.contentSource !== 'wayback' &&
+      entry.status >= 200 &&
+      entry.status < 300 &&
+      // Transient "temporarily unavailable" pages are treated like a non-2xx fetch: never cached as content.
+      entry.contentState !== 'temporarily_unavailable' &&
+      safeIndexMarkdown &&
+      payload.ephemeral !== true
+    ) {
       if (env.ARTIFACTS) {
-        await writePrivateCachedScrape({
+        const mdSha = await sha256HexString(safeIndexMarkdown);
+        const docId = `pdoc_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${u}:${extractOptionsHash}`)).slice(0, 32)}`;
+        await writeOptionsScrapeCache({
           bucket: env.ARTIFACTS,
+          isPrivate: true,
           userId,
-          url: u,
-          markdown: entry.markdown,
-          ...(entry.title ? { title: entry.title } : {}),
-          status: entry.status,
-          pipelineVersion: SCRAPE_PIPELINE_VERSION,
-          now,
+          optionsHash: extractOptionsHash,
+          record: {
+            url: u,
+            ...(entry.finalUrl ? { finalUrl: entry.finalUrl } : {}),
+            markdown: safeIndexMarkdown,
+            contentSha256: mdSha,
+            documentId: docId,
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            ...(safeFinalTitle ? { title: safeFinalTitle } : {}),
+            ...(entry.contentState ? { contentState: entry.contentState } : {}),
+            ...(entry.renderedVia ? { renderedVia: entry.renderedVia } : {}),
+            status: entry.status,
+            lastFetchedAt: entry.fetchCompletedAt ?? now,
+          },
         }).catch(() => undefined);
       }
-      if (collectionId && env.SEARCH) {
-        const idx = new D1FtsSearchIndex(env.SEARCH);
-        const privPageId = `pg_${sanitizeStorageUserId(userId)}_${u.slice(-24).replace(/[^A-Za-z0-9]/g, '_')}`;
-        await idx
-          .replacePageChunks({
-            collectionId,
-            documentId: `pdoc_${privPageId}`,
-            pageId: privPageId,
-            url: u,
-            title: entry.title || u,
-            markdown: entry.markdown,
-            fetchedAt: now,
-          })
-          .catch(() => undefined);
-      }
     }
-    const effectiveBase = entry.finalUrl || u;
-    const allChunks = entry.preChunkedRecords ?? chunkMarkdownForSearch(entry.markdown ?? '');
+    if (
+      isPrivateExtract &&
+      !entry.cached &&
+      entry.contentState !== 'temporarily_unavailable' &&
+      safeIndexMarkdown &&
+      payload.ephemeral !== true &&
+      collectionId &&
+      env.SEARCH
+    ) {
+      const idx = new D1FtsSearchIndex(env.SEARCH);
+      const privPageId = `pg_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${u}`)).slice(0, 32)}`;
+      const privDocId = `pdoc_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${safeIndexMarkdown}`)).slice(0, 32)}`;
+      await idx
+        .replacePageChunks({
+          collectionId,
+          documentId: privDocId,
+          pageId: privPageId,
+          url: u,
+          title: safeFinalTitle || u,
+          markdown: safeIndexMarkdown,
+          fetchedAt: entry.fetchCompletedAt ?? now,
+        })
+        .catch(() => undefined);
+    }
+    const allChunks = entry.preChunkedRecords ?? chunkMarkdownForSearch(safeIndexMarkdown);
     let matchedQueryTerms = 0;
     if (query) {
       if (queryTermsForMatch.length > 0) {
@@ -2293,11 +2548,8 @@ export async function executeExtractCall(params: {
         }
       }
     }
-    const safeFinalTitle = entry.title ? sanitizeExtractedTitle(entry.title, effectiveBase, redactPii) : undefined;
     if (query && matchedQueryTerms === 0) {
-      const fullCleanRaw = wantRawContent
-        ? sanitizeAndRedactExtractMarkdown(entry.markdown ?? '', effectiveBase, redactPii)
-        : undefined;
+      const fullCleanRaw = wantRawContent ? safeIndexMarkdown : undefined;
       results.push({
         url: u,
         ...(entry.finalUrl && entry.finalUrl !== u ? { finalUrl: entry.finalUrl } : {}),
@@ -2335,16 +2587,16 @@ export async function executeExtractCall(params: {
       };
     });
     const safeRawContent = wantRawContent
-      ? sanitizeAndRedactExtractMarkdown(
-          query
-            ? [...selectedChunks]
-                .sort((a, b) => a.ordinal - b.ordinal)
-                .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
-                .join('\n\n...\n\n')
-            : (entry.markdown ?? ''),
-          effectiveBase,
-          redactPii,
-        )
+      ? query
+        ? sanitizeAndRedactExtractMarkdown(
+            [...selectedChunks]
+              .sort((a, b) => a.ordinal - b.ordinal)
+              .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
+              .join('\n\n...\n\n'),
+            effectiveBase,
+            redactPii,
+          )
+        : safeIndexMarkdown
       : undefined;
     results.push({
       url: u,
@@ -2370,6 +2622,7 @@ export async function executeExtractCall(params: {
     via,
     body: {
       ok: true,
+      ...(isPrivateExtract ? { visibility: 'private' as const } : {}),
       ...(query ? { query } : {}),
       ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
       ...(collectionId ? { collectionId } : {}),

@@ -66,7 +66,7 @@ export interface NormalizedMcpRegistryEntry {
   version?: string;
   websiteUrl?: string;
   repositoryUrl?: string;
-  sources: Array<'official-registry' | 'glama'>;
+  sources: Array<'official-registry' | 'glama' | 'first-party'>;
   hasRemote: boolean;
   remotes: McpRemoteEndpointSpec[];
   packages: McpPackageSpec[];
@@ -205,10 +205,13 @@ export function parseGlamaRegistryPayload(payload: unknown, selfHost?: string): 
 export function fuseRegistryEntries(
   officialEntries: readonly NormalizedMcpRegistryEntry[],
   glamaEntries: readonly NormalizedMcpRegistryEntry[],
+  /** When set, matching first-party presets (e.g. Google's hosted Maps MCP) are prepended (Go `internal/mcpfed`). */
+  query?: string,
 ): NormalizedMcpRegistryEntry[] {
   return callCoreWasm<{ entries: NormalizedMcpRegistryEntry[] }>('mcp_reg_fuse', {
     official: officialEntries,
     glama: glamaEntries,
+    ...(query ? { query } : {}),
   }).entries;
 }
 
@@ -386,7 +389,7 @@ export async function discoverMcps(params: {
     };
   }
 
-  let fused = fuseRegistryEntries(officialEntries, glamaEntries);
+  let fused = fuseRegistryEntries(officialEntries, glamaEntries, q);
   if (remoteOnly) {
     fused = fused.filter((s) => s.hasRemote);
   }

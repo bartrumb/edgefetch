@@ -1,0 +1,13 @@
+{
+  "adapterId": "federal-register",
+  "mode": "twin",
+  "inputUrl": "https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule",
+  "expectedFetchUrl": "https://www.federalregister.gov/api/v1/documents/2024-09171.json",
+  "mockPayload": "{\"title\":\"Non-Compete Clause Rule\",\"document_number\":\"2024-09171\",\"type\":\"Rule\",\"citation\":\"89 FR 38342\",\"publication_date\":\"2024-05-07\",\"effective_on\":\"2024-09-04\",\"agencies\":[{\"name\":\"Federal Trade Commission\"}],\"cfr_references\":[{\"title\":16,\"part\":910,\"chapter\":\"I\"}],\"abstract\":\"Final rule prohibiting non-compete clauses.\",\"pdf_url\":\"https://www.govinfo.gov/content/pkg/FR-2024-05-07/pdf/2024-09171.pdf\",\"html_url\":\"https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule\"}",
+  "expectTitleIncludes": "Non-Compete Clause Rule",
+  "expectMarkdownIncludes": [
+    "2024-09171",
+    "16 CFR Part 910",
+    "Federal Trade Commission"
+  ]
+}

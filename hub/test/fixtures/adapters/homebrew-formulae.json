@@ -1,0 +1,13 @@
+{
+  "adapterId": "homebrew-formulae",
+  "mode": "twin",
+  "inputUrl": "https://formulae.brew.sh/formula/jq",
+  "expectedFetchUrl": "https://formulae.brew.sh/api/formula/jq.json",
+  "mockPayload": "{\"name\":\"jq\",\"full_name\":\"jq\",\"desc\":\"Lightweight and flexible command-line JSON processor\",\"versions\":{\"stable\":\"1.7.1\"},\"license\":\"MIT\",\"homepage\":\"https://jqlang.github.io/jq/\",\"dependencies\":[\"oniguruma\"],\"analytics\":{\"install\":{\"30d\":{\"jq\":95400}}}}",
+  "expectTitleIncludes": "jq (Homebrew Formula)",
+  "expectMarkdownIncludes": [
+    "brew install jq",
+    "95,400",
+    "`oniguruma`"
+  ]
+}

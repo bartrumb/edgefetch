@@ -234,7 +234,9 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("scrape failed: code=%d stderr=%s", code, errBuf.String())
 	}
-	if !strings.Contains(out.String(), "`Promise<void>`") {
+	// The CLI now shares the hub's full-document extractor, whose sanitizer escapes `<` inside inline code spans
+	// fail-closed (pinned in internal/extract/sanitize_test.go); the generic type itself must still be preserved.
+	if !strings.Contains(out.String(), "`Promise&lt;void>`") {
 		t.Fatalf("expected preserved generic type in CLI markdown, got: %q", out.String())
 	}
 
@@ -278,7 +280,7 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	if !strings.Contains(lines[1], `"fetch_batch"`) || !strings.Contains(lines[1], `"map"`) {
 		t.Fatalf("expected fetch_batch and map in stdio tools/list: %s", lines[1])
 	}
-	if !strings.Contains(lines[2], "Promise<void>") || !strings.Contains(lines[3], "ssrf_guard") {
+	if !strings.Contains(lines[2], "Promise&lt;void>") || !strings.Contains(lines[3], "ssrf_guard") {
 		t.Fatalf("unexpected stdio tool results:\nscrape=%s\ndoctor=%s", lines[2], lines[3])
 	}
 	if got := truncateUTF8Safe("Hello 世界🚀", 7); got != "Hello 世" {

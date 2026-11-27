@@ -1,0 +1,81 @@
+# Shared Go + TypeScript Declarative Site Adapter: TQ e-Mobility Drive Systems
+id: tq-ebike
+name: TQ e-Mobility Products & Support
+category: commerce-social
+description: "Extracts Product JSON-LD, drive system technical specs, and support documentation from www.tq-ebike.com product and help-support pages."
+domains:
+  - www.tq-ebike.com
+  - tq-ebike.com
+exampleUrls:
+  - "https://www.tq-ebike.com/en/e-bike-system/hpr50/"
+
+htmlRoutes:
+  - id: tq-ebike
+    mode: dom
+    match:
+      optionalLeadingLocale: true
+      exactSegments: false
+      anyOf:
+        - pathSegments:
+            - products
+            - param: slug
+              charset: safe_subpath
+              greedy: true
+              minLen: 1
+              maxLen: 160
+        # /<locale>/products/<model> now redirects to the overview; model pages live under /e-bike-system/<model>/.
+        - pathSegments:
+            - "e-bike-system"
+            - param: slug
+              charset: safe_subpath
+              greedy: true
+              minLen: 1
+              maxLen: 160
+        - pathSegments:
+            - "help-support"
+            - param: slug
+              charset: safe_subpath
+              greedy: true
+              minLen: 1
+              maxLen: 160
+    jsonLdTypes:
+      - Product
+    vars:
+      title:
+        jsonLdPaths:
+          - name
+        cssText:
+          - main h1
+          - h1
+          - title
+        trim: true
+      sku:
+        jsonLdPaths:
+          - sku
+        trim: true
+      brand:
+        jsonLdPaths:
+          - brand.name
+          - brand
+        trim: true
+      body:
+        cssHtmlToMd:
+          - main
+          - article
+          - .tx-specs
+          - body
+        format: strip_leading_h1
+        trim: true
+    requireVars:
+      - title
+      - body
+    titleTemplate: "{title}"
+    bullets:
+      - label: Brand
+        template: "{brand}"
+        whenVar: brand
+      - label: SKU
+        template: "`{sku}`"
+        whenVar: sku
+    bodyVar: body
+    preserveBodyLinksFromVar: body

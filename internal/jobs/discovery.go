@@ -45,6 +45,9 @@ var (
 	reDiscSmartRec    = newLazyRegexp(`(?i)https?://jobs\.smartrecruiters\.com/([A-Za-z0-9_-]+)`)
 	reDiscJobvite     = newLazyRegexp(`(?i)https?://jobs\.jobvite\.com/([A-Za-z0-9_-]+)`)
 	reDiscICIMS       = newLazyRegexp(`(?i)https?://([a-z0-9-]+)\.icims\.com/jobs\b`)
+	reDiscUKG         = newLazyRegexp(`(?i)https?://recruiting\.ultipro\.com/([A-Za-z0-9_-]+/JobBoard/[A-Za-z0-9-]+)(?:/|\b)`)
+	reDiscPaylocity   = newLazyRegexp(`(?i)https?://recruiting\.paylocity\.com/recruiting/jobs/all/([A-Za-z0-9-]+)`)
+	reDiscDover       = newLazyRegexp(`(?i)https?://(?:app\.dover\.com/jobs/([A-Za-z0-9_-]+)|jobs\.dover\.com/([A-Za-z0-9_-]+))`)
 	reFullBoardWDHost = newLazyRegexp(`(?i)^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$`)
 
 	reInferICIMSHost = newLazyRegexp(`(?i)^(?:(?:careers|jobs|external|hub|global)-)?([a-z0-9-]+?)(?:-(?:careers|jobs|portal))?\.icims\.com$`)
@@ -267,6 +270,37 @@ func DiscoverATSBoardsFromHTML(params DiscoverBoardsParams) []DiscoveredATSBoard
 			addBoard("icims", icimsSlug, "https://"+icimsSlug+".icims.com/jobs/search?ss=1&in_iframe=1")
 		}
 	}
+	for _, m := range reDiscUKG.FindAllStringSubmatch(corpus, -1) {
+		ukgSlug := m[1]
+		ukgParts := strings.Split(ukgSlug, "/")
+		if len(ukgParts) == 3 && IsValidATSSlug(ukgParts[0]) && strings.EqualFold(ukgParts[1], "JobBoard") && IsValidATSSlug(ukgParts[2]) {
+			key := "ukg:" + strings.ToLower(ukgSlug)
+			if !hasKey(found, key) {
+				found[key] = DiscoveredATSBoard{
+					Platform:       "ukg",
+					Slug:           ukgSlug,
+					BoardURL:       "https://recruiting.ultipro.com/" + ukgSlug + "/",
+					DiscoveredFrom: params.SourceURL,
+				}
+				order = append(order, key)
+			}
+		}
+	}
+	for _, m := range reDiscPaylocity.FindAllStringSubmatch(corpus, -1) {
+		plcSlug := m[1]
+		addBoard("paylocity", plcSlug, "https://recruiting.paylocity.com/Recruiting/Jobs/All/"+plcSlug)
+	}
+	for _, m := range reDiscDover.FindAllStringSubmatch(corpus, -1) {
+		dovSlug := firstNonEmpty(m[1], m[2])
+		lowDov := strings.ToLower(dovSlug)
+		if lowDov != "" && lowDov != "api" && lowDov != "apply" && lowDov != "static" && lowDov != "assets" && lowDov != "_next" && lowDov != "login" {
+			if m[1] != "" {
+				addBoard("dover", dovSlug, "https://app.dover.com/jobs/"+dovSlug)
+			} else {
+				addBoard("dover", dovSlug, "https://jobs.dover.com/"+dovSlug)
+			}
+		}
+	}
 
 	out := make([]DiscoveredATSBoard, 0, len(order))
 	for _, k := range order {
@@ -423,6 +457,20 @@ func InferCompanyFromATSURL(urlStr string) string {
 			return "unknown"
 		}
 		return ""
+	}
+	if host == "recruiting.ultipro.com" || strings.HasSuffix(host, ".ultipro.com") {
+		if len(parts) >= 1 && parts[0] != "" && !strings.EqualFold(parts[0], "JobBoard") && !strings.EqualFold(parts[0], "JobBoardView") {
+			if dec, okD := decodeSegOrEmpty(parts[0]); okD {
+				return dec
+			}
+		}
+	}
+	if host == "recruiting.paylocity.com" || strings.HasSuffix(host, ".paylocity.com") {
+		if len(parts) >= 4 && strings.EqualFold(parts[0], "recruiting") && strings.EqualFold(parts[1], "jobs") && strings.EqualFold(parts[2], "all") {
+			if dec, okD := decodeSegOrEmpty(parts[3]); okD {
+				return dec
+			}
+		}
 	}
 	if host == "dover.com" || strings.HasSuffix(host, ".dover.com") || host == "dover.io" || strings.HasSuffix(host, ".dover.io") {
 		if len(parts) >= 2 && (strings.EqualFold(parts[0], "apply") || strings.EqualFold(parts[0], "jobs") || strings.EqualFold(parts[0], "careers")) {

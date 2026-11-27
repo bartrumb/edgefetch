@@ -1,0 +1,13 @@
+{
+  "adapterId": "nuget-gallery",
+  "mode": "twin",
+  "inputUrl": "https://www.nuget.org/packages/Newtonsoft.Json",
+  "expectedFetchUrl": "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json",
+  "mockPayload": "{\"items\":[{\"@id\":\"https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/page/1.json\",\"count\":1,\"lower\":\"13.0.3\",\"upper\":\"13.0.3\",\"items\":[{\"catalogEntry\":{\"id\":\"Newtonsoft.Json\",\"version\":\"13.0.3\",\"description\":\"Json.NET is a popular high-performance JSON framework for .NET\",\"authors\":\"James Newton-King\",\"licenseExpression\":\"MIT\",\"projectUrl\":\"https://www.newtonsoft.com/json\",\"published\":\"2023-03-08T07:42:00Z\",\"listed\":true}}]}]}",
+  "expectTitleIncludes": "Newtonsoft.Json v13.0.3 (NuGet)",
+  "expectMarkdownIncludes": [
+    "dotnet add package Newtonsoft.Json --version 13.0.3",
+    "James Newton-King",
+    "Json.NET is a popular high-performance JSON framework"
+  ]
+}

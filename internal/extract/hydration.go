@@ -675,6 +675,16 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 	lineStart := 0
 	linesScanned := 0
 	for lineStart < len(combinedRSC) && linesScanned < 3_000 {
+		// Length-framed `<id>:T<hexlen>,<bytes>` rows carry no trailing newline, so slice exactly
+		// `hexlen` bytes instead of reading to `\n` (which would swallow the following rows).
+		if tID, tBody, tNext, tOK := scanFlightTextRowHydrateGo(combinedRSC, lineStart); tOK {
+			lineStart = tNext
+			linesScanned++
+			flightChunksByID[tID] = tBody
+			recordPILeaf(tBody)
+			addProseCandidate(tBody, 30)
+			continue
+		}
 		nlRel := strings.IndexByte(combinedRSC[lineStart:], '\n')
 		lineEnd := len(combinedRSC)
 		if nlRel >= 0 {
@@ -735,6 +745,10 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 					parsedFlightObjects = append(parsedFlightObjects, parsedLineObj)
 				}
 				continue
+			} else if strings.Contains(payload, `"TableSpecContents":`) || strings.Contains(payload, `"SpecContent":`) {
+				if recovered := recoverShimanoRSCChunkObjectHydrateGo(payload); recovered != nil {
+					parsedFlightObjects = append(parsedFlightObjects, recovered)
+				}
 			}
 		}
 		if len(line) >= 80 && strings.IndexByte(line, '<') >= 0 && reHydrateHTMLTagHydrateGo.MatchString(line) {
@@ -809,14 +823,25 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 	}
 
 	var distilledRecords *distilledRecordsResultHydrateGo
+	var shimanoSpecsMD string
+	var shimanoSpecRecords []map[string]any
 	if len(resolvedFlightObjects) > 0 {
 		distilledRecords = distillRecordsWithMetaHydrateGo(resolvedFlightObjects, baseURL, 250)
+		shimanoSpecsMD, shimanoSpecRecords = extractShimanoRSCSpecsHydrateGo(resolvedFlightObjects)
+		if typedMD, typedRecords := extractShimanoTypenameSpecTableHydrateGo(resolvedFlightObjects, flightChunksByID); typedMD != "" {
+			if shimanoSpecsMD != "" {
+				shimanoSpecsMD += "\n\n" + typedMD
+			} else {
+				shimanoSpecsMD = typedMD
+			}
+			shimanoSpecRecords = append(shimanoSpecRecords, typedRecords...)
+		}
 	}
 
 	proseJoined := strings.TrimSpace(strings.Join(rscBlocks, "\n\n"))
 	proseWords := countWordsSchemaGo(proseJoined)
 
-	if proseWords < 25 && distilledRecords == nil {
+	if proseWords < 25 && distilledRecords == nil && shimanoSpecsMD == "" {
 		return nil
 	}
 
@@ -824,13 +849,16 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 	if proseWords >= 25 {
 		bodyParts = append(bodyParts, proseJoined)
 	}
+	if shimanoSpecsMD != "" {
+		bodyParts = append(bodyParts, shimanoSpecsMD)
+	}
 	if distilledRecords != nil {
 		bodyParts = append(bodyParts, distilledRecords.markdown)
 	}
 	combinedBody := strings.TrimSpace(strings.Join(bodyParts, "\n\n"))
 	finalMD := combinedBody
 	if rscTitle != "" && !strings.HasPrefix(combinedBody, "# ") {
-		finalMD = "# " + rscTitle + "\n\n" + combinedBody
+		finalMD = "# " + escapeDeclMarkdownBrackets(rscTitle) + "\n\n" + combinedBody
 	}
 
 	var piParts []string
@@ -854,8 +882,433 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 		}
 		out.Truncated = distilledRecords.truncated
 		out.NextCursor = distilledRecords.nextCursor
+	} else if len(shimanoSpecRecords) > 0 {
+		out.Records = shimanoSpecRecords
+		out.Total = len(shimanoSpecRecords)
+		out.Returned = len(shimanoSpecRecords)
 	}
 	return out
+}
+
+func isUnescapedQuoteAtHydrateGo(s string, pos int) bool {
+	if pos < 0 || pos >= len(s) || s[pos] != '"' {
+		return false
+	}
+	bs := 0
+	for j := pos - 1; j >= 0 && s[j] == '\\'; j-- {
+		bs++
+	}
+	return bs%2 == 0
+}
+
+func recoverShimanoRSCChunkObjectHydrateGo(payload string) any {
+	tryCandidate := func(braceIdx, mustCoverEnd int) any {
+		if braceIdx < 0 || braceIdx >= mustCoverEnd {
+			return nil
+		}
+		balanced, endIdx, okB := ExtractBalancedJSONAt(payload, braceIdx, 512_000)
+		if !okB || endIdx <= mustCoverEnd {
+			return nil
+		}
+		var embeddedObj any
+		if json.Unmarshal([]byte(balanced), &embeddedObj) == nil && embeddedObj != nil {
+			return embeddedObj
+		}
+		return nil
+	}
+
+	for _, key := range []string{`"TableSpecContents":`, `"SpecContent":`} {
+		searchFrom := 0
+		for occ := 0; occ < 5 && searchFrom < len(payload); occ++ {
+			rel := strings.Index(payload[searchFrom:], key)
+			if rel < 0 {
+				break
+			}
+			idx := searchFrom + rel
+			searchFrom = idx + len(key)
+			if idx <= 0 {
+				continue
+			}
+
+			// Fast check: immediate `{` before key (handles broken outer strings with unescaped quotes).
+			if lastBrace := strings.LastIndexByte(payload[:idx], '{'); lastBrace >= 0 {
+				if obj := tryCandidate(lastBrace, idx); obj != nil {
+					return obj
+				}
+			}
+
+			// Backward string-aware balanced-brace scan: skips preceding closed sibling `{...}` objects.
+			balance := 0
+			inString := false
+			attempts := 0
+			for p := idx - 1; p >= 0 && attempts < 8; p-- {
+				ch := payload[p]
+				if ch == '"' && isUnescapedQuoteAtHydrateGo(payload, p) {
+					inString = !inString
+					continue
+				}
+				if inString {
+					continue
+				}
+				if ch == '}' {
+					balance++
+				} else if ch == '{' {
+					if balance > 0 {
+						balance--
+					} else {
+						attempts++
+						if obj := tryCandidate(p, idx); obj != nil {
+							return obj
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func extractShimanoRSCSpecsHydrateGo(nodes []any) (string, []map[string]any) {
+	var categories []map[string]any
+	seenCat := make(map[string]bool)
+	visited := 0
+
+	var collectFromMap func(m map[string]any, depth int)
+	var walk func(val any, depth int)
+
+	collectFromMap = func(m map[string]any, depth int) {
+		for _, key := range []string{"TableSpecContents", "SpecContent", "specContents"} {
+			rawArr, ok := m[key].([]any)
+			if !ok {
+				continue
+			}
+			for _, el := range rawArr {
+				obj, okO := el.(map[string]any)
+				if !okO {
+					continue
+				}
+				catName := strings.TrimSpace(jsonScalarToString(obj["categoryName"]))
+				if catName == "" {
+					catName = strings.TrimSpace(jsonScalarToString(obj["title"]))
+				}
+				specsArr, _ := obj["specs"].([]any)
+				if len(specsArr) == 0 {
+					specsArr, _ = obj["SpecList"].([]any)
+				}
+				if len(specsArr) == 0 {
+					continue
+				}
+				var sigBuilder strings.Builder
+				for _, rs := range specsArr {
+					if so, okS := rs.(map[string]any); okS {
+						sn := strings.TrimSpace(jsonScalarToString(so["specName"]))
+						if sn == "" {
+							sn = strings.TrimSpace(jsonScalarToString(so["name"]))
+						}
+						sv := strings.TrimSpace(jsonScalarToString(so["specValue"]))
+						if sv == "" {
+							sv = strings.TrimSpace(jsonScalarToString(so["value"]))
+						}
+						sigBuilder.WriteString(sn)
+						sigBuilder.WriteByte('=')
+						sigBuilder.WriteString(sv)
+						sigBuilder.WriteByte('\x00')
+					}
+				}
+				dedupeKey := catName + "|" + strconv.Itoa(len(specsArr)) + "|" + sigBuilder.String()
+				if seenCat[dedupeKey] {
+					continue
+				}
+				seenCat[dedupeKey] = true
+				categories = append(categories, obj)
+			}
+		}
+	}
+
+	walk = func(val any, depth int) {
+		if val == nil || depth > 14 || visited > 20_000 {
+			return
+		}
+		visited++
+		switch v := val.(type) {
+		case string:
+			trimmed := strings.TrimSpace(v)
+			if strings.HasPrefix(trimmed, "{") && (strings.Contains(trimmed, "TableSpecContents") || strings.Contains(trimmed, "SpecContent")) {
+				var parsed map[string]any
+				if json.Unmarshal([]byte(trimmed), &parsed) == nil && parsed != nil {
+					walk(parsed, depth+1)
+				}
+			}
+		case []any:
+			for _, el := range v {
+				walk(el, depth+1)
+			}
+		case map[string]any:
+			collectFromMap(v, depth)
+			for _, k := range sortedMapKeysSchemaGo(v) {
+				if unsafeObjectKeysHydrateGo[k] {
+					continue
+				}
+				walk(v[k], depth+1)
+			}
+		}
+	}
+
+	for _, n := range nodes {
+		walk(n, 0)
+	}
+	if len(categories) == 0 {
+		return "", nil
+	}
+
+	var sections []string
+	var records []map[string]any
+	for _, cat := range categories {
+		catName := strings.TrimSpace(jsonScalarToString(cat["categoryName"]))
+		if catName == "" {
+			catName = strings.TrimSpace(jsonScalarToString(cat["title"]))
+		}
+		if catName == "" {
+			catName = "Specifications"
+		}
+		specsArr, _ := cat["specs"].([]any)
+		if len(specsArr) == 0 {
+			specsArr, _ = cat["SpecList"].([]any)
+		}
+		var rows [][]string
+		for _, rs := range specsArr {
+			so, okS := rs.(map[string]any)
+			if !okS {
+				continue
+			}
+			sName := strings.TrimSpace(jsonScalarToString(so["specName"]))
+			if sName == "" {
+				sName = strings.TrimSpace(jsonScalarToString(so["name"]))
+			}
+			sVal := strings.TrimSpace(jsonScalarToString(so["specValue"]))
+			if sVal == "" {
+				sVal = strings.TrimSpace(jsonScalarToString(so["value"]))
+			}
+			if sName == "" && sVal == "" {
+				continue
+			}
+			safeCat := SanitizeSchemaPlainField(catName, 200)
+			safeName := SanitizeSchemaPlainField(sName, 200)
+			safeVal := SanitizeSchemaPlainField(sVal, 400)
+			if safeName == "" && safeVal == "" {
+				continue
+			}
+			rows = append(rows, []string{safeName, safeVal})
+			records = append(records, map[string]any{
+				"category": safeCat,
+				"name":     safeName,
+				"value":    safeVal,
+			})
+		}
+		if len(rows) > 0 {
+			sections = append(sections, "## "+SanitizeSchemaPlainField(catName, 200)+"\n\n"+formatDeclarativeGFMTable([]string{"Specification", "Value"}, rows))
+		}
+	}
+	return strings.Join(sections, "\n\n"), records
+}
+
+// extractShimanoTypenameSpecTableHydrateGo renders GraphQL-typed spec tables of the shape
+// `{"__typename":"TableSpecContents","models":[{"modelName","modelValueSet"}],"attributes":[{"attributeId","attributeKey1".."3"}]}`
+// as one GFM table per spec object (one column per model). `$` references left unresolved by the
+// depth-bounded resolver are followed through table. A model's value set may be an index-aligned
+// scalar array, an array of objects keyed by `attributeId`, or a map keyed by attributeId.
+func extractShimanoTypenameSpecTableHydrateGo(nodes []any, table map[string]any) (string, []map[string]any) {
+	deref := func(v any) any {
+		for hops := 0; hops < 6; hops++ {
+			str, ok := v.(string)
+			if !ok {
+				return v
+			}
+			refID, okR := parseFlightDollarRefHydrateGo(str, table)
+			if !okR {
+				return v
+			}
+			v = table[refID]
+		}
+		return v
+	}
+	scalar := func(v any) string {
+		return strings.TrimSpace(jsonScalarToString(deref(v)))
+	}
+
+	var specTables []map[string]any
+	visited := 0
+	var walk func(val any, depth int)
+	walk = func(val any, depth int) {
+		if val == nil || depth > 64 || visited > 20_000 || len(specTables) >= 20 {
+			return
+		}
+		visited++
+		switch v := val.(type) {
+		case []any:
+			for _, el := range v {
+				walk(el, depth+1)
+			}
+		case map[string]any:
+			if jsonScalarToString(v["__typename"]) == "TableSpecContents" {
+				if _, okM := deref(v["models"]).([]any); okM {
+					if _, okA := deref(v["attributes"]).([]any); okA {
+						specTables = append(specTables, v)
+						return
+					}
+				}
+			}
+			for _, k := range sortedMapKeysSchemaGo(v) {
+				if unsafeObjectKeysHydrateGo[k] {
+					continue
+				}
+				walk(v[k], depth+1)
+			}
+		}
+	}
+	for _, n := range nodes {
+		walk(n, 0)
+	}
+	if len(specTables) == 0 {
+		return "", nil
+	}
+
+	valueOf := func(v any) string {
+		v = deref(v)
+		if obj, ok := v.(map[string]any); ok {
+			for _, key := range []string{"value", "attributeValue", "displayValue", "valueText", "text", "label"} {
+				if s := scalar(obj[key]); s != "" {
+					return s
+				}
+			}
+			return ""
+		}
+		return scalar(v)
+	}
+	cellFor := func(set any, attrIdx int, attrID string) string {
+		switch vs := set.(type) {
+		case []any:
+			if attrID != "" {
+				for _, el := range vs {
+					if eo, ok := deref(el).(map[string]any); ok && scalar(eo["attributeId"]) == attrID {
+						return valueOf(eo)
+					}
+				}
+			}
+			if attrIdx < len(vs) {
+				if _, isObj := deref(vs[attrIdx]).(map[string]any); !isObj {
+					return valueOf(vs[attrIdx])
+				}
+			}
+		case map[string]any:
+			if attrID != "" {
+				if cell, ok := vs[attrID]; ok {
+					return valueOf(cell)
+				}
+			}
+		}
+		return ""
+	}
+
+	seen := make(map[string]bool)
+	var sections []string
+	var records []map[string]any
+	for _, st := range specTables {
+		models, _ := deref(st["models"]).([]any)
+		attrs, _ := deref(st["attributes"]).([]any)
+		if len(models) > 40 {
+			models = models[:40]
+		}
+		if len(attrs) > 500 {
+			attrs = attrs[:500]
+		}
+		catName := ""
+		for _, key := range []string{"categoryName", "title", "tableTitle", "heading"} {
+			if c := scalar(st[key]); c != "" {
+				catName = c
+				break
+			}
+		}
+		if catName == "" {
+			catName = "Specifications"
+		}
+		safeCat := SanitizeSchemaPlainField(catName, 200)
+
+		headers := []string{"Specification"}
+		var modelNames []string
+		var valueSets []any
+		for _, m := range models {
+			mo, ok := deref(m).(map[string]any)
+			if !ok {
+				continue
+			}
+			name := SanitizeSchemaPlainField(scalar(mo["modelName"]), 120)
+			if name == "" {
+				name = "Model " + strconv.Itoa(len(modelNames)+1)
+			}
+			modelNames = append(modelNames, name)
+			headers = append(headers, name)
+			valueSets = append(valueSets, deref(mo["modelValueSet"]))
+		}
+		if len(modelNames) == 0 {
+			continue
+		}
+
+		var rows [][]string
+		var tableRecords []map[string]any
+		for ai, a := range attrs {
+			ao, ok := deref(a).(map[string]any)
+			if !ok {
+				continue
+			}
+			var keyParts []string
+			for _, key := range []string{"attributeKey1", "attributeKey2", "attributeKey3"} {
+				if kp := SanitizeSchemaPlainField(scalar(ao[key]), 200); kp != "" {
+					keyParts = append(keyParts, kp)
+				}
+			}
+			if len(keyParts) == 0 {
+				continue
+			}
+			specName := strings.Join(keyParts, " / ")
+			attrID := scalar(ao["attributeId"])
+			row := []string{specName}
+			hasValue := false
+			var rowRecords []map[string]any
+			for mi, set := range valueSets {
+				cell := SanitizeSchemaPlainField(cellFor(set, ai, attrID), 400)
+				row = append(row, cell)
+				if cell != "" {
+					hasValue = true
+					rowRecords = append(rowRecords, map[string]any{
+						"category": safeCat,
+						"name":     specName,
+						"model":    modelNames[mi],
+						"value":    cell,
+					})
+				}
+			}
+			if !hasValue {
+				continue
+			}
+			rows = append(rows, row)
+			tableRecords = append(tableRecords, rowRecords...)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		section := "## " + safeCat + "\n\n" + formatDeclarativeGFMTable(headers, rows)
+		if seen[section] {
+			continue
+		}
+		seen[section] = true
+		sections = append(sections, section)
+		records = append(records, tableRecords...)
+	}
+	if len(sections) == 0 {
+		return "", nil
+	}
+	return strings.Join(sections, "\n\n"), records
 }
 
 // ExtractFromParsedStateTree walks a parsed framework state tree (Next.js, Nuxt, Remix, Angular, Wix,
@@ -1091,7 +1544,7 @@ func ExtractFromParsedStateTree(root any, framework, baseURL string, htmlToMD fu
 	bodyJoined := strings.TrimSpace(strings.Join(sections, "\n\n"))
 	finalMD := bodyJoined
 	if bestTitle != "" && !hasLeadingMarkdownH1HydrateGo(bodyJoined) {
-		finalMD = "# " + bestTitle + "\n\n" + bodyJoined
+		finalMD = "# " + escapeDeclMarkdownBrackets(bestTitle) + "\n\n" + bodyJoined
 	}
 
 	out := &HydratedFrameworkStateResult{
@@ -1874,6 +2327,82 @@ func isFlightChunkIDHydrateGo(s string) bool {
 	return true
 }
 
+// scanFlightTextRowHydrateGo parses a length-framed React Flight text row `<id>:T<hexlen>,<bytes>`
+// starting at pos (after optional leading whitespace). The body is exactly hexlen bytes of the
+// already-decoded string. The row is accepted only when the framed end lands on a row boundary
+// (see isFlightRowBoundaryHydrateGo); one trailing `\n` is consumed. Linear in the row length.
+func scanFlightTextRowHydrateGo(s string, pos int) (id, body string, next int, ok bool) {
+	p := pos
+	for p < len(s) && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n') {
+		p++
+	}
+	idStart := p
+	for p < len(s) && p-idStart <= 12 && s[p] != ':' {
+		p++
+	}
+	if p >= len(s) || s[p] != ':' || p == idStart || !isFlightChunkIDHydrateGo(s[idStart:p]) {
+		return "", "", 0, false
+	}
+	id = s[idStart:p]
+	p++
+	if p >= len(s) || s[p] != 'T' {
+		return "", "", 0, false
+	}
+	p++
+	hexStart := p
+	n := 0
+	for p < len(s) && p-hexStart < 8 {
+		d := hexDigitValueHydrateGo(s[p])
+		if d < 0 {
+			break
+		}
+		n = n*16 + d
+		p++
+	}
+	if p == hexStart || p >= len(s) || s[p] != ',' {
+		return "", "", 0, false
+	}
+	p++
+	end := p + n
+	if end > len(s) || !isFlightRowBoundaryHydrateGo(s, end) {
+		return "", "", 0, false
+	}
+	body = s[p:end]
+	next = end
+	if next < len(s) && s[next] == '\n' {
+		next++
+	}
+	return id, body, next, true
+}
+
+func hexDigitValueHydrateGo(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
+}
+
+// isFlightRowBoundaryHydrateGo reports whether pos is the end of input, a line break, or the
+// start of another `<id>:` Flight row.
+func isFlightRowBoundaryHydrateGo(s string, pos int) bool {
+	if pos >= len(s) {
+		return true
+	}
+	if s[pos] == '\n' || s[pos] == '\r' {
+		return true
+	}
+	p := pos
+	for p < len(s) && p-pos <= 12 && s[p] != ':' {
+		p++
+	}
+	return p < len(s) && s[p] == ':' && p > pos && isFlightChunkIDHydrateGo(s[pos:p])
+}
+
 func parseFlightDollarRefHydrateGo(s string, table map[string]any) (string, bool) {
 	if len(s) < 2 || len(s) > 16 || s[0] != '$' {
 		return "", false
@@ -2090,7 +2619,7 @@ func preEscapeLtDecodeEntitiesHydrateGo(s string) string {
 	if strings.IndexByte(clean, '<') >= 0 {
 		clean = strings.ReplaceAll(clean, "<", "&lt;")
 	}
-	decoded := decodeMarkdownEntitiesPreservingLtGo(clean)
+	decoded := decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(clean)
 	return StripInvisibleSchemaChars(decoded)
 }
 
@@ -2111,14 +2640,12 @@ func preEscapeUntrustedInlineHydrateGo(val any, maxLen int) string {
 	if strings.TrimSpace(cleaned) == "" {
 		return ""
 	}
-	// Pre-escape `<` to `&lt;` BEFORE `decodeMarkdownEntitiesPreservingLtGo`!
+	// Pre-escape `<` to `&lt;` BEFORE `decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo`!
 	if strings.IndexByte(cleaned, '<') >= 0 {
 		cleaned = strings.ReplaceAll(cleaned, "<", "&lt;")
 	}
-	decoded := StripInvisibleSchemaChars(decodeMarkdownEntitiesPreservingLtGo(cleaned))
-	safe := neutralizeAllUnsafeMarkdownLinksLinearGo(decoded)
-	safe = strings.ReplaceAll(safe, "\r", " ")
-	safe = strings.ReplaceAll(safe, "\n", " ")
+	decoded := StripInvisibleSchemaChars(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(cleaned))
+	safe := escapeUnescapedMarkdownBracketsGo(decoded)
 	safe = strings.ReplaceAll(safe, "<", "&lt;")
 	safe = strings.Join(strings.Fields(safe), " ")
 	if maxLen > 0 && utf16UnitsLenSchemaGo(safe) > maxLen {
@@ -2279,10 +2806,10 @@ func formatInertiaPagePropsHydrateGo(inertiaObj map[string]any, baseURL string, 
 				}
 				safeScalar := preEscapeUntrustedInlineHydrateGo(clean, 300)
 				if bestTitle == "" && (lower == "title" || lower == "pagetitle" || lower == "headline" || lower == "name") && len(clean) <= 180 {
-					bestTitle = preEscapeUntrustedInlineHydrateGo(clean, 180)
+					bestTitle = SanitizeScrapedMetadataField(clean, 180)
 				}
 				if bestDescription == "" && (lower == "description" || lower == "summary" || lower == "excerpt") && len(clean) >= 20 && len(clean) <= 400 && !reAnyAlphaTagHydrateGo.MatchString(clean) {
-					bestDescription = preEscapeUntrustedInlineHydrateGo(clean, 400)
+					bestDescription = SanitizeScrapedMetadataField(clean, 400)
 				}
 				isProse := len(clean) >= 80 || lower == "body" || lower == "content" || lower == "markdown" || lower == "html" || lower == "descriptionhtml"
 				if isProse && containsWhitespaceHydrateGo(clean) {
@@ -2415,9 +2942,9 @@ func formatInertiaPagePropsHydrateGo(inertiaObj map[string]any, baseURL string, 
 		return nil
 	}
 
-	headingTitle := bestTitle
+	headingTitle := preEscapeUntrustedInlineHydrateGo(bestTitle, 180)
 	if headingTitle == "" {
-		headingTitle = strings.ReplaceAll(compClean, "/", " — ")
+		headingTitle = preEscapeUntrustedInlineHydrateGo(strings.ReplaceAll(compClean, "/", " — "), 180)
 	}
 	headingTitle = strings.Join(strings.Fields(headingTitle), " ")
 

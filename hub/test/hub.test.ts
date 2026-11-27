@@ -1626,7 +1626,7 @@ test('V2-9: Worker Hub serves /health, /admin, /v1/capabilities, and /mcp over n
     );
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 17);
+    assert.equal(mcpJson.result.tools.length, 19);
   } finally {
     coord.close();
     metaDb.close();
@@ -3185,7 +3185,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       fetchFn: v24Fetch,
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.8.12');
+    assert.equal(caps.version, '2.8.18');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);
@@ -5110,6 +5110,8 @@ test('M1-B Search providers, Agent SSE/async/no-ctx waitUntil, Jobs, Catalog, Ma
     WEBHOOK_SECRET: webhookSecret,
     OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:4318',
     OTEL_SERVICE_NAME: 'edgefetch-hub-m1b-orch',
+    // ATS boards in this suite are mocked on the node (agent) path only; keep jobs off the edge route.
+    JOBS_EDGE_ATS_FETCH: 'off',
     SAFE_FETCH: mockSafeFetch,
     SAFE_PUBLIC_FETCH: mockPublicFetch,
     META: metaDb as unknown as D1Database,
@@ -13012,9 +13014,9 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
     );
   }
 
-  // Also verify zero-drift sharing with all 17 canonical MCP tool schemas
+  // Also verify zero-drift sharing with all 19 canonical MCP tool schemas
   const canonicalTools = buildCanonicalMcpToolSchemas();
-  assert.equal(canonicalTools.length, 17);
+  assert.equal(canonicalTools.length, 19);
   assert.deepEqual(components.schemas.ScrapeRequest, MCP_TOOL_SCHEMAS.scrape);
   assert.deepEqual(components.schemas.ExtractRequest, MCP_TOOL_SCHEMAS.extract);
   assert.deepEqual(components.schemas.InteractRequest, MCP_TOOL_SCHEMAS.interact);

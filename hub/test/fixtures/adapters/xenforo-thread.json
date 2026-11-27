@@ -1,0 +1,10 @@
+{
+  "adapterId": "xenforo-thread",
+  "mode": "html",
+  "inputUrl": "https://forums.electricbikereview.com/threads/bosch-gen4-noise.9912/",
+  "mockPayload": "<!doctype html><html><body><h1 class=\"p-title-value\">Bosch Gen4 Noise Fix</h1><article class=\"message message--post\" data-author=\"Alice\"><time class=\"u-dt\" datetime=\"2026-03-10T14:22:00Z\">Mar 10, 2026</time><div class=\"bbWrapper\"><p>Check mounting bolts.</p></div><aside class=\"message-signature\">Sig noise</aside></article></body></html>",
+  "expectMarkdownIncludes": [
+    "Original Post — Alice",
+    "Check mounting bolts."
+  ]
+}

@@ -1,0 +1,36 @@
+# Shared Go + TypeScript Declarative Site Adapter: EUR-Lex EU Legal Documents
+id: eur-lex
+name: EUR-Lex
+category: public-records
+description: "Upgrades eur-lex.europa.eu/legal-content/<LANG>/TXT/?uri=* pages to the static /TXT/HTML/?uri=* twin while respecting robots.txt Crawl-delay and never touching disallowed /TXT/DOC/."
+domains:
+  - eur-lex.europa.eu
+exampleUrls:
+  - "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679"
+
+match:
+  exactSegments: true
+  pathSegments:
+    - legal-content
+    - param: lang
+      charset: alnum
+      minLen: 2
+      maxLen: 3
+      transform: upper
+    - TXT
+  queryParams:
+    - name: uri
+      param: uri
+      charset: safe_subpath
+      minLen: 3
+      maxLen: 200
+
+twin:
+  fetchUrl: "https://eur-lex.europa.eu/legal-content/{lang}/TXT/HTML/?uri={uri}"
+  kind: text
+  accept: text/html
+  maxBytes: 4194304
+
+extract:
+  textMode: html_document
+  titleTemplate: "EUR-Lex {uri} ({lang})"

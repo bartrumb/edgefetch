@@ -1,0 +1,17 @@
+# Shared Go + TypeScript Declarative Site Adapter: Magento 2 & Shopware 6 Storefronts
+id: shopware-magento
+name: "Magento 2 & Shopware 6 Storefronts"
+category: commerce-social
+description: "Structurally detects Magento 2 (text/x-magento-init swatches and bounded products-render-info) and Shopware 6 (sw-product-detail and property tables) storefronts."
+domains:
+  - www.shopware.com
+  - business.adobe.com
+universalEngine: true
+exampleUrls:
+  - https://www.shopware.com/en/products/sample
+
+htmlRoutes:
+  - id: shopware-magento
+    match:
+      exactSegments: false
+    mode: shopware_magento_html

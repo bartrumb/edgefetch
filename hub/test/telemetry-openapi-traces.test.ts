@@ -1498,7 +1498,7 @@ function assertOpenApiSourceAndSchemaContract(params: {
 
   // 3. Verify ALL 17 canonical MCP tool schemas match `McpTool_*Input` AND shared REST request schemas!
   const mcpTools = params.mcpTools ?? buildCanonicalMcpToolSchemas();
-  assert.equal(mcpTools.length, 17);
+  assert.equal(mcpTools.length, 19);
   for (const tool of mcpTools) {
     const pascal = tool.name
       .split('_')
@@ -1832,7 +1832,7 @@ test('R8-H7-1: matchesApprovedWildcard matches identically in compiler and runti
 });
 
 test('R8-H7-2: Compiler & runtime reject exact-subdomain hijack of *.wikipedia.org, careers.*.com, jobs.*.com, and gitlab.*', () => {
-  assert.equal(DECLARATIVE_SITE_ADAPTERS.length, 56);
+  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 68, `expected >= 68 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
   assert.doesNotThrow(() =>
     validateManifestSet(COMPILED_BUNDLE.manifests.map((obj) => ({ obj, label: `${obj.id}.yaml` }))),
   );
@@ -4279,11 +4279,15 @@ test('Live Trace Remediation Suite: ATS 404 fast-return, closed ?error=true Chro
     },
   });
   assert.equal(allstateScrapedUrls.some((u) => u.includes('feathery')), false, 'Unrelated company board feathery must be filtered before Wave 1');
-  assert.equal(
-    allstateScrapedUrls.some((u) => u.includes('smartrecruiters.com/allstate') || u.includes('greenhouse.io/allstate')),
-    false,
-    'Speculative 4-ATS probes must be skipped when ats_search already found a confirmed company board',
-  );
+  // Direct-first: the company's own ATS boards are probed once, before the web search. They are never re-probed after
+  // ats_search confirms the company's Workday board, and the Workday board found by search is still scraped.
+  for (const probe of ['smartrecruiters.com/allstate', 'greenhouse.io/allstate']) {
+    assert.ok(
+      allstateScrapedUrls.filter((u) => u.includes(probe)).length <= 1,
+      `Speculative ATS probe ${probe} must run at most once (direct-first), never again after ats_search found the board`,
+    );
+  }
+  assert.ok(allstateScrapedUrls.some((u) => u.includes('allstate.wd5.myworkdayjobs.com')), 'search-found Workday board is scraped');
 
   // `scrubSpanToDevErrorReport` ignores expected `not_found`, `blocked`, `skip`, and wrapper `mcp_tool_error` spans
   const { scrubSpanToDevErrorReport } = await import('../src/dev-telemetry');

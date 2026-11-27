@@ -1,0 +1,263 @@
+# Shared Go + TypeScript Declarative Site Adapter: CPSC Recalls & SaferProducts.gov
+id: cpsc-recalls
+name: CPSC Recalls & SaferProducts.gov
+category: public-records
+description: "Formats bounded saferproducts.gov RecallNumber queries via JSON twin and extracts structured recall details and RecallNumber from cpsc.gov/Recalls pages (never fetching the unfiltered 25 MiB SaferProducts dump)."
+domains:
+  - www.saferproducts.gov
+  - saferproducts.gov
+  - www.cpsc.gov
+  - cpsc.gov
+exampleUrls:
+  - "https://www.saferproducts.gov/RestWebServices/Recall?format=json&RecallNumber=24123"
+  - "https://www.cpsc.gov/Recalls/2024/Example-Recall-Notice"
+
+routes:
+  # Bounded SaferProducts REST lookup (requires RecallNumber query parameter)
+  - match:
+      hosts:
+        - www.saferproducts.gov
+        - saferproducts.gov
+      pathEquals:
+        - /RestWebServices/Recall
+        - /RestWebServices/Recall/
+      queryParams:
+        - names:
+            - RecallNumber
+            - recallnumber
+            - recallNumber
+            - RECALLNUMBER
+          param: recallNum
+          charset: cpsc_recall_num
+          minLen: 2
+          maxLen: 24
+          transform: strip_dashes
+    twin:
+      fetchUrl: "https://www.saferproducts.gov/RestWebServices/Recall?format=json&RecallNumber={recallNum}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      unwrapFirstArrayElement: true
+      requireFields:
+        - RecallNumber
+        - Title
+      vars:
+        title:
+          paths:
+            - Title
+          trim: true
+        recallNumber:
+          paths:
+            - RecallNumber
+          trim: true
+        recallDate:
+          paths:
+            - RecallDate
+          sliceMax: 10
+        lastPublishDate:
+          paths:
+            - LastPublishDate
+          sliceMax: 10
+        description:
+          paths:
+            - Description
+          trim: true
+        descShort:
+          paths:
+            - Description
+          trim: true
+          sliceMax: 260
+        consumerContact:
+          paths:
+            - ConsumerContact
+          trim: true
+        recallUrl:
+          paths:
+            - URL
+          requireHttps: true
+        hazards:
+          paths:
+            - Hazards
+          subField: Name
+          join: "; "
+          limit: 10
+        remedies:
+          paths:
+            - Remedies
+          subField: Name
+          join: "; "
+          limit: 10
+        manufacturers:
+          paths:
+            - Manufacturers
+          subField: Name
+          join: ", "
+          limit: 10
+        retailers:
+          paths:
+            - Retailers
+          subField: Name
+          join: ", "
+          limit: 10
+        injuries:
+          paths:
+            - Injuries
+          subField: Name
+          join: "; "
+          limit: 10
+      titleTemplate: "{title} (Recall #{recallNumber})"
+      descriptionVar: descShort
+      publishedTimeVar: recallDate
+      bullets:
+        - label: Recall Number
+          template: "`{recallNumber}`"
+        - label: Recall Date
+          template: "{recallDate}"
+          whenVar: recallDate
+        - label: Last Published
+          template: "{lastPublishDate}"
+          whenVar: lastPublishDate
+        - label: Hazards
+          template: "{hazards}"
+          whenVar: hazards
+        - label: Remedies
+          template: "{remedies}"
+          whenVar: remedies
+        - label: Injuries / Incidents
+          template: "{injuries}"
+          whenVar: injuries
+        - label: Manufacturers
+          template: "{manufacturers}"
+          whenVar: manufacturers
+        - label: Retailers
+          template: "{retailers}"
+          whenVar: retailers
+        - label: Consumer Contact
+          template: "{consumerContact}"
+          whenVar: consumerContact
+        - label: CPSC URL
+          template: "{recallUrl}"
+          whenVar: recallUrl
+      sections:
+        - heading: Description
+          textVar: description
+        - heading: Products
+          arrayPath: Products
+          limit: 25
+          columns:
+            - header: Name
+              paths:
+                - Name
+            - header: Model
+              paths:
+                - Model
+              code: true
+            - header: Units
+              paths:
+                - NumberOfUnits
+            - header: Type
+              paths:
+                - Type
+        - heading: Images
+          arrayPath: Images
+          limit: 10
+          requireItemVar: imgUrl
+          collectLinkVars:
+            - imgUrl
+          itemVars:
+            imgUrl:
+              paths:
+                - URL
+              requireHttps: true
+            imgCap:
+              paths:
+                - Caption
+              default: Recall product image
+          itemTemplate: "[{imgCap}]({imgUrl})"
+      linksVars:
+        - recallUrl
+      recordFields:
+        recallNumber: "{recallNumber}"
+        title: "{title}"
+        recallDate: "{recallDate}"
+        url: "{recallUrl}"
+        hazards: "{hazards}"
+        remedies: "{remedies}"
+        manufacturers: "{manufacturers}"
+
+htmlRoutes:
+  - match:
+      anyOf:
+        - hosts:
+            - www.cpsc.gov
+            - cpsc.gov
+          exactSegments: false
+          pathSegments:
+            - Recalls
+            - param: year
+              charset: digits
+              minLen: 4
+              maxLen: 4
+            - param: slug
+              charset: url_seg
+        - hosts:
+            - www.cpsc.gov
+            - cpsc.gov
+          exactSegments: false
+          pathSegments:
+            - recalls
+            - param: year
+              charset: digits
+              minLen: 4
+              maxLen: 4
+            - param: slug
+              charset: url_seg
+    mode: dom
+    vars:
+      title:
+        cssText:
+          - h1
+        metaKeys:
+          - og:title
+        trim: true
+      recallNumber:
+        regexExtract:
+          source: doc_text_and_img_alts
+          pattern: "(?i)Recall\\s*(?:Number|No\\.?|#)\\s*:?\\s*([0-9]{2}-?[0-9]{2,5})"
+          group: 1
+        trim: true
+      recallDate:
+        metaKeys:
+          - article:published_time
+        cssText:
+          - time
+          - ".recall-detail__date"
+        trim: true
+      summary:
+        metaKeys:
+          - description
+          - og:description
+        trim: true
+      body:
+        cssHtmlToMd:
+          - "main article"
+          - ".recall-detail"
+          - ".node--type-recall"
+          - main
+          - article
+        format: strip_leading_h1
+    requireVars:
+      - title
+      - body
+    titleTemplate: "{title}"
+    descriptionVar: summary
+    publishedTimeVar: recallDate
+    bullets:
+      - label: Recall Number
+        template: "`{recallNumber}`"
+        whenVar: recallNumber
+      - label: Recall Date
+        template: "{recallDate}"
+        whenVar: recallDate
+    bodyVar: body

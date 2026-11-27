@@ -12,8 +12,16 @@ import {
   sanitizeNodeSuppliedUrls,
   sniffLargeStructuredJsonKind,
   tryParseJsonPayloadForScrape,
+  capInlineRecordsToBudget,
+  resolveScrapeMaxChars,
 } from '../src/scrape';
-import { readArtifactPage } from '../src/storage';
+import {
+  hydrateReplyBodiesFromR2,
+  INLINE_HYDRATION_BUDGET_BYTES,
+  r2ArtifactKey,
+  readArtifactPage,
+  writeArtifactToR2,
+} from '../src/storage';
 import { MAX_WASM_INPUT_BYTES, resetIsolateBudgetForTests } from '../src/wasm-bridge';
 import { NodeFsR2Bucket } from './stubs/cf-storage-mocks';
 
@@ -337,4 +345,311 @@ test('JSON over the 2 MiB JS-parse cap keeps OpenAPI / notebook formatting via t
   assert.ok(generic.length > 2 * 1024 * 1024);
   assert.equal(sniffLargeStructuredJsonKind(generic, 'https://data.example.com/rows.json'), null);
   assert.equal(tryParseJsonPayloadForScrape(generic, 'application/json', 'https://data.example.com/rows.json')?.structuredKind, undefined);
+});
+
+test('L-02: primary agent bodyOmitted without extractedOnNode returns edgeBudgetExceeded: true while preserving parsed PDFs', async () => {
+  resetIsolateBudgetForTests();
+  const pageUrl = 'https://omitted.example.com/sitemap.xml';
+  const blobSha = 'c'.repeat(64);
+  const res = await executeScrapeCall({
+    payload: { url: pageUrl, formats: ['markdown'] },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:home-node',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: pageUrl,
+            finalUrl: pageUrl,
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/xml',
+            bodyOmitted: true,
+            artifact: { blobSha256: blobSha, contentSha256: 'd'.repeat(64), contentBytes: 5 * 1024 * 1024 },
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.edgeBudgetExceeded, true);
+  assert.equal(res.body.artifactId, blobSha);
+  assert.equal(res.body.markdown, '');
+  const warnings = (res.body.warnings as string[] | undefined) ?? [];
+  assert.ok(warnings.some((w) => w.includes('4 MiB WASM input budget')), JSON.stringify(warnings));
+
+  // Regression guard: node-parsed PDF with bodyOmitted: true still succeeds without edgeBudgetExceeded.
+  const pdfUrl = 'https://omitted.example.com/manual.pdf';
+  const pdfRes = await executeScrapeCall({
+    payload: { url: pdfUrl, formats: ['markdown'] },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:home-node',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: pdfUrl,
+            finalUrl: pdfUrl,
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/pdf',
+            pdfEngine: 'poppler-pdftotext',
+            bodyOmitted: true,
+            markdown: '# Manual\n\nParsed on node.',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(pdfRes.status, 200);
+  assert.equal(pdfRes.body.edgeBudgetExceeded, undefined);
+  assert.match(String(pdfRes.body.markdown ?? ''), /Parsed on node\./);
+});
+
+test('L-03: hydrateReplyBodiesFromR2 and executeScrapeCall allow rawBase64/binary > 4 MiB up to wire budget', async (t) => {
+  const dirs: string[] = [];
+  t.after(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+  resetIsolateBudgetForTests();
+  const bucket = tempBucket(dirs) as unknown as R2Bucket;
+
+  // Store a 6 MiB payload and a 15 MiB payload in R2.
+  const sixMibBytes = new Uint8Array(6 * 1024 * 1024);
+  sixMibBytes.fill(0x41);
+  const sixArt = await writeArtifactToR2({ bucket, rawBytes: sixMibBytes, retention: 'transient' });
+
+  const fifteenMibBytes = new Uint8Array(15 * 1024 * 1024);
+  fifteenMibBytes.fill(0x42);
+  const fifteenArt = await writeArtifactToR2({ bucket, rawBytes: fifteenMibBytes, retention: 'transient' });
+
+  const mixedReply = JSON.stringify({
+    results: [
+      {
+        id: 'bin-1',
+        kind: 'binary',
+        url: 'https://files.example.com/6mb.pdf',
+        status: 200,
+        outcome: 'ok',
+        bodyOmitted: true,
+        artifact: { blobSha256: sixArt.blobSha256, contentSha256: sixArt.contentSha256, contentBytes: sixMibBytes.byteLength, retention: 'transient' },
+      },
+      {
+        id: 'b64-2',
+        kind: 'scrape',
+        url: 'https://files.example.com/6mb.html',
+        status: 200,
+        outcome: 'ok',
+        bodyOmitted: true,
+        artifact: { blobSha256: sixArt.blobSha256, contentSha256: sixArt.contentSha256, contentBytes: sixMibBytes.byteLength, retention: 'transient' },
+      },
+      {
+        id: 'normal-3',
+        kind: 'scrape',
+        url: 'https://files.example.com/normal-6mb.html',
+        status: 200,
+        outcome: 'ok',
+        artifact: { blobSha256: sixArt.blobSha256, contentSha256: sixArt.contentSha256, contentBytes: sixMibBytes.byteLength, retention: 'transient' },
+      },
+      {
+        id: 'too-big-4',
+        kind: 'binary',
+        url: 'https://files.example.com/15mb.pdf',
+        status: 200,
+        outcome: 'ok',
+        artifact: { blobSha256: fifteenArt.blobSha256, contentSha256: fifteenArt.contentSha256, contentBytes: fifteenMibBytes.byteLength, retention: 'transient' },
+      },
+    ],
+  });
+
+  const hydratedStr = await hydrateReplyBodiesFromR2(
+    mixedReply,
+    bucket,
+    INLINE_HYDRATION_BUDGET_BYTES,
+    MAX_WASM_INPUT_BYTES,
+    new Set(['b64-2']),
+  );
+  const hydrated = JSON.parse(hydratedStr) as { results: Array<Record<string, unknown>> };
+  assert.equal(typeof hydrated.results[0]!.body, 'string', 'kind=binary 6 MiB must hydrate');
+  assert.equal(hydrated.results[0]!.bodyOmitted, undefined);
+  assert.equal(typeof hydrated.results[1]!.body, 'string', 'allowAbovePerItemCapIds 6 MiB must hydrate');
+  assert.equal(hydrated.results[1]!.bodyOmitted, undefined);
+  assert.equal(hydrated.results[2]!.body, undefined, 'normal 6 MiB scrape must still be omitted');
+  assert.equal(hydrated.results[2]!.bodyOmitted, true);
+  assert.equal(hydrated.results[3]!.body, undefined, '15 MiB binary (~20 MiB base64) must omit under 18 MiB wire budget');
+  assert.equal(hydrated.results[3]!.bodyOmitted, true);
+
+  // executeScrapeCall with formats: ['rawBase64'] on >4 MiB HTML must request INLINE_HYDRATION_BUDGET_BYTES and never hit WASM.
+  const bigHtml = `<!doctype html><html><body>${'A'.repeat(5 * 1024 * 1024)}</body></html>`;
+  let seenMaxInline: unknown;
+  const rawHtmlRes = await executeScrapeCall({
+    payload: { url: 'https://files.example.com/big.html', formats: ['rawBase64'] },
+    env: {},
+    executeHubFetch: async (_t, rawCall) => {
+      const parsed = JSON.parse(rawCall) as { options?: { maxInlineBodyBytes?: number } };
+      seenMaxInline = parsed.options?.maxInlineBodyBytes;
+      return {
+        status: 200,
+        via: 'cloudflare',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://files.example.com/big.html',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html',
+              body: bigHtml,
+              bodyEncoding: 'utf-8',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(seenMaxInline, INLINE_HYDRATION_BUDGET_BYTES);
+  assert.equal(rawHtmlRes.status, 200);
+  assert.equal(Buffer.from(String(rawHtmlRes.body.rawBase64), 'base64').toString('utf-8'), bigHtml);
+});
+
+test('L-05: wd-stub-render-1 and auto-render-1 pass maxInlineBodyBytes: MAX_WASM_INPUT_BYTES', async () => {
+  resetIsolateBudgetForTests();
+  const captured: Array<{ id: string; maxInlineBodyBytes: unknown }> = [];
+
+  // 1. auto-render-1
+  const thinSpaUrl = 'https://spa.example.com/app';
+  await executeScrapeCall({
+    payload: { url: thinSpaUrl, formats: ['markdown'] },
+    env: {},
+    executeHubFetch: async (_t, rawCall) => {
+      const parsed = JSON.parse(rawCall) as { options?: { maxInlineBodyBytes?: unknown }; requests?: Array<{ id?: string }> };
+      const reqId = parsed.requests?.[0]?.id ?? '';
+      captured.push({ id: reqId, maxInlineBodyBytes: parsed.options?.maxInlineBodyBytes });
+      if (reqId === 'auto-render-1') {
+        return {
+          status: 200,
+          via: 'agent:browser',
+          bodyText: JSON.stringify({
+            results: [{ id: reqId, url: thinSpaUrl, status: 200, outcome: 'ok', contentType: 'text/html', body: '<html><body><main><h1>Loaded</h1><p>' + 'word '.repeat(80) + '</p></main></body></html>', bodyEncoding: 'utf-8' }],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'cloudflare',
+        bodyText: JSON.stringify({
+          results: [{ id: reqId, url: thinSpaUrl, status: 200, outcome: 'ok', contentType: 'text/html', body: '<html><body><div id="root"></div><script src="/app.js"></script></body></html>', bodyEncoding: 'utf-8' }],
+        }),
+      };
+    },
+  });
+
+  // 2. wd-stub-render-1
+  const wdUrl = 'https://acme.wd1.myworkdayjobs.com/en-US/Careers';
+  await executeScrapeCall({
+    payload: { url: wdUrl, formats: ['markdown'] },
+    env: {},
+    executeHubFetch: async (_t, rawCall) => {
+      const parsed = JSON.parse(rawCall) as { options?: { maxInlineBodyBytes?: unknown }; requests?: Array<{ id?: string }> };
+      const reqId = parsed.requests?.[0]?.id ?? '';
+      captured.push({ id: reqId, maxInlineBodyBytes: parsed.options?.maxInlineBodyBytes });
+      if (reqId === 'wd-stub-render-1') {
+        return {
+          status: 200,
+          via: 'agent:browser',
+          bodyText: JSON.stringify({
+            results: [{ id: reqId, url: wdUrl, status: 200, outcome: 'ok', contentType: 'text/html', body: '<html><body><main><h1>Careers</h1></main></body></html>', bodyEncoding: 'utf-8' }],
+          }),
+        };
+      }
+      if (reqId === 'scrape-1') {
+        return {
+          status: 200,
+          via: 'cloudflare',
+          bodyText: JSON.stringify({
+            results: [{ id: reqId, url: wdUrl, status: 200, outcome: 'ok', contentType: 'application/json', body: '{"widget":"redirect","url":"https://acme.wd1.myworkdayjobs.com/en-US/Careers","externalSpa":true}', bodyEncoding: 'utf-8' }],
+          }),
+        };
+      }
+      return { status: 500, via: 'cloudflare', bodyText: '{}' };
+    },
+  });
+
+  const autoCap = captured.find((c) => c.id === 'auto-render-1');
+  const wdCap = captured.find((c) => c.id === 'wd-stub-render-1');
+  assert.ok(autoCap, `expected auto-render-1 call, got ${JSON.stringify(captured)}`);
+  assert.ok(wdCap, `expected wd-stub-render-1 call, got ${JSON.stringify(captured)}`);
+  assert.equal(autoCap.maxInlineBodyBytes, MAX_WASM_INPUT_BYTES);
+  assert.equal(wdCap.maxInlineBodyBytes, MAX_WASM_INPUT_BYTES);
+});
+
+test('R16: inline records[] stay within the scrape maxChars budget (catalog twins could return ~439 KB for maxChars 600)', () => {
+  const product = (i: number) => ({ id: i, title: `Product ${i}`, body: 'x'.repeat(2_000), variants: [{ sku: `SKU-${i}`, price: 999 }] });
+  const records = Array.from({ length: 50 }, (_, i) => product(i));
+  const body = { ok: true, markdown: '# Catalog', records, pagination: { page: 1, hasMore: true } };
+  const fullLen = JSON.stringify(records).length;
+  assert.ok(fullLen > 100_000, 'fixture is large enough to need trimming');
+
+  // A. Over budget: whole records from the front, serialized size within the budget, and an explicit trim report.
+  const capped = capInlineRecordsToBudget(body, 10_000);
+  const kept = capped.records as unknown[];
+  assert.ok(kept.length > 0 && kept.length < 50);
+  assert.ok(JSON.stringify(kept).length <= 10_000, `kept ${JSON.stringify(kept).length} chars`);
+  assert.deepEqual(kept[0], records[0], 'records are kept whole and in order');
+  assert.equal(capped.recordsTruncated, true);
+  assert.equal(capped.recordsReturned, kept.length);
+  assert.equal(capped.recordsTotal, 50);
+  assert.match(String(capped.recordsHint), /read_artifact/);
+  assert.equal(capped.markdown, '# Catalog');
+  assert.deepEqual(capped.pagination, body.pagination, 'other fields are untouched');
+  assert.equal(body.records.length, 50, 'the input body is not mutated');
+
+  // B. Under budget: returned unchanged (no truncation fields).
+  const small = { records: [product(1)] };
+  assert.equal(capInlineRecordsToBudget(small, 100_000), small);
+  // ATS board `jobs[]` is held to the same budget (a Greenhouse board returned ~83 KB inline under the MCP default).
+  const jobsBody = { ok: true, jobs: Array.from({ length: 200 }, (_, i) => ({ title: `Role ${i}`, url: `https://x.example/jobs/${i}`, snippet: 'z'.repeat(300) })) };
+  const cappedJobs = capInlineRecordsToBudget(jobsBody, 5_000);
+  assert.ok(JSON.stringify(cappedJobs.jobs).length <= 5_000);
+  assert.equal(cappedJobs.jobsTruncated, true);
+  assert.equal(cappedJobs.jobsTotal, 200);
+  assert.equal((cappedJobs.jobs as unknown[]).length, cappedJobs.jobsReturned);
+
+  // C. A single record larger than the budget: none kept, still reported.
+  const huge = capInlineRecordsToBudget({ records: [{ body: 'y'.repeat(5_000) }] }, 1_000);
+  assert.deepEqual(huge.records, []);
+  assert.equal(huge.recordsTotal, 1);
+
+  // D. Budget source: explicit maxChars, else the MCP default, else none (REST callers keep full records).
+  assert.equal(resolveScrapeMaxChars({ maxChars: 600 }), 600);
+  assert.equal(resolveScrapeMaxChars({ defaultMaxChars: 100_000 }), 100_000);
+  assert.equal(resolveScrapeMaxChars({ maxChars: 600, defaultMaxChars: 100_000 }), 600);
+  assert.equal(resolveScrapeMaxChars({}), undefined);
+  assert.equal(resolveScrapeMaxChars({ maxChars: 10 }), 500, 'clamped to the same 500..500000 range as markdown');
+});
+
+
+test('R19b: scrape asks for HTML (not origin Markdown) when a DOM site adapter is registered for the host', async () => {
+  const sentAccept = new Map<string, string>();
+  const hub = async (_t: string, bodyText: string) => {
+    const call = JSON.parse(bodyText) as { requests?: Array<{ id?: string; url?: string; accept?: string }> };
+    for (const r of call.requests ?? []) if (r.id === 'scrape-1') sentAccept.set(String(r.url), String(r.accept ?? ''));
+    const r0 = call.requests?.[0];
+    return {
+      status: 200,
+      via: 'cf',
+      bodyText: JSON.stringify({
+        results: [{ id: r0?.id, url: r0?.url, status: 200, outcome: 'ok', contentType: 'text/html', body: '<html><body><main><h1>Doc</h1><p>Body text here.</p></main></body></html>' }],
+      }),
+    };
+  };
+  for (const url of ['https://fccid.io/BCG-E3542A', 'https://example.com/docs/page']) {
+    await executeScrapeCall({ payload: { url, maxAgeMs: 0 }, env: {}, executeHubFetch: hub as never });
+  }
+  assert.match(String(sentAccept.get('https://fccid.io/BCG-E3542A')), /^text\/html/, 'DOM-adapter host requests HTML');
+  assert.match(String(sentAccept.get('https://example.com/docs/page')), /text\/markdown/, 'other hosts still prefer origin Markdown');
 });

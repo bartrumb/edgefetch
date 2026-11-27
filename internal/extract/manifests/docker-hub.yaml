@@ -1,0 +1,283 @@
+# Shared Go + TypeScript Declarative Site Adapter: Docker Hub
+id: docker-hub
+name: Docker Hub
+category: developer
+description: "Upgrades hub.docker.com repository and /tags pages (both /_/<repo> official library and /r/<ns>/<repo>) to the keyless Docker Hub v2 JSON API."
+domains:
+  - hub.docker.com
+exampleUrls:
+  - "https://hub.docker.com/_/alpine"
+  - "https://hub.docker.com/_/alpine/tags"
+  - "https://hub.docker.com/r/library/nginx"
+  - "https://hub.docker.com/r/library/nginx/tags"
+
+routes:
+  # Route 1: Official library tags /_/<repo>/tags
+  - match:
+      defaults:
+        ns: library
+      exactSegments: false
+      pathSegments:
+        - "_"
+        - param: repo
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+        - tags
+    twin:
+      fetchUrl: "https://hub.docker.com/v2/repositories/library/{repo}/tags?page_size=25"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - results
+      vars:
+        totalCount:
+          paths:
+            - count
+          format: int_comma
+      titleTemplate: "{ns}/{repo} — Docker Tags ({totalCount} total)"
+      titleWhenVar: totalCount
+      titleFallbackTemplate: "{ns}/{repo} — Docker Tags"
+      sections:
+        - heading: Recent Tags
+          arrayPath: results
+          limit: 25
+          itemVars:
+            platforms:
+              paths:
+                - images
+              subFieldsJoin:
+                fields:
+                  - os
+                  - architecture
+                sep: "/"
+              join: ", "
+              limit: 8
+            sizeHuman:
+              paths:
+                - full_size
+              format: bytes_human
+          columns:
+            - header: Tag
+              paths:
+                - name
+              code: true
+            - header: Size
+              template: "{sizeHuman}"
+            - header: Architectures
+              template: "{platforms}"
+            - header: Last Updated
+              paths:
+                - last_updated
+              sliceMax: 10
+
+  # Route 2: Community repository tags /r/<ns>/<repo>/tags
+  - match:
+      exactSegments: false
+      pathSegments:
+        - r
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+        - param: repo
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+        - tags
+    twin:
+      fetchUrl: "https://hub.docker.com/v2/repositories/{ns}/{repo}/tags?page_size=25"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - results
+      vars:
+        totalCount:
+          paths:
+            - count
+          format: int_comma
+      titleTemplate: "{ns}/{repo} — Docker Tags ({totalCount} total)"
+      titleWhenVar: totalCount
+      titleFallbackTemplate: "{ns}/{repo} — Docker Tags"
+      sections:
+        - heading: Recent Tags
+          arrayPath: results
+          limit: 25
+          itemVars:
+            platforms:
+              paths:
+                - images
+              subFieldsJoin:
+                fields:
+                  - os
+                  - architecture
+                sep: "/"
+              join: ", "
+              limit: 8
+            sizeHuman:
+              paths:
+                - full_size
+              format: bytes_human
+          columns:
+            - header: Tag
+              paths:
+                - name
+              code: true
+            - header: Size
+              template: "{sizeHuman}"
+            - header: Architectures
+              template: "{platforms}"
+            - header: Last Updated
+              paths:
+                - last_updated
+              sliceMax: 10
+
+  # Route 3: Official library repository /_/<repo>
+  - match:
+      defaults:
+        ns: library
+      exactSegments: false
+      pathSegments:
+        - "_"
+        - param: repo
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+    twin:
+      fetchUrl: "https://hub.docker.com/v2/repositories/library/{repo}/"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - name
+        - namespace
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        desc:
+          paths:
+            - description
+          trim: true
+        pulls:
+          paths:
+            - pull_count
+          format: int_comma
+        stars:
+          paths:
+            - star_count
+          format: int_comma
+        statusDesc:
+          paths:
+            - status_description
+        lastUpdated:
+          paths:
+            - last_updated
+          sliceMax: 10
+        fullDesc:
+          paths:
+            - full_description
+          format: demote_h1
+          trim: true
+      titleTemplate: "{namespace}/{name} (Docker Hub)"
+      descriptionVar: desc
+      publishedTimeVar: lastUpdated
+      introVar: desc
+      bullets:
+        - label: Pull Command
+          template: "`docker pull {name}`"
+        - label: Pulls
+          template: "{pulls}"
+          whenVar: pulls
+        - label: Stars
+          template: "{stars}"
+          whenVar: stars
+        - label: Status
+          template: "{statusDesc}"
+          whenVar: statusDesc
+        - label: Last Updated
+          template: "{lastUpdated}"
+          whenVar: lastUpdated
+      bodyVar: fullDesc
+
+  # Route 4: Community repository /r/<ns>/<repo>
+  - match:
+      exactSegments: false
+      pathSegments:
+        - r
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+        - param: repo
+          charset: pkg
+          minLen: 1
+          maxLen: 128
+    twin:
+      fetchUrl: "https://hub.docker.com/v2/repositories/{ns}/{repo}/"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - name
+        - namespace
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        desc:
+          paths:
+            - description
+          trim: true
+        pulls:
+          paths:
+            - pull_count
+          format: int_comma
+        stars:
+          paths:
+            - star_count
+          format: int_comma
+        statusDesc:
+          paths:
+            - status_description
+        lastUpdated:
+          paths:
+            - last_updated
+          sliceMax: 10
+        fullDesc:
+          paths:
+            - full_description
+          format: demote_h1
+          trim: true
+      titleTemplate: "{namespace}/{name} (Docker Hub)"
+      descriptionVar: desc
+      publishedTimeVar: lastUpdated
+      introVar: desc
+      bullets:
+        - label: Pull Command
+          template: "`docker pull {namespace}/{name}`"
+        - label: Pulls
+          template: "{pulls}"
+          whenVar: pulls
+        - label: Stars
+          template: "{stars}"
+          whenVar: stars
+        - label: Status
+          template: "{statusDesc}"
+          whenVar: statusDesc
+        - label: Last Updated
+          template: "{lastUpdated}"
+          whenVar: lastUpdated
+      bodyVar: fullDesc

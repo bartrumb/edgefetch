@@ -431,23 +431,32 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		if baseURL == "" {
 			baseURL = r.URL
 		}
-		ext := extract.ExtractHTML(string(rawBody), extract.ExtractOptions{
+		// Full-fidelity extractor (same as the Hub/WASM path): drops `<script>`/`<style>` and hidden
+		// (`display:none`, `hidden`, `aria-hidden`) subtrees before main-content selection, so inline
+		// JS and visually hidden text never leak into node Markdown.
+		ext := extract.ExtractHTMLDocumentFull(string(rawBody), extract.FullExtractOptions{
 			BaseURL:         baseURL,
 			OnlyMainContent: onlyMain,
-			IncludeLinks:    wantLinks,
 			IncludeImages:   wantImages,
-			IncludeBranding: wantBranding,
 			RedactPII:       r.RedactPII,
-			Query:           r.Query,
 		})
+		md, text := ext.Markdown, ext.Text
+		if strings.TrimSpace(r.Query) != "" {
+			md = extract.RerankPassages(md, r.Query, 16_000)
+			text = extract.RerankPassages(text, r.Query, 16_000)
+			if r.RedactPII {
+				md = extract.RedactPII(md)
+				text = extract.RedactPII(text)
+			}
+		}
 		res.Title = ext.Title
 		res.Description = ext.Description
 		res.Favicon = ext.Favicon
 		if wantMarkdown && res.Markdown == "" {
-			res.Markdown = ext.Markdown
+			res.Markdown = md
 		}
 		if wantText {
-			res.Text = ext.Text
+			res.Text = text
 		}
 		if wantLinks {
 			res.Links = ext.Links
@@ -456,7 +465,8 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 			res.Images = ext.Images
 		}
 		if wantBranding {
-			res.Branding = ext.Branding
+			bCopy := ext.Branding
+			res.Branding = &bCopy
 		}
 		if !opts.IncludeBody && !wantRawHTML {
 			res.Body = ""

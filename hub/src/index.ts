@@ -82,6 +82,10 @@ import {
   type CatalogCallPayload,
   type CatalogHubFetchFn,
 } from './catalog';
+import { executeCompanyCall, type CompanyToolPayload } from './company';
+import { executeSalariesCall, type SalariesToolPayload } from './salaries';
+/** Slug of Google's official hosted Maps MCP preset (Go `mcpfed.GoogleMapsMCPSlug`). */
+const GOOGLE_MAPS_MCP_SLUG = 'google-maps';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   cancelBatchScrape,
@@ -104,7 +108,25 @@ import {
 } from './map-crawl';
 import { handleMcpRequest, isMcpRootRequest } from './mcp';
 import {
+  createSqliteHubSecretsStore,
+  applyHubSecretOverlayFromBinding,
+  HUB_SECRETS_SQLITE_SCHEMA,
+  type HubSecretRow,
+  type HubSecretsStore,
+} from './hub-secrets';
+import {
+  ACCESS_POLICY_SQLITE_SCHEMA,
+  createSqliteAccessPolicyStore,
+  evaluateRouteAccess,
+  listSharedServersFor,
+  loadAccessPolicySnapshot,
+  type AccessPolicyRuleRow,
+  type AccessPolicyStore,
+  type McpServerShareRow,
+} from './access-policy';
+import {
   executeFederatedMcpQuery,
+  sanitizeConnectorStructuredValue,
   tryScrapeViaConnectedMcp,
   type QueryMcpCallInput,
 } from './mcp-federation';
@@ -164,15 +186,16 @@ import {
   executeInteractCall,
   executeScrapeCall,
   extractHtmlDocument,
+  sanitizeInlineHtmlInMarkdown,
   SCRAPE_PIPELINE_VERSION,
   type InteractRequestPayload,
   type ScrapeRequestPayload,
 } from './scrape';
 import {
-  COLLECTION_ID_RE,
   D1FtsSearchIndex,
   executeExtractCall,
   resolveUserCollectionId,
+  sanitizeExtractedTitle,
   type ExtractRequestPayload,
 } from './search-index';
 import {
@@ -186,6 +209,7 @@ import {
   handleAgentArtifactUpload,
   handleArtifactGetRequest,
   hydrateReplyBodiesFromR2,
+  isPrivateRequestPayload,
   MAX_ARTIFACT_CONTENT_BYTES,
   normalizeVisibility,
   r2DerivedKey,
@@ -216,6 +240,12 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   BRAVE_API_KEY?: string;
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_WEBSEARCH_API_TOKEN?: string;
+  CLOUDFLARE_AI_GATEWAY_ID?: string;
+  CLOUDFLARE_WEBSEARCH_PROVIDER?: string;
+  CLOUDFLARE_WEBSEARCH_BYOK_ALIAS?: string;
+  CERAMIC_API_KEY?: string;
   WEBHOOK_SECRET?: string;
   EDGEFETCH_PUBLIC_ORIGIN?: string;
   EDGEFETCH_DISABLE_UPDATE_CHECK?: string;
@@ -258,10 +288,10 @@ function tryAcquireUserConcurrencySlot(
   };
 }
 
-function userQuotaExceededResponse(message: string): Response {
+function userQuotaExceededResponse(message: string, isPrivate = false): Response {
   return Response.json(
-    { ok: false, success: false, error: 'user_quota_exceeded', message },
-    { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '2' } },
+    { ok: false, success: false, error: 'user_quota_exceeded', message, ...(isPrivate ? { visibility: 'private' } : {}) },
+    { status: 429, headers: { 'cache-control': isPrivate ? 'private, no-store' : 'no-store', 'retry-after': '2' } },
   );
 }
 
@@ -273,6 +303,8 @@ export class AgentHubDO extends DurableObject<Env> {
   private readonly mcpVault: McpVaultStore;
   private readonly activity: ActivityStore;
   private readonly settings: HubSettingsStore;
+  private readonly hubSecrets: HubSecretsStore;
+  private readonly accessPolicy: AccessPolicyStore;
   private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
   private trackerHydrated = false;
@@ -314,6 +346,8 @@ export class AgentHubDO extends DurableObject<Env> {
         ${MCP_VAULT_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
         ${HUB_SETTINGS_SQLITE_SCHEMA}
+        ${HUB_SECRETS_SQLITE_SCHEMA}
+        ${ACCESS_POLICY_SQLITE_SCHEMA}
       `);
       const existingAlarm = await this.ctx.storage.getAlarm();
       if (existingAlarm === null) {
@@ -536,17 +570,28 @@ export class AgentHubDO extends DurableObject<Env> {
       },
     };
 
+    let selfHost: string | undefined;
+    if (env.EDGEFETCH_PUBLIC_ORIGIN) {
+      try {
+        selfHost = new URL(env.EDGEFETCH_PUBLIC_ORIGIN).hostname;
+      } catch {
+        // ignore invalid EDGEFETCH_PUBLIC_ORIGIN
+      }
+    }
     this.engine = new AgentHubEngine({
       getSockets: (tag) => this.ctx.getWebSockets(tag) as unknown as HubSocketLike[],
       cooldowns,
       hostWindows,
       affinities,
       hostHealth,
+      ...(selfHost ? { selfHost } : {}),
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.mcpVault = createSqliteMcpVaultStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.settings = createSqliteHubSettingsStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.hubSecrets = createSqliteHubSecretsStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.accessPolicy = createSqliteAccessPolicyStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
 
   override async alarm(): Promise<void> {
@@ -944,6 +989,36 @@ export class AgentHubDO extends DurableObject<Env> {
     return await this.mcpVault.consumeOAuthState(stateHash, userId, now);
   }
 
+  // `hub_secrets` + `access_policies`/`mcp_server_shares` RPCs. Names match HubSecretsStore / AccessPolicyStore so the
+  // stub itself satisfies those ports (hub/src/hub-secrets.ts, hub/src/access-policy.ts).
+  async listHubSecretRows(): Promise<HubSecretRow[]> {
+    return await this.hubSecrets.listHubSecretRows();
+  }
+  async putHubSecretRow(row: HubSecretRow): Promise<void> {
+    await this.hubSecrets.putHubSecretRow(row);
+  }
+  async deleteHubSecretRow(name: string): Promise<boolean> {
+    return await this.hubSecrets.deleteHubSecretRow(name);
+  }
+  async listAccessPolicyRules(): Promise<AccessPolicyRuleRow[]> {
+    return await this.accessPolicy.listAccessPolicyRules();
+  }
+  async putAccessPolicyRule(row: AccessPolicyRuleRow): Promise<void> {
+    await this.accessPolicy.putAccessPolicyRule(row);
+  }
+  async deleteAccessPolicyRule(subject: string, resource: string): Promise<boolean> {
+    return await this.accessPolicy.deleteAccessPolicyRule(subject, resource);
+  }
+  async listMcpServerShares(): Promise<McpServerShareRow[]> {
+    return await this.accessPolicy.listMcpServerShares();
+  }
+  async putMcpServerShare(row: McpServerShareRow): Promise<void> {
+    await this.accessPolicy.putMcpServerShare(row);
+  }
+  async deleteMcpServerShare(ownerUserId: string, slug: string, subject: string): Promise<boolean> {
+    return await this.accessPolicy.deleteMcpServerShare(ownerUserId, slug, subject);
+  }
+
   async getHubSetting(key: string): Promise<string | null> {
     return await this.settings.getSetting(key);
   }
@@ -1216,8 +1291,36 @@ function wrapSseResponseWithFlush(res: Response, onClose: () => void | Promise<u
 
 const devTelemetrySettingCache = new WeakMap<object, { value: string | null; expiresAt: number }>();
 
+/** Module-level handle on the real authorizer; `fetch()` shadows `authorizeMcpRequest` with a policy-gated wrapper. */
+const authorizeMcpRequestUngated = authorizeMcpRequest;
+
+/** Thrown by the gated authorizer when access policy denies a route; converted to a 403 by `withRouteSpan`/`fetch`. */
+class AccessPolicyDeniedSignal extends Error {
+  constructor(readonly response: Response) {
+    super('forbidden_by_policy');
+  }
+}
+
+/**
+ * Route-policy resource path for a request path: `/v1/*` as-is, Firecrawl-compatible `/v2/*` and
+ * `/compat/firecrawl/v2/*` and Tavily `/compat/tavily/*` mapped onto their `/v1/*` equivalents so compat aliases
+ * can't bypass a `/v1` rule. `null` = not policy-governed (e.g. `/mcp`, `/admin`, `/oauth/*`).
+ */
+function policyRoutePathFor(pathname: string): string | null {
+  if (pathname === '/v1' || pathname.startsWith('/v1/')) return pathname;
+  if (pathname.startsWith('/v2/')) return `/v1${pathname.slice('/v2'.length)}`;
+  if (pathname.startsWith('/compat/firecrawl/v2/')) return `/v1${pathname.slice('/compat/firecrawl/v2'.length)}`;
+  if (pathname.startsWith('/compat/tavily/')) return `/v1/${pathname.slice('/compat/tavily/'.length)}`;
+  return null;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    // Admin-managed provider-key overrides (hub_secrets) win over deployment env for this request. Bootstrap
+    // secrets (CALLER_TOKEN, VAULT_MASTER_KEY, ...) can never be overridden, so auth is unaffected. No-op without
+    // VAULT_MASTER_KEY; cached 30 s per isolate; never throws.
+    const deploymentEnv: Env = env;
+    env = await applyHubSecretOverlayFromBinding(env);
     const url = new URL(request.url);
     if (typeof env.EDGEFETCH_PUBLIC_ORIGIN === 'string' && env.EDGEFETCH_PUBLIC_ORIGIN.trim() !== '') {
       try {
@@ -1328,10 +1431,15 @@ export default {
               stageTimingsMs: undefined as { dispatchMs: number; hydrateR2Ms: number; totalHubMs: number } | undefined,
             };
           }
+          const activeCaller = getActiveCallerAuthContext();
+          const tenantUserId = activeCaller?.userId ? sanitizeStorageUserId(activeCaller.userId) : 'owner';
+          const isPrivateTenant = tenantUserId !== 'owner' && tenantUserId !== 'anonymous';
+
           let wantsIncludeBody = false;
           let maxInlineBodyBytesOpt: number | undefined;
           let bodyRetentionOpt: ArtifactRetention | 'off' | undefined;
           let bodyCollectionId: string | undefined;
+          const rawBase64RequestIds = new Set<string>();
           try {
             const parsedCall = JSON.parse(body) as {
               options?: {
@@ -1340,6 +1448,11 @@ export default {
                 artifactRetention?: string;
                 collectionId?: string;
               };
+              requests?: Array<{
+                id?: unknown;
+                kind?: unknown;
+                formats?: unknown;
+              }>;
             };
             wantsIncludeBody = Boolean(parsedCall.options?.includeBody);
             if (
@@ -1354,15 +1467,31 @@ export default {
               bodyRetentionOpt = rawOptRet;
             }
             const rawColl = parsedCall.options?.collectionId;
-            if (typeof rawColl === 'string' && COLLECTION_ID_RE.test(rawColl.trim())) {
-              bodyCollectionId = rawColl.trim();
+            if (typeof rawColl === 'string' && rawColl.trim()) {
+              const resolvedBodyColl = resolveUserCollectionId(
+                rawColl.trim(),
+                tenantUserId,
+                isPrivateTenant ? 'private' : 'public',
+              );
+              if (resolvedBodyColl.ok) {
+                bodyCollectionId = resolvedBodyColl.scopedId;
+              }
+            }
+            if (Array.isArray(parsedCall.requests)) {
+              for (const reqItem of parsedCall.requests) {
+                if (!reqItem || typeof reqItem.id !== 'string' || !reqItem.id) continue;
+                const isBinaryKind = reqItem.kind === 'binary';
+                const hasRawBase64Format =
+                  Array.isArray(reqItem.formats) &&
+                  reqItem.formats.some((f) => f === 'rawBase64' || f === 'base64');
+                if (isBinaryKind || hasRawBase64Format) {
+                  rawBase64RequestIds.add(reqItem.id);
+                }
+              }
             }
           } catch {
             wantsIncludeBody = false;
           }
-          const activeCaller = getActiveCallerAuthContext();
-          const tenantUserId = activeCaller?.userId ? sanitizeStorageUserId(activeCaller.userId) : 'owner';
-          const isPrivateTenant = tenantUserId !== 'owner' && tenantUserId !== 'anonymous';
 
           const resolvedCollectionId = collectionId ?? bodyCollectionId;
           const effectiveRetentionPref = artifactRetention ?? bodyRetentionOpt ?? (resolvedCollectionId && env.ARTIFACTS && env.META ? 'stored' : undefined);
@@ -1504,6 +1633,7 @@ export default {
                     env.ARTIFACTS,
                     undefined,
                     maxInlineBodyBytesOpt,
+                    rawBase64RequestIds.size > 0 ? rawBase64RequestIds : undefined,
                   );
                   hydrateR2Ms = Date.now() - hydStart;
                 }
@@ -1630,13 +1760,70 @@ export default {
         },
       );
 
+    const accessPolicyStore = (): AccessPolicyStore | null => {
+      if (!env.AGENT_HUB) return null;
+      const stub = hub() as unknown as Partial<AccessPolicyStore>;
+      // Real DO stubs expose every RPC; minimal test doubles without the policy RPCs mean "no policy configured".
+      return typeof stub.listAccessPolicyRules === 'function' && typeof stub.listMcpServerShares === 'function'
+        ? (stub as AccessPolicyStore)
+        : null;
+    };
+    const accessPolicyCacheKey = (env.AGENT_HUB as unknown as object | undefined) ?? 'default';
+    /** Spread into executeFederatedMcpQuery / tryScrapeViaConnectedMcp so shared MCP servers resolve for members. */
+    const federationPolicyOpts = (): { accessPolicy?: AccessPolicyStore; accessPolicyCacheKey?: string | object } => {
+      const store = accessPolicyStore();
+      return store ? { accessPolicy: store, accessPolicyCacheKey } : {};
+    };
+
+    /**
+     * Policy-gated authorizer (shadows the module import for every route below). After a SUCCESSFUL auth on a
+     * policy-governed path it evaluates `route:<path>`; a denial throws AccessPolicyDeniedSignal carrying the 403
+     * `forbidden_by_policy` response (logged to the activity log), so every /v1 route is covered by this one hook.
+     * Owners bypass route policy. Policy-store failures fail closed for non-owners.
+     */
+    const authorizeMcpRequest: typeof authorizeMcpRequestUngated = async (params) => {
+      const res = await authorizeMcpRequestUngated(params);
+      const policyPath = policyRoutePathFor(url.pathname);
+      if (!res.ok || !policyPath || res.role === 'owner') return res;
+      const store = accessPolicyStore();
+      if (!store) return res;
+      const caller = { userId: res.userId || resolveCallerUserId(res), role: res.role };
+      let decision: { allowed: boolean; reason: string };
+      try {
+        decision = await evaluateRouteAccess(caller, policyPath, { store, cacheKey: accessPolicyCacheKey });
+      } catch {
+        decision = { allowed: false, reason: 'policy_unavailable' };
+      }
+      if (decision.allowed) return res;
+      void request.body?.cancel().catch(() => undefined);
+      await hubActivityProxy(hub).recordEvent({
+        level: 'warn',
+        category: 'admin',
+        event: 'access_denied_route',
+        summary: `Route ${policyPath} denied by access policy for ${caller.userId}`,
+        details: { userId: caller.userId, path: policyPath, reason: decision.reason },
+      });
+      throw new AccessPolicyDeniedSignal(
+        Response.json(
+          { ok: false, error: 'forbidden_by_policy', path: policyPath, reason: decision.reason },
+          { status: 403, headers: { 'cache-control': 'private, no-store' } },
+        ),
+      );
+    };
+
     const withRouteSpan = async (
       name: string,
       attrs: Record<string, string | number | boolean | undefined>,
       fn: () => Promise<Response>,
     ): Promise<Response> =>
       (getActiveRequestTracer() ?? rootTracer).withSpan(name, { kind: 1, attributes: attrs }, async (routeSpan) => {
-        const res = await fn();
+        let res: Response;
+        try {
+          res = await fn();
+        } catch (err) {
+          if (!(err instanceof AccessPolicyDeniedSignal)) throw err;
+          res = err.response;
+        }
         routeSpan.setAttribute('http.response.status_code', res.status);
         routeSpan.setStatus(res.status < 500);
         return res;
@@ -1732,6 +1919,108 @@ export default {
           };
       const activity = hubActivityProxy(hub);
       const safePublicFetch = env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch;
+
+      /** `company` + `salaries` executors shared by the MCP tools and the REST routes. */
+      const makeVerticalExecutors = (sourceLabel: string, callerUserId: string, callerTier: string) => {
+        const runJobs = (jobsArgs: Record<string, unknown>) =>
+          executeJobsCall({
+            payload: jobsArgs as JobsToolPayload,
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+            userId: callerUserId,
+            authTier: callerTier,
+            executeSearch: async (sArgs) => {
+              const sOut = await executeSearchCall({
+                payload: sArgs as SearchRequestPayload,
+                env,
+                executeHubFetch,
+                source: `${sourceLabel}-jobs-search`,
+                userId: callerUserId,
+              });
+              return { status: sOut.status, body: sOut.body };
+            },
+            executeScrape: async (scArgs) => {
+              const scOut = await executeScrapeCall({
+                payload: scArgs as ScrapeRequestPayload,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `${sourceLabel}-jobs-scrape`,
+                userId: callerUserId,
+              });
+              return { status: scOut.status, body: scOut.body };
+            },
+          });
+        const activeScopes = getActiveCallerAuthContext()?.scopes ?? [];
+        // Google Maps enrichment calls the caller's own connected Maps MCP, so it needs the same `mcp:call` scope.
+        const mayCallMcp = activeScopes.length === 0 || activeScopes.includes('mcp:call');
+        const callMapsPlaces = mayCallMcp
+          ? async (query: string): Promise<string | null> => {
+              const listed = await executeFederatedMcpQuery({
+                userId: callerUserId,
+                input: { action: 'list_tools', server: GOOGLE_MAPS_MCP_SLUG },
+                vaultStore,
+                ...federationPolicyOpts(),
+                vaultMasterKey: env.VAULT_MASTER_KEY,
+                fetchFn: safePublicFetch,
+                selfHost: url.hostname,
+              });
+              if (listed.status !== 200) return null;
+              const tools = Array.isArray(listed.body.tools) ? (listed.body.tools as Array<Record<string, unknown>>) : [];
+              const tool = tools.find((t) => t.name === 'search_places');
+              if (!tool) return null;
+              const props = ((tool.inputSchema as { properties?: Record<string, { type?: string }> } | undefined)?.properties ?? {});
+              const required = ((tool.inputSchema as { required?: string[] } | undefined)?.required ?? []).filter(
+                (k) => props[k]?.type === 'string',
+              );
+              const argName =
+                required[0] ??
+                Object.keys(props).find((k) => /query|text/i.test(k) && props[k]?.type === 'string') ??
+                'textQuery';
+              const out = await executeFederatedMcpQuery({
+                userId: callerUserId,
+                input: { action: 'call_tool', server: GOOGLE_MAPS_MCP_SLUG, tool: 'search_places', arguments: { [argName]: query } },
+                vaultStore,
+                ...federationPolicyOpts(),
+                vaultMasterKey: env.VAULT_MASTER_KEY,
+                fetchFn: safePublicFetch,
+                selfHost: url.hostname,
+              });
+              if (out.status !== 200) return null;
+              const res = (out.body.result ?? out.body) as unknown;
+              return JSON.stringify(res);
+            }
+          : undefined;
+        return {
+          company: (args: Record<string, unknown>) =>
+            executeCompanyCall({
+              payload: args as CompanyToolPayload,
+              deps: {
+                scrapePage: async (pageUrl) => {
+                  const scOut = await executeScrapeCall({
+                    payload: { url: pageUrl, formats: ['markdown', 'rawHtml'], renderMode: 'auto' } as ScrapeRequestPayload,
+                    env,
+                    executeHubFetch,
+                    selfHost: url.hostname,
+                    source: `${sourceLabel}-company-page`,
+                    userId: callerUserId,
+                  });
+                  return { status: scOut.status, body: scOut.body };
+                },
+                fetchFn: safePublicFetch,
+                runJobs: async ({ company, domains, limit }) =>
+                  runJobs({ company, ...(domains ? { domains } : {}), limit, includeBuiltIn: false }),
+                ...(callMapsPlaces ? { callMapsPlaces } : {}),
+              },
+            }),
+          salaries: (args: Record<string, unknown>) =>
+            executeSalariesCall({
+              payload: args as SalariesToolPayload,
+              env: { ...(env.META ? { META: env.META } : {}) },
+              runJobsSearch: async ({ query, locations, company }) =>
+                runJobs({ query, ...(locations ? { locations } : {}), ...(company ? { company } : {}), limit: 50, includeBuiltIn: false }),
+            }),
+        };
+      };
 
       const makeCatalogHubFetch = (sourceLabel: string): CatalogHubFetchFn => {
         const boundTracer = getActiveRequestTracer();
@@ -1834,6 +2123,10 @@ export default {
 
       if (url.pathname === '/mcp' || isMcpRootRequest(request, url)) {
         return await handleMcpRequest(request, url, {
+          ...(() => {
+            const store = accessPolicyStore();
+            return store ? { accessPolicy: store, accessPolicyCacheKey } : {};
+          })(),
           serverName: 'edgefetch-hub',
           serverVersion: HUB_VERSION,
           ownerSecret: env.CALLER_TOKEN,
@@ -1962,6 +2255,7 @@ export default {
                     ? { allowedMcpTools: cleanArgs.allowedMcpTools as ReadonlyArray<string> }
                     : {}),
                   vaultStore,
+                  ...federationPolicyOpts(),
                   vaultMasterKey: env.VAULT_MASTER_KEY,
                   fetchFn: safePublicFetch,
                   selfHost: url.hostname,
@@ -2077,7 +2371,16 @@ export default {
             if (existingId) {
               if (args.cancel === true) {
                 const cRes = await cancelCrawlJob(existingId, env.META, effectiveUserId);
-                return { status: cRes.status, body: { ok: cRes.ok, crawlId: existingId, status: 'cancelled' } };
+                const isPrivCancel = sanitizeStorageUserId(effectiveUserId) !== 'owner' || cRes.visibility === 'private';
+                return {
+                  status: cRes.status,
+                  body: {
+                    ok: cRes.ok,
+                    ...(isPrivCancel ? { visibility: 'private' as const } : {}),
+                    crawlId: existingId,
+                    status: 'cancelled',
+                  },
+                };
               }
               const st = await getCrawlJobStatus({
                 crawlId: existingId,
@@ -2090,14 +2393,22 @@ export default {
               return st.ok ? { status: 200, body: st.crawl } : { status: st.status, body: { ok: false, error: st.error } };
             }
             const crawlArgs: Record<string, unknown> = { ...args };
+            const isPrivateCrawlReq = isPrivateRequestPayload(crawlArgs, effectiveUserId);
             let displayCollectionId: string | undefined;
             if (typeof crawlArgs.collectionId === 'string' && crawlArgs.collectionId.trim()) {
-              const resolvedColl = resolveUserCollectionId(crawlArgs.collectionId, effectiveUserId);
+              const resolvedColl = resolveUserCollectionId(
+                crawlArgs.collectionId,
+                effectiveUserId,
+                isPrivateCrawlReq ? 'private' : 'public',
+              );
               if (!resolvedColl.ok) {
                 return { status: resolvedColl.status, body: { ok: false, error: resolvedColl.error, message: resolvedColl.message } };
               }
               crawlArgs.collectionId = resolvedColl.scopedId;
               displayCollectionId = resolvedColl.displayId;
+            }
+            if (isPrivateCrawlReq && crawlArgs.visibility !== 'private') {
+              crawlArgs.visibility = 'private';
             }
             const created = await createCrawlJob({
               payload: crawlArgs,
@@ -2150,6 +2461,7 @@ export default {
               status: 202,
               body: {
                 ok: true,
+                ...(isPrivateCrawlReq ? { visibility: 'private' as const } : {}),
                 crawlId: created.crawlId,
                 status: 'queued',
                 collectionId: resolvedCollectionId,
@@ -2224,6 +2536,18 @@ export default {
           findExtractors: ({ query, category, limit }) => {
             return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
           },
+          executeCompany: async ({ args, principal, userId }) => {
+            const activeAuth = getActiveCallerAuthContext();
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
+            const effectiveTier = activeAuth?.role ?? (effectiveUserId === 'owner' ? 'owner' : 'member');
+            return makeVerticalExecutors(`mcp:${principal ?? 'client'}`, effectiveUserId, effectiveTier).company(args);
+          },
+          executeSalaries: async ({ args, principal, userId }) => {
+            const activeAuth = getActiveCallerAuthContext();
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
+            const effectiveTier = activeAuth?.role ?? (effectiveUserId === 'owner' ? 'owner' : 'member');
+            return makeVerticalExecutors(`mcp:${principal ?? 'client'}`, effectiveUserId, effectiveTier).salaries(args);
+          },
           executeCatalog: async ({ args, principal }) => {
             const effectiveUserId = getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
             return await executeCatalogCall({
@@ -2239,18 +2563,50 @@ export default {
           },
           executeAgent: async ({ args, principal, userId }) => {
             const effectiveUserId = userId ?? resolveCallerUserId({ principal });
+            const isCallerPrivate = sanitizeStorageUserId(effectiveUserId) !== 'owner';
             if (typeof args.agentId === 'string' && args.agentId.trim()) {
               const aid = args.agentId.trim();
               if (args.cancel === true) {
                 const cRes = await cancelAgentRun(aid, env.META, effectiveUserId);
-                return { status: cRes.status, body: { ok: cRes.ok, id: aid, status: 'cancelled' } };
+                const isPrivCancel = isCallerPrivate || cRes.visibility === 'private';
+                return {
+                  status: cRes.status,
+                  body: {
+                    ok: cRes.ok,
+                    ...(isPrivCancel ? { visibility: 'private' as const } : {}),
+                    id: aid,
+                    status: 'cancelled',
+                  },
+                };
               }
               const rec = await loadAgentRun(aid, env.META, effectiveUserId);
-              if (!rec) return { status: 404, body: { ok: false, error: 'agent_not_found' } };
-              if (args.trace === true) {
-                return { status: 200, body: { ok: true, id: rec.id, threadId: rec.threadId, status: rec.status, spans: rec.trace } };
+              if (!rec) {
+                return {
+                  status: 404,
+                  body: { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: 'agent_not_found' },
+                };
               }
-              return { status: 200, body: formatPublicAgentResponse(rec, false) };
+              const isPrivRec = isCallerPrivate || rec.visibility === 'private';
+              if (args.trace === true) {
+                return {
+                  status: 200,
+                  body: {
+                    ok: true,
+                    ...(isPrivRec ? { visibility: 'private' as const } : {}),
+                    id: rec.id,
+                    threadId: rec.threadId,
+                    status: rec.status,
+                    spans: rec.trace,
+                  },
+                };
+              }
+              return {
+                status: 200,
+                body: {
+                  ...formatPublicAgentResponse(rec, false),
+                  ...(isPrivRec ? { visibility: 'private' as const } : {}),
+                },
+              };
             }
             const mcpAgentWaitUntil = trackedCtx?.waitUntil
               ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
@@ -2259,8 +2615,10 @@ export default {
                     .catch(() => undefined)
                     .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
                 };
+            const isPrivateReq = isPrivateRequestPayload(args, effectiveUserId);
+            const effectiveArgs = isPrivateReq && args.visibility !== 'private' ? { ...args, visibility: 'private' } : args;
             const out = await startOrExecuteAgentCall({
-              payload: args,
+              payload: effectiveArgs,
               env,
               executeHubFetch,
               selfHost: url.hostname,
@@ -2268,12 +2626,20 @@ export default {
               userId: effectiveUserId,
               sessionSigningSecret: sessionSecret,
               vaultStore,
+              ...federationPolicyOpts(),
               waitUntil: mcpAgentWaitUntil,
             });
             if (out.kind === 'sse') {
-              return { status: 200, body: { ok: true, note: 'SSE stream completed' } };
+              return {
+                status: 200,
+                body: { ok: true, ...(isPrivateReq ? { visibility: 'private' as const } : {}), note: 'SSE stream completed' },
+              };
             }
-            return { status: out.status, body: out.body };
+            const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+            return {
+              status: out.status,
+              body: { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+            };
           },
           discoverMcps: async ({ query, remoteOnly, limit }) => {
             const out = await discoverMcps({
@@ -2303,6 +2669,7 @@ export default {
               userId: effectiveUserId,
               input: args as QueryMcpCallInput,
               vaultStore,
+              ...federationPolicyOpts(),
               vaultMasterKey: env.VAULT_MASTER_KEY,
               fetchFn: safePublicFetch,
               selfHost: url.hostname,
@@ -2310,8 +2677,11 @@ export default {
           },
           ...(env.SEARCH
             ? {
-                searchCollection: async ({ collectionId, query, limit, userId }) => {
-                  const resolved = resolveUserCollectionId(collectionId, userId);
+                searchCollection: async ({ collectionId, query, limit, userId, visibility }) => {
+                  const effectiveUser = userId ?? 'owner';
+                  const effectiveVis =
+                    visibility === 'private' || sanitizeStorageUserId(effectiveUser) !== 'owner' ? 'private' : 'public';
+                  const resolved = resolveUserCollectionId(collectionId, effectiveUser, effectiveVis);
                   if (!resolved.ok) {
                     return { ok: false as const, status: resolved.status, error: resolved.error };
                   }
@@ -2354,6 +2724,13 @@ export default {
       }
 
       const adminRes = await handleAdminRoute(request, url, {
+        ...(env.AGENT_HUB ? { hubSecretsStore: hub() as unknown as HubSecretsStore } : {}),
+        secretsEnv: deploymentEnv as unknown as Record<string, unknown>,
+        ...(() => {
+          const store = accessPolicyStore();
+          return store ? { accessPolicyStore: store } : {};
+        })(),
+        recordAdminEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
         serviceName: 'EdgeFetch Hub',
         mcpSlug: 'edgefetch',
         ownerSecret: env.CALLER_TOKEN,
@@ -2515,7 +2892,11 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
           return Response.json(buildCapabilities(env, HUB_VERSION), {
             status: 200,
@@ -2539,7 +2920,11 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
           const category = url.searchParams.get('category') ?? undefined;
           const extractors = listRegisteredAdapters(category);
@@ -2569,10 +2954,17 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
           if (auth.role !== 'owner') {
-            return Response.json({ ok: true, hosts: [] }, { status: 200, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { ok: true, visibility: 'private' as const, hosts: [] },
+              { status: 200, headers: { 'cache-control': 'private, no-store' } },
+            );
           }
           const rawLimit = Number(url.searchParams.get('limit') ?? 100);
           const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100;
@@ -2596,7 +2988,11 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
           const rawDays = Number(url.searchParams.get('days') ?? 7);
           const safeDays = Number.isFinite(rawDays) ? Math.max(1, Math.min(90, Math.floor(rawDays))) : 7;
@@ -2608,12 +3004,13 @@ export default {
             return Response.json(
               {
                 ok: true,
+                visibility: 'private' as const,
                 configured: Boolean(env.META),
                 windowDays: safeDays,
                 sinceMs: Date.now() - safeDays * 86_400_000,
                 hosts: [],
               },
-              { status: 200, headers: { 'cache-control': 'no-store' } },
+              { status: 200, headers: { 'cache-control': 'private, no-store' } },
             );
           }
           const radar = await queryHostGapRadar({
@@ -2629,7 +3026,28 @@ export default {
       const compatMeta = resolveCompatSpanMeta(url.pathname);
       if (compatMeta) {
         const compatRes = await withRouteSpan(compatMeta.spanName, { 'edgefetch.compat': compatMeta.flavor }, async () => {
+          // Compat aliases authenticate inside handleCompatRoutes; when any access rule exists, pre-authorize through
+          // the policy-gated authorizer so /v2 and /compat/* can't bypass a /v1 route rule (throws -> 403).
+          const compatPolicyStore = accessPolicyStore();
+          if (compatPolicyStore) {
+            const compatSnap = await loadAccessPolicySnapshot({ store: compatPolicyStore, cacheKey: accessPolicyCacheKey }).catch(
+              () => null,
+            );
+            if (!compatSnap || compatSnap.rules.length > 0) {
+              await authorizeMcpRequest({
+                request,
+                origin: url.origin,
+                ownerSecret: env.CALLER_TOKEN,
+                ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
+                store: oauthStore,
+              });
+            }
+          }
           let releaseCompatScrapeSlot: (() => void) | null = null;
+          let preReadBody:
+            | { ok: true; text: string; byteLength: number }
+            | { ok: false; error: 'too_large' | 'read_error' }
+            | undefined;
           if (
             request.method === 'POST' &&
             (compatMeta.spanName === 'edgefetch.scrape' || compatMeta.spanName === 'edgefetch.batch_scrape')
@@ -2641,28 +3059,49 @@ export default {
               ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
               store: oauthStore,
             });
-            if (preAuth.ok) {
+            if (preAuth.ok && preAuth.scopes.includes('crawl:fetch')) {
               const callerUid = resolveCallerUserId(preAuth as { userId?: string; principal?: string });
+              let parsedPreBody: Record<string, unknown> | null = null;
+              let preBodyParsedAttempted = false;
+              const readPreBodyOnce = async (): Promise<Record<string, unknown> | null> => {
+                if (!preReadBody) {
+                  preReadBody = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+                }
+                if (!preBodyParsedAttempted) {
+                  preBodyParsedAttempted = true;
+                  if (preReadBody.ok) {
+                    try {
+                      const rawParsed = JSON.parse(preReadBody.text);
+                      if (rawParsed && typeof rawParsed === 'object' && !Array.isArray(rawParsed)) {
+                        parsedPreBody = rawParsed as Record<string, unknown>;
+                      }
+                    } catch {
+                      // let compat handler return 400
+                    }
+                  }
+                }
+                return parsedPreBody;
+              };
+              const resolveCompatPrePrivate = async (): Promise<boolean> => {
+                if (sanitizeStorageUserId(callerUid) !== 'owner') return true;
+                const parsed = await readPreBodyOnce();
+                return isPrivateRequestPayload(parsed, callerUid);
+              };
               const hasMcpCallScope = !preAuth.principal.startsWith('oauth:') || preAuth.scopes.includes('mcp:call');
               if (!hasMcpCallScope && compatMeta.spanName === 'edgefetch.scrape') {
-                const cloned = await readBodyTextCapped(request.clone() as unknown as Request, MAX_CALL_UTF8_BYTES);
-                if (cloned.ok) {
-                  try {
-                    const parsedBody = JSON.parse(cloned.text) as Record<string, unknown>;
-                    if (parsedBody.preferMcp === true || parsedBody.useConnectedMcp === true) {
-                      return Response.json(
-                        {
-                          ok: false,
-                          success: false,
-                          error: 'insufficient_scope',
-                          message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
-                        },
-                        { status: 403, headers: { 'cache-control': 'no-store' } },
-                      );
-                    }
-                  } catch {
-                    // let compat handler return 400
-                  }
+                const parsed = await readPreBodyOnce();
+                if (parsed && (parsed.preferMcp === true || parsed.useConnectedMcp === true)) {
+                  const isPriv = isPrivateRequestPayload(parsed, callerUid);
+                  return Response.json(
+                    {
+                      ok: false,
+                      success: false,
+                      ...(isPriv ? { visibility: 'private' as const } : {}),
+                      error: 'insufficient_scope',
+                      message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
+                    },
+                    { status: 403, headers: { 'cache-control': isPriv ? 'private, no-store' : 'no-store' } },
+                  );
                 }
               }
               if (compatMeta.spanName === 'edgefetch.scrape') {
@@ -2672,13 +3111,19 @@ export default {
                   MAX_CONCURRENT_SCRAPES_PER_USER,
                 );
                 if (!releaseCompatScrapeSlot) {
+                  const isPriv = await resolveCompatPrePrivate();
+                  void request.body?.cancel().catch(() => undefined);
                   return userQuotaExceededResponse(
                     `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                    isPriv,
                   );
                 }
               } else if ((inFlightScrapesByUser.get(callerUid) ?? 0) >= MAX_CONCURRENT_SCRAPES_PER_USER) {
+                const isPriv = await resolveCompatPrePrivate();
+                void request.body?.cancel().catch(() => undefined);
                 return userQuotaExceededResponse(
                   `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                  isPriv,
                 );
               }
             }
@@ -2700,6 +3145,7 @@ export default {
               executeHubFetch,
               waitUntil: compatWaitUntil,
               tracer: getActiveRequestTracer() ?? rootTracer,
+              ...(preReadBody ? { preReadBody } : {}),
             });
             if (res && (res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
               return wrapSseResponseWithFlush(res, () => {
@@ -2736,7 +3182,11 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
           const blobSha256 = url.pathname.slice('/v1/artifacts/'.length).trim().toLowerCase();
           return await handleArtifactGetRequest({
@@ -2766,7 +3216,11 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
           const q = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
           const remoteOnly = url.searchParams.get('remoteOnly') === 'true' || url.searchParams.get('remoteOnly') === '1';
@@ -2779,6 +3233,38 @@ export default {
             selfHost: url.hostname,
           });
           return Response.json(out, { status: out.status, headers: { 'cache-control': 'no-store' } });
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/mcp/shared') {
+        return withRouteSpan('edgefetch.mcp_shared', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            mcpToken: env.MCP_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch') && !auth.scopes.includes('mcp:call')) {
+            return Response.json({ error: 'insufficient_scope', visibility: 'private' as const }, { status: 403, headers: { 'cache-control': 'private, no-store' } });
+          }
+          const userId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const store = accessPolicyStore();
+          // Members see only name/slug/tools of servers shared with them: never URLs, auth summaries, or credentials.
+          const shared = store
+            ? await listSharedServersFor(userId, { store, vaultStore, cacheKey: accessPolicyCacheKey })
+            : [];
+          const san = sanitizeConnectorStructuredValue(shared);
+          return Response.json(
+            { ok: true, visibility: 'private', userId, count: shared.length, sanitized: san.sanitized, fullySanitized: san.fullySanitized, servers: san.value },
+            { status: 200, headers: { 'cache-control': 'private, no-store' } },
+          );
         });
       }
 
@@ -2797,44 +3283,69 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const userId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(userId) !== 'owner';
+          const privHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const cappedMcpQuery = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedMcpQuery.ok) {
             return Response.json(
-              { error: cappedMcpQuery.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedMcpQuery.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
+              {
+                error: cappedMcpQuery.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedMcpQuery.error === 'too_large' ? 413 : 400, headers: privHdrs },
             );
           }
           let payload: QueryMcpCallInput;
           try {
-            payload = JSON.parse(cappedMcpQuery.text) as QueryMcpCallInput;
+            const parsed = JSON.parse(cappedMcpQuery.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: privHdrs },
+              );
+            }
+            payload = parsed as QueryMcpCallInput;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: privHdrs },
+            );
           }
           const action = payload.action ?? 'list_connected';
           if (action === 'call_tool' || action === 'list_tools') {
             if (!auth.scopes.includes('mcp:call')) {
-              return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+              return Response.json(
+                { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 403, headers: privHdrs },
+              );
             }
           } else if (
             !auth.scopes.includes('crawl:read') &&
             !auth.scopes.includes('crawl:fetch') &&
             !auth.scopes.includes('mcp:call')
           ) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: privHdrs },
+            );
           }
-          const userId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const out = await executeFederatedMcpQuery({
             userId,
             input: payload,
             vaultStore,
+            ...federationPolicyOpts(),
             vaultMasterKey: env.VAULT_MASTER_KEY,
             fetchFn: safePublicFetch,
             selfHost: url.hostname,
           });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'private, no-store' },
-          });
+          return Response.json(
+            { ...out.body, ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+            {
+              status: out.status,
+              headers: { 'cache-control': 'private, no-store' },
+            },
+          );
         });
       }
 
@@ -2852,26 +3363,50 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              {
+                error: 'insufficient_scope',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: 403, headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' } },
+            );
           }
           const cappedScrape = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedScrape.ok) {
             return Response.json(
-              { error: cappedScrape.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedScrape.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedScrape.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              {
+                status: cappedScrape.error === 'too_large' ? 413 : 400,
+                headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' },
+              },
             );
           }
           let payload: ScrapeRequestPayload;
           try {
-            payload = JSON.parse(cappedScrape.text) as ScrapeRequestPayload;
+            const parsed = JSON.parse(cappedScrape.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' } },
+              );
+            }
+            payload = parsed as ScrapeRequestPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' } },
+            );
           }
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const hasMcpCallScope = !auth.principal.startsWith('oauth:') || auth.scopes.includes('mcp:call');
           const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanScrapeObj } =
             payload as unknown as Record<string, unknown>;
+          const isPrivateScrapeReq = isPrivateRequestPayload(cleanScrapeObj, callerUserId);
           const hasScrapeAllowedMcpTools = cleanScrapeObj.allowedMcpTools !== undefined;
           if (
             (cleanScrapeObj.preferMcp === true || cleanScrapeObj.useConnectedMcp === true || hasScrapeAllowedMcpTools) &&
@@ -2880,10 +3415,11 @@ export default {
             return Response.json(
               {
                 ok: false,
+                ...(isPrivateScrapeReq ? { visibility: 'private' } : {}),
                 error: 'insufficient_scope',
                 message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
               },
-              { status: 403, headers: { 'cache-control': 'no-store' } },
+              { status: 403, headers: { 'cache-control': isPrivateScrapeReq ? 'private, no-store' : 'no-store' } },
             );
           }
           if (hasScrapeAllowedMcpTools) {
@@ -2892,10 +3428,11 @@ export default {
               return Response.json(
                 {
                   ok: false,
+                  ...(isPrivateScrapeReq ? { visibility: 'private' } : {}),
                   error: parsedAllowed.error,
                   message: parsedAllowed.message,
                 },
-                { status: 400, headers: { 'cache-control': 'no-store' } },
+                { status: 400, headers: { 'cache-control': isPrivateScrapeReq ? 'private, no-store' : 'no-store' } },
               );
             }
           }
@@ -2907,6 +3444,7 @@ export default {
           if (!releaseScrapeSlot) {
             return userQuotaExceededResponse(
               `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+              isPrivateScrapeReq,
             );
           }
           try {
@@ -2936,6 +3474,7 @@ export default {
                   ? { allowedMcpTools: cleanScrapeObj.allowedMcpTools as ReadonlyArray<string> }
                   : {}),
                 vaultStore,
+                ...federationPolicyOpts(),
                 vaultMasterKey: env.VAULT_MASTER_KEY,
                 fetchFn: safePublicFetch,
                 selfHost: url.hostname,
@@ -2958,7 +3497,9 @@ export default {
               source: `scrape:${auth.principal}`,
               userId: auth.userId,
             });
-            const isPrivateScrape = (out.body as { visibility?: string }).visibility === 'private';
+            const isPrivateScrape =
+              (out.body as { visibility?: string }).visibility === 'private' ||
+              isPrivateRequestPayload(cleanPayload, callerUserId);
             return Response.json(out.body, {
               status: out.status,
               headers: {
@@ -2996,17 +3537,27 @@ export default {
               { status: 401, headers: { ...corsHeaders, 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const privCorsHeaders = {
+            ...corsHeaders,
+            'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store',
+          };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: corsHeaders });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: privCorsHeaders },
+            );
           }
           const cappedClip = await readBodyTextCapped(request, 4 * 1024 * 1024);
           if (!cappedClip.ok) {
             return Response.json(
               {
                 error: cappedClip.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
                 ...(cappedClip.error === 'too_large' ? { message: 'Tab clip exceeds 4 MiB limit' } : {}),
               },
-              { status: cappedClip.error === 'too_large' ? 413 : 400, headers: corsHeaders },
+              { status: cappedClip.error === 'too_large' ? 413 : 400, headers: privCorsHeaders },
             );
           }
           let clipPayload: {
@@ -3019,10 +3570,25 @@ export default {
             visibility?: unknown;
           };
           try {
-            clipPayload = JSON.parse(cappedClip.text) as typeof clipPayload;
+            const parsed = JSON.parse(cappedClip.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: privCorsHeaders },
+              );
+            }
+            clipPayload = parsed as typeof clipPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400, headers: corsHeaders });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: privCorsHeaders },
+            );
           }
+          const isPrivateClipReq = isPrivateRequestPayload(clipPayload, callerUserId);
+          const clipRespHeaders = {
+            ...corsHeaders,
+            'cache-control': isPrivateClipReq ? 'private, no-store' : 'no-store',
+          };
           const tabUrl = typeof clipPayload.url === 'string' ? clipPayload.url.trim() : '';
           let parsedTabUrl: URL;
           try {
@@ -3031,12 +3597,19 @@ export default {
               throw new Error('scheme');
             }
           } catch {
-            return Response.json({ error: 'invalid_url', message: 'Valid http(s) tab url required' }, { status: 400, headers: corsHeaders });
+            return Response.json(
+              {
+                error: 'invalid_url',
+                message: 'Valid http(s) tab url required',
+                ...(isPrivateClipReq ? { visibility: 'private' as const } : {}),
+              },
+              { status: 400, headers: clipRespHeaders },
+            );
           }
           parsedTabUrl.hash = '';
           const cleanUrl = parsedTabUrl.toString();
           const clipVisibility =
-            clipPayload.visibility === 'private' || auth.userId !== 'owner'
+            clipPayload.visibility === 'private' || isCallerPrivate
               ? 'private'
               : normalizeVisibility(clipPayload.visibility);
           const rawCollectionId =
@@ -3046,8 +3619,12 @@ export default {
           const resolvedClipCollection = resolveUserCollectionId(rawCollectionId, auth.userId, clipVisibility);
           if (!resolvedClipCollection.ok) {
             return Response.json(
-              { error: resolvedClipCollection.error, message: resolvedClipCollection.message },
-              { status: resolvedClipCollection.status, headers: corsHeaders },
+              {
+                error: resolvedClipCollection.error,
+                message: resolvedClipCollection.message,
+                ...(clipVisibility === 'private' ? { visibility: 'private' as const } : {}),
+              },
+              { status: resolvedClipCollection.status, headers: clipRespHeaders },
             );
           }
           const collectionId = resolvedClipCollection.displayId;
@@ -3066,8 +3643,21 @@ export default {
             if (!resolvedTitle && extracted.title) resolvedTitle = extracted.title;
             description = extracted.description;
           }
+          if (markdown) {
+            markdown = sanitizeInlineHtmlInMarkdown(markdown, cleanUrl).trim();
+          }
+          if (resolvedTitle) {
+            resolvedTitle = sanitizeExtractedTitle(resolvedTitle, cleanUrl, false) ?? '';
+          }
           if (!markdown) {
-            return Response.json({ error: 'empty_content', message: 'Clipped tab produced empty Markdown' }, { status: 400, headers: corsHeaders });
+            return Response.json(
+              {
+                error: 'empty_content',
+                message: 'Clipped tab produced empty Markdown',
+                ...(clipVisibility === 'private' ? { visibility: 'private' as const } : {}),
+              },
+              { status: 400, headers: clipRespHeaders },
+            );
           }
 
           const contentSha256 = await sha256HexString(markdown);
@@ -3116,7 +3706,7 @@ export default {
               pipelineVersion: SCRAPE_PIPELINE_VERSION,
               markdown,
             },
-            { status: 200, headers: corsHeaders },
+            { status: 200, headers: clipRespHeaders },
           );
         });
       }
@@ -3135,24 +3725,48 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              {
+                error: 'insufficient_scope',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: 403, headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' } },
+            );
           }
           const cappedExtract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedExtract.ok) {
             return Response.json(
-              { error: cappedExtract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedExtract.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedExtract.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              {
+                status: cappedExtract.error === 'too_large' ? 413 : 400,
+                headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' },
+              },
             );
           }
           let payload: ExtractRequestPayload;
           try {
-            payload = JSON.parse(cappedExtract.text) as ExtractRequestPayload;
+            const parsed = JSON.parse(cappedExtract.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' } },
+              );
+            }
+            payload = parsed as ExtractRequestPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' } },
+            );
           }
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const rawPayloadObj = payload as unknown as Record<string, unknown>;
+          const isPrivateExtractReq = isPrivateRequestPayload(rawPayloadObj, callerUserId);
           const hasInvalidUrls =
             !Array.isArray(rawPayloadObj.urls) || rawPayloadObj.urls.length === 0 || rawPayloadObj.urls.length > 20;
           const releaseExtractSlots = hasInvalidUrls
@@ -3161,6 +3775,7 @@ export default {
           if (!releaseExtractSlots) {
             return userQuotaExceededResponse(
               `Per-user concurrent extract limit (${MAX_CONCURRENT_EXTRACTS_PER_USER} requests / ${MAX_CONCURRENT_EXTRACT_URLS_PER_USER} URLs) exceeded.`,
+              isPrivateExtractReq,
             );
           }
           try {
@@ -3170,11 +3785,17 @@ export default {
               executeHubFetch,
               selfHost: url.hostname,
               source: `extract:${auth.principal}`,
-              userId: auth.userId,
+              userId: callerUserId,
             });
+            const isPrivateExtract =
+              (out.body as { visibility?: string }).visibility === 'private' || isPrivateExtractReq;
             return Response.json(out.body, {
               status: out.status,
-              headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+              headers: {
+                'cache-control': isPrivateExtract ? 'private, no-store' : 'no-store',
+                'x-crawler-via': out.via,
+                ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+              },
             });
           } finally {
             releaseExtractSlots();
@@ -3196,23 +3817,42 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedInteract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedInteract.ok) {
             return Response.json(
-              { error: cappedInteract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedInteract.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedInteract.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedInteract.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: InteractRequestPayload;
           try {
-            payload = JSON.parse(cappedInteract.text) as InteractRequestPayload;
+            const parsed = JSON.parse(cappedInteract.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as InteractRequestPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const releaseInteractSlot = tryAcquireUserConcurrencySlot(
             inFlightInteractsByUser,
             callerUserId,
@@ -3221,6 +3861,7 @@ export default {
           if (!releaseInteractSlot) {
             return userQuotaExceededResponse(
               `Per-user concurrent interact limit (${MAX_CONCURRENT_INTERACTS_PER_USER}) exceeded.`,
+              isPrivateReq,
             );
           }
           try {
@@ -3231,13 +3872,17 @@ export default {
               selfHost: url.hostname,
               source: `interact:${auth.principal}`,
               principal: auth.principal,
-              userId: auth.userId,
+              userId: callerUserId,
               sessionSigningSecret: sessionSecret,
             });
-            return Response.json(out.body, {
-              status: out.status,
-              headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
-            });
+            const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+            return Response.json(
+              { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+              {
+                status: out.status,
+                headers: { 'cache-control': isPrivOut ? 'private, no-store' : 'no-store', 'x-crawler-via': out.via },
+              },
+            );
           } finally {
             releaseInteractSlot();
           }
@@ -3258,27 +3903,47 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedMap = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedMap.ok) {
             return Response.json(
-              { error: cappedMap.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedMap.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedMap.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedMap.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: MapRequestPayload;
           try {
-            payload = JSON.parse(cappedMap.text) as MapRequestPayload;
+            const parsed = JSON.parse(cappedMap.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as MapRequestPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const releaseMapSlot = tryAcquireUserMapSlot(callerUserId);
           if (!releaseMapSlot) {
             return userQuotaExceededResponse(
               `Per-user concurrent map limit (${MAX_CONCURRENT_MAPS_PER_USER}) exceeded.`,
+              isPrivateReq,
             );
           }
           try {
@@ -3288,10 +3953,14 @@ export default {
               selfHost: url.hostname,
               source: `map:${auth.principal}`,
             });
-            return Response.json(out.body, {
-              status: out.status,
-              headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
-            });
+            const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+            return Response.json(
+              { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+              {
+                status: out.status,
+                headers: { 'cache-control': isPrivOut ? 'private, no-store' : 'no-store', 'x-crawler-via': out.via },
+              },
+            );
           } finally {
             releaseMapSlot();
           }
@@ -3313,21 +3982,42 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const cappedSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedSearch.ok) {
             return Response.json(
-              { error: cappedSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedSearch.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedSearch.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: SearchRequestPayload;
           try {
-            payload = JSON.parse(cappedSearch.text) as SearchRequestPayload;
+            const parsed = JSON.parse(cappedSearch.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as SearchRequestPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const out = await executeSearchCall({
             payload,
             env,
@@ -3337,10 +4027,14 @@ export default {
             // crawl:read may search; only crawl:fetch may make the hub fetch caller-chosen sites (as /v1/map requires).
             allowLiveFetch: auth.scopes.includes('crawl:fetch'),
           });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
-          });
+          const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+          return Response.json(
+            { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+            {
+              status: out.status,
+              headers: { 'cache-control': isPrivOut ? 'private, no-store' : 'no-store', 'x-crawler-via': out.via },
+            },
+          );
         });
       }
 
@@ -3359,23 +4053,47 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const cappedPreview = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedPreview.ok) {
             return Response.json(
-              { error: cappedPreview.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedPreview.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedPreview.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedPreview.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: Record<string, unknown>;
           try {
-            payload = JSON.parse(cappedPreview.text) as Record<string, unknown>;
+            const parsed = JSON.parse(cappedPreview.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as Record<string, unknown>;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const prev = previewCrawlParams(payload, url.hostname);
-          return Response.json(prev.body, { status: prev.status, headers: { 'cache-control': 'no-store' } });
+          return Response.json(
+            { ...prev.body, ...(isPrivateReq ? { visibility: 'private' as const } : {}) },
+            { status: prev.status, headers: { 'cache-control': isPrivateReq ? 'private, no-store' : 'no-store' } },
+          );
         });
       }
 
@@ -3393,26 +4111,47 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedBatch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedBatch.ok) {
             return Response.json(
-              { error: cappedBatch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedBatch.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedBatch.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedBatch.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: Record<string, unknown>;
           try {
-            payload = JSON.parse(cappedBatch.text) as Record<string, unknown>;
+            const parsed = JSON.parse(cappedBatch.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as Record<string, unknown>;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
+          const batchHdrs = { 'cache-control': isPrivateReq ? 'private, no-store' : 'no-store' };
           if ((inFlightScrapesByUser.get(callerUserId) ?? 0) >= MAX_CONCURRENT_SCRAPES_PER_USER) {
             return userQuotaExceededResponse(
               `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+              isPrivateReq,
             );
           }
           const batchOut = await startOrExecuteBatchScrape({
@@ -3430,6 +4169,7 @@ export default {
                   status: 429,
                   body: {
                     ok: false,
+                    ...(isPrivateReq ? { visibility: 'private' as const } : {}),
                     error: 'user_quota_exceeded',
                     message: `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
                   },
@@ -3453,16 +4193,22 @@ export default {
           });
           if (!batchOut.ok) {
             return Response.json(
-              { ok: false, error: batchOut.error, message: batchOut.message },
+              {
+                ok: false,
+                ...(isPrivateReq ? { visibility: 'private' as const } : {}),
+                error: batchOut.error,
+                message: batchOut.message,
+              },
               {
                 status: batchOut.status,
-                headers: batchOut.status === 429 ? { 'cache-control': 'no-store', 'retry-after': '2' } : { 'cache-control': 'no-store' },
+                headers: batchOut.status === 429 ? { ...batchHdrs, 'retry-after': '2' } : batchHdrs,
               },
             );
           }
           return Response.json(
             {
               ok: true,
+              ...(isPrivateReq ? { visibility: 'private' as const } : {}),
               id: batchOut.job.id,
               status: batchOut.job.status,
               total: batchOut.job.total,
@@ -3472,7 +4218,7 @@ export default {
               url: `${url.origin}/v1/batch/scrape/${batchOut.job.id}`,
               ...(payload.sync === true ? { data: batchOut.job.data, errors: batchOut.job.errors } : {}),
             },
-            { status: batchOut.status, headers: { 'cache-control': 'no-store' } },
+            { status: batchOut.status, headers: batchHdrs },
           );
         });
       }
@@ -3492,27 +4238,62 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const rawBatchId = safeDecodeURIComponent(batchRouteMatch[1] ?? '');
           if (rawBatchId === null) {
-            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+            return Response.json(
+              {
+                ok: false,
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                error: 'bad_request',
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
+            );
           }
           const batchId = rawBatchId.trim();
           if (request.method === 'GET') {
             if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-              return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+              return Response.json(
+                { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: 'insufficient_scope' },
+                { status: 403, headers: callerHdrs },
+              );
             }
             const job = getBatchScrapeStatus(batchId, auth.userId);
-            if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
-            return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
+            if (!job) {
+              return Response.json(
+                { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: 'batch_not_found' },
+                { status: 404, headers: callerHdrs },
+              );
+            }
+            const isPrivBatch = isCallerPrivate || job.visibility === 'private';
+            const { visibility: _jobVis, ...restJob } = job;
+            return Response.json(
+              { ok: true, ...(isPrivBatch ? { visibility: 'private' as const } : {}), ...restJob },
+              { status: 200, headers: { 'cache-control': isPrivBatch ? 'private, no-store' : 'no-store' } },
+            );
           }
           if (request.method === 'DELETE') {
             if (!auth.scopes.includes('crawl:fetch')) {
-              return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403 });
+              return Response.json(
+                { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: 'insufficient_scope' },
+                { status: 403, headers: callerHdrs },
+              );
             }
+            const existingJob = getBatchScrapeStatus(batchId, auth.userId);
             const ok = cancelBatchScrape(batchId, auth.userId);
-            return Response.json({ ok, id: batchId, status: 'cancelled' }, { status: ok ? 200 : 404 });
+            const isPrivBatch = isCallerPrivate || existingJob?.visibility === 'private';
+            return Response.json(
+              { ok, ...(isPrivBatch ? { visibility: 'private' as const } : {}), id: batchId, status: 'cancelled' },
+              { status: ok ? 200 : 404, headers: { 'cache-control': isPrivBatch ? 'private, no-store' : 'no-store' } },
+            );
           }
-          return Response.json({ error: 'not_found' }, { status: 404 });
+          return Response.json(
+            { error: 'not_found', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+            { status: 404, headers: callerHdrs },
+          );
         });
       }
 
@@ -3530,22 +4311,42 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedAgent = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedAgent.ok) {
             return Response.json(
-              { error: cappedAgent.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedAgent.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedAgent.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedAgent.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: Record<string, unknown>;
           try {
-            payload = JSON.parse(cappedAgent.text) as Record<string, unknown>;
+            const parsed = JSON.parse(cappedAgent.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as Record<string, unknown>;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const wantSse = (request.headers.get('accept') ?? '').toLowerCase().includes('text/event-stream');
           const agentWaitUntil = trackedCtx?.waitUntil
             ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
@@ -3554,7 +4355,6 @@ export default {
                   .catch(() => undefined)
                   .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
               };
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const out = await startOrExecuteAgentCall({
             payload,
             env,
@@ -3564,6 +4364,7 @@ export default {
             userId: callerUserId,
             sessionSigningSecret: sessionSecret,
             vaultStore,
+            ...federationPolicyOpts(),
             wantSseStream: wantSse,
             waitUntil: agentWaitUntil,
           });
@@ -3574,13 +4375,17 @@ export default {
               return p;
             });
           }
-          return Response.json(out.body, {
-            status: out.status,
-            headers: {
-              'cache-control': 'no-store',
-              ...(out.status === 429 ? { 'retry-after': '2' } : {}),
+          const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+          return Response.json(
+            { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+            {
+              status: out.status,
+              headers: {
+                'cache-control': isPrivOut ? 'private, no-store' : 'no-store',
+                ...(out.status === 429 ? { 'retry-after': '2' } : {}),
+              },
             },
-          });
+          );
         });
       }
 
@@ -3600,20 +4405,41 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const rawAgentId = safeDecodeURIComponent(agentTraceMatch[1] ?? '');
           if (rawAgentId === null) {
-            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+            return Response.json(
+              {
+                ok: false,
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                error: 'bad_request',
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
+            );
           }
           const agentId = rawAgentId.trim();
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const rec = await loadAgentRun(agentId, env.META, callerUserId);
-          if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
+          if (!rec) {
+            return Response.json(
+              { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: 'agent_not_found' },
+              { status: 404, headers: callerHdrs },
+            );
+          }
+          const isPrivTrace = isCallerPrivate || rec.visibility === 'private';
           return Response.json(
             {
               ok: true,
               success: true,
+              ...(isPrivTrace ? { visibility: 'private' as const } : {}),
               id: rec.id,
               threadId: rec.threadId,
               status: rec.status,
@@ -3622,7 +4448,7 @@ export default {
               trace: rec.trace,
               events: rec.trace,
             },
-            { status: 200, headers: { 'cache-control': 'no-store' } },
+            { status: 200, headers: { 'cache-control': isPrivTrace ? 'private, no-store' : 'no-store' } },
           );
         });
       }
@@ -3642,28 +4468,60 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const rawAgentId = safeDecodeURIComponent(agentRouteMatch[1] ?? '');
           if (rawAgentId === null) {
-            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+            return Response.json(
+              {
+                ok: false,
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                error: 'bad_request',
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
+            );
           }
           const agentId = rawAgentId.trim();
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           if (request.method === 'GET') {
             if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-              return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+              return Response.json(
+                { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 403, headers: callerHdrs },
+              );
             }
             const rec = await loadAgentRun(agentId, env.META, callerUserId);
-            if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
-            return Response.json(formatPublicAgentResponse(rec, false), { status: 200, headers: { 'cache-control': 'no-store' } });
+            if (!rec) {
+              return Response.json(
+                { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: 'agent_not_found' },
+                { status: 404, headers: callerHdrs },
+              );
+            }
+            const isPrivGet = isCallerPrivate || rec.visibility === 'private';
+            return Response.json(
+              { ...formatPublicAgentResponse(rec, false), ...(isPrivGet ? { visibility: 'private' as const } : {}) },
+              { status: 200, headers: { 'cache-control': isPrivGet ? 'private, no-store' : 'no-store' } },
+            );
           }
           if (request.method === 'DELETE') {
             if (!auth.scopes.includes('crawl:fetch')) {
-              return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+              return Response.json(
+                { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 403, headers: callerHdrs },
+              );
             }
             const cRes = await cancelAgentRun(agentId, env.META, callerUserId);
-            return Response.json({ ok: cRes.ok, id: agentId, status: 'cancelled' }, { status: cRes.status });
+            const isPrivCancel = isCallerPrivate || cRes.visibility === 'private';
+            return Response.json(
+              { ok: cRes.ok, ...(isPrivCancel ? { visibility: 'private' as const } : {}), id: agentId, status: 'cancelled' },
+              { status: cRes.status, headers: { 'cache-control': isPrivCancel ? 'private, no-store' : 'no-store' } },
+            );
           }
-          return Response.json({ error: 'not_found' }, { status: 404 });
+          return Response.json(
+            { error: 'not_found', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+            { status: 404, headers: callerHdrs },
+          );
         });
       }
 
@@ -3681,29 +4539,55 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedCrawl = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedCrawl.ok) {
             return Response.json(
-              { error: cappedCrawl.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedCrawl.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedCrawl.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedCrawl.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: Record<string, unknown>;
           try {
-            payload = JSON.parse(cappedCrawl.text) as Record<string, unknown>;
+            const parsed = JSON.parse(cappedCrawl.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as Record<string, unknown>;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
+          const crawlHdrs = { 'cache-control': isPrivateReq ? 'private, no-store' : 'no-store' };
           let displayCollectionId: string | undefined;
           if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
-            const resolvedColl = resolveUserCollectionId(payload.collectionId, auth.userId);
+            const resolvedColl = resolveUserCollectionId(payload.collectionId, auth.userId, isPrivateReq ? 'private' : 'public');
             if (!resolvedColl.ok) {
               return Response.json(
-                { ok: false, error: resolvedColl.error, message: resolvedColl.message },
-                { status: resolvedColl.status, headers: { 'cache-control': 'no-store' } },
+                {
+                  ok: false,
+                  ...(isPrivateReq ? { visibility: 'private' as const } : {}),
+                  error: resolvedColl.error,
+                  message: resolvedColl.message,
+                },
+                { status: resolvedColl.status, headers: crawlHdrs },
               );
             }
             payload = { ...payload, collectionId: resolvedColl.scopedId };
@@ -3717,8 +4601,16 @@ export default {
           });
           if (!created.ok) {
             return Response.json(
-              { ok: false, error: created.error, message: created.message },
-              { status: created.status, headers: { 'cache-control': 'no-store' } },
+              {
+                ok: false,
+                ...(isPrivateReq ? { visibility: 'private' as const } : {}),
+                error: created.error,
+                message: created.message,
+              },
+              {
+                status: created.status,
+                headers: created.status === 429 ? { ...crawlHdrs, 'retry-after': '2' } : crawlHdrs,
+              },
             );
           }
           let startedViaWorkflow = false;
@@ -3760,12 +4652,13 @@ export default {
           return Response.json(
             {
               ok: true,
+              ...(isPrivateReq ? { visibility: 'private' as const } : {}),
               id: created.crawlId,
               status: payload.sync === true ? 'completed' : 'queued',
               collectionId: displayCollectionId ?? created.options.collectionId,
               url: `${url.origin}/v1/crawl/${created.crawlId}`,
             },
-            { status: payload.sync === true ? 200 : 202, headers: { 'cache-control': 'no-store' } },
+            { status: payload.sync === true ? 200 : 202, headers: crawlHdrs },
           );
         });
       }
@@ -3785,14 +4678,28 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const rawCrawlId = safeDecodeURIComponent(crawlRouteMatch[1] ?? '');
           if (rawCrawlId === null) {
-            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+            return Response.json(
+              {
+                ok: false,
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                error: 'bad_request',
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
+            );
           }
           const crawlId = rawCrawlId.trim();
           if (request.method === 'GET') {
             if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-              return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+              return Response.json(
+                { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 403, headers: callerHdrs },
+              );
             }
             const st = await getCrawlJobStatus({
               crawlId,
@@ -3802,17 +4709,37 @@ export default {
               limit: Number(url.searchParams.get('limit') ?? 25),
               userId: auth.userId,
             });
-            if (!st.ok) return Response.json({ ok: false, error: st.error }, { status: st.status });
-            return Response.json({ ok: true, ...st.crawl }, { status: 200, headers: { 'cache-control': 'no-store' } });
+            if (!st.ok) {
+              return Response.json(
+                { ok: false, ...(isCallerPrivate ? { visibility: 'private' as const } : {}), error: st.error },
+                { status: st.status, headers: callerHdrs },
+              );
+            }
+            const isCrawlPrivate = isCallerPrivate || st.crawl.visibility === 'private';
+            const crawlStatusHdrs = { 'cache-control': isCrawlPrivate ? 'private, no-store' : 'no-store' };
+            return Response.json(
+              { ok: true, ...(isCrawlPrivate ? { visibility: 'private' as const } : {}), ...st.crawl },
+              { status: 200, headers: crawlStatusHdrs },
+            );
           }
           if (request.method === 'DELETE') {
             if (!auth.scopes.includes('crawl:fetch')) {
-              return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+              return Response.json(
+                { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 403, headers: callerHdrs },
+              );
             }
             const cRes = await cancelCrawlJob(crawlId, env.META, auth.userId);
-            return Response.json({ ok: cRes.ok, id: crawlId, status: 'cancelled' }, { status: cRes.status });
+            const isCrawlPrivate = isCallerPrivate || cRes.visibility === 'private';
+            return Response.json(
+              { ok: cRes.ok, ...(isCrawlPrivate ? { visibility: 'private' as const } : {}), id: crawlId, status: 'cancelled' },
+              { status: cRes.status, headers: { 'cache-control': isCrawlPrivate ? 'private, no-store' : 'no-store' } },
+            );
           }
-          return Response.json({ error: 'not_found' }, { status: 404 });
+          return Response.json(
+            { error: 'not_found', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+            { status: 404, headers: callerHdrs },
+          );
         });
       }
 
@@ -3832,40 +4759,82 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!env.SEARCH) {
-            return Response.json({ error: 'search_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'search_not_configured', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 503, headers: callerHdrs },
+            );
           }
           const rawCollectionId = safeDecodeURIComponent(collectionSearchMatch[1] ?? '');
           if (rawCollectionId === null) {
-            return Response.json({ error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400, headers: { 'cache-control': 'no-store' } });
-          }
-          const resolvedCol = resolveUserCollectionId(rawCollectionId.trim(), auth.userId);
-          if (!resolvedCol.ok) {
             return Response.json(
-              { error: resolvedCol.error, message: resolvedCol.message },
-              { status: resolvedCol.status, headers: { 'cache-control': 'no-store' } },
+              {
+                error: 'bad_request',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
             );
           }
           let query = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
           let limit = Number(url.searchParams.get('limit') ?? 10);
+          let reqVisibility = url.searchParams.get('visibility') ?? '';
           if (request.method === 'POST') {
             const cappedColSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
             if (!cappedColSearch.ok) {
               return Response.json(
-                { error: cappedColSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-                { status: cappedColSearch.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
+                {
+                  error: cappedColSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                  ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                },
+                { status: cappedColSearch.error === 'too_large' ? 413 : 400, headers: callerHdrs },
               );
             }
             try {
-              const bodyJson = JSON.parse(cappedColSearch.text) as { query?: unknown; q?: unknown; limit?: unknown };
+              const parsed = JSON.parse(cappedColSearch.text);
+              if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return Response.json(
+                  { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                  { status: 400, headers: callerHdrs },
+                );
+              }
+              const bodyJson = parsed as { query?: unknown; q?: unknown; limit?: unknown; visibility?: unknown };
               if (typeof bodyJson.query === 'string') query = bodyJson.query;
               else if (typeof bodyJson.q === 'string') query = bodyJson.q;
               if (typeof bodyJson.limit === 'number' && Number.isFinite(bodyJson.limit)) limit = bodyJson.limit;
+              if (typeof bodyJson.visibility === 'string') reqVisibility = bodyJson.visibility;
             } catch {
-              return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
             }
+          }
+          const isPrivateColSearch = isCallerPrivate || reqVisibility.trim().toLowerCase() === 'private';
+          const colHdrs = { 'cache-control': isPrivateColSearch ? 'private, no-store' : 'no-store' };
+          const resolvedCol = resolveUserCollectionId(
+            rawCollectionId.trim(),
+            auth.userId,
+            isPrivateColSearch ? 'private' : 'public',
+          );
+          if (!resolvedCol.ok) {
+            return Response.json(
+              {
+                error: resolvedCol.error,
+                message: resolvedCol.message,
+                ...(isPrivateColSearch ? { visibility: 'private' as const } : {}),
+              },
+              { status: resolvedCol.status, headers: colHdrs },
+            );
           }
           const idx = new D1FtsSearchIndex(env.SEARCH);
           const hits = await idx.searchCollection({
@@ -3876,11 +4845,12 @@ export default {
           return Response.json(
             {
               ok: true,
+              ...(isPrivateColSearch ? { visibility: 'private' as const } : {}),
               collectionId: resolvedCol.displayId,
               query,
               hits: hits.map((h) => ({ ...h, collectionId: resolvedCol.displayId })),
             },
-            { status: 200, headers: { 'cache-control': 'no-store' } },
+            { status: 200, headers: colHdrs },
           );
         });
       }
@@ -3899,23 +4869,42 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedJobs = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedJobs.ok) {
             return Response.json(
-              { error: cappedJobs.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedJobs.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedJobs.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedJobs.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: JobsToolPayload;
           try {
-            payload = JSON.parse(cappedJobs.text) as JobsToolPayload;
+            const parsed = JSON.parse(cappedJobs.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as JobsToolPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
-          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const callerAuthTier = auth.role ?? (callerUserId === 'owner' ? 'owner' : 'member');
           const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
             inFlightScrapesByUser,
@@ -3925,6 +4914,7 @@ export default {
           if (!releaseScrapeSlot) {
             return userQuotaExceededResponse(
               `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+              isPrivateReq,
             );
           }
           try {
@@ -3955,12 +4945,119 @@ export default {
                 return { status: scOut.status, body: scOut.body };
               },
             });
-            return Response.json(out.body, {
-              status: out.status,
-              headers: { 'cache-control': 'no-store' },
-            });
+            const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+            return Response.json(
+              { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+              {
+                status: out.status,
+                headers: {
+                  'cache-control': isPrivOut ? 'private, no-store' : 'no-store',
+                  ...(out.status === 429 ? { 'retry-after': '2' } : {}),
+                },
+              },
+            );
           } finally {
             releaseScrapeSlot();
+          }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/company') {
+        return withRouteSpan('edgefetch.company', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
+          }
+          const capped = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!capped.ok) {
+            return Response.json({ error: 'payload_too_large' }, { status: 413, headers: callerHdrs });
+          }
+          let args: Record<string, unknown>;
+          try {
+            const parsed = JSON.parse(capped.text || '{}') as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+            args = parsed as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'invalid_json' }, { status: 400, headers: callerHdrs });
+          }
+          const tier = (auth as { role?: string }).role ?? (callerUserId === 'owner' ? 'owner' : 'member');
+          const releaseSlot = tryAcquireUserConcurrencySlot(inFlightScrapesByUser, callerUserId, MAX_CONCURRENT_SCRAPES_PER_USER);
+          if (!releaseSlot) {
+            return Response.json({ ok: false, error: 'user_quota_exceeded' }, { status: 429, headers: callerHdrs });
+          }
+          try {
+            const ex = makeVerticalExecutors('api:company', callerUserId, tier);
+            const out = await ex.company(args);
+            return Response.json(out.body, { status: out.status, headers: callerHdrs });
+          } finally {
+            releaseSlot();
+          }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/salaries') {
+        return withRouteSpan('edgefetch.salaries', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
+          }
+          const capped = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!capped.ok) {
+            return Response.json({ error: 'payload_too_large' }, { status: 413, headers: callerHdrs });
+          }
+          let args: Record<string, unknown>;
+          try {
+            const parsed = JSON.parse(capped.text || '{}') as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+            args = parsed as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'invalid_json' }, { status: 400, headers: callerHdrs });
+          }
+          const tier = (auth as { role?: string }).role ?? (callerUserId === 'owner' ? 'owner' : 'member');
+          const releaseSlot = tryAcquireUserConcurrencySlot(inFlightScrapesByUser, callerUserId, MAX_CONCURRENT_SCRAPES_PER_USER);
+          if (!releaseSlot) {
+            return Response.json({ ok: false, error: 'user_quota_exceeded' }, { status: 429, headers: callerHdrs });
+          }
+          try {
+            const ex = makeVerticalExecutors('api:salaries', callerUserId, tier);
+            const out = await ex.salaries(args);
+            return Response.json(out.body, { status: out.status, headers: callerHdrs });
+          } finally {
+            releaseSlot();
           }
         });
       }
@@ -3979,22 +5076,42 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            return Response.json(
+              { error: 'insufficient_scope', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: callerHdrs },
+            );
           }
           const cappedCat = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedCat.ok) {
             return Response.json(
-              { error: cappedCat.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedCat.error === 'too_large' ? 413 : 400 },
+              {
+                error: cappedCat.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+              },
+              { status: cappedCat.error === 'too_large' ? 413 : 400, headers: callerHdrs },
             );
           }
           let payload: CatalogCallPayload;
           try {
-            payload = JSON.parse(cappedCat.text) as CatalogCallPayload;
+            const parsed = JSON.parse(cappedCat.text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return Response.json(
+                { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+                { status: 400, headers: callerHdrs },
+              );
+            }
+            payload = parsed as CatalogCallPayload;
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json(
+              { error: 'bad_json', ...(isCallerPrivate ? { visibility: 'private' as const } : {}) },
+              { status: 400, headers: callerHdrs },
+            );
           }
+          const isPrivateReq = isPrivateRequestPayload(payload, callerUserId);
           const out = await executeCatalogCall({
             payload,
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
@@ -4005,10 +5122,17 @@ export default {
             devTelemetrySetting: getCachedDevTelemetrySetting,
             ...(trackedCtx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } } : {}),
           });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store' },
-          });
+          const isPrivOut = isPrivateReq || (out.body as { visibility?: string }).visibility === 'private';
+          return Response.json(
+            { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+            {
+              status: out.status,
+              headers: {
+                'cache-control': isPrivOut ? 'private, no-store' : 'no-store',
+                ...(out.status === 429 ? { 'retry-after': '2' } : {}),
+              },
+            },
+          );
         });
       }
 
@@ -4028,11 +5152,26 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const rawCatalogId = safeDecodeURIComponent(catalogRecordsMatch[1] ?? '');
           if (rawCatalogId === null) {
-            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+            return Response.json(
+              {
+                ok: false,
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                error: 'bad_request',
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
+            );
           }
           const catalogId = rawCatalogId.trim();
           const vendors = url.searchParams.getAll('vendor').filter(Boolean);
@@ -4057,10 +5196,14 @@ export default {
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
             ...(auth.scopes.includes('crawl:fetch') ? { executeHubFetch: makeCatalogHubFetch('catalog_records') } : {}),
           });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store' },
-          });
+          const isPrivOut = isCallerPrivate || (out.body as { visibility?: string }).visibility === 'private';
+          return Response.json(
+            { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+            {
+              status: out.status,
+              headers: { 'cache-control': isPrivOut ? 'private, no-store' : 'no-store' },
+            },
+          );
         });
       }
 
@@ -4080,11 +5223,26 @@ export default {
             );
           }
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            const isPriv403 = sanitizeStorageUserId(resolveCallerUserId(auth as { userId?: string; principal?: string })) !== 'owner';
+            return Response.json(
+              { error: 'insufficient_scope', ...(isPriv403 ? { visibility: 'private' as const } : {}) },
+              { status: 403, headers: { 'cache-control': isPriv403 ? 'private, no-store' : 'no-store' } },
+            );
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+          const callerHdrs = { 'cache-control': isCallerPrivate ? 'private, no-store' : 'no-store' };
           const rawCatalogId = safeDecodeURIComponent(catalogStatusMatch[1] ?? '');
           if (rawCatalogId === null) {
-            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+            return Response.json(
+              {
+                ok: false,
+                ...(isCallerPrivate ? { visibility: 'private' as const } : {}),
+                error: 'bad_request',
+                message: 'Malformed URL path parameter',
+              },
+              { status: 400, headers: callerHdrs },
+            );
           }
           const catalogId = rawCatalogId.trim();
           const out = await getCatalogStatus({
@@ -4092,10 +5250,14 @@ export default {
             userId: auth.userId,
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
           });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store' },
-          });
+          const isPrivOut = isCallerPrivate || (out.body as { visibility?: string }).visibility === 'private';
+          return Response.json(
+            { ...out.body, ...(isPrivOut ? { visibility: 'private' as const } : {}) },
+            {
+              status: out.status,
+              headers: { 'cache-control': isPrivOut ? 'private, no-store' : 'no-store' },
+            },
+          );
         });
       }
 
@@ -4108,17 +5270,21 @@ export default {
             return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
           }
           const parsedTarget = parseFetchTarget(url);
-          if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
+          if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400, headers: { 'cache-control': 'no-store' } });
           const cappedFetch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedFetch.ok) {
             return Response.json(
               { error: cappedFetch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedFetch.error === 'too_large' ? 413 : 400 },
+              { status: cappedFetch.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
             );
           }
           let body = cappedFetch.text;
           try {
-            const parsedReq = JSON.parse(body) as Record<string, unknown>;
+            const parsedRaw = JSON.parse(body);
+            if (!parsedRaw || typeof parsedRaw !== 'object' || Array.isArray(parsedRaw)) {
+              return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+            }
+            const parsedReq = parsedRaw as Record<string, unknown>;
             if (url.pathname === '/fetch') {
               if (typeof parsedReq.url === 'string') {
                 const wikiArt = parseWikipediaArticleUrl(parsedReq.url);
@@ -4173,7 +5339,7 @@ export default {
               }
             }
           } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400 });
+            return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
           }
           const rawRetention = url.searchParams.get('artifacts');
           const artifactRetention: ArtifactRetention | 'off' | undefined =
@@ -4220,7 +5386,18 @@ export default {
             },
           },
           async (httpSpan) => {
-            const res = await runWithCallerAuthContext(async () => annotateCallerAuthFailure(url, await routeRequest()), undefined, env);
+            const res = await runWithCallerAuthContext(
+              async () => {
+                try {
+                  return annotateCallerAuthFailure(url, await routeRequest());
+                } catch (err) {
+                  if (err instanceof AccessPolicyDeniedSignal) return err.response;
+                  throw err;
+                }
+              },
+              undefined,
+              env,
+            );
             httpSpan.setAttribute('http.response.status_code', res.status);
             httpSpan.setStatus(res.status < 500);
             return res;

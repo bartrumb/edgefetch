@@ -1,0 +1,13 @@
+{
+  "adapterId": "docker-hub",
+  "mode": "twin",
+  "inputUrl": "https://hub.docker.com/_/alpine",
+  "expectedFetchUrl": "https://hub.docker.com/v2/repositories/library/alpine/",
+  "mockPayload": "{\"namespace\":\"library\",\"name\":\"alpine\",\"description\":\"A minimal Docker image based on Alpine Linux\",\"pull_count\":10000000,\"star_count\":11000,\"status_description\":\"Active\",\"last_updated\":\"2026-02-01T00:00:00Z\",\"full_description\":\"# Alpine Linux\\n\\nOnly 5 MB.\"}",
+  "expectTitleIncludes": "library/alpine (Docker Hub)",
+  "expectMarkdownIncludes": [
+    "docker pull alpine",
+    "10,000,000",
+    "Only 5 MB."
+  ]
+}

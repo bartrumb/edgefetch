@@ -14,7 +14,8 @@ import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
-import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
+import { evaluateToolAccess, filterToolDefinitions, type AccessCallerContext, type AccessPolicyStore } from './access-policy';
+import { authorizeMcpRequest, getActiveCallerAuthContext, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { formatFenceSafeUntrustedMcpEnvelope, sanitizeConnectorStructuredValue } from './mcp-federation';
 import { parseAllowedMcpTools, resolveCallerUserId } from './mcp-vault';
 import { getActiveRequestTracer, type RequestTracer } from './otel';
@@ -30,6 +31,7 @@ import {
   type TargetUrlRejectionReason,
 } from './overflow';
 import { readBodyTextCapped } from './safe-input';
+import { isPrivateRequestPayload, sanitizeStorageUserId } from './storage';
 import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
 import { checkAndRecordWikipediaArticleQuota, parseWikipediaArticleUrl } from './wikipedia';
 
@@ -166,6 +168,10 @@ export interface McpExecuteFetchResult {
 }
 
 export interface McpServerDeps {
+  /** Hub access policy (tools/list filter + tools/call gate). Absent = no policy (default allow). */
+  accessPolicy?: AccessPolicyStore;
+  /** Snapshot cache key for `accessPolicy` (the AGENT_HUB binding object in production). */
+  accessPolicyCacheKey?: string | object;
   serverName: string;
   serverVersion: string;
   ownerSecret?: string;
@@ -238,6 +244,16 @@ export interface McpServerDeps {
     principal?: string;
     userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeCompany?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+    userId?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeSalaries?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+    userId?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeAgent?: (params: {
     args: Record<string, unknown>;
     principal?: string;
@@ -263,6 +279,7 @@ export interface McpServerDeps {
     query: string;
     limit?: number;
     userId?: string;
+    visibility?: 'public' | 'private';
   }) => Promise<{ ok: true; hits: Array<Record<string, unknown>> } | { ok: false; status: number; error: string }>;
   scheduleBackground?: (promise: Promise<unknown>) => void;
   tracer?: RequestTracer;
@@ -351,6 +368,8 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'crawl' ||
     toolName === 'jobs' ||
     toolName === 'catalog' ||
+    toolName === 'company' ||
+    toolName === 'salaries' ||
     toolName === 'agent'
   ) {
     return 'crawl:fetch';
@@ -893,6 +912,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           includePaths: { type: 'array', items: { type: 'string' }, description: 'Optional path prefixes or regexes to include.' },
           excludePaths: { type: 'array', items: { type: 'string' }, description: 'Optional path prefixes or regexes to skip.' },
           collectionId: { type: 'string', description: 'Optional collection ID to index crawled pages into for search_collection.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Cache and storage visibility ("private" isolates crawled pages and indexed collections to the authenticated user).',
+          },
           offset: { type: 'integer', minimum: 0, default: 0, description: 'Result offset when polling an existing crawlId.' },
         },
         additionalProperties: false,
@@ -947,6 +972,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           collectionId: { type: 'string', description: 'Optional indexed collection ID to merge into search results.' },
           noCache: { type: 'boolean', default: false, description: 'Set true to bypass cached search results and fetch fresh results.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Cache and search isolation mode ("private" isolates search and collection results to the authenticated user).',
+          },
         },
         required: ['query'],
         additionalProperties: true,
@@ -973,6 +1004,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           query: { type: 'string', description: 'Keyword query to match against indexed document chunks.' },
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: 'Maximum matching chunks to return (1..50).' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Index isolation visibility ("private" searches the authenticated user private collection).',
+          },
         },
         required: ['query'],
         additionalProperties: false,
@@ -1037,6 +1074,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
             default: true,
             description:
               'Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only).',
+          },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Cache and storage visibility ("private" disables shared artifact persistence and isolates responses to the authenticated user).',
           },
           site: { type: 'string', description: 'Optional browser-capable worker site ID.' },
         },
@@ -1199,6 +1242,55 @@ export function buildCanonicalMcpToolSchemas(options?: {
       },
     },
     {
+      name: 'company',
+      description:
+        'Builds a sourced company profile from official and public sources: the company website (schema.org Organization, socials), Wikidata (founded, HQ, industry, employees, ticker), SEC EDGAR (legal name, SIC, latest annual revenue), GitHub, its official ATS job board (open roles, locations), and Google Maps place details when a Google Maps MCP is connected. Every field carries its source.',
+      annotations: {
+        title: 'Company Profile (Sourced)',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Company name (e.g. "Cloudflare"). Provide name and/or domain.' },
+          domain: { type: 'string', description: 'Company website domain (e.g. "cloudflare.com"); strongly recommended for accurate matching.' },
+          includeHiring: { type: 'boolean', default: true, description: 'Include the official ATS hiring summary (open roles, locations, sample titles).' },
+          includePlaces: { type: 'boolean', default: true, description: 'Include Google Maps place details when a Google Maps MCP server is connected.' },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'salaries',
+      description:
+        'Aggregates employer-posted pay ranges for a job title from official ATS job postings EdgeFetch has seen (p10/p25/median/p75/p90, by seniority, location, and company, with sample postings). Runs a fresh jobs search when data is thin or refresh=true. Ranges are posted by employers, not self-reported estimates.',
+      annotations: {
+        title: 'Salary Ranges from Employer Postings',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Job title (e.g. "Senior Software Engineer", "Solutions Engineer").' },
+          location: { type: 'string', description: 'Optional location ("Remote", "United States", "New York, NY", "London").' },
+          seniority: { type: 'string', description: 'Optional seniority filter (junior, mid, senior, staff, principal, manager, director, ...).' },
+          company: { type: 'string', description: 'Optional company filter.' },
+          currency: { type: 'string', description: 'Optional ISO 4217 currency (defaults to the most common in the matches).' },
+          basis: { type: 'string', enum: ['base', 'total', 'ote', 'all'], description: 'Pay basis filter (default: base when enough base ranges exist).' },
+          maxAgeDays: { type: 'integer', minimum: 1, maximum: 730, description: 'Only use postings seen within this many days (default 180).' },
+          refresh: { type: 'boolean', default: false, description: 'Run a fresh jobs search first to collect new observations.' },
+        },
+        required: ['title'],
+        additionalProperties: false,
+      },
+    },
+    {
       name: 'catalog',
       description:
         'Extracts normalized product, variant, pricing, SKU, and availability records from a public Shopify or WooCommerce storefront (respecting robots.txt and rate limits), or pages and filters an existing catalog snapshot by catalogId.',
@@ -1274,6 +1366,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           maxPages: { type: 'integer', minimum: 1, maximum: 40 },
           threadId: { type: 'string', description: 'Optional prior `agt_...` threadId for multi-turn follow-up.' },
           zeroDataRetention: { type: 'boolean', default: false, description: 'When true, skips persisting run history or cached artifacts.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Run and storage visibility ("private" isolates run state, memory, and tool scrapes to the authenticated user).',
+          },
           safe: { type: 'boolean', default: false },
           location: {
             type: 'object',
@@ -1402,6 +1500,8 @@ function buildToolDefinitions(deps: McpServerDeps) {
       if (t.name === 'read_artifact') return Boolean(deps.readArtifact);
       if (t.name === 'jobs') return Boolean(deps.executeJobs);
       if (t.name === 'catalog') return Boolean(deps.executeCatalog);
+      if (t.name === 'company') return Boolean(deps.executeCompany);
+      if (t.name === 'salaries') return Boolean(deps.executeSalaries);
       if (t.name === 'find_extractors') return Boolean(deps.findExtractors);
       if (t.name === 'agent') return Boolean(deps.executeAgent);
       if (t.name === 'discover_mcps') return Boolean(deps.discoverMcps);
@@ -2101,12 +2201,22 @@ async function handleToolCallInner(
     const collectionId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
     const query = typeof args.query === 'string' ? args.query : '';
     const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 10;
-    const res = await deps.searchCollection({ collectionId, query, limit, userId });
+    const visibility = args.visibility === 'private' ? 'private' : args.visibility === 'public' ? 'public' : undefined;
+    const res = await deps.searchCollection({ collectionId, query, limit, userId, ...(visibility ? { visibility } : {}) });
     if (!res.ok) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: res.error }) }], isError: true };
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify({ collectionId, query, hits: res.hits }, null, 2) }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            { collectionId, ...(visibility === 'private' ? { visibility: 'private' as const } : {}), query, hits: res.hits },
+            null,
+            2,
+          ),
+        },
+      ],
     };
   }
 
@@ -2188,6 +2298,21 @@ async function handleToolCallInner(
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'catalog_not_configured' }) }], isError: true };
     }
     const res = await deps.executeCatalog({ args, principal, userId });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'company' || name === 'salaries') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    const exec = name === 'company' ? deps.executeCompany : deps.executeSalaries;
+    if (!exec) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `${name}_not_configured` }) }], isError: true };
+    }
+    const res = await exec({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -2410,6 +2535,13 @@ async function handleToolCall(
   }
 }
 
+/** Caller identity for tool policy: the request's auth context, else derived from the dispatch userId. */
+function toolPolicyCaller(userId: string): AccessCallerContext {
+  const active = getActiveCallerAuthContext();
+  if (active && active.userId === userId) return { userId: active.userId, role: active.role };
+  return { userId, role: userId === 'owner' ? 'owner' : 'member' };
+}
+
 async function dispatchRpcMessage(
   msg: JsonRpcRequest,
   scopes: string[],
@@ -2567,7 +2699,12 @@ async function dispatchRpcMessage(
       return {
         body: jsonRpcResult(id, {
           ...modernMeta,
-          tools: buildToolDefinitions(deps),
+          tools: deps.accessPolicy
+            ? await filterToolDefinitions(toolPolicyCaller(userId), buildToolDefinitions(deps), {
+                store: deps.accessPolicy,
+                ...(deps.accessPolicyCacheKey !== undefined ? { cacheKey: deps.accessPolicyCacheKey } : {}),
+              })
+            : buildToolDefinitions(deps),
           ...(isModern ? { ttlMs: 300_000, cacheScope: 'private' as const } : {}),
         }),
       };
@@ -2580,6 +2717,37 @@ async function dispatchRpcMessage(
       if (!toolName) {
         await finishMcpTurn();
         return { body: jsonRpcError(id, -32602, 'Missing tool name') };
+      }
+      // Access policy gate. Unknown tool names fall through to the normal "Unknown tool" result.
+      if (deps.accessPolicy && buildToolDefinitions(deps).some((t) => t.name === toolName)) {
+        const policyCaller = toolPolicyCaller(userId);
+        let decision: { allowed: boolean; reason: string };
+        try {
+          decision = await evaluateToolAccess(policyCaller, toolName, {
+            store: deps.accessPolicy,
+            ...(deps.accessPolicyCacheKey !== undefined ? { cacheKey: deps.accessPolicyCacheKey } : {}),
+          });
+        } catch {
+          decision = policyCaller.role === 'owner' ? { allowed: true, reason: 'owner_bypass' } : { allowed: false, reason: 'policy_unavailable' };
+        }
+        if (!decision.allowed) {
+          await finishMcpTurn({
+            level: 'warn',
+            category: 'admin',
+            event: 'access_denied_tool',
+            summary: `Tool ${toolName} denied by access policy for ${policyCaller.userId}`,
+            details: { userId: policyCaller.userId, tool: toolName, reason: decision.reason, principal },
+          });
+          return {
+            status: 403,
+            body: jsonRpcError(id, -32003, `Tool ${toolName} is not permitted by the hub access policy.`, {
+              error: 'forbidden_by_policy',
+              status: 403,
+              tool: toolName,
+              reason: decision.reason,
+            }),
+          };
+        }
       }
       const activeTracer = deps.tracer ?? getActiveRequestTracer();
       const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps, userId);
@@ -2764,6 +2932,48 @@ export function isMcpRootRequest(request: Request, url: URL): boolean {
   return false;
 }
 
+function isMcpRpcRequestPrivate(req: unknown, callerUserId: string): boolean {
+  if (sanitizeStorageUserId(callerUserId) !== 'owner') return true;
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return false;
+  const r = req as Record<string, unknown>;
+  const params =
+    r.params && typeof r.params === 'object' && !Array.isArray(r.params)
+      ? (r.params as Record<string, unknown>)
+      : null;
+  const args =
+    params?.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
+      ? params.arguments
+      : null;
+  return args ? isPrivateRequestPayload(args, callerUserId) : false;
+}
+
+function isMcpRpcResponsePrivate(body: Record<string, unknown>): boolean {
+  const res =
+    body.result && typeof body.result === 'object' && !Array.isArray(body.result)
+      ? (body.result as Record<string, unknown>)
+      : null;
+  if (!res) return false;
+  if (res.visibility === 'private') return true;
+  const sc =
+    res.structuredContent && typeof res.structuredContent === 'object' && !Array.isArray(res.structuredContent)
+      ? (res.structuredContent as Record<string, unknown>)
+      : null;
+  if (sc?.visibility === 'private') return true;
+  const content = Array.isArray(res.content) ? res.content : null;
+  if (content && content[0] && typeof content[0] === 'object') {
+    const txt = (content[0] as { text?: unknown }).text;
+    if (typeof txt === 'string' && txt.includes('"visibility"')) {
+      try {
+        const parsedTxt = JSON.parse(txt) as { visibility?: unknown };
+        if (parsedTxt?.visibility === 'private') return true;
+      } catch {
+        // ignore non-JSON tool output
+      }
+    }
+  }
+  return false;
+}
+
 export async function handleMcpRequest(request: Request, url: URL, deps: McpServerDeps): Promise<Response> {
   const origin = url.origin;
   const resolvedDeps: McpServerDeps = deps.selfHost ? deps : { ...deps, selfHost: url.hostname };
@@ -2797,6 +3007,10 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     );
   }
 
+  const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+  const isCallerPrivate = sanitizeStorageUserId(callerUserId) !== 'owner';
+  const callerCacheControl = isCallerPrivate ? 'private, no-store' : 'no-store';
+
   if (request.method === 'DELETE') {
     return new Response(null, { status: 204, headers: cors });
   }
@@ -2811,9 +3025,15 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
   const cappedBody = await readBodyTextCapped(request, Math.min(MAX_MCP_REQUEST_BYTES, MAX_MCP_REQUEST_BYTES));
   if (!cappedBody.ok) {
     if (cappedBody.error === 'too_large') {
-      return Response.json(jsonRpcError(null, -32600, 'MCP payload exceeds 256 KiB'), { status: 413, headers: cors });
+      return Response.json(jsonRpcError(null, -32600, 'MCP payload exceeds 256 KiB'), {
+        status: 413,
+        headers: { 'cache-control': callerCacheControl, ...cors },
+      });
     }
-    return Response.json(jsonRpcError(null, -32700, 'Parse error'), { status: 400, headers: cors });
+    return Response.json(jsonRpcError(null, -32700, 'Parse error'), {
+      status: 400,
+      headers: { 'cache-control': callerCacheControl, ...cors },
+    });
   }
   const rawText = cappedBody.text;
 
@@ -2821,18 +3041,25 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
   try {
     parsed = JSON.parse(rawText);
   } catch {
-    return Response.json(jsonRpcError(null, -32700, 'Parse error'), { status: 400, headers: cors });
+    return Response.json(jsonRpcError(null, -32700, 'Parse error'), {
+      status: 400,
+      headers: { 'cache-control': callerCacheControl, ...cors },
+    });
   }
 
   const userAgent = request.headers.get('user-agent') ?? 'mcp-client';
-  const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
 
   if (Array.isArray(parsed)) {
     if (parsed.length === 0 || parsed.length > 20) {
-      return Response.json(jsonRpcError(null, -32600, 'Invalid batch length'), { status: 400, headers: cors });
+      return Response.json(jsonRpcError(null, -32600, 'Invalid batch length'), {
+        status: 400,
+        headers: { 'cache-control': callerCacheControl, ...cors },
+      });
     }
+    let isPrivateBatchHttp = isCallerPrivate;
     const replies: Array<Record<string, unknown>> = [];
     for (const item of parsed) {
+      if (isMcpRpcRequestPrivate(item, callerUserId)) isPrivateBatchHttp = true;
       const out = await dispatchRpcMessage(
         (item ?? {}) as JsonRpcRequest,
         auth.scopes,
@@ -2842,21 +3069,29 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
         false,
         callerUserId,
       );
-      if (out) replies.push(out.body);
+      if (out) {
+        if (isMcpRpcResponsePrivate(out.body)) isPrivateBatchHttp = true;
+        replies.push(out.body);
+      }
     }
     if (replies.length === 0) return new Response(null, { status: 202, headers: cors });
     return Response.json(replies, {
       status: 200,
-      headers: { 'cache-control': 'no-store', 'mcp-protocol-version': DEFAULT_PROTOCOL_VERSION, ...cors },
+      headers: {
+        'cache-control': isPrivateBatchHttp ? 'private, no-store' : 'no-store',
+        'mcp-protocol-version': DEFAULT_PROTOCOL_VERSION,
+        ...cors,
+      },
     });
   }
 
   const msg = (parsed ?? {}) as JsonRpcRequest;
+  let isPrivateMcpHttp = isCallerPrivate || isMcpRpcRequestPrivate(msg, callerUserId);
   const era = validateRequestEra(request, msg);
   if (!era.ok) {
     return Response.json(era.body, {
       status: era.status,
-      headers: { 'cache-control': 'no-store', ...cors },
+      headers: { 'cache-control': isPrivateMcpHttp ? 'private, no-store' : 'no-store', ...cors },
     });
   }
 
@@ -2868,7 +3103,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
       return Response.json(jsonRpcError(msg.id ?? null, -32001, `Insufficient OAuth scope: ${needed} is required.`), {
         status: 403,
         headers: {
-          'cache-control': 'no-store',
+          'cache-control': isPrivateMcpHttp ? 'private, no-store' : 'no-store',
           'www-authenticate': wwwAuth,
           ...cors,
         },
@@ -2880,6 +3115,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
   if (!single) {
     return new Response(null, { status: 202, headers: cors });
   }
+  if (isMcpRpcResponsePrivate(single.body)) isPrivateMcpHttp = true;
   if (single.sseLeading) {
     // SSE response stream: the leading notifications (e.g. `notifications/subscriptions/acknowledged`), then the final
     // JSON-RPC response, which ends the stream.
@@ -2888,7 +3124,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
       status: 200,
       headers: {
         'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-store',
+        'cache-control': isPrivateMcpHttp ? 'private, no-store' : 'no-store',
         'x-accel-buffering': 'no',
         'mcp-protocol-version': era.negotiatedVersion,
         ...cors,
@@ -2897,6 +3133,10 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
   }
   return Response.json(single.body, {
     status: single.status ?? 200,
-    headers: { 'cache-control': 'no-store', 'mcp-protocol-version': era.negotiatedVersion, ...cors },
+    headers: {
+      'cache-control': isPrivateMcpHttp ? 'private, no-store' : 'no-store',
+      'mcp-protocol-version': era.negotiatedVersion,
+      ...cors,
+    },
   });
 }

@@ -56,15 +56,23 @@ export async function readBodyTextCapped(
       if (value && value.byteLength > 0) {
         total += value.byteLength;
         if (total > maxBytes) {
-          await reader.cancel('body exceeds maxBytes').catch(() => undefined);
+          // Do not await reader.cancel(): cancelling one branch of a WHATWG ReadableStreamTee
+          // (e.g., request.clone()) waits indefinitely on the unconsumed sibling branch in Node.js.
+          void reader.cancel('body exceeds maxBytes').catch(() => undefined);
           return { ok: false, error: 'too_large' };
         }
         chunks.push(value);
       }
     }
   } catch {
-    await reader.cancel().catch(() => undefined);
+    void reader.cancel().catch(() => undefined);
     return { ok: false, error: 'read_error' };
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
   }
 
   if (chunks.length === 0) return { ok: true, text: '', byteLength: 0 };

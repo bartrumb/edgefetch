@@ -12,7 +12,25 @@
  *  4. Interactive URL Crawl & Tuning Runner with visual DNS / TCP / TLS / TTFB waterfall bar.
  *  5. Remote Site 429 Cooldowns + Active MCP Client Connections (both OAuth 2.1 grants and Bearer clients).
  */
-import type { HubEventRecord, McpClientActivity } from './activity-log';
+import type { HubEventInput, HubEventRecord, McpClientActivity } from './activity-log';
+import {
+  buildAccessPolicyAuditEvent,
+  deleteAccessPolicyRule,
+  deleteMcpServerShare,
+  listAccessPolicyRules,
+  listMcpServerShares,
+  putAccessPolicyRule,
+  putMcpServerShare,
+  type AccessPolicyStore,
+} from './access-policy';
+import {
+  buildHubSecretAuditEvent,
+  deleteHubSecret,
+  listHubSecretStatus,
+  setHubSecret,
+  type HubSecretsStore,
+} from './hub-secrets';
+import { MCP_TOOL_SCHEMAS } from './mcp';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
 import type { DevTelemetrySettingsView } from './dev-telemetry';
@@ -104,11 +122,61 @@ function safeJsonForInlineScript(val: unknown): string {
     .replace(/\u2029/g, '\\u2029');
 }
 
+async function readAdminJsonObject(
+  request: Request,
+  maxBytes = 16_384,
+): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; status: number; error: string }> {
+  const capped = await readBodyTextCapped(request, maxBytes);
+  if (!capped.ok) return { ok: false, status: capped.error === 'too_large' ? 413 : 400, error: 'payload_too_large' };
+  try {
+    const parsed = JSON.parse(capped.text || '{}') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, status: 400, error: 'bad_json' };
+    return { ok: true, value: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false, status: 400, error: 'invalid_json' };
+  }
+}
+
 function adminJson(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: ADMIN_JSON_HEADERS });
 }
 
+/** /v1 routes offered in the access-policy resource picker (UI hint only; any valid /v1 path is accepted). */
+const ADMIN_POLICY_ROUTE_HINTS = [
+  '/v1/*',
+  '/v1/scrape',
+  '/v1/search',
+  '/v1/extract',
+  '/v1/interact',
+  '/v1/map',
+  '/v1/crawl*',
+  '/v1/crawl/params-preview',
+  '/v1/batch/scrape*',
+  '/v1/agent*',
+  '/v1/jobs',
+  '/v1/company',
+  '/v1/salaries',
+  '/v1/catalog*',
+  '/v1/collections/*',
+  '/v1/artifacts/*',
+  '/v1/ingest-tab',
+  '/v1/mcp/query',
+  '/v1/mcp/registry',
+  '/v1/mcp/shared',
+  '/v1/capabilities',
+  '/v1/extractors',
+  '/v1/hosts*',
+] as const;
+
 export interface AdminPortalDeps {
+  /** `hub_secrets` store (AgentHubDO stub). Absent = secrets API returns 501. */
+  hubSecretsStore?: HubSecretsStore;
+  /** The DEPLOYMENT env (before the hub_secrets overlay) for secret status (`env` vs `override` vs `unset`). */
+  secretsEnv?: Record<string, unknown>;
+  /** `access_policies` + `mcp_server_shares` store (AgentHubDO stub). Absent = policy API returns 501. */
+  accessPolicyStore?: AccessPolicyStore;
+  /** Activity-log sink for `admin` category audit events (never carries secret values). */
+  recordAdminEvent?: (ev: HubEventInput) => Promise<void> | void;
   serviceName: string;
   mcpSlug: string;
   sampleUrl?: string;
@@ -535,6 +603,7 @@ function renderDashboardHtml(params: {
           <button type="button" class="primary" id="custom-mcp-btn" style="padding:4px 11px;font-size:0.78rem">+ Connect Custom HTTPS MCP</button>
         </span>
       </h2>
+      <p class="muted" style="margin:0 0 8px" id="mcp-gmaps-hint">Tip: search the registry for <strong>google maps</strong> to connect Google's hosted Maps MCP (preset slug <code>google-maps</code>). Paste your Google Maps Platform key into the <code>X-Goog-Api-Key</code> field; the <code>company</code> tool then adds place details. Share it below so members can use it without seeing the key.</p>
       <p class="muted" style="margin:0 0 12px">Connect downstream Streamable HTTP / SSE MCP servers once in your per-user <code>AES-256-GCM</code> vault. EdgeFetch routes matching domains and <code>query_mcp</code> calls agent-to-agent with zero prompt schema bloat.</p>
 
       <div style="margin-bottom:14px">
@@ -609,6 +678,65 @@ function renderDashboardHtml(params: {
         <button type="button" class="primary" id="mcp-reg-search-btn">Search Registry</button>
       </div>
       <div id="mcp-reg-grid" class="grid-3"><div class="muted">Click "Search Registry" to browse live remote MCP connectors from registry.modelcontextprotocol.io and glama.ai.</div></div>
+    </section>
+
+    <section class="card" id="secrets-card" style="display:none">
+      <h2>
+        <span>Secrets &amp; Provider Keys</span>
+        <button type="button" id="secrets-refresh-btn" style="padding:4px 11px;font-size:0.78rem">Refresh</button>
+      </h2>
+      <div id="secrets-vault-banner" style="display:none;margin-bottom:12px;padding:10px 12px;background:#78350f;border:1px solid #d97706;border-radius:8px;color:#fde68a;font-size:0.85rem">VAULT_MASTER_KEY is not configured: overrides can't be saved or applied until it is set via deployment (<code>wrangler secret put VAULT_MASTER_KEY</code>).</div>
+      <p class="muted" style="margin:0 0 12px">Overrides are sealed with <code>AES-256-GCM</code> (bound to each secret's name) and win over deployment env within ~30&nbsp;s. Secret values are never shown again, only a fingerprint (first 8 hex of SHA-256). Plain-config values (provider ids, base URLs, model names) are shown in full. Bootstrap secrets are read-only here; set them via deployment.</p>
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>Source</th><th>Fingerprint / value</th><th>Updated</th><th>Set / rotate</th></tr></thead>
+        <tbody id="secrets-tbody"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody>
+      </table>
+      <div id="secrets-status" class="muted" style="margin-top:8px"></div>
+    </section>
+
+    <section class="card" id="policy-card" style="display:none">
+      <h2><span>Access Policy (<span id="policy-count">0</span> rules)</span></h2>
+      <p class="muted" style="margin:0 0 12px">Defaults: every MCP tool and <code>/v1</code> route is <strong>allowed</strong>; other users' MCP servers are <strong>denied</strong> unless shared. A rule for a specific user beats a global (<code>*</code>) rule, an exact resource beats a <code>*</code> prefix, and deny beats allow. Hub owners always bypass tool and route rules, so a rule can never lock the admin out.</p>
+      <form id="policy-form" class="form-grid" style="margin-bottom:12px">
+        <div>
+          <label for="pol-subject">Subject</label>
+          <select id="pol-subject"><option value="*">* (everyone)</option></select>
+        </div>
+        <div>
+          <label for="pol-resource">Resource</label>
+          <input id="pol-resource" type="text" list="pol-resource-list" required placeholder="tool:agent, route:/v1/agent*, mcp_server:gh_1/notes">
+          <datalist id="pol-resource-list"></datalist>
+        </div>
+        <div>
+          <label for="pol-effect">Effect</label>
+          <select id="pol-effect"><option value="deny">deny</option><option value="allow">allow</option></select>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:8px">
+          <button type="submit" class="primary" id="pol-add-btn">Add rule</button>
+          <span id="policy-status" class="muted"></span>
+        </div>
+      </form>
+      <table>
+        <thead><tr><th>Subject</th><th>Resource</th><th>Effect</th><th>Updated</th><th>Actions</th></tr></thead>
+        <tbody id="policy-tbody"><tr><td colspan="5" class="muted">No rules: defaults apply.</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card" id="sharing-card">
+      <h2><span>MCP Server Sharing</span></h2>
+      <p class="muted" style="margin:0 0 12px">Share your connected MCP servers with everyone or specific hub users. Credentials stay sealed in your vault: others see only the server's name, slug, and tools, and call it through the hub as <code>&lt;yourUserId&gt;/&lt;slug&gt;</code>.</p>
+      <table>
+        <thead><tr><th>Your server</th><th>Shared with</th><th>Share</th></tr></thead>
+        <tbody id="sharing-tbody"><tr><td colspan="3" class="muted">No connected servers to share.</td></tr></tbody>
+      </table>
+      <div id="sharing-all-wrap" style="display:none;margin-top:12px">
+        <div class="muted" style="margin-bottom:6px">All shares on this hub (owner view):</div>
+        <table>
+          <thead><tr><th>Owner</th><th>Server</th><th>Subject</th><th>Actions</th></tr></thead>
+          <tbody id="sharing-all-tbody"></tbody>
+        </table>
+      </div>
+      <div id="sharing-status" class="muted" style="margin-top:8px"></div>
     </section>
 
     ${
@@ -975,6 +1103,7 @@ function renderDashboardHtml(params: {
       }
 
       renderMcpConnectors(data.mcpServers || [], Boolean(data.vaultConfigured));
+      loadPolicyCards(data);
       renderLogs();
     }
 
@@ -1222,6 +1351,202 @@ function renderDashboardHtml(params: {
       });
     });
 
+    let policyCardsLoaded = false;
+    async function adminApi(method, path, body) {
+      const init = { method, headers: { 'accept': 'application/json' } };
+      if (method !== 'GET') {
+        init.headers['content-type'] = 'application/json';
+        init.headers['x-csrf-token'] = CSRF;
+        init.body = JSON.stringify(body || {});
+      }
+      const res = await fetch(path, init);
+      let out = {};
+      try { out = await res.json(); } catch {}
+      return { status: res.status, out };
+    }
+
+    async function loadSecretsCard() {
+      const { status, out } = await adminApi('GET', '/admin/api/secrets');
+      const tbody = el('secrets-tbody');
+      if (status !== 200 || !out.ok) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">' + esc(out.error || ('HTTP ' + status)) + '</td></tr>';
+        return;
+      }
+      el('secrets-vault-banner').style.display = out.vaultConfigured ? 'none' : 'block';
+      const rows = Array.isArray(out.secrets) ? out.secrets : [];
+      tbody.innerHTML = rows.map((s) => {
+        const kind = !s.managed ? 'bootstrap' : (s.secret ? 'secret' : 'plain config');
+        const kindCls = !s.managed ? 'lvl-warn' : (s.secret ? 'lvl-info' : 'cat');
+        const shown = s.secret ? (s.fingerprint ? '<code>' + esc(s.fingerprint) + '</code>' : '<span class="muted">—</span>') : (s.value ? '<code>' + esc(s.value) + '</code>' : '<span class="muted">—</span>');
+        const updated = s.updatedAt ? esc(relTime(s.updatedAt)) + (s.updatedBy ? ' <span class="muted">by ' + esc(s.updatedBy) + '</span>' : '') : '<span class="muted">—</span>';
+        let action = '<span class="muted">set via deployment</span>';
+        if (s.managed) {
+          action = '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+            '<input type="' + (s.secret ? 'password' : 'text') + '" autocomplete="new-password" data-secret-input="' + esc(s.name) + '" placeholder="' + (s.source === 'unset' ? 'Set value' : 'New value') + '" style="min-width:180px">' +
+            '<button type="button" class="primary" data-secret-save="' + esc(s.name) + '" style="padding:4px 8px;font-size:0.75rem"' + (out.vaultConfigured ? '' : ' disabled') + '>Save</button>' +
+            (s.source === 'override' ? '<button type="button" class="danger" data-secret-clear="' + esc(s.name) + '"' + (out.vaultConfigured ? '' : ' disabled') + '>Clear override</button>' : '') +
+            '</div>';
+        }
+        return '<tr>' +
+          '<td><code>' + esc(s.name) + '</code></td>' +
+          '<td><span class="badge ' + kindCls + '">' + esc(kind) + '</span></td>' +
+          '<td>' + esc(s.source) + '</td>' +
+          '<td>' + shown + '</td>' +
+          '<td>' + updated + '</td>' +
+          '<td>' + action + '</td>' +
+        '</tr>';
+      }).join('') || '<tr><td colspan="6" class="muted">No secrets reported.</td></tr>';
+    }
+
+    el('secrets-tbody').addEventListener('click', async (ev) => {
+      const saveBtn = ev.target.closest('[data-secret-save]');
+      const clearBtn = ev.target.closest('[data-secret-clear]');
+      if (saveBtn) {
+        const name = saveBtn.getAttribute('data-secret-save');
+        const inp = document.querySelector('[data-secret-input="' + CSS.escape(name) + '"]');
+        const value = inp ? inp.value : '';
+        if (!value.trim()) { el('secrets-status').textContent = 'Enter a value for ' + name + ' first.'; return; }
+        const { out } = await adminApi('POST', '/admin/api/secrets', { name, value });
+        if (inp) inp.value = '';
+        el('secrets-status').textContent = out.ok ? (name + ' saved (fingerprint ' + out.fingerprint + ').') : ('Error: ' + (out.message || out.error));
+        loadSecretsCard();
+      } else if (clearBtn) {
+        const name = clearBtn.getAttribute('data-secret-clear');
+        if (!confirm('Clear the override for ' + name + '? The deployment env value (if any) applies again.')) return;
+        const { out } = await adminApi('DELETE', '/admin/api/secrets/' + encodeURIComponent(name));
+        el('secrets-status').textContent = out.ok ? (name + ' override cleared.') : ('Error: ' + (out.message || out.error));
+        loadSecretsCard();
+      }
+    });
+    el('secrets-refresh-btn').addEventListener('click', () => loadSecretsCard());
+
+    async function loadPolicyCard() {
+      const { status, out } = await adminApi('GET', '/admin/api/policies');
+      const tbody = el('policy-tbody');
+      if (status !== 200 || !out.ok) {
+        tbody.innerHTML = '<tr><td colspan="5" class="muted">' + esc(out.error || ('HTTP ' + status)) + '</td></tr>';
+        return;
+      }
+      const users = (lastStateData && Array.isArray(lastStateData.users)) ? lastStateData.users : [];
+      const subjSel = el('pol-subject');
+      const current = subjSel.value;
+      subjSel.innerHTML = '<option value="*">* (everyone)</option>' + users.map((u) =>
+        '<option value="' + esc(u.userId) + '">' + esc(u.githubLogin ? '@' + u.githubLogin + ' (' + u.userId + ')' : u.userId) + '</option>').join('');
+      if (current) subjSel.value = current;
+      const opts = [];
+      (out.toolNames || []).forEach((t) => opts.push('tool:' + t));
+      opts.push('tool:*');
+      (out.routeHints || []).forEach((r) => opts.push('route:' + r));
+      el('pol-resource-list').innerHTML = opts.map((o) => '<option value="' + esc(o) + '"></option>').join('');
+      const rules = Array.isArray(out.rules) ? out.rules : [];
+      el('policy-count').textContent = rules.length;
+      tbody.innerHTML = rules.length ? rules.map((r) =>
+        '<tr>' +
+          '<td><code>' + esc(r.subject) + '</code></td>' +
+          '<td><code>' + esc(r.resource) + '</code></td>' +
+          '<td><span class="badge ' + (r.effect === 'deny' ? 'lvl-error' : 'lvl-info') + '">' + esc(r.effect) + '</span></td>' +
+          '<td>' + esc(relTime(r.updatedAt)) + ' <span class="muted">by ' + esc(r.updatedBy) + '</span></td>' +
+          '<td><button type="button" class="danger" data-policy-del-subject="' + esc(r.subject) + '" data-policy-del-resource="' + esc(r.resource) + '">Delete</button></td>' +
+        '</tr>').join('') : '<tr><td colspan="5" class="muted">No rules: defaults apply.</td></tr>';
+    }
+
+    el('policy-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const { out } = await adminApi('POST', '/admin/api/policies', {
+        subject: el('pol-subject').value,
+        resource: el('pol-resource').value.trim(),
+        effect: el('pol-effect').value,
+      });
+      el('policy-status').textContent = out.ok ? 'Rule saved.' : ('Error: ' + (out.message || out.error));
+      if (out.ok) el('pol-resource').value = '';
+      loadPolicyCard();
+    });
+    el('policy-tbody').addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('[data-policy-del-subject]');
+      if (!btn) return;
+      const { out } = await adminApi('DELETE', '/admin/api/policies', {
+        subject: btn.getAttribute('data-policy-del-subject'),
+        resource: btn.getAttribute('data-policy-del-resource'),
+      });
+      el('policy-status').textContent = out.ok ? 'Rule deleted.' : ('Error: ' + (out.message || out.error));
+      loadPolicyCard();
+    });
+
+    async function loadSharingCard() {
+      const { status, out } = await adminApi('GET', '/admin/api/mcp/shares');
+      const tbody = el('sharing-tbody');
+      if (status !== 200 || !out.ok) {
+        tbody.innerHTML = '<tr><td colspan="3" class="muted">' + esc(out.error || ('HTTP ' + status)) + '</td></tr>';
+        return;
+      }
+      const servers = Array.isArray(out.servers) ? out.servers : [];
+      const shares = Array.isArray(out.shares) ? out.shares : [];
+      tbody.innerHTML = servers.length ? servers.map((srv) => {
+        const mine = shares.filter((sh) => sh.slug === srv.slug);
+        const chips = mine.length ? mine.map((sh) =>
+          '<span class="chip"><code>' + esc(sh.subject === '*' ? 'everyone' : sh.subject) + '</code> ' +
+          '<button type="button" class="danger" data-share-del-slug="' + esc(srv.slug) + '" data-share-del-subject="' + esc(sh.subject) + '" style="padding:1px 6px;font-size:0.7rem">Unshare</button></span>').join(' ') : '<span class="muted">not shared</span>';
+        return '<tr>' +
+          '<td><strong>' + esc(srv.name) + '</strong> <span class="muted"><code>' + esc(srv.slug) + '</code></span></td>' +
+          '<td>' + chips + '</td>' +
+          '<td style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+            '<button type="button" data-share-everyone="' + esc(srv.slug) + '" style="padding:4px 8px;font-size:0.75rem">Share with everyone</button>' +
+            '<input type="text" data-share-user-input="' + esc(srv.slug) + '" placeholder="user id (e.g. gh_123)" style="min-width:140px">' +
+            '<button type="button" class="primary" data-share-user="' + esc(srv.slug) + '" style="padding:4px 8px;font-size:0.75rem">Share</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('') : '<tr><td colspan="3" class="muted">No connected servers to share.</td></tr>';
+      const allWrap = el('sharing-all-wrap');
+      if (Array.isArray(out.allShares)) {
+        allWrap.style.display = 'block';
+        el('sharing-all-tbody').innerHTML = out.allShares.length ? out.allShares.map((sh) =>
+          '<tr><td><code>' + esc(sh.ownerUserId) + '</code></td><td><code>' + esc(sh.slug) + '</code></td><td><code>' + esc(sh.subject) + '</code></td>' +
+          '<td><button type="button" class="danger" data-share-del-owner="' + esc(sh.ownerUserId) + '" data-share-del-slug="' + esc(sh.slug) + '" data-share-del-subject="' + esc(sh.subject) + '">Remove</button></td></tr>').join('')
+          : '<tr><td colspan="4" class="muted">No shares yet.</td></tr>';
+      } else {
+        allWrap.style.display = 'none';
+      }
+    }
+
+    async function onSharingClick(ev) {
+      const everyone = ev.target.closest('[data-share-everyone]');
+      const userBtn = ev.target.closest('[data-share-user]');
+      const delBtn = ev.target.closest('[data-share-del-slug]');
+      let res = null;
+      if (everyone) {
+        res = await adminApi('POST', '/admin/api/mcp/shares', { slug: everyone.getAttribute('data-share-everyone'), subject: '*' });
+      } else if (userBtn) {
+        const slug = userBtn.getAttribute('data-share-user');
+        const inp = document.querySelector('[data-share-user-input="' + CSS.escape(slug) + '"]');
+        const subject = inp ? inp.value.trim() : '';
+        if (!subject) { el('sharing-status').textContent = 'Enter a user id to share with.'; return; }
+        res = await adminApi('POST', '/admin/api/mcp/shares', { slug, subject });
+      } else if (delBtn) {
+        const body = { slug: delBtn.getAttribute('data-share-del-slug'), subject: delBtn.getAttribute('data-share-del-subject') };
+        const owner = delBtn.getAttribute('data-share-del-owner');
+        if (owner) body.ownerUserId = owner;
+        res = await adminApi('DELETE', '/admin/api/mcp/shares', body);
+      }
+      if (!res) return;
+      el('sharing-status').textContent = res.out.ok ? 'Sharing updated.' : ('Error: ' + (res.out.message || res.out.error));
+      loadSharingCard();
+    }
+    el('sharing-tbody').addEventListener('click', onSharingClick);
+    el('sharing-all-tbody').addEventListener('click', onSharingClick);
+
+    function loadPolicyCards(data) {
+      if (policyCardsLoaded) return;
+      policyCardsLoaded = true;
+      const isOwner = Boolean(data && data.viewer && data.viewer.role === 'owner');
+      el('secrets-card').style.display = isOwner ? 'block' : 'none';
+      el('policy-card').style.display = isOwner ? 'block' : 'none';
+      if (isOwner) {
+        loadSecretsCard();
+        loadPolicyCard();
+      }
+      loadSharingCard();
+    }
+
     async function loadState() {
       const res = await fetch('/admin/api/state', { headers: { 'accept': 'application/json' } });
       if (res.status === 401) { location.reload(); return; }
@@ -1453,7 +1778,13 @@ async function withAdminAuditSpan<T>(
     | 'mcp_connect'
     | 'mcp_disconnect'
     | 'mcp_test'
-    | 'mcp_oauth',
+    | 'mcp_oauth'
+    | 'secret_set'
+    | 'secret_delete'
+    | 'policy_set'
+    | 'policy_delete'
+    | 'share_set'
+    | 'share_delete',
   fn: (span: AdminAuditSpan) => Promise<T>,
 ): Promise<T> {
   const tracer = getActiveRequestTracer();
@@ -1761,7 +2092,19 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
                         ? ('mcp_test' as const)
                         : path === '/admin/mcp/oauth/start'
                           ? ('mcp_oauth' as const)
-                          : null
+                          : path === '/admin/api/secrets' || path.startsWith('/admin/api/secrets/')
+                            ? request.method === 'DELETE'
+                              ? ('secret_delete' as const)
+                              : ('secret_set' as const)
+                            : path === '/admin/api/policies'
+                              ? request.method === 'DELETE'
+                                ? ('policy_delete' as const)
+                                : ('policy_set' as const)
+                              : path === '/admin/api/mcp/shares'
+                                ? request.method === 'DELETE'
+                                  ? ('share_delete' as const)
+                                  : ('share_set' as const)
+                                : null
       : null;
 
   if (!session.ok) {
@@ -1920,6 +2263,45 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     );
   }
 
+  if (path === '/admin/api/secrets' && request.method === 'GET') {
+    if (session.role !== 'owner') return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+    if (!deps.hubSecretsStore) return adminJson({ ok: false, error: 'hub_secrets_unavailable' }, 501);
+    const secrets = await listHubSecretStatus(deps.secretsEnv ?? {}, deps.hubSecretsStore, {
+      ...(deps.vaultMasterKey !== undefined ? { vaultMasterKey: deps.vaultMasterKey } : {}),
+    });
+    return adminJson({ ok: true, vaultConfigured: validateVaultMasterKey(deps.vaultMasterKey).ok, secrets }, 200);
+  }
+
+  if (path === '/admin/api/policies' && request.method === 'GET') {
+    if (session.role !== 'owner') return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+    if (!deps.accessPolicyStore) return adminJson({ ok: false, error: 'access_policy_unavailable' }, 501);
+    const rules = await listAccessPolicyRules(deps.accessPolicyStore);
+    return adminJson(
+      {
+        ok: true,
+        rules,
+        toolNames: Object.keys(MCP_TOOL_SCHEMAS).sort(),
+        routeHints: [...ADMIN_POLICY_ROUTE_HINTS],
+        defaults: { tool: 'allow', route: 'allow', mcp_server: 'deny' },
+        ownerBypass: true,
+      },
+      200,
+    );
+  }
+
+  if (path === '/admin/api/mcp/shares' && request.method === 'GET') {
+    if (!deps.accessPolicyStore) return adminJson({ ok: false, error: 'access_policy_unavailable' }, 501);
+    const all = await listMcpServerShares(deps.accessPolicyStore);
+    const own = all.filter((s) => s.ownerUserId === userId);
+    const servers = deps.vaultStore
+      ? (await deps.vaultStore.listServers(userId)).map((r) => ({ slug: r.slug, name: r.name, enabled: r.enabled }))
+      : [];
+    return adminJson(
+      { ok: true, userId, servers, shares: own, ...(session.role === 'owner' ? { allShares: all } : {}) },
+      200,
+    );
+  }
+
   if (path === '/admin/mcp/oauth/start' && request.method === 'GET') {
     return withAdminAuditSpan('mcp_oauth', async () => {
       const qCsrf = url.searchParams.get('csrf') ?? '';
@@ -2065,11 +2447,18 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { grantId?: string } = {};
         if (capped.text.trim()) {
+          let parsed: unknown;
           try {
-            body = JSON.parse(capped.text) as { grantId?: string };
+            parsed = JSON.parse(capped.text);
           } catch {
-            body = {};
+            parsed = {};
           }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as { grantId?: string };
         }
         if (!body.grantId || typeof body.grantId !== 'string') {
           span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
@@ -2095,7 +2484,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       if (!capped.ok) return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
       let body: { remoteUrl?: unknown; confirmedAuthOrigin?: unknown } = {};
       try {
-        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown; confirmedAuthOrigin?: unknown };
+        const parsed = JSON.parse(capped.text || '{}') as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return adminJson({ ok: false, error: 'bad_json' }, 400);
+        }
+        body = parsed as { remoteUrl?: unknown; confirmedAuthOrigin?: unknown };
       } catch {
         return adminJson({ error: 'invalid_json' }, 400);
       }
@@ -2121,7 +2514,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: Record<string, unknown> = {};
         try {
-          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as Record<string, unknown>;
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
@@ -2181,7 +2578,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: Record<string, unknown> = {};
         try {
-          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as Record<string, unknown>;
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
@@ -2296,7 +2697,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: Record<string, unknown> = {};
         try {
-          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as Record<string, unknown>;
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
@@ -2428,7 +2833,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
         let body: { slug?: unknown } = {};
         try {
-          body = JSON.parse(capped.text || '{}') as { slug?: unknown };
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as { slug?: unknown };
         } catch {
           return adminJson({ error: 'invalid_json' }, 400);
         }
@@ -2436,6 +2845,59 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!slug) return adminJson({ ok: false, error: 'missing_slug' }, 400);
         const deleted = await deps.vaultStore.deleteServer(userId, slug);
         return adminJson({ ok: true, deleted }, 200);
+      });
+    }
+
+    if (path === '/admin/api/mcp/shares' && (request.method === 'POST' || request.method === 'DELETE')) {
+      const isDelete = request.method === 'DELETE';
+      return withAdminAuditSpan(isDelete ? 'share_delete' : 'share_set', async (span) => {
+        span.setAttribute('admin.user_id', session.userId);
+        if (!deps.accessPolicyStore) {
+          span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+          span.setStatus(false, 'unsupported');
+          return adminJson({ ok: false, error: 'access_policy_unavailable' }, 501);
+        }
+        const body = await readAdminJsonObject(request);
+        if (!body.ok) {
+          span.setAttributes({ 'admin.outcome': body.error, 'http.response.status_code': body.status });
+          span.setStatus(false, body.error);
+          return adminJson({ ok: false, error: body.error }, body.status);
+        }
+        const requestedOwner = typeof body.value.ownerUserId === 'string' ? body.value.ownerUserId.trim() : '';
+        // Members may only share/unshare their OWN servers; hub owners may manage any user's shares.
+        if (session.role !== 'owner' && requestedOwner && requestedOwner !== userId) {
+          span.setAttributes({ 'admin.outcome': 'forbidden_role', 'http.response.status_code': 403 });
+          span.setStatus(false, 'forbidden_role');
+          return adminJson({ ok: false, error: 'forbidden_role', message: 'Members can only share their own MCP servers.' }, 403);
+        }
+        const ownerUserId = session.role === 'owner' && requestedOwner ? requestedOwner : userId;
+        const slug = typeof body.value.slug === 'string' ? body.value.slug : '';
+        const subject = typeof body.value.subject === 'string' ? body.value.subject : '';
+        const out = isDelete
+          ? await deleteMcpServerShare({ store: deps.accessPolicyStore, ownerUserId, slug, subject })
+          : await putMcpServerShare({
+              store: deps.accessPolicyStore,
+              ...(deps.vaultStore ? { vaultStore: deps.vaultStore } : {}),
+              ownerUserId,
+              slug,
+              subject,
+            });
+        if (!out.ok) {
+          span.setAttributes({ 'admin.outcome': out.error, 'http.response.status_code': out.status });
+          span.setStatus(false, out.error);
+          return adminJson(out, out.status);
+        }
+        span.setAttributes({ 'admin.outcome': 'ok', 'admin.share_owner': ownerUserId, 'http.response.status_code': 200 });
+        await deps.recordAdminEvent?.(
+          buildAccessPolicyAuditEvent({
+            action: isDelete ? 'share_delete' : 'share_set',
+            actorUserId: session.userId,
+            subject,
+            ownerUserId,
+            slug,
+          }),
+        );
+        return adminJson(out, 200);
       });
     }
 
@@ -2453,6 +2915,107 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         });
       }
       return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+    }
+
+    const secretPathMatch = /^\/admin\/api\/secrets(?:\/([A-Za-z0-9_]{1,64}))?$/.exec(path);
+    if (secretPathMatch && (request.method === 'POST' || request.method === 'DELETE')) {
+      const isDelete = request.method === 'DELETE';
+      return withAdminAuditSpan(isDelete ? 'secret_delete' : 'secret_set', async (span) => {
+        span.setAttribute('admin.user_id', session.userId);
+        if (!deps.hubSecretsStore) {
+          span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+          span.setStatus(false, 'unsupported');
+          return adminJson({ ok: false, error: 'hub_secrets_unavailable' }, 501);
+        }
+        let name = secretPathMatch[1] ?? '';
+        let value = '';
+        if (!isDelete || !name) {
+          const body = await readAdminJsonObject(request, 16_384);
+          if (!body.ok) {
+            span.setAttributes({ 'admin.outcome': body.error, 'http.response.status_code': body.status });
+            span.setStatus(false, body.error);
+            return adminJson({ ok: false, error: body.error }, body.status);
+          }
+          if (!name && typeof body.value.name === 'string') name = body.value.name.trim();
+          value = typeof body.value.value === 'string' ? body.value.value : '';
+        }
+        const safeName = name.replace(/[^A-Za-z0-9_]/g, '').slice(0, 64);
+        span.setAttribute('admin.setting_name', safeName);
+        const out = isDelete
+          ? await deleteHubSecret({ store: deps.hubSecretsStore, vaultMasterKey: deps.vaultMasterKey, name })
+          : await setHubSecret({ store: deps.hubSecretsStore, vaultMasterKey: deps.vaultMasterKey, name, value, actorUserId: session.userId });
+        // The submitted value is never echoed: responses carry name/fingerprint/metadata only.
+        value = '';
+        if (!out.ok) {
+          span.setAttributes({ 'admin.outcome': out.error, 'http.response.status_code': out.status });
+          span.setStatus(false, out.error);
+          await deps.recordAdminEvent?.(
+            buildHubSecretAuditEvent({ action: 'rejected', name: safeName, actorUserId: session.userId, error: out.error }),
+          );
+          return adminJson({ ok: false, error: out.error, message: out.message }, out.status);
+        }
+        span.setAttributes({ 'admin.outcome': 'ok', 'http.response.status_code': 200 });
+        await deps.recordAdminEvent?.(
+          buildHubSecretAuditEvent({
+            action: isDelete ? 'delete' : 'set',
+            name: out.name,
+            actorUserId: session.userId,
+            ...('fingerprint' in out ? { fingerprint: out.fingerprint } : {}),
+          }),
+        );
+        return adminJson(out, 200);
+      });
+    }
+
+    if (path === '/admin/api/policies' && (request.method === 'POST' || request.method === 'DELETE')) {
+      const isDelete = request.method === 'DELETE';
+      return withAdminAuditSpan(isDelete ? 'policy_delete' : 'policy_set', async (span) => {
+        span.setAttribute('admin.user_id', session.userId);
+        if (!deps.accessPolicyStore) {
+          span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+          span.setStatus(false, 'unsupported');
+          return adminJson({ ok: false, error: 'access_policy_unavailable' }, 501);
+        }
+        const body = await readAdminJsonObject(request);
+        if (!body.ok) {
+          span.setAttributes({ 'admin.outcome': body.error, 'http.response.status_code': body.status });
+          span.setStatus(false, body.error);
+          return adminJson({ ok: false, error: body.error }, body.status);
+        }
+        const subject = typeof body.value.subject === 'string' ? body.value.subject : '';
+        const resource = typeof body.value.resource === 'string' ? body.value.resource : '';
+        const effect = typeof body.value.effect === 'string' ? body.value.effect : '';
+        if (isDelete) {
+          const out = await deleteAccessPolicyRule({ store: deps.accessPolicyStore, subject, resource });
+          if (!out.ok) {
+            span.setAttributes({ 'admin.outcome': out.error, 'http.response.status_code': out.status });
+            span.setStatus(false, out.error);
+            return adminJson(out, out.status);
+          }
+          span.setAttributes({ 'admin.outcome': 'ok', 'http.response.status_code': 200 });
+          await deps.recordAdminEvent?.(
+            buildAccessPolicyAuditEvent({ action: 'rule_delete', actorUserId: session.userId, subject: out.subject, resource: out.resource }),
+          );
+          return adminJson(out, 200);
+        }
+        const out = await putAccessPolicyRule({ store: deps.accessPolicyStore, subject, resource, effect, actorUserId: session.userId });
+        if (!out.ok) {
+          span.setAttributes({ 'admin.outcome': out.error, 'http.response.status_code': out.status });
+          span.setStatus(false, out.error);
+          return adminJson(out, out.status);
+        }
+        span.setAttributes({ 'admin.outcome': 'ok', 'http.response.status_code': 200 });
+        await deps.recordAdminEvent?.(
+          buildAccessPolicyAuditEvent({
+            action: 'rule_set',
+            actorUserId: session.userId,
+            subject: out.rule.subject,
+            resource: out.rule.resource,
+            effect: out.rule.effect,
+          }),
+        );
+        return adminJson(out, 200);
+      });
     }
 
     const envOwnerId = (ghEnv.GITHUB_OWNER_ID ?? '').trim();
@@ -2545,7 +3108,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { userId?: string; role?: string; disabled?: boolean } = {};
         try {
-          body = JSON.parse(capped.text || '{}') as typeof body;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as typeof body;
         } catch {
           body = {};
         }
@@ -2671,7 +3240,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { userId?: string } = {};
         try {
-          body = JSON.parse(capped.text || '{}') as typeof body;
+          const parsed = JSON.parse(capped.text || '{}') as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ ok: false, error: 'bad_json' }, 400);
+          }
+          body = parsed as typeof body;
         } catch {
           body = {};
         }
@@ -2758,11 +3333,18 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { siteId?: string } = {};
         if (capped.text.trim()) {
+          let parsed: unknown;
           try {
-            body = JSON.parse(capped.text) as { siteId?: string };
+            parsed = JSON.parse(capped.text);
           } catch {
-            body = {};
+            parsed = {};
           }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as { siteId?: string };
         }
         await deps.clearAffinities(body.siteId);
         span.setAttributes({
@@ -2790,7 +3372,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         let body: { enabled?: unknown } = {};
         try {
-          body = JSON.parse(capped.text) as { enabled?: unknown };
+          const parsed = JSON.parse(capped.text) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as { enabled?: unknown };
         } catch {
           span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
           span.setStatus(false, 'invalid_json');
@@ -2858,13 +3446,20 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           includeBody?: boolean;
         } = {};
         if (capped.text.trim()) {
+          let parsed: unknown;
           try {
-            body = JSON.parse(capped.text) as typeof body;
+            parsed = JSON.parse(capped.text);
           } catch {
             span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
             span.setStatus(false, 'invalid_json');
             return adminJson({ error: 'invalid_json' }, 400);
           }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            span.setAttributes({ 'admin.outcome': 'bad_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'bad_json');
+            return adminJson({ error: 'bad_json' }, 400);
+          }
+          body = parsed as typeof body;
         }
         if (!body.url || typeof body.url !== 'string') {
           span.setAttributes({ 'admin.outcome': 'missing_url', 'http.response.status_code': 400 });

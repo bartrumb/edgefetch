@@ -85,6 +85,26 @@ routes:
     extract:
       commerceMode: shopify_product
 
+  # 4. *.myshopify.com collection pages (/collections/<handle>) -> /collections/<handle>/products.json?limit=50
+  - match:
+      hosts:
+        - "*.myshopify.com"
+      optionalLeadingLocale: true
+      exactSegments: true
+      pathSegments:
+        - collections
+        - param: handle
+          charset: slug
+          maxLen: 160
+    twin:
+      id: shopify
+      fetchUrl: "https://{host}/collections/{handle}/products.json?limit=50"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      commerceMode: shopify_catalog_page
+
 # Custom-domain post-fetch HTML product extractor (embedded JSON + Schema.org Product fallback)
 htmlRoutes:
   - id: shopify

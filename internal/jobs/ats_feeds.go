@@ -22,7 +22,16 @@ func (s *ATSPreFetchSpec) formatWWRFeed(rawBody string) *ATSFormattedResult {
 			if len(r.Locations) > 0 && r.Locations[0] != "" {
 				loc = r.Locations[0]
 			}
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)** — %s · %s", r.Title, r.URL, r.Company, loc))
+			lines = append(
+				lines,
+				fmt.Sprintf(
+					"- **[%s](%s)** — %s · %s",
+					sanitizeATSMarkdownText(r.Title, 512),
+					r.URL,
+					sanitizeATSMarkdownText(r.Company, 256),
+					sanitizeATSMarkdownText(loc, 180),
+				),
+			)
 		}
 	}
 	return &ATSFormattedResult{
@@ -53,7 +62,15 @@ func (s *ATSPreFetchSpec) formatHimalayasFeed(rawBody string) *ATSFormattedResul
 	links := make([]string, 0, len(records))
 	for _, r := range records {
 		links = append(links, r.URL)
-		lines = append(lines, fmt.Sprintf("- **[%s](%s)** — %s", r.Title, r.URL, r.Company))
+		lines = append(
+			lines,
+			fmt.Sprintf(
+				"- **[%s](%s)** — %s",
+				sanitizeATSMarkdownText(r.Title, 512),
+				r.URL,
+				sanitizeATSMarkdownText(r.Company, 256),
+			),
+		)
 	}
 	return &ATSFormattedResult{
 		Title:     fmt.Sprintf("Himalayas Remote Jobs (%d)", len(records)),
@@ -76,7 +93,15 @@ func (s *ATSPreFetchSpec) formatWorkingNomadsFeed(rawBody string) *ATSFormattedR
 	for i, r := range records {
 		links = append(links, r.URL)
 		if i < 50 {
-			lines = append(lines, fmt.Sprintf("- **[%s](%s)** — %s", r.Title, r.URL, r.Company))
+			lines = append(
+				lines,
+				fmt.Sprintf(
+					"- **[%s](%s)** — %s",
+					sanitizeATSMarkdownText(r.Title, 512),
+					r.URL,
+					sanitizeATSMarkdownText(r.Company, 256),
+				),
+			)
 		}
 	}
 	return &ATSFormattedResult{
@@ -170,8 +195,8 @@ func ParsePublicJobFeedRecords(feedID, rawBody string) []StructuredJobRecord {
 			pos = closeIdx + 7
 
 			fullTitle := StripTagsPlain(extractLinearXMLSimpleTag(itemXML, "title"))
-			link := StripTagsPlain(extractLinearXMLSimpleTag(itemXML, "link"))
-			if fullTitle == "" || !strings.HasPrefix(link, "https://") {
+			link := sanitizeATSHttpsURL(StripTagsPlain(extractLinearXMLSimpleTag(itemXML, "link")), "")
+			if fullTitle == "" || link == "" {
 				continue
 			}
 			company := "We Work Remotely"
@@ -180,7 +205,15 @@ func ParsePublicJobFeedRecords(feedID, rawBody string) []StructuredJobRecord {
 				company = strings.TrimSpace(fullTitle[:colon])
 				role = strings.TrimSpace(fullTitle[colon+1:])
 			}
-			region := StripTagsPlain(extractLinearXMLSimpleTag(itemXML, "region"))
+			role = SanitizeJobFieldPlain(role, 512)
+			company = SanitizeJobFieldPlain(company, 256)
+			if role == "" {
+				continue
+			}
+			if company == "" {
+				company = "We Work Remotely"
+			}
+			region := SanitizeJobFieldPlain(extractLinearXMLSimpleTag(itemXML, "region"), 180)
 			if region == "" {
 				region = "Remote"
 			}
@@ -213,16 +246,19 @@ func ParsePublicJobFeedRecords(feedID, rawBody string) []StructuredJobRecord {
 			if !okJ || j == nil {
 				continue
 			}
-			title := strings.TrimSpace(anyString(j["title"]))
-			company := strings.TrimSpace(anyString(j["companyName"]))
+			title := SanitizeJobFieldPlain(anyString(j["title"]), 512)
+			company := SanitizeJobFieldPlain(anyString(j["companyName"]), 256)
 			if company == "" {
 				company = "Himalayas Listing"
 			}
 			jURL := ""
-			if al, okA := j["applicationLink"].(string); okA && strings.HasPrefix(al, "https://") {
-				jURL = al
-			} else if g, okG := j["guid"].(string); okG && strings.HasPrefix(g, "https://") {
-				jURL = g
+			if al, okA := j["applicationLink"].(string); okA {
+				jURL = sanitizeATSHttpsURL(al, "")
+			}
+			if jURL == "" {
+				if g, okG := j["guid"].(string); okG {
+					jURL = sanitizeATSHttpsURL(g, "")
+				}
 			}
 			if title == "" || jURL == "" {
 				continue
@@ -230,7 +266,7 @@ func ParsePublicJobFeedRecords(feedID, rawBody string) []StructuredJobRecord {
 			var locs []string
 			if lr, okL := j["locationRestrictions"].([]any); okL {
 				for _, x := range lr {
-					if sx := anyString(x); sx != "" {
+					if sx := SanitizeJobFieldPlain(anyString(x), 180); sx != "" {
 						locs = append(locs, sx)
 					}
 				}
@@ -305,19 +341,19 @@ func ParsePublicJobFeedRecords(feedID, rawBody string) []StructuredJobRecord {
 			if !okJ || j == nil {
 				continue
 			}
-			title := strings.TrimSpace(anyString(j["title"]))
-			company := strings.TrimSpace(anyString(j["company_name"]))
+			title := SanitizeJobFieldPlain(anyString(j["title"]), 512)
+			company := SanitizeJobFieldPlain(anyString(j["company_name"]), 256)
 			if company == "" {
 				company = "Working Nomads Listing"
 			}
 			jURL := ""
-			if uStr, okU := j["url"].(string); okU && strings.HasPrefix(uStr, "https://") {
-				jURL = uStr
+			if uStr, okU := j["url"].(string); okU {
+				jURL = sanitizeATSHttpsURL(uStr, "")
 			}
 			if title == "" || jURL == "" {
 				continue
 			}
-			loc := strings.TrimSpace(anyString(j["location"]))
+			loc := SanitizeJobFieldPlain(anyString(j["location"]), 180)
 			if loc == "" {
 				loc = "Remote"
 			}

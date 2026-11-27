@@ -1,0 +1,12 @@
+{
+  "adapterId": "bosch-ebike-help",
+  "mode": "html",
+  "inputUrl": "https://help.bosch-ebike.com/us/help-center/ebw-error-codes?models=bdu37yy",
+  "mockPayload": "<!doctype html><html><body><nav aria-label=\"breadcrumb\"><a href=\"/us/help-center\">Help Center</a></nav><div class=\"dodo-service-include__error\" aria-hidden=\"true\">Error chrome</div><main><h1>Error 503</h1><p>Check speed sensor alignment.</p><a href=\"/files/sensor.pdf\">Sensor PDF</a></main></body></html>",
+  "expectMarkdownIncludes": [
+    "Error 503",
+    "Check speed sensor alignment.",
+    "bdu37yy",
+    "https://help.bosch-ebike.com/files/sensor.pdf"
+  ]
+}

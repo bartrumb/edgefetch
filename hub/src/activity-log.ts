@@ -8,7 +8,7 @@
 import type { SqlStorageLike } from './oauth';
 
 export type ActivityLevel = 'info' | 'warn' | 'error';
-export type ActivityCategory = 'crawl' | 'mcp' | 'agent' | 'oauth' | 'failover';
+export type ActivityCategory = 'crawl' | 'mcp' | 'agent' | 'oauth' | 'failover' | 'admin';
 export type EventDetailMap = Record<string, string | number | boolean | null>;
 
 export function redactUrlForLog(rawUrl: string | undefined | null): string {

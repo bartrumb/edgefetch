@@ -1,0 +1,60 @@
+# Shared Go + TypeScript Declarative Site Adapter: Bicycle Retailer and Industry News
+id: bicycleretailer
+name: Bicycle Retailer & Industry News
+category: commerce-social
+description: "Extracts Drupal .node-article body, .view-content listings, and author/publishedTime metadata from bicycleretailer.com while stripping sidebar ads and leaving /rss.xml to feed XML parsing."
+domains:
+  - www.bicycleretailer.com
+  - bicycleretailer.com
+exampleUrls:
+  - "https://www.bicycleretailer.com/industry-news/2026/11/01/ebike-battery-rules"
+  - "https://www.bicycleretailer.com/industry-news"
+
+htmlRoutes:
+  - id: bicycleretailer
+    mode: dom
+    match:
+      exactSegments: false
+      reservedFirstSegment:
+        - admin
+        - user
+      excludeSegmentSuffixes:
+        - .xml
+        - .rss
+        - .atom
+    vars:
+      title:
+        cssText:
+          - article.node-article h1
+          - main h1
+          - h1
+          - title
+        metaKeys:
+          - og:title
+        trim: true
+      author:
+        metaKeys:
+          - author
+          - article:author
+        trim: true
+      publishedTime:
+        metaKeys:
+          - article:published_time
+        trim: true
+      body:
+        cssHtmlToMd:
+          - article.node-article .field-name-body
+          - .node-article .field-name-body
+          - .field-name-body
+          - .view-content
+          - article.node-article
+          - main
+        format: strip_leading_h1
+        trim: true
+    requireVars:
+      - title
+    titleTemplate: "{title}"
+    authorVar: author
+    publishedTimeVar: publishedTime
+    bodyVar: body
+    preserveBodyLinksFromVar: body

@@ -65,6 +65,10 @@ export function resolveCustomDomainShopifyProductTwinUrl(productUrl: string): { 
   return callCoreWasm<{ twin: { jsonUrl: string; jsUrl: string; handle: string } | null }>('commerce_resolve_shopify_twin', { productUrl: String(productUrl ?? '') }).twin ?? null;
 }
 
+export function resolveCustomDomainShopifyCollectionTwinUrl(pageUrl: string): { jsonUrl: string; handle: string } | null {
+  return callCoreWasm<{ twin: { jsonUrl: string; handle: string } | null }>('commerce_resolve_shopify_collection_twin', { pageUrl: String(pageUrl ?? '') }).twin ?? null;
+}
+
 export function normalizeShopifyProductRecord(
   rawProd: Record<string, unknown>,
   originStr: string,
@@ -93,8 +97,17 @@ export function enrichShopifyProductFromJson(params: {
   return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_enrich_shopify_json', meta, String(params.rawJson ?? '')).doc ?? null;
 }
 
-export function formatShopifyProductsFeedTwin(rawBody: string, origUrl: string): TwinFormattedDoc | null {
-  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_shopify_feed', { origUrl: String(origUrl ?? '') }, String(rawBody ?? '')).doc ?? null;
+export function formatShopifyProductsFeedTwin(
+  rawBody: string,
+  origUrl: string,
+  opts?: { twinUrl?: string; currency?: string | null },
+): TwinFormattedDoc | null {
+  const meta = {
+    origUrl: String(origUrl ?? ''),
+    ...(opts?.twinUrl ? { twinUrl: opts.twinUrl } : {}),
+    ...(opts?.currency ? { currency: opts.currency } : {}),
+  };
+  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_shopify_feed', meta, String(rawBody ?? '')).doc ?? null;
 }
 
 export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId = 'shopify'): PostFetchSiteResult | null {
@@ -113,6 +126,10 @@ export function isWooCommerceHtmlOrHeaders(rawHtml: string, headers?: HeaderInpu
 
 export function resolveCustomDomainWooCommerceProductTwinUrl(productUrl: string): { slug: string; storeApiUrl: string } | null {
   return callCoreWasm<{ twin: { slug: string; storeApiUrl: string } | null }>('commerce_resolve_woocommerce_twin', { productUrl: String(productUrl ?? '') }).twin ?? null;
+}
+
+export function resolveCustomDomainWooCommerceCatalogTwinUrl(pageUrl: string): { kind: string; slug?: string; storeApiUrl: string } | null {
+  return callCoreWasm<{ twin: { kind: string; slug?: string; storeApiUrl: string } | null }>('commerce_resolve_woocommerce_catalog_twin', { pageUrl: String(pageUrl ?? '') }).twin ?? null;
 }
 
 export function normalizeWooCommerceProductRecord(
@@ -134,8 +151,12 @@ export function enrichWooCommerceProductFromStoreApi(params: {
   return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_enrich_woocommerce_json', meta, String(params.rawJson ?? '')).doc ?? null;
 }
 
-export function formatWcStoreApiListTwin(rawBody: string, origUrl: string): TwinFormattedDoc | null {
-  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_wc_list', { origUrl: String(origUrl ?? '') }, String(rawBody ?? '')).doc ?? null;
+export function formatWcStoreApiListTwin(rawBody: string, origUrl: string, twinUrl?: string): TwinFormattedDoc | null {
+  const meta = {
+    origUrl: String(origUrl ?? ''),
+    ...(twinUrl ? { twinUrl } : {}),
+  };
+  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_wc_list', meta, String(rawBody ?? '')).doc ?? null;
 }
 
 export function formatWcStoreApiProductTwin(rawBody: string, origUrl: string, _htmlToMd: HtmlFragmentConverter): TwinFormattedDoc | null {
@@ -150,6 +171,128 @@ export function extractWooCommerceProductHtml(ctx: HtmlExtractContext, extractor
     extractorId,
   };
   return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_woocommerce_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
+}
+
+export function extractWooCommerceCatalogHtml(ctx: HtmlExtractContext, extractorId = 'woocommerce'): PostFetchSiteResult | null {
+  const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
+  return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_woocommerce_catalog_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
+}
+
+export function isSquarespaceCommerceHtmlOrHeaders(rawHtml: string, headers?: HeaderInput): boolean {
+  return callCoreWasmRaw<{ ok: boolean }>('commerce_is_squarespace_html', { headers: headersToRecord(headers) }, String(rawHtml ?? '')).ok;
+}
+
+export function resolveSquarespaceCommerceTwinUrl(pageUrl: string): string | null {
+  return callCoreWasm<{ twinUrl: string | null }>('commerce_resolve_squarespace_twin', { pageUrl: String(pageUrl ?? '') }).twinUrl ?? null;
+}
+
+export function formatSquarespaceCommerceJson(rawBody: string, origUrl: string): TwinFormattedDoc | null {
+  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_squarespace_json', { origUrl: String(origUrl ?? '') }, String(rawBody ?? '')).doc ?? null;
+}
+
+export function extractSquarespaceCommerceHtml(ctx: HtmlExtractContext, extractorId = 'squarespace-commerce'): PostFetchSiteResult | null {
+  const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
+  return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_squarespace_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
+}
+
+export function isBigCommerceHtmlOrHeaders(rawHtml: string, headers?: HeaderInput): boolean {
+  return callCoreWasmRaw<{ ok: boolean }>('commerce_is_bigcommerce_html', { headers: headersToRecord(headers) }, String(rawHtml ?? '')).ok;
+}
+
+export function extractBigCommerceHtml(ctx: HtmlExtractContext, extractorId = 'bigcommerce-store'): PostFetchSiteResult | null {
+  const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
+  return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_bigcommerce_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
+}
+
+export function formatBigCommerceXmlSitemap(rawBody: string, origUrl: string): TwinFormattedDoc | null {
+  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_bigcommerce_sitemap', { origUrl: String(origUrl ?? '') }, String(rawBody ?? '')).doc ?? null;
+}
+
+export function isSfccDemandwareHtmlOrHeaders(rawHtml: string, headers?: HeaderInput): boolean {
+  return callCoreWasmRaw<{ ok: boolean }>('commerce_is_sfcc_html', { headers: headersToRecord(headers) }, String(rawHtml ?? '')).ok;
+}
+
+export function resolveSfccProductVariationTwinUrl(pageUrl: string, rawHtml: string): { variationUrl: string; pid: string } | null {
+  return callCoreWasmRaw<{ twin: { variationUrl: string; pid: string } | null }>('commerce_resolve_sfcc_twin', { pageUrl: String(pageUrl ?? '') }, String(rawHtml ?? '')).twin ?? null;
+}
+
+export function formatSfccProductVariationJson(
+  rawBody: string,
+  origUrl: string,
+  fallbackHtml = '',
+  fallbackMd = '',
+): TwinFormattedDoc | null {
+  const meta = {
+    origUrl: String(origUrl ?? ''),
+    ...(fallbackHtml ? { fallbackHtml: String(fallbackHtml).slice(0, 512_000) } : {}),
+    ...(fallbackMd ? { fallbackMd: String(fallbackMd).slice(0, 32_768) } : {}),
+  };
+  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_sfcc_variation', meta, String(rawBody ?? '')).doc ?? null;
+}
+
+export function extractSfccProductHtml(ctx: HtmlExtractContext, extractorId = 'sfcc-demandware'): PostFetchSiteResult | null {
+  const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
+  return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_sfcc_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
+}
+
+export function isMagento2HtmlOrHeaders(rawHtml: string, headers?: HeaderInput): boolean {
+  return callCoreWasmRaw<{ ok: boolean }>('commerce_is_magento2_html', { headers: headersToRecord(headers) }, String(rawHtml ?? '')).ok;
+}
+
+export function isShopware6HtmlOrHeaders(rawHtml: string, headers?: HeaderInput): boolean {
+  return callCoreWasmRaw<{ ok: boolean }>('commerce_is_shopware6_html', { headers: headersToRecord(headers) }, String(rawHtml ?? '')).ok;
+}
+
+export function resolveMagento2RenderInfoTwinUrl(pageUrl: string, rawHtml: string): string | null {
+  return callCoreWasmRaw<{ twinUrl: string | null }>('commerce_resolve_magento2_twin', { pageUrl: String(pageUrl ?? '') }, String(rawHtml ?? '')).twinUrl ?? null;
+}
+
+export function formatMagento2RenderInfoJson(rawBody: string, origUrl: string, fallbackHtml = ''): TwinFormattedDoc | null {
+  const meta = {
+    origUrl: String(origUrl ?? ''),
+    ...(fallbackHtml ? { fallbackHtml: String(fallbackHtml).slice(0, 512_000) } : {}),
+  };
+  return callCoreWasmRaw<{ doc: TwinFormattedDoc | null }>('commerce_format_magento2_render_info', meta, String(rawBody ?? '')).doc ?? null;
+}
+
+export function extractMagento2ProductHtml(ctx: HtmlExtractContext, extractorId = 'shopware-magento'): PostFetchSiteResult | null {
+  const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
+  return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_magento2_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
+}
+
+export function extractShopware6ProductHtml(ctx: HtmlExtractContext, extractorId = 'shopware-magento'): PostFetchSiteResult | null {
+  const loose = ctx as unknown as { html?: string; currentMarkdown?: string };
+  const meta = {
+    url: String(ctx.url),
+    currentMarkdown: String(ctx.currentMd ?? loose.currentMarkdown ?? '').slice(0, 32_768),
+    extractorId,
+  };
+  return callCoreWasmRaw<{ result: PostFetchSiteResult | null }>('commerce_extract_shopware6_html', meta, String(ctx.rawHtml ?? loose.html ?? '')).result ?? null;
 }
 
 export function buildDeclarativeCatalogSpec(cfg: DeclarativeCatalogConfig): CatalogSpec {

@@ -53,12 +53,23 @@ func handlePhase2CatalogRawRPC(op string, meta json.RawMessage, rawStr string) (
 
 	case "commerce_format_shopify_feed":
 		var m struct {
-			OrigURL string `json:"origUrl"`
+			OrigURL  string `json:"origUrl"`
+			TwinURL  string `json:"twinUrl"`
+			Currency string `json:"currency"`
 		}
 		if len(meta) > 0 {
 			_ = json.Unmarshal(meta, &m)
 		}
-		return map[string]any{"doc": catalog.FormatShopifyProductsFeedTwin(rawStr, m.OrigURL)}, true, nil
+		var doc *catalog.TwinFormattedDoc
+		if m.TwinURL != "" || m.Currency != "" {
+			doc = catalog.FormatShopifyProductsFeedTwin(rawStr, m.OrigURL, catalog.ShopifyFeedFormatOptions{
+				TwinURL:  m.TwinURL,
+				Currency: m.Currency,
+			})
+		} else {
+			doc = catalog.FormatShopifyProductsFeedTwin(rawStr, m.OrigURL)
+		}
+		return map[string]any{"doc": doc}, true, nil
 
 	case "commerce_extract_shopify_html":
 		var m struct {
@@ -104,11 +115,12 @@ func handlePhase2CatalogRawRPC(op string, meta json.RawMessage, rawStr string) (
 	case "commerce_format_wc_list":
 		var m struct {
 			OrigURL string `json:"origUrl"`
+			TwinURL string `json:"twinUrl"`
 		}
 		if len(meta) > 0 {
 			_ = json.Unmarshal(meta, &m)
 		}
-		return map[string]any{"doc": catalog.FormatWCStoreAPIListTwin(rawStr, m.OrigURL)}, true, nil
+		return map[string]any{"doc": catalog.FormatWCStoreAPIListTwinWithOptions(rawStr, m.OrigURL, m.TwinURL)}, true, nil
 
 	case "commerce_format_wc_product":
 		var m struct {
@@ -130,6 +142,190 @@ func handlePhase2CatalogRawRPC(op string, meta json.RawMessage, rawStr string) (
 		}
 		return map[string]any{
 			"result": catalog.ExtractWooCommerceProductHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
+		}, true, nil
+
+	case "commerce_extract_woocommerce_catalog_html":
+		var m struct {
+			URL             string `json:"url"`
+			CurrentMarkdown string `json:"currentMarkdown"`
+			ExtractorID     string `json:"extractorId"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{
+			"result": catalog.ExtractWooCommerceCatalogHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
+		}, true, nil
+
+	case "commerce_is_squarespace_html":
+		var m struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"ok": catalog.IsSquarespaceCommerceHTMLOrHeaders(rawStr, m.Headers)}, true, nil
+
+	case "commerce_format_squarespace_json":
+		var m struct {
+			OrigURL string `json:"origUrl"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"doc": catalog.FormatSquarespaceCommerceJSON(rawStr, m.OrigURL)}, true, nil
+
+	case "commerce_extract_squarespace_html":
+		var m struct {
+			URL             string `json:"url"`
+			CurrentMarkdown string `json:"currentMarkdown"`
+			ExtractorID     string `json:"extractorId"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{
+			"result": catalog.ExtractSquarespaceCommerceHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
+		}, true, nil
+
+	case "commerce_is_bigcommerce_html":
+		var m struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"ok": catalog.IsBigCommerceHTMLOrHeaders(rawStr, m.Headers)}, true, nil
+
+	case "commerce_extract_bigcommerce_html":
+		var m struct {
+			URL             string `json:"url"`
+			CurrentMarkdown string `json:"currentMarkdown"`
+			ExtractorID     string `json:"extractorId"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{
+			"result": catalog.ExtractBigCommerceHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
+		}, true, nil
+
+	case "commerce_format_bigcommerce_sitemap":
+		var m struct {
+			OrigURL string `json:"origUrl"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"doc": catalog.FormatBigCommerceXMLSitemap(rawStr, m.OrigURL)}, true, nil
+
+	case "commerce_is_sfcc_html":
+		var m struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"ok": catalog.IsSFCCDemandwareHTMLOrHeaders(rawStr, m.Headers)}, true, nil
+
+	case "commerce_resolve_sfcc_twin":
+		var m struct {
+			PageURL string `json:"pageUrl"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"twin": catalog.ResolveSFCCProductVariationTwinURL(m.PageURL, rawStr)}, true, nil
+
+	case "commerce_format_sfcc_variation":
+		var m struct {
+			OrigURL      string `json:"origUrl"`
+			FallbackHTML string `json:"fallbackHtml"`
+			FallbackMD   string `json:"fallbackMd"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"doc": catalog.FormatSFCCProductVariationJSON(rawStr, m.OrigURL, m.FallbackHTML, m.FallbackMD)}, true, nil
+
+	case "commerce_extract_sfcc_html":
+		var m struct {
+			URL             string `json:"url"`
+			CurrentMarkdown string `json:"currentMarkdown"`
+			ExtractorID     string `json:"extractorId"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{
+			"result": catalog.ExtractSFCCProductHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
+		}, true, nil
+
+	case "commerce_is_magento2_html":
+		var m struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"ok": catalog.IsMagento2HTMLOrHeaders(rawStr, m.Headers)}, true, nil
+
+	case "commerce_is_shopware6_html":
+		var m struct {
+			Headers map[string]string `json:"headers"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"ok": catalog.IsShopware6HTMLOrHeaders(rawStr, m.Headers)}, true, nil
+
+	case "commerce_resolve_magento2_twin":
+		var m struct {
+			PageURL string `json:"pageUrl"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		twinURL := catalog.ResolveMagento2RenderInfoTwinURL(m.PageURL, rawStr)
+		if twinURL == "" {
+			return map[string]any{"twinUrl": nil}, true, nil
+		}
+		return map[string]any{"twinUrl": twinURL}, true, nil
+
+	case "commerce_format_magento2_render_info":
+		var m struct {
+			OrigURL      string `json:"origUrl"`
+			FallbackHTML string `json:"fallbackHtml"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{"doc": catalog.FormatMagento2RenderInfoJSON(rawStr, m.OrigURL, m.FallbackHTML)}, true, nil
+
+	case "commerce_extract_magento2_html":
+		var m struct {
+			URL             string `json:"url"`
+			CurrentMarkdown string `json:"currentMarkdown"`
+			ExtractorID     string `json:"extractorId"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{
+			"result": catalog.ExtractMagento2ProductHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
+		}, true, nil
+
+	case "commerce_extract_shopware6_html":
+		var m struct {
+			URL             string `json:"url"`
+			CurrentMarkdown string `json:"currentMarkdown"`
+			ExtractorID     string `json:"extractorId"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return map[string]any{
+			"result": catalog.ExtractShopware6ProductHTML(m.URL, rawStr, m.CurrentMarkdown, m.ExtractorID),
 		}, true, nil
 
 	case "commerce_spec_parse_page":
@@ -240,6 +436,15 @@ func handlePhase2CatalogRPC(op string, payload json.RawMessage) (any, bool, erro
 		}
 		return map[string]any{"twin": catalog.ResolveCustomDomainShopifyProductTwinURL(p.ProductURL)}, true, nil
 
+	case "commerce_resolve_shopify_collection_twin":
+		var p struct {
+			PageURL string `json:"pageUrl"`
+		}
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, true, err
+		}
+		return map[string]any{"twin": catalog.ResolveCustomDomainShopifyCollectionTwinURL(p.PageURL)}, true, nil
+
 	case "commerce_normalize_shopify_record":
 		var p struct {
 			RawProd map[string]any                   `json:"rawProd"`
@@ -261,6 +466,28 @@ func handlePhase2CatalogRPC(op string, payload json.RawMessage) (any, bool, erro
 			return nil, true, err
 		}
 		return map[string]any{"twin": catalog.ResolveCustomDomainWooCommerceProductTwinURL(p.ProductURL)}, true, nil
+
+	case "commerce_resolve_woocommerce_catalog_twin":
+		var p struct {
+			PageURL string `json:"pageUrl"`
+		}
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, true, err
+		}
+		return map[string]any{"twin": catalog.ResolveCustomDomainWooCommerceCatalogTwinURL(p.PageURL)}, true, nil
+
+	case "commerce_resolve_squarespace_twin":
+		var p struct {
+			PageURL string `json:"pageUrl"`
+		}
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, true, err
+		}
+		twinURL := catalog.ResolveSquarespaceCommerceTwinURL(p.PageURL)
+		if twinURL == "" {
+			return map[string]any{"twinUrl": nil}, true, nil
+		}
+		return map[string]any{"twinUrl": twinURL}, true, nil
 
 	case "commerce_normalize_woocommerce_record":
 		var p struct {

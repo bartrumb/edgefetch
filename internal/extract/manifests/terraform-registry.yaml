@@ -1,0 +1,748 @@
+# Shared Go + TypeScript Declarative Site Adapter: Terraform Registry
+id: terraform-registry
+name: Terraform Registry
+category: developer
+description: "Upgrades registry.terraform.io provider and module pages to the official keyless /v1/ JSON API with versions, documentation entries, inputs, outputs, and README."
+domains:
+  - registry.terraform.io
+exampleUrls:
+  - "https://registry.terraform.io/providers/hashicorp/random"
+  - "https://registry.terraform.io/providers/hashicorp/random/3.8.1"
+  - "https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws"
+  - "https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/5.1.0"
+
+routes:
+  # Route 1: Versioned provider /providers/<ns>/<name>/<ver>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - providers
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: name
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: ver
+          charset: url_seg
+          reserved:
+            - latest
+            - docs
+          minLen: 1
+          maxLen: 64
+    twin:
+      fetchUrl: "https://registry.terraform.io/v1/providers/{ns}/{name}/{ver}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - namespace
+        - name
+        - version
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        version:
+          paths:
+            - version
+        tier:
+          paths:
+            - tier
+        downloads:
+          paths:
+            - downloads
+          format: int_comma
+        publishedAt:
+          paths:
+            - published_at
+          sliceMax: 10
+        desc:
+          paths:
+            - description
+          trim: true
+        source:
+          paths:
+            - source
+          requireHttps: true
+        versionCount:
+          paths:
+            - versions
+          format: array_len_comma
+      titleTemplate: "{namespace}/{name} v{version} (Terraform Provider)"
+      descriptionVar: desc
+      publishedTimeVar: publishedAt
+      introVar: desc
+      bullets:
+        - label: Provider
+          template: "`{namespace}/{name}`"
+        - label: Version
+          template: "`{version}`"
+        - label: Tier
+          template: "{tier}"
+          whenVar: tier
+        - label: Downloads
+          template: "{downloads}"
+          whenVar: downloads
+        - label: Published
+          template: "{publishedAt}"
+          whenVar: publishedAt
+        - label: Available Versions
+          template: "{versionCount}"
+          whenVar: versionCount
+        - label: Source
+          template: "{source}"
+          whenVar: source
+      sections:
+        - heading: Documentation Entries
+          arrayPath: docs
+          limit: 40
+          columns:
+            - header: Title
+              paths:
+                - title
+            - header: Category
+              paths:
+                - category
+            - header: Language
+              paths:
+                - language
+            - header: Path
+              paths:
+                - path
+              code: true
+      linksVars:
+        - source
+
+  # Route 2: Latest provider alias /providers/<ns>/<name>/latest
+  - match:
+      exactSegments: true
+      pathSegments:
+        - providers
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: name
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: ver
+          charset: alnum
+          allowValues:
+            - latest
+          minLen: 6
+          maxLen: 6
+    twin:
+      fetchUrl: "https://registry.terraform.io/v1/providers/{ns}/{name}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - namespace
+        - name
+        - version
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        version:
+          paths:
+            - version
+        tier:
+          paths:
+            - tier
+        downloads:
+          paths:
+            - downloads
+          format: int_comma
+        publishedAt:
+          paths:
+            - published_at
+          sliceMax: 10
+        desc:
+          paths:
+            - description
+          trim: true
+        source:
+          paths:
+            - source
+          requireHttps: true
+        versionCount:
+          paths:
+            - versions
+          format: array_len_comma
+      titleTemplate: "{namespace}/{name} v{version} (Terraform Provider)"
+      descriptionVar: desc
+      publishedTimeVar: publishedAt
+      introVar: desc
+      bullets:
+        - label: Provider
+          template: "`{namespace}/{name}`"
+        - label: Version
+          template: "`{version}`"
+        - label: Tier
+          template: "{tier}"
+          whenVar: tier
+        - label: Downloads
+          template: "{downloads}"
+          whenVar: downloads
+        - label: Published
+          template: "{publishedAt}"
+          whenVar: publishedAt
+        - label: Available Versions
+          template: "{versionCount}"
+          whenVar: versionCount
+        - label: Source
+          template: "{source}"
+          whenVar: source
+      sections:
+        - heading: Documentation Entries
+          arrayPath: docs
+          limit: 40
+          columns:
+            - header: Title
+              paths:
+                - title
+            - header: Category
+              paths:
+                - category
+            - header: Language
+              paths:
+                - language
+            - header: Path
+              paths:
+                - path
+              code: true
+      linksVars:
+        - source
+
+  # Route 3: Latest provider /providers/<ns>/<name>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - providers
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: name
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+    twin:
+      fetchUrl: "https://registry.terraform.io/v1/providers/{ns}/{name}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - namespace
+        - name
+        - version
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        version:
+          paths:
+            - version
+        tier:
+          paths:
+            - tier
+        downloads:
+          paths:
+            - downloads
+          format: int_comma
+        publishedAt:
+          paths:
+            - published_at
+          sliceMax: 10
+        desc:
+          paths:
+            - description
+          trim: true
+        source:
+          paths:
+            - source
+          requireHttps: true
+        versionCount:
+          paths:
+            - versions
+          format: array_len_comma
+      titleTemplate: "{namespace}/{name} v{version} (Terraform Provider)"
+      descriptionVar: desc
+      publishedTimeVar: publishedAt
+      introVar: desc
+      bullets:
+        - label: Provider
+          template: "`{namespace}/{name}`"
+        - label: Version
+          template: "`{version}`"
+        - label: Tier
+          template: "{tier}"
+          whenVar: tier
+        - label: Downloads
+          template: "{downloads}"
+          whenVar: downloads
+        - label: Published
+          template: "{publishedAt}"
+          whenVar: publishedAt
+        - label: Available Versions
+          template: "{versionCount}"
+          whenVar: versionCount
+        - label: Source
+          template: "{source}"
+          whenVar: source
+      sections:
+        - heading: Documentation Entries
+          arrayPath: docs
+          limit: 40
+          columns:
+            - header: Title
+              paths:
+                - title
+            - header: Category
+              paths:
+                - category
+            - header: Language
+              paths:
+                - language
+            - header: Path
+              paths:
+                - path
+              code: true
+      linksVars:
+        - source
+
+  # Route 4: Versioned module /modules/<ns>/<name>/<provider>/<ver>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - modules
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: name
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: provider
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: ver
+          charset: url_seg
+          reserved:
+            - latest
+            - submodules
+            - examples
+          minLen: 1
+          maxLen: 64
+    twin:
+      fetchUrl: "https://registry.terraform.io/v1/modules/{ns}/{name}/{provider}/{ver}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - namespace
+        - name
+        - provider
+        - version
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        provider:
+          paths:
+            - provider
+        version:
+          paths:
+            - version
+        verified:
+          paths:
+            - verified
+          format: bool_map
+          trueValue: Verified
+          falseValue: Unverified
+        downloads:
+          paths:
+            - downloads
+          format: int_comma
+        publishedAt:
+          paths:
+            - published_at
+          sliceMax: 10
+        desc:
+          paths:
+            - description
+          trim: true
+        source:
+          paths:
+            - source
+          requireHttps: true
+        readme:
+          paths:
+            - root.readme
+          format: demote_h1
+          trim: true
+      titleTemplate: "{namespace}/{name}/{provider} v{version} (Terraform Module)"
+      descriptionVar: desc
+      publishedTimeVar: publishedAt
+      introVar: desc
+      bullets:
+        - label: Module
+          template: "`{namespace}/{name}/{provider}`"
+        - label: Version
+          template: "`{version}`"
+        - label: Status
+          template: "{verified}"
+          whenVar: verified
+        - label: Downloads
+          template: "{downloads}"
+          whenVar: downloads
+        - label: Published
+          template: "{publishedAt}"
+          whenVar: publishedAt
+        - label: Source
+          template: "{source}"
+          whenVar: source
+      bodyVar: readme
+      sections:
+        - heading: Inputs
+          arrayPath: root.inputs
+          limit: 60
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Type
+              paths:
+                - type
+              code: true
+            - header: Required
+              paths:
+                - required
+            - header: Description
+              paths:
+                - description
+        - heading: Outputs
+          arrayPath: root.outputs
+          limit: 40
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Description
+              paths:
+                - description
+        - heading: Submodules
+          arrayPath: submodules
+          limit: 30
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Path
+              paths:
+                - path
+              code: true
+      linksVars:
+        - source
+
+  # Route 5: Latest module alias /modules/<ns>/<name>/<provider>/latest
+  - match:
+      exactSegments: true
+      pathSegments:
+        - modules
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: name
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: provider
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: ver
+          charset: alnum
+          allowValues:
+            - latest
+          minLen: 6
+          maxLen: 6
+    twin:
+      fetchUrl: "https://registry.terraform.io/v1/modules/{ns}/{name}/{provider}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - namespace
+        - name
+        - provider
+        - version
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        provider:
+          paths:
+            - provider
+        version:
+          paths:
+            - version
+        verified:
+          paths:
+            - verified
+          format: bool_map
+          trueValue: Verified
+          falseValue: Unverified
+        downloads:
+          paths:
+            - downloads
+          format: int_comma
+        publishedAt:
+          paths:
+            - published_at
+          sliceMax: 10
+        desc:
+          paths:
+            - description
+          trim: true
+        source:
+          paths:
+            - source
+          requireHttps: true
+        readme:
+          paths:
+            - root.readme
+          format: demote_h1
+          trim: true
+      titleTemplate: "{namespace}/{name}/{provider} v{version} (Terraform Module)"
+      descriptionVar: desc
+      publishedTimeVar: publishedAt
+      introVar: desc
+      bullets:
+        - label: Module
+          template: "`{namespace}/{name}/{provider}`"
+        - label: Version
+          template: "`{version}`"
+        - label: Status
+          template: "{verified}"
+          whenVar: verified
+        - label: Downloads
+          template: "{downloads}"
+          whenVar: downloads
+        - label: Published
+          template: "{publishedAt}"
+          whenVar: publishedAt
+        - label: Source
+          template: "{source}"
+          whenVar: source
+      bodyVar: readme
+      sections:
+        - heading: Inputs
+          arrayPath: root.inputs
+          limit: 60
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Type
+              paths:
+                - type
+              code: true
+            - header: Required
+              paths:
+                - required
+            - header: Description
+              paths:
+                - description
+        - heading: Outputs
+          arrayPath: root.outputs
+          limit: 40
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Description
+              paths:
+                - description
+        - heading: Submodules
+          arrayPath: submodules
+          limit: 30
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Path
+              paths:
+                - path
+              code: true
+      linksVars:
+        - source
+
+  # Route 6: Latest module /modules/<ns>/<name>/<provider>
+  - match:
+      exactSegments: true
+      pathSegments:
+        - modules
+        - param: ns
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: name
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+        - param: provider
+          charset: pkg
+          minLen: 1
+          maxLen: 80
+    twin:
+      fetchUrl: "https://registry.terraform.io/v1/modules/{ns}/{name}/{provider}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - namespace
+        - name
+        - provider
+        - version
+      vars:
+        namespace:
+          paths:
+            - namespace
+        name:
+          paths:
+            - name
+        provider:
+          paths:
+            - provider
+        version:
+          paths:
+            - version
+        verified:
+          paths:
+            - verified
+          format: bool_map
+          trueValue: Verified
+          falseValue: Unverified
+        downloads:
+          paths:
+            - downloads
+          format: int_comma
+        publishedAt:
+          paths:
+            - published_at
+          sliceMax: 10
+        desc:
+          paths:
+            - description
+          trim: true
+        source:
+          paths:
+            - source
+          requireHttps: true
+        readme:
+          paths:
+            - root.readme
+          format: demote_h1
+          trim: true
+      titleTemplate: "{namespace}/{name}/{provider} v{version} (Terraform Module)"
+      descriptionVar: desc
+      publishedTimeVar: publishedAt
+      introVar: desc
+      bullets:
+        - label: Module
+          template: "`{namespace}/{name}/{provider}`"
+        - label: Version
+          template: "`{version}`"
+        - label: Status
+          template: "{verified}"
+          whenVar: verified
+        - label: Downloads
+          template: "{downloads}"
+          whenVar: downloads
+        - label: Published
+          template: "{publishedAt}"
+          whenVar: publishedAt
+        - label: Source
+          template: "{source}"
+          whenVar: source
+      bodyVar: readme
+      sections:
+        - heading: Inputs
+          arrayPath: root.inputs
+          limit: 60
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Type
+              paths:
+                - type
+              code: true
+            - header: Required
+              paths:
+                - required
+            - header: Description
+              paths:
+                - description
+        - heading: Outputs
+          arrayPath: root.outputs
+          limit: 40
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Description
+              paths:
+                - description
+        - heading: Submodules
+          arrayPath: submodules
+          limit: 30
+          columns:
+            - header: Name
+              paths:
+                - name
+              code: true
+            - header: Path
+              paths:
+                - path
+              code: true
+      linksVars:
+        - source

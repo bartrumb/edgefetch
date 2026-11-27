@@ -1,0 +1,193 @@
+# Shared Go + TypeScript Declarative Site Adapter: Federal Register
+id: federal-register
+name: Federal Register
+category: public-records
+description: "Upgrades federalregister.gov/documents/<yyyy>/<mm>/<dd>/<doc_number>/* pages to the official /api/v1/documents/<doc_number>.json twin (strictly excluding disallowed /documents/current)."
+domains:
+  - www.federalregister.gov
+  - federalregister.gov
+exampleUrls:
+  - "https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule"
+
+match:
+  exactSegments: false
+  pathSegments:
+    - documents
+    - param: yyyy
+      charset: digits
+      minLen: 4
+      maxLen: 4
+    - param: mm
+      charset: digits
+      minLen: 2
+      maxLen: 2
+    - param: dd
+      charset: digits
+      minLen: 2
+      maxLen: 2
+    - param: docNumber
+      charset: alnum_dash
+      minLen: 3
+      maxLen: 64
+
+twin:
+  fetchUrl: "https://www.federalregister.gov/api/v1/documents/{docNumber}.json"
+  kind: json
+  accept: application/json
+  maxBytes: 4194304
+
+extract:
+  requireFields:
+    - title
+    - document_number
+  vars:
+    title:
+      paths:
+        - title
+      trim: true
+    docNumber:
+      paths:
+        - document_number
+    docType:
+      paths:
+        - type
+    citation:
+      paths:
+        - citation
+    pubDate:
+      paths:
+        - publication_date
+    # The URL date segments are cosmetic to federalregister.gov routing (the document number alone
+    # resolves), so a mismatch means the link points at a different document than it claims.
+    urlDate:
+      template: "{yyyy}-{mm}-{dd}"
+    pubDateMatchesUrl:
+      paths:
+        - publication_date
+      equalsVar: urlDate
+    effectiveOn:
+      paths:
+        - effective_on
+    dates:
+      paths:
+        - dates
+      trim: true
+    action:
+      paths:
+        - action
+      trim: true
+    agencies:
+      paths:
+        - agencies
+      subField: name
+      join: ", "
+      limit: 12
+    cfrRefs:
+      paths:
+        - cfr_references
+      subFieldsJoin:
+        fields:
+          - title
+          - part
+        sep: " CFR Part "
+        fallbackField: title
+      join: "; "
+      limit: 20
+    dockets:
+      paths:
+        - docket_ids
+      join: ", "
+      limit: 12
+    abstract:
+      paths:
+        - abstract
+      trim: true
+    abstractShort:
+      paths:
+        - abstract
+      trim: true
+      sliceMax: 260
+    pdfUrl:
+      paths:
+        - pdf_url
+      requireHttps: true
+    bodyHtmlUrl:
+      paths:
+        - body_html_url
+      requireHttps: true
+    xmlUrl:
+      paths:
+        - full_text_xml_url
+      requireHttps: true
+    htmlUrl:
+      paths:
+        - html_url
+      requireHttps: true
+  titleTemplate: "{title}"
+  descriptionVar: abstractShort
+  authorVar: agencies
+  publishedTimeVar: pubDate
+  bullets:
+    - label: Document Number
+      template: "`{docNumber}`"
+    - label: Type
+      template: "{docType}"
+      whenVar: docType
+    - label: Citation
+      template: "{citation}"
+      whenVar: citation
+    - label: Agencies
+      template: "{agencies}"
+      whenVar: agencies
+    - label: Published
+      template: "{pubDate}"
+      whenVar: pubDate
+    - label: Warning
+      template: "Publication date {pubDate} does not match the URL date {urlDate}; the URL may point to a different document than its date suggests."
+      whenVar: pubDate
+      unlessVar: pubDateMatchesUrl
+    - label: Effective On
+      template: "{effectiveOn}"
+      whenVar: effectiveOn
+    - label: Dates
+      template: "{dates}"
+      whenVar: dates
+    - label: Action
+      template: "{action}"
+      whenVar: action
+    - label: CFR References
+      template: "{cfrRefs}"
+      whenVar: cfrRefs
+    - label: Docket IDs
+      template: "{dockets}"
+      whenVar: dockets
+    - label: PDF
+      template: "{pdfUrl}"
+      whenVar: pdfUrl
+    - label: Body HTML
+      template: "{bodyHtmlUrl}"
+      whenVar: bodyHtmlUrl
+    - label: Full Text XML
+      template: "{xmlUrl}"
+      whenVar: xmlUrl
+  sections:
+    - heading: Abstract
+      textVar: abstract
+    - heading: CFR References
+      arrayPath: cfr_references
+      limit: 25
+      columns:
+        - header: Title
+          paths:
+            - title
+        - header: Part
+          paths:
+            - part
+        - header: Chapter
+          paths:
+            - chapter
+  linksVars:
+    - pdfUrl
+    - htmlUrl
+    - bodyHtmlUrl
+    - xmlUrl

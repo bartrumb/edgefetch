@@ -1,0 +1,307 @@
+# Shared Go + TypeScript Declarative Site Adapter: OSV & GitHub Security Advisories (GHSA)
+id: osv-ghsa
+name: OSV & GitHub Security Advisories
+category: developer
+description: "Upgrades osv.dev/vulnerability/<id> and github.com/advisories/GHSA-* pages to the keyless api.osv.dev/v1/vulns JSON API with canonical lowercase GHSA IDs and bounded affected-version slices."
+domains:
+  - osv.dev
+  - www.osv.dev
+  - github.com
+exampleUrls:
+  - "https://osv.dev/vulnerability/GHSA-jfh8-c2jp-5v3q"
+  - "https://github.com/advisories/GHSA-jfh8-c2jp-5v3q"
+
+routes:
+  # Route 1: OSV vulnerability /vulnerability/<vulnId>
+  - match:
+      hosts:
+        - osv.dev
+        - www.osv.dev
+      exactSegments: false
+      pathSegments:
+        - vulnerability
+        - param: vulnId
+          charset: url_seg
+          minLen: 4
+          maxLen: 80
+    twin:
+      fetchUrl: "https://api.osv.dev/v1/vulns/{vulnId}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - id
+      vars:
+        id:
+          paths:
+            - id
+        summary:
+          paths:
+            - summary
+          trim: true
+        details:
+          paths:
+            - details
+          trim: true
+        summaryShort:
+          paths:
+            - summary
+            - details
+          trim: true
+          sliceMax: 260
+        aliases:
+          paths:
+            - aliases
+          itemWrap: "`"
+          join: ", "
+          limit: 12
+        severityScore:
+          paths:
+            - severity.0.score
+        severityType:
+          paths:
+            - severity.0.type
+        published:
+          paths:
+            - published
+          sliceMax: 10
+        modified:
+          paths:
+            - modified
+          sliceMax: 10
+        osvUrl:
+          template: "https://osv.dev/vulnerability/{id}"
+          requireHttps: true
+      titleTemplate: "{id} — {summary}"
+      titleWhenVar: summary
+      titleFallbackTemplate: "{id} (OSV Advisory)"
+      descriptionVar: summaryShort
+      publishedTimeVar: published
+      introVar: summary
+      bullets:
+        - label: Advisory ID
+          template: "`{id}`"
+        - label: Aliases
+          template: "{aliases}"
+          whenVar: aliases
+        - label: Severity
+          template: "`{severityScore}` ({severityType})"
+          whenVar: severityScore
+        - label: Published
+          template: "{published}"
+          whenVar: published
+        - label: Modified
+          template: "{modified}"
+          whenVar: modified
+        - label: OSV URL
+          template: "{osvUrl}"
+          whenVar: osvUrl
+      bodyVar: details
+      sections:
+        - heading: Affected Packages
+          arrayPath: affected
+          limit: 20
+          itemVars:
+            versionsCount:
+              paths:
+                - versions
+              format: array_len_comma
+            versionsSample:
+              paths:
+                - versions
+              limit: 12
+              itemWrap: "`"
+              join: ", "
+            fixedVersions:
+              nestedSubValues:
+                arrayPath: ranges
+                subArrayField: events
+                valueField: fixed
+                limit: 12
+                join: ", "
+          columns:
+            - header: Ecosystem
+              paths:
+                - package.ecosystem
+            - header: Package
+              paths:
+                - package.name
+              code: true
+            - header: Affected Count
+              template: "{versionsCount}"
+            - header: Sample Versions
+              template: "{versionsSample}"
+            - header: Fixed
+              template: "{fixedVersions}"
+        - heading: References
+          arrayPath: references
+          limit: 20
+          requireItemVar: refUrl
+          collectLinkVars:
+            - refUrl
+          itemVars:
+            refUrl:
+              paths:
+                - url
+              requireHttps: true
+            refType:
+              paths:
+                - type
+          columns:
+            - header: Type
+              template: "{refType}"
+            - header: URL
+              template: "{refUrl}"
+      linksVars:
+        - osvUrl
+
+  # Route 2: GitHub Security Advisories /advisories/GHSA-* -> lowercase suffix for api.osv.dev
+  - match:
+      hosts:
+        - github.com
+      exactSegments: true
+      pathPrefix: "/advisories/GHSA-"
+      pathSegments:
+        - advisories
+        - param: ghsaBody
+          stripPrefix: "GHSA-"
+          charset: alnum_dash
+          minLen: 14
+          maxLen: 14
+          transform: lower
+    twin:
+      fetchUrl: "https://api.osv.dev/v1/vulns/GHSA-{ghsaBody}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireFields:
+        - id
+      vars:
+        id:
+          paths:
+            - id
+        summary:
+          paths:
+            - summary
+          trim: true
+        details:
+          paths:
+            - details
+          trim: true
+        summaryShort:
+          paths:
+            - summary
+            - details
+          trim: true
+          sliceMax: 260
+        aliases:
+          paths:
+            - aliases
+          itemWrap: "`"
+          join: ", "
+          limit: 12
+        severityScore:
+          paths:
+            - severity.0.score
+        severityType:
+          paths:
+            - severity.0.type
+        published:
+          paths:
+            - published
+          sliceMax: 10
+        modified:
+          paths:
+            - modified
+          sliceMax: 10
+        ghsaUrl:
+          template: "https://github.com/advisories/GHSA-{ghsaBody}"
+          requireHttps: true
+        osvUrl:
+          template: "https://osv.dev/vulnerability/{id}"
+          requireHttps: true
+      titleTemplate: "{id} — {summary}"
+      titleWhenVar: summary
+      titleFallbackTemplate: "{id} (GitHub Advisory)"
+      descriptionVar: summaryShort
+      publishedTimeVar: published
+      introVar: summary
+      bullets:
+        - label: Advisory ID
+          template: "`{id}`"
+        - label: Aliases
+          template: "{aliases}"
+          whenVar: aliases
+        - label: Severity
+          template: "`{severityScore}` ({severityType})"
+          whenVar: severityScore
+        - label: Published
+          template: "{published}"
+          whenVar: published
+        - label: Modified
+          template: "{modified}"
+          whenVar: modified
+        - label: OSV URL
+          template: "{osvUrl}"
+          whenVar: osvUrl
+      bodyVar: details
+      sections:
+        - heading: Affected Packages
+          arrayPath: affected
+          limit: 20
+          itemVars:
+            versionsCount:
+              paths:
+                - versions
+              format: array_len_comma
+            versionsSample:
+              paths:
+                - versions
+              limit: 12
+              itemWrap: "`"
+              join: ", "
+            fixedVersions:
+              nestedSubValues:
+                arrayPath: ranges
+                subArrayField: events
+                valueField: fixed
+                limit: 12
+                join: ", "
+          columns:
+            - header: Ecosystem
+              paths:
+                - package.ecosystem
+            - header: Package
+              paths:
+                - package.name
+              code: true
+            - header: Affected Count
+              template: "{versionsCount}"
+            - header: Sample Versions
+              template: "{versionsSample}"
+            - header: Fixed
+              template: "{fixedVersions}"
+        - heading: References
+          arrayPath: references
+          limit: 20
+          requireItemVar: refUrl
+          collectLinkVars:
+            - refUrl
+          itemVars:
+            refUrl:
+              paths:
+                - url
+              requireHttps: true
+            refType:
+              paths:
+                - type
+          columns:
+            - header: Type
+              template: "{refType}"
+            - header: URL
+              template: "{refUrl}"
+      linksVars:
+        - osvUrl
+        - ghsaUrl

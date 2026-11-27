@@ -13,6 +13,7 @@ import { getActiveCallerAuthContext } from './oauth';
 import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { compileSafeUserRegex } from './safe-input';
 import type { OptionalStorageBindings } from './storage';
+import { recordSalaryObservations } from './salaries';
 import { callCoreWasm, callCoreWasmRaw, callCoreWasmRawMetaPair } from './wasm-bridge';
 
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
@@ -195,8 +196,64 @@ export const PUBLIC_JOB_FEEDS = [
 export const MAX_JOBS_CONCURRENT_SCRAPES = 4;
 export const MAX_JOBS_TOTAL_SCRAPES = 40;
 export const JOBS_CACHE_TTL_MS = 5 * 60 * 1_000;
+/** Concurrent scrapes allowed per host for ATS JSON-API fetches served from the Cloudflare edge (node fetches stay at 1). */
+export const JOBS_ATS_API_HOST_CONCURRENCY = 3;
+/** Cross-call (R2 + META D1 index) cache lifetime for ATS board responses. */
+export const JOBS_BOARD_CACHE_TTL_MS = 10 * 60 * 1_000;
+const JOBS_BOARD_CACHE_MAX_BYTES = 3 * 1024 * 1024;
 export const MAX_JOBS_CACHE_ENTRIES = 128;
 export const JOBS_PER_ITEM_TIMEOUT_MS = 18_000;
+/**
+ * Wall-clock budget for one jobs call. MCP clients give up at 60 s; a broad (no company/domains) search spent ~4 s on
+ * SERP queries and then ~19 s per candidate-board scrape, so it was cancelled at 60 s with nothing returned. After this
+ * budget no new board scrape starts, in-flight scrapes are capped to the time left, and the call returns what it has.
+ */
+export const JOBS_WALL_BUDGET_MS = 40_000;
+/**
+ * Broad searches (no `company` / `domains`) scrape at most this many candidate boards/postings per call and hand back a
+ * `continueCursor` for the rest, so results arrive in chunks well inside the client timeout instead of one call trying
+ * to cover every candidate (~19 s per board scrape).
+ */
+export const JOBS_BROAD_CHUNK_URLS = 6;
+const JOBS_CONTINUATION_PREFIX = 'jc1.';
+const MAX_JOBS_CONTINUATION_URLS = 60;
+
+/** Continuation state for a chunked broad jobs search: the query it belongs to and the candidates not yet scraped. */
+export interface JobsContinuation {
+  q: string;
+  b: string[];
+  p: string[];
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let bin = '';
+  for (const byte of bytes) bin += String.fromCharCode(byte);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function encodeJobsContinuation(state: JobsContinuation): string {
+  return JOBS_CONTINUATION_PREFIX + bytesToBase64Url(new TextEncoder().encode(JSON.stringify(state)));
+}
+
+/**
+ * Decodes a `continueCursor`. Returns null unless it is well-formed, belongs to `expectedQuery`, and every URL is an
+ * `https://` URL (callers additionally keep only known multi-tenant ATS hosts), so a hand-made cursor cannot steer the
+ * hub at arbitrary sites.
+ */
+export function decodeJobsContinuation(raw: string, expectedQuery: string): JobsContinuation | null {
+  if (!raw.startsWith(JOBS_CONTINUATION_PREFIX) || raw.length > 16_384) return null;
+  try {
+    const b64 = raw.slice(JOBS_CONTINUATION_PREFIX.length).replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+    const parsed = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)))) as Partial<JobsContinuation>;
+    if (!parsed || parsed.q !== expectedQuery || !Array.isArray(parsed.b) || !Array.isArray(parsed.p)) return null;
+    const clean = (list: unknown[]): string[] =>
+      list.filter((u): u is string => typeof u === 'string' && u.length <= 2_048 && u.startsWith('https://')).slice(0, MAX_JOBS_CONTINUATION_URLS);
+    return { q: parsed.q, b: clean(parsed.b), p: clean(parsed.p) };
+  } catch {
+    return null;
+  }
+}
 
 const MAX_JOBS_QUERY_CHARS = 256;
 const REMOTE_LOCATION_TOKENS = new Set(['remote', 'anywhere', 'work from home', 'wfh']);
@@ -1286,6 +1343,148 @@ async function executeJobsVerifyMode(params: {
   };
 }
 
+/**
+ * Cross-call ATS board cache. Board responses (public JSON APIs) are kept for `JOBS_BOARD_CACHE_TTL_MS` in R2, gated by a
+ * META D1 index row so a cold lookup never issues a blind R2 GET (an error-level `NoSuchKey` span). Repeat and paginated
+ * company searches then skip the board fetch entirely, across Worker isolates.
+ */
+const JOBS_BOARD_CACHE_DDL =
+  'CREATE TABLE IF NOT EXISTS jobs_board_cache (cache_key TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL)';
+const jobsBoardCacheReady = new WeakSet<object>();
+async function ensureJobsBoardCache(metaDb: D1Database): Promise<boolean> {
+  const key = metaDb as unknown as object;
+  if (jobsBoardCacheReady.has(key)) return true;
+  try {
+    await metaDb.prepare(JOBS_BOARD_CACHE_DDL).run();
+    jobsBoardCacheReady.add(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function jobsBoardCacheKey(scopeFreeKey: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`jobs-board-v1|${scopeFreeKey}`));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function readJobsBoardCache(
+  env: OptionalStorageBindings | undefined,
+  cacheKey: string,
+  now: number,
+): Promise<{ status: number; body: Record<string, unknown> } | null> {
+  if (!env?.META || !env.ARTIFACTS || !(await ensureJobsBoardCache(env.META))) return null;
+  const row = await env.META.prepare('SELECT fetched_at FROM jobs_board_cache WHERE cache_key = ? LIMIT 1')
+    .bind(cacheKey)
+    .first<{ fetched_at: number }>()
+    .catch(() => null);
+  if (!row || typeof row.fetched_at !== 'number' || now - row.fetched_at > JOBS_BOARD_CACHE_TTL_MS) return null;
+  const obj = await env.ARTIFACTS.get(`derived/jobs-board-cache/${cacheKey}.json`).catch(() => null);
+  if (!obj) return null;
+  try {
+    const parsed = (await obj.json()) as { fetchedAt?: number; body?: Record<string, unknown> };
+    if (
+      !parsed?.body ||
+      parsed.body.ok !== true ||
+      typeof parsed.fetchedAt !== 'number' ||
+      now - parsed.fetchedAt > JOBS_BOARD_CACHE_TTL_MS
+    ) {
+      return null;
+    }
+    return { status: 200, body: { ...parsed.body, boardCacheHit: true } };
+  } catch {
+    return null;
+  }
+}
+async function writeJobsBoardCache(
+  env: OptionalStorageBindings | undefined,
+  cacheKey: string,
+  body: Record<string, unknown>,
+  now: number,
+): Promise<void> {
+  if (!env?.META || !env.ARTIFACTS || !(await ensureJobsBoardCache(env.META))) return;
+  const json = JSON.stringify({ fetchedAt: now, body });
+  if (json.length > JOBS_BOARD_CACHE_MAX_BYTES) return;
+  try {
+    await env.ARTIFACTS.put(`derived/jobs-board-cache/${cacheKey}.json`, json, {
+      httpMetadata: { contentType: 'application/json' },
+    });
+    await env.META.prepare(
+      'INSERT INTO jobs_board_cache (cache_key, fetched_at) VALUES (?, ?) ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at',
+    )
+      .bind(cacheKey, now)
+      .run();
+  } catch {
+    // best-effort cache
+  }
+}
+
+/**
+ * Known-boards index (META D1): which ATS board a company actually uses, learned from successful board scrapes. A
+ * company search probes these first, so companies whose tenant cannot be guessed (Workday `<tenant>.wdN`, custom
+ * Greenhouse slugs) skip the web search after their first lookup. Rows are only written for boards that returned jobs,
+ * sit on a known multi-tenant ATS host, and matched the requested company scope.
+ */
+const JOBS_KNOWN_BOARDS_DDL =
+  'CREATE TABLE IF NOT EXISTS jobs_known_boards (company_key TEXT NOT NULL, board_url TEXT NOT NULL, platform TEXT NOT NULL, ' +
+  'hits INTEGER NOT NULL DEFAULT 1, last_ok_at INTEGER NOT NULL, PRIMARY KEY (company_key, board_url))';
+export const JOBS_KNOWN_BOARD_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const JOBS_KNOWN_BOARDS_PER_COMPANY = 3;
+const jobsKnownBoardsReady = new WeakSet<object>();
+async function ensureJobsKnownBoards(metaDb: D1Database): Promise<boolean> {
+  const key = metaDb as unknown as object;
+  if (jobsKnownBoardsReady.has(key)) return true;
+  try {
+    await metaDb.prepare(JOBS_KNOWN_BOARDS_DDL).run();
+    jobsKnownBoardsReady.add(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Normalized index key for a company filter (`"Allstate Insurance"` -> `allstateinsurance`). */
+export function jobsKnownBoardCompanyKey(company: string): string {
+  return normalizeDottedCorporateAbbreviations(company).toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 80);
+}
+
+async function readKnownJobsBoards(metaDb: D1Database | undefined, companyKey: string, now: number): Promise<string[]> {
+  if (!metaDb || !companyKey || !(await ensureJobsKnownBoards(metaDb))) return [];
+  const rows = await metaDb
+    .prepare(
+      'SELECT board_url FROM jobs_known_boards WHERE company_key = ? AND last_ok_at >= ? ORDER BY hits DESC, last_ok_at DESC LIMIT ?',
+    )
+    .bind(companyKey, now - JOBS_KNOWN_BOARD_MAX_AGE_MS, JOBS_KNOWN_BOARDS_PER_COMPANY)
+    .all<{ board_url: string }>()
+    .catch(() => null);
+  return (rows?.results ?? [])
+    .map((r) => r.board_url)
+    .filter((u): u is string => typeof u === 'string' && u.startsWith('https://'))
+    .filter((u) => {
+      try {
+        return isKnownMultiTenantAtsHost(new URL(u).hostname.toLowerCase().replace(/\.+$/, ''));
+      } catch {
+        return false;
+      }
+    });
+}
+
+async function recordKnownJobsBoards(
+  metaDb: D1Database | undefined,
+  companyKey: string,
+  boards: Map<string, string>,
+  now: number,
+): Promise<void> {
+  if (!metaDb || !companyKey || boards.size === 0 || !(await ensureJobsKnownBoards(metaDb))) return;
+  const stmts = [...boards].slice(0, JOBS_KNOWN_BOARDS_PER_COMPANY).map(([boardUrl, platform]) =>
+    metaDb
+      .prepare(
+        `INSERT INTO jobs_known_boards (company_key, board_url, platform, hits, last_ok_at) VALUES (?, ?, ?, 1, ?)
+         ON CONFLICT(company_key, board_url) DO UPDATE SET hits = hits + 1, last_ok_at = excluded.last_ok_at`,
+      )
+      .bind(companyKey, boardUrl, platform, now),
+  );
+  await metaDb.batch(stmts).catch(() => undefined);
+}
+
 export async function executeJobsCall(params: {
   payload: JobsToolPayload;
   env: OptionalStorageBindings & Record<string, unknown>;
@@ -1294,6 +1493,8 @@ export async function executeJobsCall(params: {
   userId?: string;
   authTier?: string;
   tracer?: RequestTracer | TraceContext;
+  /** Overrides `JOBS_WALL_BUDGET_MS` (tests). */
+  wallBudgetMs?: number;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const activeCallerCtx = getActiveCallerAuthContext();
@@ -1316,8 +1517,25 @@ export async function executeJobsCall(params: {
     let activeScrapes = 0;
     let totalScrapesUsed = 0;
     let budgetExhausted = false;
+    const wallBudgetMs =
+      typeof params.wallBudgetMs === 'number' && Number.isFinite(params.wallBudgetMs) && params.wallBudgetMs > 0
+        ? params.wallBudgetMs
+        : JOBS_WALL_BUDGET_MS;
+    const wallDeadlineAt = Date.now() + wallBudgetMs;
+    let timeBudgetExhausted = false;
+    /** True once the call's wall-clock budget is spent; also marks the scrape budget exhausted so later waves stop. */
+    const overWallBudget = (): boolean => {
+      if (Date.now() < wallDeadlineAt) return false;
+      timeBudgetExhausted = true;
+      budgetExhausted = true;
+      return true;
+    };
+    const remainingItemTimeoutMs = (): number =>
+      Math.max(500, Math.min(JOBS_PER_ITEM_TIMEOUT_MS, wallDeadlineAt - Date.now()));
     const scrapeWaitQueue: Array<() => void> = [];
-    const activeHostScrapes = new Set<string>();
+    /** In-flight scrapes per effective host; ATS API hosts served from the edge allow `JOBS_ATS_API_HOST_CONCURRENCY`. */
+    const activeHostScrapes = new Map<string, number>();
+    const hostActive = (h: string): number => activeHostScrapes.get(h) ?? 0;
     const hostWaitQueues = new Map<string, Array<() => void>>();
 
     const resolveEffectiveScrapeHost = (args: Record<string, unknown>): string => {
@@ -1372,10 +1590,32 @@ export async function executeJobsCall(params: {
         }
       }
 
+      // ATS JSON APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday) are public endpoints that do not block bots:
+      // fetch them from the Cloudflare edge instead of a home node unless the caller pinned a target.
+      // `JOBS_EDGE_ATS_FETCH=off` disables edge routing (operator kill switch).
+      const edgeAtsEnabled = String(env?.JOBS_EDGE_ATS_FETCH ?? '').trim().toLowerCase() !== 'off';
+      const atsSpecForRoute =
+        edgeAtsEnabled && args.target === undefined && !payload.target && typeof args.url === 'string'
+          ? resolveAtsPreFetchSpec(args.url)
+          : null;
+      const edgeRouted = Boolean(atsSpecForRoute);
+      const routedArgs: Record<string, unknown> = edgeRouted ? { ...args, target: 'container' } : args;
+      const hostCap = edgeRouted ? JOBS_ATS_API_HOST_CONCURRENCY : 1;
+
+      // Cross-call board cache (public ATS board APIs only; never caller-specific requests).
+      const isCacheableBoard =
+        edgeRouted &&
+        args.noCache !== true &&
+        args.headers === undefined &&
+        args.cookies === undefined &&
+        Boolean(classifyFullBoardKey(String(args.url))?.isBoard || isSmartRecruitersBoardUrl(String(args.url)));
+      const scopeFreeKey = isCacheableBoard ? buildJobsScrapeCacheKey(args, 'public') : null;
+      let boardCacheKey: string | null = null;
+
       const effectiveHost = resolveEffectiveScrapeHost(args);
       if (effectiveHost) {
-        while (activeHostScrapes.has(effectiveHost)) {
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+        while (hostActive(effectiveHost) >= hostCap) {
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
             budgetExhausted = true;
             wakeAllWaiters();
             return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
@@ -1391,25 +1631,25 @@ export async function executeJobsCall(params: {
           if (cacheKey) {
             const cachedAfterHostWait = readJobsScrapeCache(cachePartition, cacheKey);
             if (cachedAfterHostWait) {
-              if (!activeHostScrapes.has(effectiveHost)) wakeNextHostWaiter(effectiveHost);
+              if (hostActive(effectiveHost) < hostCap) wakeNextHostWaiter(effectiveHost);
               return cachedAfterHostWait;
             }
             const flightAfterHostWait = cachePartition.inFlight.get(cacheKey);
             if (flightAfterHostWait) {
-              if (!activeHostScrapes.has(effectiveHost)) wakeNextHostWaiter(effectiveHost);
+              if (hostActive(effectiveHost) < hostCap) wakeNextHostWaiter(effectiveHost);
               const sharedRes = await withJobsItemTimeout(flightAfterHostWait);
               return cloneJobsScrapeResponse(sharedRes);
             }
           }
         }
-        activeHostScrapes.add(effectiveHost);
+        activeHostScrapes.set(effectiveHost, hostActive(effectiveHost) + 1);
       }
 
       let acquiredGlobal = false;
       let flightPromise: Promise<JobsScrapeResponse> | null = null;
       try {
         while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
             budgetExhausted = true;
             wakeAllWaiters();
             return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
@@ -1429,7 +1669,7 @@ export async function executeJobsCall(params: {
             }
           }
         }
-        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || overWallBudget()) {
           budgetExhausted = true;
           wakeAllWaiters();
           return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
@@ -1439,13 +1679,39 @@ export async function executeJobsCall(params: {
         totalScrapesUsed++;
         const runSingle = (): Promise<JobsScrapeResponse> =>
           withJobsItemTimeout(
-            Promise.resolve().then(() => (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args))),
+            Promise.resolve().then(async () => {
+              // Inside the shared flight so parallel callers still coalesce onto one lookup/fetch.
+              if (scopeFreeKey) {
+                boardCacheKey = await jobsBoardCacheKey(scopeFreeKey);
+                const persisted = await readJobsBoardCache(env, boardCacheKey, Date.now());
+                if (persisted) return persisted;
+              }
+              const runRaw = (a: Record<string, unknown>) =>
+                activeTracer ? activeTracer.run(() => rawExecuteScrape(a)) : rawExecuteScrape(a);
+              const first = await runRaw(routedArgs);
+              // Edge fetch failed (anything but success or a definitive 404/410): retry once through the normal route
+              // while budget remains, so an edge outage never costs results.
+              if (
+                edgeRouted &&
+                !(first.status === 200 && first.body?.ok === true) &&
+                first.status !== 404 &&
+                first.status !== 410 &&
+                wallDeadlineAt - Date.now() > 3_000
+              ) {
+                return runRaw(args);
+              }
+              return first;
+            }),
+            remainingItemTimeoutMs(),
           );
         flightPromise = runSingle();
         if (cacheKey) cachePartition.inFlight.set(cacheKey, flightPromise);
         const out = await flightPromise;
         if (cacheKey && out.status === 200 && out.body?.ok === true) {
           writeJobsScrapeCache(cachePartition, cacheKey, out);
+        }
+        if (boardCacheKey && out.status === 200 && out.body?.ok === true && out.body.boardCacheHit !== true && Array.isArray(out.body.jobs)) {
+          await writeJobsBoardCache(env, boardCacheKey, out.body, Date.now());
         }
         return cacheKey ? cloneJobsScrapeResponse(out) : out;
       } finally {
@@ -1454,12 +1720,14 @@ export async function executeJobsCall(params: {
         }
         if (acquiredGlobal) {
           activeScrapes--;
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) wakeAllWaiters();
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || timeBudgetExhausted) wakeAllWaiters();
           else scrapeWaitQueue.shift()?.();
         }
         if (effectiveHost) {
-          activeHostScrapes.delete(effectiveHost);
-          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) wakeAllWaiters();
+          const left = hostActive(effectiveHost) - 1;
+          if (left > 0) activeHostScrapes.set(effectiveHost, left);
+          else activeHostScrapes.delete(effectiveHost);
+          if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES || timeBudgetExhausted) wakeAllWaiters();
           else wakeNextHostWaiter(effectiveHost);
         }
       }
@@ -1578,6 +1846,10 @@ export async function executeJobsCall(params: {
           ? Math.min(10_000, parseInt(rawCursorStr, 10))
           : 0;
     const hasCompanyOrDomainScope = Boolean(companyFilter) || domainsInput.length > 0;
+    // Chunked broad search: a `continueCursor` from the previous call resumes with its unscraped candidates and skips
+    // the SERP / Built In / public-feed steps that already ran. Bound to the same query + remote flag.
+    const continuationKey = JSON.stringify([query.toLowerCase(), wantRemote ?? null]);
+    const resumeState = !hasCompanyOrDomainScope ? decodeJobsContinuation(rawCursorStr, continuationKey) : null;
     const includeBuiltIn = hasCompanyOrDomainScope ? payload.includeBuiltIn === true : payload.includeBuiltIn !== false;
     const excludeList = Array.isArray(payload.exclude)
       ? (payload.exclude as Array<Record<string, unknown>>)
@@ -1602,6 +1874,65 @@ export async function executeJobsCall(params: {
         const tried: string[] = [];
         const foundForDom: DiscoveredAtsBoard[] = [];
         let domHitBudgetCap = false;
+        const explicitWdMatch = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(dom);
+        if (explicitWdMatch) {
+          const wdTenant = explicitWdMatch[1]!.toLowerCase();
+          const wdCapTenant = wdTenant.charAt(0).toUpperCase() + wdTenant.slice(1);
+          const wdUpperTenant = wdTenant.toUpperCase();
+          const candidateSites = [
+            ...new Set(['External', wdCapTenant, `${wdCapTenant}ExternalCareerSite`, `${wdUpperTenant}ExternalCareerSite`, wdTenant]),
+          ];
+          for (const siteName of candidateSites) {
+            const wdBoardUrl = `https://${dom}/${siteName}`;
+            tried.push(wdBoardUrl);
+            const r = await executeScrape({
+              url: wdBoardUrl,
+              renderMode: 'off',
+              discoverLlmsTxt: false,
+              preferOriginMarkdown: false,
+              ephemeral: true,
+              atsLiteBoard: true,
+              formats: ['markdown', 'links'],
+              ...(payload.target ? { target: payload.target } : {}),
+              ...(payload.site ? { site: payload.site } : {}),
+            }).catch(() => null);
+            if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
+              domHitBudgetCap = true;
+              break;
+            }
+            if (r && r.status === 200 && r.body?.ok === true) {
+              const jobsArr = Array.isArray(r.body.jobs) ? (r.body.jobs as unknown[]) : [];
+              const links = Array.isArray(r.body.links) ? (r.body.links as string[]) : [];
+              if (jobsArr.length > 0 || links.length > 0) {
+                const entry: DiscoveredAtsBoard = {
+                  domain: dom,
+                  platform: 'workday',
+                  slug: `${wdTenant}/${siteName}`,
+                  boardUrl: wdBoardUrl,
+                  discoveredFrom: `direct-ats-domain:${dom}`,
+                  boardStatus: 'ok',
+                };
+                foundForDom.push(entry);
+                discoveredBoards.push(entry);
+                candidateUrls.add(wdBoardUrl);
+                return;
+              }
+            }
+          }
+          if (foundForDom.length === 0) {
+            const finalStatus: AtsBoardStatus = domHitBudgetCap ? 'budget_exhausted' : 'not_found';
+            discoveredBoards.push({
+              domain: dom,
+              platform: 'workday',
+              slug: wdTenant,
+              boardUrl: '',
+              discoveredFrom: 'none',
+              boardStatus: finalStatus,
+              tried,
+            });
+          }
+          return;
+        }
         const domBrandInfo = extractRegistrableBrandInfo(dom);
         const baseSlug = (domBrandInfo?.sld ?? dom.split('.')[0] ?? '').toLowerCase();
         const canSlugProbe = isValidAtsSlug(baseSlug);
@@ -1780,7 +2111,9 @@ export async function executeJobsCall(params: {
           });
           notes.push(
             domHitBudgetCap
-              ? `Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before completing ATS board discovery for "${dom}".`
+              ? timeBudgetExhausted
+                ? `Time budget (${Math.round(wallBudgetMs / 1_000)} s) reached before completing ATS board discovery for "${dom}".`
+                : `Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before completing ATS board discovery for "${dom}".`
               : `No ATS job board discovered for "${dom}" after probing ${tried.length} candidates.`,
           );
         }
@@ -1817,8 +2150,16 @@ export async function executeJobsCall(params: {
     const scopedQueries = atsGroups.map((grp) => `${grp} ${coreTerms}`.trim());
     if (primaryCompanySlug) {
       const nonCompanyTerms = [searchQueryExpr, wantRemote ? 'remote' : ''].filter(Boolean).join(' ');
+      const explicitWdHostsForCompany = domainsInput.filter((d) => {
+        const m = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(d);
+        return Boolean(m && m[1]!.toLowerCase() === primaryCompanySlug.toLowerCase());
+      });
+      const wdSiteClauses =
+        explicitWdHostsForCompany.length > 0
+          ? explicitWdHostsForCompany.map((h) => `site:${h}`)
+          : [`site:${primaryCompanySlug}.wd5.myworkdayjobs.com`, `site:${primaryCompanySlug}.wd1.myworkdayjobs.com`];
       scopedQueries.push(
-        `(site:jobs.smartrecruiters.com/${primaryCompanySlug} OR site:${primaryCompanySlug}.wd5.myworkdayjobs.com OR site:${primaryCompanySlug}.wd1.myworkdayjobs.com) ${nonCompanyTerms}`.trim(),
+        `(site:jobs.smartrecruiters.com/${primaryCompanySlug} OR ${wdSiteClauses.join(' OR ')}) ${nonCompanyTerms}`.trim(),
       );
     }
 
@@ -1839,6 +2180,8 @@ export async function executeJobsCall(params: {
     }
     for (const dom of domainsInput) {
       preWaveAllowedTokens.add(dom);
+      const explicitWd = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(dom);
+      if (explicitWd?.[1]) preWaveAllowedTokens.add(explicitWd[1].toLowerCase());
       for (const expanded of expandCompanyFilterTokens(dom)) preWaveAllowedTokens.add(expanded);
     }
     for (const db of discoveredBoards) {
@@ -1863,42 +2206,6 @@ export async function executeJobsCall(params: {
         jobCompany: companyFilter,
       }).ok;
     };
-
-    if (coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
-      const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
-      const searchCandidateCap =
-        postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(40, Math.max(30, limit * 2));
-      const searchResponses = await Promise.all(
-        scopedQueries.map((sq) =>
-          executeSearch({
-            query: sq,
-            maxResults: searchMaxResults,
-            ...(env?.SERPER_API_KEY ? { mode: 'serper' } : {}),
-          }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
-        ),
-      );
-
-      let addedSearchHits = 0;
-      for (const sr of searchResponses) {
-        const webResults = Array.isArray(sr.body?.results) ? (sr.body.results as Array<Record<string, unknown>>) : [];
-        for (const hit of webResults) {
-          const u = typeof hit.url === 'string' ? hit.url.trim() : '';
-          if (u.startsWith('https://') && candidateUrls.size < searchCandidateCap) {
-            let hitHost = '';
-            try {
-              hitHost = new URL(u).hostname.toLowerCase().replace(/\.+$/, '');
-            } catch {
-              hitHost = '';
-            }
-            if (hitHost && isKnownMultiTenantAtsHost(hitHost) && matchesScopedAtsCandidateUrl(u)) {
-              candidateUrls.add(u);
-              addedSearchHits++;
-            }
-          }
-        }
-      }
-      if (addedSearchHits > 0) sourcesUsed.add('ats_search');
-    }
 
     const companyWordsLower = companyFilter
       ? normalizeDottedCorporateAbbreviations(companyFilter).toLowerCase().match(/[a-z0-9]+/g) ?? []
@@ -1955,6 +2262,85 @@ export async function executeJobsCall(params: {
       return outUrls;
     };
 
+    /** Scrape args for a candidate board/posting URL; shared by the direct-first probe and the candidate wave so the
+     * wave reuses the probe's cached response instead of fetching the board twice. */
+    const boardScrapeArgs = (u: string, scrapeUrl: string): Record<string, unknown> => {
+      const srBoard = isSmartRecruitersBoardUrl(u);
+      const info = classifyFullBoardKey(u);
+      const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
+      const isGhBoard = Boolean(info?.platform.startsWith('greenhouse') && info.isBoard);
+      return {
+        url: scrapeUrl,
+        renderMode: srBoard ? 'off' : 'auto',
+        discoverLlmsTxt: false,
+        preferOriginMarkdown: false,
+        ephemeral: true,
+        ...(isGhBoard ? { atsLiteBoard: true } : {}),
+        formats: needLinks ? ['markdown', 'links'] : ['markdown'],
+        ...(payload.target ? { target: payload.target } : {}),
+        ...(payload.site ? { site: payload.site } : {}),
+      };
+    };
+
+    // Direct-first: for a company search, probe the company's own Greenhouse / Ashby / Lever / SmartRecruiters boards
+    // before any web search. A board that lists jobs is authoritative (it holds every opening), so the SERP step is
+    // skipped: no search-provider dependency and ~4 s saved. Companies without a probeable board (e.g. Workday) still
+    // fall through to the SERP discovery below.
+    let directFirstHit = false;
+    if (!resumeState && companyFilter && domainsInput.length === 0 && primaryCompanySlug && boardStartOffset === 0) {
+      const knownBoardUrls = await readKnownJobsBoards(env?.META, jobsKnownBoardCompanyKey(companyFilter), Date.now());
+      const probeUrls = [...new Set([...knownBoardUrls, ...buildDirectCompanyProbeUrls()])];
+      const probeOut = await Promise.all(
+        probeUrls.map((u) => executeScrape(boardScrapeArgs(u, u)).catch(() => null)),
+      );
+      for (let pi = 0; pi < probeUrls.length; pi++) {
+        const res = probeOut[pi];
+        const jobsArr = res?.status === 200 && res.body?.ok === true ? res.body.jobs : undefined;
+        if (Array.isArray(jobsArr) && jobsArr.length > 0) {
+          candidateUrls.add(probeUrls[pi]!);
+          directFirstHit = true;
+          if (knownBoardUrls.includes(probeUrls[pi]!)) sourcesUsed.add('ats_known_board');
+        }
+      }
+      if (directFirstHit) sourcesUsed.add('ats_direct');
+    }
+
+    if (!resumeState && !directFirstHit && coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
+      const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
+      const searchCandidateCap =
+        postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(40, Math.max(30, limit * 2));
+      const searchResponses = await Promise.all(
+        scopedQueries.map((sq) =>
+          executeSearch({
+            query: sq,
+            maxResults: searchMaxResults,
+            ...(env?.SERPER_API_KEY ? { mode: 'serper' } : {}),
+          }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
+        ),
+      );
+
+      let addedSearchHits = 0;
+      for (const sr of searchResponses) {
+        const webResults = Array.isArray(sr.body?.results) ? (sr.body.results as Array<Record<string, unknown>>) : [];
+        for (const hit of webResults) {
+          const u = typeof hit.url === 'string' ? hit.url.trim() : '';
+          if (u.startsWith('https://') && candidateUrls.size < searchCandidateCap) {
+            let hitHost = '';
+            try {
+              hitHost = new URL(u).hostname.toLowerCase().replace(/\.+$/, '');
+            } catch {
+              hitHost = '';
+            }
+            if (hitHost && isKnownMultiTenantAtsHost(hitHost) && matchesScopedAtsCandidateUrl(u)) {
+              candidateUrls.add(u);
+              addedSearchHits++;
+            }
+          }
+        }
+      }
+      if (addedSearchHits > 0) sourcesUsed.add('ats_search');
+    }
+
     if (companyFilter && domainsInput.length === 0 && primaryCompanySlug) {
       const normSlug = primaryCompanySlug.toLowerCase().replace(/[^a-z0-9]+/g, '');
       const alreadyHasConfirmedCompanyAts = [...candidateUrls].some((u) => {
@@ -1978,7 +2364,7 @@ export async function executeJobsCall(params: {
 
     const collected: StructuredJobRecord[] = [];
 
-    if (includeBuiltIn && query) {
+    if (includeBuiltIn && query && !resumeState) {
       const builtInUrl = `https://builtin.com/jobs${wantRemote !== false ? '/remote' : ''}?search=${encodeURIComponent(query)}`;
       const biRes = await executeScrape({
         url: builtInUrl,
@@ -1999,7 +2385,7 @@ export async function executeJobsCall(params: {
       }
     }
 
-    if (payload.includePublicFeeds === true) {
+    if (payload.includePublicFeeds === true && !resumeState) {
       const feedOuts = await Promise.all(
         PUBLIC_JOB_FEEDS.map(async (feed) => ({
           feed,
@@ -2021,6 +2407,16 @@ export async function executeJobsCall(params: {
       }
     }
 
+    if (resumeState) {
+      for (const u of [...resumeState.b, ...resumeState.p]) {
+        try {
+          if (isKnownMultiTenantAtsHost(new URL(u).hostname.toLowerCase().replace(/\.+$/, ''))) candidateUrls.add(u);
+        } catch {
+          // skip malformed cursor entries
+        }
+      }
+      sourcesUsed.add('ats_search_continuation');
+    }
     const rawUrlList = [...candidateUrls].filter((u) => matchesScopedAtsCandidateUrl(u));
     const postingCountByBoard = new Map<string, { count: number; boardUrl: string; platform: string; slug: string; hasBoard: boolean }>();
     const smartRecruitersPostingOrgs = new Set<string>();
@@ -2100,6 +2496,25 @@ export async function executeJobsCall(params: {
       ),
     ];
 
+    // Broad searches scrape one chunk per call (boards first) and return the rest as a continuation cursor.
+    let remainingContinuation: JobsContinuation | null = null;
+    let candidatesInChunk = boardWaveUrls.length + postingWaveUrls.length;
+    if (!hasCompanyOrDomainScope && candidatesInChunk > JOBS_BROAD_CHUNK_URLS) {
+      const boardTake = Math.min(boardWaveUrls.length, JOBS_BROAD_CHUNK_URLS);
+      const postingTake = Math.min(postingWaveUrls.length, JOBS_BROAD_CHUNK_URLS - boardTake);
+      const restBoards = boardWaveUrls.splice(boardTake);
+      const restPostings = postingWaveUrls.splice(postingTake);
+      remainingContinuation = {
+        q: continuationKey,
+        b: restBoards.slice(0, MAX_JOBS_CONTINUATION_URLS),
+        p: restPostings.slice(0, MAX_JOBS_CONTINUATION_URLS),
+      };
+      candidatesInChunk = boardWaveUrls.length + postingWaveUrls.length;
+    }
+
+    /** Company boards that returned jobs this call (board URL -> platform), written to the known-boards index. */
+    const learnedCompanyBoards = new Map<string, string>();
+
     const fetchedCompleteBoards = new Set<string>();
     const fetchedQueriedWorkdayBoards = new Map<string, { matchedCount: number; reqIds: Set<string> }>();
     const preWaveNowMs = Date.now();
@@ -2130,6 +2545,7 @@ export async function executeJobsCall(params: {
 
     const smartRecruitersPostingsToEnrich: StructuredJobRecord[] = [];
     const unverifiedPayUrls = new Set<string>();
+    const verifiedBoardJobUrls = new Set<string>();
     let anyBoardTruncated = false;
     let primaryNextCursor: string | undefined;
 
@@ -2181,19 +2597,7 @@ export async function executeJobsCall(params: {
                 scrapeUrl = u;
               }
             }
-            const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
-            const isGhBoard = Boolean(info?.platform.startsWith('greenhouse') && info.isBoard);
-            return executeScrape({
-              url: scrapeUrl,
-              renderMode: srBoard ? 'off' : 'auto',
-              discoverLlmsTxt: false,
-              preferOriginMarkdown: false,
-              ephemeral: true,
-              ...(isGhBoard ? { atsLiteBoard: true } : {}),
-              formats: needLinks ? ['markdown', 'links'] : ['markdown'],
-              ...(payload.target ? { target: payload.target } : {}),
-              ...(payload.site ? { site: payload.site } : {}),
-            }).catch(() => null);
+            return executeScrape(boardScrapeArgs(u, scrapeUrl)).catch(() => null);
           }),
         );
 
@@ -2220,6 +2624,8 @@ export async function executeJobsCall(params: {
           }
 
           const cState = typeof sc.body.contentState === 'string' ? sc.body.contentState : undefined;
+          // A maintenance page says nothing about the board: skip it without marking the board closed.
+          if (cState === 'temporarily_unavailable') continue;
           if (cState === 'closed_posting' || cState === 'soft_404' || cState === 'login_wall') {
             if (discEntry) {
               discEntry.boardStatus = classifyAtsBoardStatus({
@@ -2236,6 +2642,24 @@ export async function executeJobsCall(params: {
             const fullInfo = classifyFullBoardKey(origU);
             if (fullInfo && sc.body.truncated !== true && boardStartOffset === 0) {
               fetchedCompleteBoards.add(fullInfo.key);
+            }
+            if (
+              companyFilter &&
+              domainsInput.length === 0 &&
+              sc.body.jobs.length > 0 &&
+              (fullInfo?.isBoard || isSmartRecruitersBoardUrl(origU)) &&
+              matchesScopedAtsCandidateUrl(origU)
+            ) {
+              try {
+                const boardU = new URL(origU);
+                if (isKnownMultiTenantAtsHost(boardU.hostname.toLowerCase().replace(/\.+$/, ''))) {
+                  boardU.search = '';
+                  boardU.hash = '';
+                  learnedCompanyBoards.set(boardU.toString(), fullInfo?.platform ?? 'smartrecruiters');
+                }
+              } catch {
+                // not a URL we can index
+              }
             }
             const boardExtId =
               typeof sc.body.extractorId === 'string' && sc.body.extractorId
@@ -2397,32 +2821,74 @@ export async function executeJobsCall(params: {
             continue;
           }
 
-          if (Array.isArray(sc.body.records) && sc.body.extractorId === 'icims') {
-            sourcesUsed.add('ats:icims');
-            resolvedAdapterIds.add('icims');
-            const icimsRecs = sc.body.records as Array<Record<string, unknown>>;
-            const icimsCo = inferCompanyFromAtsUrl(origU);
-            for (const rc of icimsRecs) {
+          if (
+            Array.isArray(sc.body.records) &&
+            (sc.body.extractorId === 'icims' || sc.body.extractorId === 'ukg-paylocity-dover')
+          ) {
+            const extId = sc.body.extractorId;
+            const boardRecs = sc.body.records as Array<Record<string, unknown>>;
+            const boardCoFallback = inferCompanyFromAtsUrl(origU);
+            const isVerifiedBoard = Boolean(
+              discEntry &&
+                discEntry.discoveredFrom &&
+                !discEntry.discoveredFrom.startsWith('slug-probe:') &&
+                !discEntry.discoveredFrom.startsWith('search:'),
+            );
+            if (discEntry) {
+              discEntry.boardStatus = classifyAtsBoardStatus({
+                httpStatus: sc.status,
+                requestedUrl: origU,
+                finalUrl: typeof sc.body.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+                jobCount: boardRecs.length,
+              });
+              if (typeof sc.body.total === 'number') discEntry.total = sc.body.total;
+              discEntry.returned = boardRecs.length;
+              discEntry.truncated = Boolean(sc.body.truncated);
+            }
+            let defaultSource = extId === 'icims' ? 'icims' : 'ukg-paylocity-dover';
+            if (extId === 'ukg-paylocity-dover') {
+              if (/ultipro\.com/i.test(origU)) defaultSource = 'ukg';
+              else if (/paylocity\.com/i.test(origU)) defaultSource = 'paylocity';
+              else if (/dover\.(?:com|io)/i.test(origU)) defaultSource = 'dover';
+            }
+            sourcesUsed.add(`ats:${defaultSource}`);
+            resolvedAdapterIds.add(extId);
+            for (const rc of boardRecs) {
               const rTitle = typeof rc.title === 'string' ? rc.title.trim() : '';
-              const rUrl = typeof rc.url === 'string' ? rc.url.trim() : '';
+              const rUrl =
+                typeof rc.url === 'string' && rc.url.trim()
+                  ? rc.url.trim()
+                  : typeof rc.applyUrl === 'string'
+                    ? rc.applyUrl.trim()
+                    : '';
               if (!rTitle || !rUrl) continue;
+              if (isVerifiedBoard) {
+                verifiedBoardJobUrls.add(rUrl.replace(/\/+$/, '').toLowerCase());
+              }
+              const rApplyUrl = typeof rc.applyUrl === 'string' && rc.applyUrl.trim() ? rc.applyUrl.trim() : rUrl;
               const rLoc =
                 typeof rc.location === 'string'
                   ? rc.location.trim()
                   : Array.isArray(rc.locations) && typeof rc.locations[0] === 'string'
                     ? rc.locations[0].trim()
                     : '';
-              const rSalary = typeof rc.salary === 'string' ? rc.salary : typeof rc.payRaw === 'string' ? rc.payRaw : '';
+              const rComp = typeof rc.company === 'string' && rc.company.trim() ? rc.company.trim() : boardCoFallback;
+              const rDesc = typeof rc.description === 'string' ? rc.description.trim() : '';
+              const payText = [rc.salary, rc.payRaw, rc.compensation, rDesc, rTitle]
+                .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+                .join(' ');
+              const rSource = typeof rc.source === 'string' && rc.source.trim() ? rc.source.trim() : defaultSource;
               collected.push({
                 title: rTitle,
-                company: icimsCo,
+                company: rComp,
                 url: rUrl,
-                applyUrl: rUrl,
-                workplaceType: inferWorkdayWorkplaceType('', rLoc, rTitle),
+                applyUrl: rApplyUrl,
+                workplaceType: inferWorkdayWorkplaceType(rDesc, rLoc, rTitle),
                 locations: rLoc ? [rLoc] : [],
-                pay: rSalary ? parsePayFromText(rSalary) : null,
+                pay: payText ? parsePayFromText(payText) : null,
                 postedAt: typeof rc.postedAt === 'string' ? rc.postedAt : null,
-                source: 'icims',
+                source: rSource,
+                ...(rDesc ? { snippet: rDesc.slice(0, 240) } : {}),
               });
             }
             continue;
@@ -2487,9 +2953,13 @@ export async function executeJobsCall(params: {
       }
     };
 
-    for (const waveUrls of [boardWaveUrls, postingWaveUrls]) {
-      await runCandidateWave(waveUrls);
-    }
+    await runCandidateWave(boardWaveUrls);
+    // Company-scoped: once the company's board was read, individual postings only add pay/details for the jobs still
+    // missing, so fetch at most 2x the remaining slots instead of every search hit (each is a ~4 s detail fetch).
+    const boardRead = fetchedCompleteBoards.size > 0 || fetchedQueriedWorkdayBoards.size > 0;
+    const postingCap =
+      hasCompanyOrDomainScope && boardRead ? Math.max(2, (limit - collected.length) * 2) : postingWaveUrls.length;
+    await runCandidateWave(postingWaveUrls.slice(0, postingCap));
 
     if (
       companyFilter &&
@@ -2559,6 +3029,8 @@ export async function executeJobsCall(params: {
             if (dropIdx >= 0) collected.splice(dropIdx, 1);
             continue;
           }
+          // Keep the listing, but don't enrich it from a maintenance page.
+          if (detState === 'temporarily_unavailable') continue;
           if (det.status !== 200 || det.body?.ok !== true) continue;
           const detHtml =
             typeof det.body.rawHtml === 'string' ? det.body.rawHtml : typeof det.body.html === 'string' ? det.body.html : '';
@@ -2594,7 +3066,11 @@ export async function executeJobsCall(params: {
       allowedCompanyTokens.add(companyFilter);
       for (const expanded of expandCompanyFilterTokens(companyFilter)) allowedCompanyTokens.add(expanded);
     }
-    for (const dom of domainsInput) allowedCompanyTokens.add(dom);
+    for (const dom of domainsInput) {
+      allowedCompanyTokens.add(dom);
+      const explicitWd = /^([a-z0-9-]+)\.(wd\d+)\.myworkday(?:jobs|site)\.com$/i.exec(dom);
+      if (explicitWd?.[1]) allowedCompanyTokens.add(explicitWd[1].toLowerCase());
+    }
     for (const db of discoveredBoards) {
       const isVerifiedFirstPartyLink =
         Boolean(db.discoveredFrom) &&
@@ -2605,17 +3081,22 @@ export async function executeJobsCall(params: {
         if (rootSlug) allowedCompanyTokens.add(rootSlug);
       }
     }
-    const allowedBoardPrefixes = discoveredBoards
-      .filter(
-        (b) =>
-          Boolean(b.discoveredFrom) &&
-          !b.discoveredFrom.startsWith('slug-probe:') &&
-          !b.discoveredFrom.startsWith('search:') &&
-          b.boardStatus !== 'not_found' &&
-          b.boardStatus !== 'budget_exhausted' &&
-          b.boardUrl,
-      )
-      .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase());
+    const allowedBoardPrefixes = [
+      ...new Set([
+        ...discoveredBoards
+          .filter(
+            (b) =>
+              Boolean(b.discoveredFrom) &&
+              !b.discoveredFrom.startsWith('slug-probe:') &&
+              !b.discoveredFrom.startsWith('search:') &&
+              b.boardStatus !== 'not_found' &&
+              b.boardStatus !== 'budget_exhausted' &&
+              b.boardUrl,
+          )
+          .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase()),
+        ...verifiedBoardJobUrls,
+      ]),
+    ];
 
     const rankOut = callCoreWasm<{
       finalIndices: Array<{ index: number; matchedOn: 'phrase' | 'all_tokens' | 'company_filter'; payUnknown?: boolean }>;
@@ -2656,7 +3137,21 @@ export async function executeJobsCall(params: {
         `Board listing was cut short; pass \`cursor: "${resolvedTopCursor}"\` (or \`offset: ${resolvedTopCursor}\`) to fetch the next page.`,
       );
     }
-    if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
+    if (remainingContinuation) {
+      notes.push(
+        `Checked ${candidatesInChunk} candidate job board(s)/posting(s) in this call; ` +
+          `${remainingContinuation.b.length + remainingContinuation.p.length} more remain. ` +
+          'Pass `cursor` = `continueCursor` with the same query to check the next chunk (no new web search).',
+      );
+    }
+    if (timeBudgetExhausted && !notes.some((n) => n.includes('Time budget'))) {
+      notes.push(
+        `Time budget (${Math.round(wallBudgetMs / 1_000)} s) reached before all candidate boards could be checked; results are partial. ` +
+          (hasCompanyOrDomainScope
+            ? 'Pass `cursor` (when present) or narrow `query` / `locations` to check the rest.'
+            : 'Add `company` or `domains` to narrow the search.'),
+      );
+    } else if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
       notes.push(`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all candidate boards could be checked.`);
     }
     if (payUnverifiedCount > 0 && !notes.some((n) => n.includes('pay not verified'))) {
@@ -2665,7 +3160,17 @@ export async function executeJobsCall(params: {
       );
     }
     if (candidateUrls.size === 0 && collected.length === 0 && domainsInput.length === 0) {
-      notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
+      // Only blame configuration when no search provider is configured; otherwise the search ran and matched nothing.
+      const hasSearchProvider = Boolean(
+        env?.SERPER_API_KEY || env?.BRAVE_API_KEY || env?.TAVILY_API_KEY || env?.SEARXNG_URL || env?.SEARCH,
+      );
+      notes.push(
+        hasSearchProvider
+          ? timeBudgetExhausted
+            ? 'No ATS job boards were found within the time budget. Add `company` or `domains` to narrow the search.'
+            : 'The job-board search ran but matched no ATS boards for this query. Try a broader query, or add `company` or `domains`.'
+          : 'No ATS search results returned: no search provider is configured on the Hub (set SERPER_API_KEY, BRAVE_API_KEY, TAVILY_API_KEY or SEARXNG_URL).',
+      );
     }
 
     const boardsDiscoveredCount = discoveredBoards.filter((b) => b.boardStatus !== 'not_found' && Boolean(b.boardUrl)).length;
@@ -2674,6 +3179,11 @@ export async function executeJobsCall(params: {
     activeTracer?.setAttribute('edgefetch.jobs.jobs_returned', finalJobs.length);
     if (resolvedAdapterIds.size > 0) {
       activeTracer?.setAttribute('edgefetch.adapter_id', [...resolvedAdapterIds].join(','));
+    }
+    // Salary aggregation: record the employer-posted pay ranges this search returned (Go plausibility gate).
+    await recordSalaryObservations(env?.META, collected).catch(() => 0);
+    if (companyFilter && learnedCompanyBoards.size > 0) {
+      await recordKnownJobsBoards(env?.META, jobsKnownBoardCompanyKey(companyFilter), learnedCompanyBoards, Date.now());
     }
 
     return {
@@ -2695,6 +3205,13 @@ export async function executeJobsCall(params: {
         ...(responseTruncated ? { truncated: true } : {}),
         ...(resolvedTopCursor ? { nextCursor: resolvedTopCursor } : {}),
         ...(budgetExhausted ? { budgetExhausted: true } : {}),
+        ...(timeBudgetExhausted ? { timeBudgetExhausted: true } : {}),
+        ...(remainingContinuation
+          ? {
+              continueCursor: encodeJobsContinuation(remainingContinuation),
+              remainingCandidates: remainingContinuation.b.length + remainingContinuation.p.length,
+            }
+          : {}),
         sourcesUsed: [...sourcesUsed],
         count: finalJobs.length,
         candidatesChecked: candidateUrls.size,

@@ -213,6 +213,11 @@ func DecodeHTMLEntities(input string) string {
 					i = p + 1
 					continue
 				}
+				if mapped, ok := lookupHTML5NamedEntityNonASCIIGo(rawName); ok {
+					sb.WriteString(mapped)
+					i = p + 1
+					continue
+				}
 			}
 		}
 		sb.WriteByte(input[i])
@@ -384,7 +389,7 @@ func FormatInertiaPagePropsToMarkdown(props map[string]any, pageURL string) *For
 		return nil
 	}
 	rawComp, _ := props["component"].(string)
-	decodedComp := stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesPreservingLtGo(DecodeHTMLEntities(stripInvisibleSmugglingCharsGo(rawComp))))
+	decodedComp := stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(stripInvisibleSmugglingCharsGo(rawComp)))
 	compClean := neutralizeAllUnsafeMarkdownLinksLinearGo(decodedComp)
 	compClean = strings.NewReplacer("\r", " ", "\n", " ", "`", " ", "<", "&lt;").Replace(compClean)
 	component := strings.Join(strings.Fields(compClean), " ")
@@ -406,8 +411,8 @@ func FormatInertiaPagePropsToMarkdown(props map[string]any, pageURL string) *For
 		if strings.TrimSpace(rawStr) == "" {
 			return ""
 		}
-		decoded := stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesPreservingLtGo(rawStr))
-		safe := neutralizeAllUnsafeMarkdownLinksLinearGo(decoded)
+		decoded := stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesEscapingLinkBracketsPreservingLtGo(rawStr))
+		safe := escapeUnescapedMarkdownBracketsGo(decoded)
 		safe = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ", "<", "&lt;").Replace(safe)
 		safe = strings.TrimSpace(safe)
 		if len(safe) > maxLen {
@@ -440,7 +445,7 @@ func FormatInertiaPagePropsToMarkdown(props map[string]any, pageURL string) *For
 			conv := strings.TrimSpace(stripInvisibleSmugglingCharsGo(sub.Markdown))
 			return strings.ReplaceAll(neutralizeAllUnsafeMarkdownLinksLinearGo(conv), "<", "&lt;")
 		}
-		decoded := stripInvisibleSmugglingCharsGo(decodeMarkdownEntitiesPreservingLtGo(cleaned))
+		decoded := stripInvisibleSmugglingCharsGo(decodeMarkdownProseEntitiesPreservingLinksAndLtGo(cleaned))
 		return strings.ReplaceAll(neutralizeAllUnsafeMarkdownLinksLinearGo(decoded), "<", "&lt;")
 	}
 
@@ -479,11 +484,11 @@ func FormatInertiaPagePropsToMarkdown(props map[string]any, pageURL string) *For
 				}
 				safeScalar := preEscapeInline(clean, 300)
 				if bestTitle == "" && (lower == "title" || lower == "pagetitle" || lower == "headline" || lower == "name") && len(clean) <= 180 {
-					bestTitle = preEscapeInline(clean, 180)
+					bestTitle = SanitizeScrapedMetadataField(clean, 180)
 				}
 				if bestDescription == "" && (lower == "description" || lower == "summary" || lower == "excerpt") &&
 					len(clean) >= 20 && len(clean) <= 400 && !strings.Contains(clean, "<") {
-					bestDescription = preEscapeInline(clean, 400)
+					bestDescription = SanitizeScrapedMetadataField(clean, 400)
 				}
 				isProse := len(clean) >= 80 || lower == "body" || lower == "content" || lower == "markdown" || lower == "html" || lower == "descriptionhtml"
 				if isProse && strings.ContainsAny(clean, " \t\r\n") {
@@ -612,9 +617,9 @@ func FormatInertiaPagePropsToMarkdown(props map[string]any, pageURL string) *For
 	if len(propSections) == 0 {
 		return nil
 	}
-	headingTitle := bestTitle
+	headingTitle := preEscapeInline(bestTitle, 180)
 	if headingTitle == "" {
-		headingTitle = strings.ReplaceAll(component, "/", " — ")
+		headingTitle = preEscapeInline(strings.ReplaceAll(component, "/", " — "), 180)
 	}
 	headingTitle = strings.Join(strings.Fields(headingTitle), " ")
 	sections := append([]string{"# " + headingTitle, "- **Inertia Component**: `" + component + "`"}, propSections...)
@@ -768,7 +773,9 @@ func ExtractStructuredJSONFromPageWithDiagnostics(
 					{"brand", "brand"},
 					{"currency", "currency"},
 					{"sku", "sku"},
-					{"availability", "availability"},
+					{"mpn", "mpn"},
+					{"gtin", "gtin"},
+					{"gtin", "gtin13"},
 				} {
 					if lazyProduct[pair[0]] == nil {
 						if s, ok := rec[pair[1]].(string); ok && strings.TrimSpace(s) != "" {
@@ -784,21 +791,66 @@ func ExtractStructuredJSONFromPageWithDiagnostics(
 						if lazyProduct["price"] == nil && v0["price"] != nil {
 							lazyProduct["price"] = v0["price"]
 						}
+						if lazyProduct["currency"] == nil {
+							if c, okC := v0["currency"].(string); okC && strings.TrimSpace(c) != "" {
+								lazyProduct["currency"] = strings.TrimSpace(c)
+							}
+						}
 						if lazyProduct["sku"] == nil {
 							if s, okS := v0["sku"].(string); okS && strings.TrimSpace(s) != "" {
 								lazyProduct["sku"] = strings.TrimSpace(s)
 							}
 						}
-						if lazyProduct["availability"] == nil {
-							if av, okA := v0["available"].(bool); okA {
-								if av {
-									lazyProduct["availability"] = "InStock"
-								} else {
-									lazyProduct["availability"] = "OutOfStock"
-								}
+						if lazyProduct["gtin"] == nil {
+							if b, okB := v0["barcode"].(string); okB && strings.TrimSpace(b) != "" {
+								lazyProduct["gtin"] = strings.TrimSpace(b)
 							}
 						}
 					}
+				}
+				recordAvail := normalizeRecordAvailabilityFmtGo(rec["availability"])
+				if recordAvail == "" {
+					recordAvail = normalizeRecordAvailabilityFmtGo(rec["available"])
+				}
+				if recordAvail == "" {
+					if variants, ok := rec["variants"].([]any); ok && len(variants) > 0 {
+						var normAvails []string
+						for _, vrAny := range variants {
+							vr, okV := vrAny.(map[string]any)
+							if !okV || vr == nil {
+								continue
+							}
+							va := normalizeRecordAvailabilityFmtGo(vr["availability"])
+							if va == "" {
+								va = normalizeRecordAvailabilityFmtGo(vr["available"])
+							}
+							if va != "" {
+								normAvails = append(normAvails, va)
+							}
+						}
+						if len(normAvails) == 1 {
+							recordAvail = normAvails[0]
+						} else if len(normAvails) > 1 {
+							picked := normAvails[0]
+							for _, pref := range []string{"InStock", "PreOrder", "BackOrder"} {
+								foundPref := false
+								for _, na := range normAvails {
+									if na == pref {
+										picked = pref
+										foundPref = true
+										break
+									}
+								}
+								if foundPref {
+									break
+								}
+							}
+							recordAvail = picked
+						}
+					}
+				}
+				if recordAvail != "" && (doc.PreferRecordAvailability || lazyProduct["availability"] == nil) {
+					lazyProduct["availability"] = recordAvail
 				}
 			}
 		}
@@ -813,31 +865,37 @@ func ExtractStructuredJSONFromPageWithDiagnostics(
 		var val any
 		found := false
 
+		skipTopLevelLDForLiveAvail := doc.PreferRecordAvailability &&
+			(lowerProp == "availability" || lowerProp == "stockstatus" ||
+				lowerProp == "instock" || lowerProp == "available" || lowerProp == "in_stock")
+
 		// 1. JSON-LD exact key match (case-insensitive)
-		for _, ld := range jsonLdObjects {
-			for _, k := range sortedMapKeys(ld) {
-				if strings.EqualFold(k, propName) && ld[k] != nil {
-					cand := ld[k]
-					if propType == "string" {
-						if cm, isMap := cand.(map[string]any); isMap {
-							if nm, ok := cm["name"].(string); ok && strings.TrimSpace(nm) != "" {
-								cand = strings.TrimSpace(nm)
-							} else if u, ok := cm["url"].(string); ok && strings.TrimSpace(u) != "" {
-								cand = strings.TrimSpace(u)
-							} else if id, ok := cm["@id"].(string); ok && strings.TrimSpace(id) != "" {
-								cand = strings.TrimSpace(id)
-							} else {
-								continue
+		if !skipTopLevelLDForLiveAvail {
+			for _, ld := range jsonLdObjects {
+				for _, k := range sortedMapKeys(ld) {
+					if strings.EqualFold(k, propName) && ld[k] != nil {
+						cand := ld[k]
+						if propType == "string" {
+							if cm, isMap := cand.(map[string]any); isMap {
+								if nm, ok := cm["name"].(string); ok && strings.TrimSpace(nm) != "" {
+									cand = strings.TrimSpace(nm)
+								} else if u, ok := cm["url"].(string); ok && strings.TrimSpace(u) != "" {
+									cand = strings.TrimSpace(u)
+								} else if id, ok := cm["@id"].(string); ok && strings.TrimSpace(id) != "" {
+									cand = strings.TrimSpace(id)
+								} else {
+									continue
+								}
 							}
 						}
+						val = cand
+						found = true
+						break
 					}
-					val = cand
-					found = true
+				}
+				if found {
 					break
 				}
-			}
-			if found {
-				break
 			}
 		}
 
@@ -976,12 +1034,60 @@ func ExtractStructuredJSONFromPageWithDiagnostics(
 	return result, matchedFields, unfilledFields
 }
 
+func normalizeRecordAvailabilityFmtGo(v any) string {
+	switch val := v.(type) {
+	case bool:
+		if val {
+			return "InStock"
+		}
+		return "OutOfStock"
+	case string:
+		s := strings.ToLower(strings.Join(strings.Fields(val), " "))
+		if s == "" {
+			return ""
+		}
+		if strings.Contains(s, "out of stock") || strings.Contains(s, "outofstock") ||
+			strings.Contains(s, "not in stock") || strings.Contains(s, "not-in-stock") ||
+			strings.Contains(s, "not instock") || strings.Contains(s, "not available") ||
+			strings.Contains(s, "no longer available") || strings.Contains(s, "sold out") ||
+			strings.Contains(s, "soldout") || strings.Contains(s, "unavailable") ||
+			strings.Contains(s, "discontinued") || s == "false" || s == "0" {
+			return "OutOfStock"
+		}
+		if strings.Contains(s, "preorder") || strings.Contains(s, "pre-order") || strings.Contains(s, "pre_order") {
+			return "PreOrder"
+		}
+		if strings.Contains(s, "backorder") || strings.Contains(s, "back-order") || strings.Contains(s, "back_order") {
+			return "BackOrder"
+		}
+		if strings.Contains(s, "instock") || strings.Contains(s, "in stock") ||
+			strings.Contains(s, "in_stock") || s == "available" || s == "true" || s == "1" {
+			return "InStock"
+		}
+	}
+	return ""
+}
+
 func isNumericTypeFmtGo(v any) bool {
 	switch v.(type) {
 	case int, int64, float64, float32, json.Number:
 		return true
 	}
 	return false
+}
+
+func normalizeAlphaNumLowerFmtGo(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			sb.WriteByte(c + ('a' - 'A'))
+		} else if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			sb.WriteByte(c)
+		}
+	}
+	return sb.String()
 }
 
 func lookupSchemaProductFieldFmtGo(lowerProp string, getProduct func() map[string]any) (any, bool) {
@@ -1001,31 +1107,58 @@ func lookupSchemaProductFieldFmtGo(lowerProp string, getProduct func() map[strin
 		prodKey = "brand"
 	case "sku", "productid":
 		prodKey = "sku"
+	case "mpn", "partnumber", "part_number", "model":
+		prodKey = "mpn"
 	case "gtin", "gtin13", "ean", "upc":
 		prodKey = "gtin"
+	case "url":
+		prodKey = "url"
 	case "rating", "ratingvalue", "averagerating":
 		prodKey = "rating"
 	case "reviewcount", "reviews_count", "ratingcount":
 		prodKey = "reviewCount"
-	default:
-		return nil, false
 	}
 	prod := getProduct()
 	if len(prod) == 0 {
 		return nil, false
 	}
-	v, exists := prod[prodKey]
-	if !exists || v == nil {
-		return nil, false
-	}
-	if isInStockBool {
-		s := strings.ToLower(strings.TrimSpace(jsonScalarToString(v)))
-		if s == "" {
-			return nil, false
+	if prodKey != "" {
+		v, exists := prod[prodKey]
+		if (!exists || v == nil) && prodKey == "mpn" {
+			v, exists = prod["sku"]
 		}
-		return strings.Contains(s, "instock") || s == "true" || s == "available", true
+		if exists && v != nil {
+			if isInStockBool {
+				s := strings.ToLower(strings.TrimSpace(jsonScalarToString(v)))
+				if s == "" {
+					return nil, false
+				}
+				return strings.Contains(s, "instock") || s == "true" || s == "available", true
+			}
+			return v, true
+		}
 	}
-	return v, true
+	normProp := normalizeAlphaNumLowerFmtGo(lowerProp)
+	if normProp == "category" {
+		if cv, ok := prod["category"]; ok && cv != nil {
+			return cv, true
+		}
+		normProp = "producttype"
+	}
+	if specsStr, ok := prod["specs"].(map[string]string); ok {
+		for sk, sv := range specsStr {
+			if normalizeAlphaNumLowerFmtGo(sk) == normProp && sv != "" {
+				return sv, true
+			}
+		}
+	} else if specsAny, ok := prod["specs"].(map[string]any); ok {
+		for sk, sv := range specsAny {
+			if normalizeAlphaNumLowerFmtGo(sk) == normProp && sv != nil {
+				return sv, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func extractSchemaArrayFieldFmtGo(propName, cleanMD, rawHTML string) []string {
@@ -1242,8 +1375,8 @@ func extractSchemaScalarHeuristicFmtGo(propName, lowerProp, propType, mdScanSlic
 	trimmedKey := strings.Trim(propName, " \t_-")
 	if trimmedKey != "" && mdScanSlice != "" {
 		escaped := regexp.QuoteMeta(trimmedKey)
-		fuzzy := reCamelSplitFmtGo.ReplaceAllString(escaped, `$1[ \t_-]{0,8}$2`)
-		fuzzy = reFuzzySepRunsFmtGo.ReplaceAllString(fuzzy, `[ \t_-]{0,8}`)
+		fuzzy := reFuzzySepRunsFmtGo.ReplaceAllString(escaped, `[ \t_-]{0,8}`)
+		fuzzy = reCamelSplitFmtGo.ReplaceAllString(fuzzy, `$1[ \t_-]{0,8}$2`)
 		pat := `(?im)(?:^|\n)[ \t]{0,32}(?:[-*][ \t]{0,16})?\*{0,2}` + fuzzy + `\*{0,2}[ \t]{0,16}:[ \t]{0,16}([^\r\n]{1,500})`
 		if kvRe, err := regexp.Compile(pat); err == nil {
 			if m := kvRe.FindStringSubmatch(mdScanSlice); len(m) >= 2 {
@@ -1266,6 +1399,22 @@ func extractSchemaScalarHeuristicFmtGo(propName, lowerProp, propType, mdScanSlic
 					}
 					if cand != "" {
 						return cand, true
+					}
+				}
+			}
+		}
+		if strings.Contains(mdScanSlice, "|") {
+			gfmPat := `(?im)^[ \t]*\|[ \t]*\*{0,2}` + fuzzy + `(?:\s*\([^|\r\n]{1,40}\))?\*{0,2}[ \t]*\|[ \t]*([^|\r\n]{1,500})\|`
+			if gfmRe, err := regexp.Compile(gfmPat); err == nil {
+				for _, gm := range gfmRe.FindAllStringSubmatch(mdScanSlice, 8) {
+					if len(gm) >= 2 {
+						cand := strings.TrimSpace(gm[1])
+						if len(cand) >= 2 && cand[0] == '`' && cand[len(cand)-1] == '`' && !strings.Contains(cand[1:len(cand)-1], "`") {
+							cand = cand[1 : len(cand)-1]
+						}
+						if cand != "" && strings.Trim(cand, "-: \t") != "" {
+							return strings.TrimSpace(cand), true
+						}
 					}
 				}
 			}
@@ -1330,20 +1479,20 @@ func FormatVCardToMarkdown(raw string) *FormattedPayloadDoc {
 				vcardData["fullName"] = val
 			}
 		case "TITLE":
-			bullets = append(bullets, "- **Title**: "+val)
+			bullets = append(bullets, "- **Title**: "+escapeDeclMarkdownBrackets(val))
 			vcardData["title"] = val
 		case "ORG":
 			org := strings.ReplaceAll(val, ";", " · ")
-			bullets = append(bullets, "- **Organization**: "+org)
+			bullets = append(bullets, "- **Organization**: "+escapeDeclMarkdownBrackets(org))
 			vcardData["organization"] = org
 		case "EMAIL":
-			bullets = append(bullets, "- **Email**: "+val)
+			bullets = append(bullets, "- **Email**: "+escapeDeclMarkdownBrackets(val))
 			vcardData["email"] = val
 		case "TEL":
-			bullets = append(bullets, "- **Phone**: "+val)
+			bullets = append(bullets, "- **Phone**: "+escapeDeclMarkdownBrackets(val))
 			vcardData["phone"] = val
 		case "URL":
-			bullets = append(bullets, "- **URL**: "+val)
+			bullets = append(bullets, "- **URL**: "+escapeDeclMarkdownBrackets(val))
 			vcardData["url"] = val
 		case "ADR":
 			var parts []string
@@ -1354,11 +1503,11 @@ func FormatVCardToMarkdown(raw string) *FormattedPayloadDoc {
 			}
 			if len(parts) > 0 {
 				cleanAdr := strings.Join(parts, ", ")
-				bullets = append(bullets, "- **Location**: "+cleanAdr)
+				bullets = append(bullets, "- **Location**: "+escapeDeclMarkdownBrackets(cleanAdr))
 				vcardData["location"] = cleanAdr
 			}
 		case "NOTE":
-			bullets = append(bullets, "- **Note**: "+val)
+			bullets = append(bullets, "- **Note**: "+escapeDeclMarkdownBrackets(val))
 			vcardData["note"] = val
 		}
 	}
@@ -1368,12 +1517,12 @@ func FormatVCardToMarkdown(raw string) *FormattedPayloadDoc {
 	}
 	heading := "# Contact Card (vCard)"
 	if fullName != "" {
-		heading = "# " + fullName
+		heading = "# " + escapeDeclMarkdownBrackets(fullName)
 	}
 	lines := append([]string{heading, ""}, bullets...)
 	return &FormattedPayloadDoc{
-		Title:      fullName,
-		Markdown:   strings.TrimSpace(strings.Join(lines, "\n")),
+		Title:      SanitizeScrapedMetadataField(fullName, 512),
+		Markdown:   SanitizeScrapedMarkdown(strings.TrimSpace(strings.Join(lines, "\n"))),
 		Structured: vcardData,
 	}
 }
@@ -1503,19 +1652,19 @@ func FormatICalendarToMarkdown(raw string) *FormattedPayloadDoc {
 			if dtEnd != "" && dtEnd != dtStart {
 				when = dtStart + " → " + dtEnd
 			}
-			bullets = append(bullets, "- **When**: "+when)
+			bullets = append(bullets, "- **When**: "+escapeDeclMarkdownBrackets(when))
 		}
 		if location != "" {
-			bullets = append(bullets, "- **Location**: "+location)
+			bullets = append(bullets, "- **Location**: "+escapeDeclMarkdownBrackets(location))
 		}
 		lowURL := asciiLowerExtractString(evURL[:minInt(len(evURL), 8)])
 		if strings.HasPrefix(lowURL, "https://") || strings.HasPrefix(lowURL, "http://") {
-			bullets = append(bullets, "- **URL**: "+evURL)
+			bullets = append(bullets, "- **URL**: "+escapeDeclMarkdownBrackets(evURL))
 		}
 		if desc != "" {
-			bullets = append(bullets, "- **Details**: "+truncateUTF8SafeFullDocGo(desc, 600))
+			bullets = append(bullets, "- **Details**: "+escapeDeclMarkdownBrackets(truncateUTF8SafeFullDocGo(desc, 600)))
 		}
-		evLines := append([]string{"## " + evTitle}, bullets...)
+		evLines := append([]string{"## " + escapeDeclMarkdownBrackets(evTitle)}, bullets...)
 		eventSections = append(eventSections, strings.Join(evLines, "\n"))
 		structuredEvents = append(structuredEvents, map[string]any{
 			"summary":  evTitle,
@@ -1533,17 +1682,17 @@ func FormatICalendarToMarkdown(raw string) *FormattedPayloadDoc {
 	if title == "" {
 		title = "Calendar Events"
 	}
-	blocks := []string{"# " + title}
+	blocks := []string{"# " + escapeDeclMarkdownBrackets(title)}
 	if calDesc != "" && calDesc != title {
-		blocks = append(blocks, calDesc)
+		blocks = append(blocks, escapeDeclMarkdownBlock(calDesc))
 	}
 	if len(eventSections) > 0 {
 		blocks = append(blocks, strings.Join(eventSections, "\n\n"))
 	}
 	return &FormattedPayloadDoc{
-		Title:       title,
-		Description: calDesc,
-		Markdown:    strings.Join(blocks, "\n\n"),
+		Title:       SanitizeScrapedMetadataField(title, 512),
+		Description: SanitizeScrapedMetadataField(calDesc, 2000),
+		Markdown:    SanitizeScrapedMarkdown(strings.Join(blocks, "\n\n")),
 		Structured:  structuredEvents,
 	}
 }
@@ -1641,37 +1790,46 @@ func FormatGitPatchToMarkdown(raw, urlStr string) *FormattedPayloadDoc {
 	if title == "" {
 		title = fallbackTitle
 	}
+	safeTitle := SanitizeScrapedMetadataField(title, 512)
+	if safeTitle == "" {
+		safeTitle = "Git Patch"
+	}
+	safeAuthor := SanitizeScrapedMeta(author)
+	safeDate := SanitizeScrapedMeta(date)
 	var metaBullets []string
 	if commitSha != "" {
 		shortCommit := commitSha
 		if len(shortCommit) > 12 {
 			shortCommit = shortCommit[:12]
 		}
-		metaBullets = append(metaBullets, "- **Commit**: `"+shortCommit+"`")
+		safeCommit := sanitizeDeclInlineCodeVal(SanitizeScrapedMeta(shortCommit))
+		metaBullets = append(metaBullets, "- **Commit**: `"+safeCommit+"`")
 	}
-	if author != "" {
-		metaBullets = append(metaBullets, "- **Author**: "+author)
+	if safeAuthor != "" {
+		metaBullets = append(metaBullets, "- **Author**: "+escapeDeclMarkdownBrackets(safeAuthor))
 	}
-	if date != "" {
-		metaBullets = append(metaBullets, "- **Date**: "+date)
+	if safeDate != "" {
+		metaBullets = append(metaBullets, "- **Date**: "+escapeDeclMarkdownBrackets(safeDate))
 	}
 
-	sections := []string{"# " + title}
+	sections := []string{"# " + escapeDeclMarkdownBrackets(safeTitle)}
 	if len(metaBullets) > 0 {
 		sections = append(sections, strings.Join(metaBullets, "\n"))
 	}
 	if commitBody != "" {
-		sections = append(sections, commitBody)
+		if safeCommitBody := SanitizeMarkdownWithOptions(commitBody, "", false); safeCommitBody != "" {
+			sections = append(sections, safeCommitBody)
+		}
 	}
 	sections = append(sections, MakeSafeCodeFence(diffBody, "diff", true))
 
 	desc := ""
 	if commitBody != "" {
 		firstLine := strings.TrimSpace(strings.Split(commitBody, "\n")[0])
-		desc = truncateUTF8SafeFullDocGo(firstLine, 280)
+		desc = SanitizeScrapedMetadataField(escapeDeclMarkdownBrackets(firstLine), 280)
 	}
 	return &FormattedPayloadDoc{
-		Title:       title,
+		Title:       safeTitle,
 		Description: desc,
 		Markdown:    strings.Join(sections, "\n\n"),
 	}
@@ -1775,10 +1933,15 @@ func FormatSourceCodeURLToMarkdown(raw, urlStr, contentType string) *FormattedPa
 		}
 	}
 
+	safeTitle := SanitizeScrapedMetadataField(title, 512)
+	if safeTitle == "" {
+		safeTitle = SanitizeScrapedMetadataField(baseName, 512)
+	}
+	safeDesc := SanitizeScrapedMetadataField(escapeDeclMarkdownBrackets(description), 512)
 	return &FormattedPayloadDoc{
-		Title:       title,
-		Description: description,
-		Markdown:    "# " + title + "\n\n" + MakeSafeCodeFence(trimmed, lang, false),
+		Title:       safeTitle,
+		Description: safeDesc,
+		Markdown:    "# " + escapeDeclMarkdownBrackets(safeTitle) + "\n\n" + MakeSafeCodeFence(trimmed, lang, false),
 	}
 }
 
@@ -1901,10 +2064,10 @@ func FormatFeedXMLToMarkdown(raw, baseURL string) (doc *FormattedPayloadDoc, lin
 
 	var lines []string
 	if feedTitle != "" {
-		lines = append(lines, "# "+feedTitle)
+		lines = append(lines, "# "+escapeDeclMarkdownBrackets(feedTitle))
 	}
 	if feedDesc != "" && feedDesc != feedTitle {
-		lines = append(lines, feedDesc)
+		lines = append(lines, escapeDeclMarkdownBlock(feedDesc))
 	}
 
 	links = make([]string, 0)
@@ -2009,7 +2172,7 @@ func FormatFeedXMLToMarkdown(raw, baseURL string) (doc *FormattedPayloadDoc, lin
 					IncludeImages:   false,
 				}).Markdown
 			} else {
-				bodyMD = cleanInlineHTMLFullDocGo(rawContent)
+				bodyMD = escapeDeclMarkdownBlock(cleanInlineHTMLFullDocGo(rawContent))
 			}
 			if len(bodyMD) > 1800 {
 				cut := strings.LastIndexByte(bodyMD[:1800], ' ')
@@ -2020,13 +2183,15 @@ func FormatFeedXMLToMarkdown(raw, baseURL string) (doc *FormattedPayloadDoc, lin
 			}
 		}
 
-		heading := "## " + itemTitle
+		safeItemTitle := escapeDeclMarkdownBrackets(itemTitle)
+		heading := "## " + safeItemTitle
 		if resolvedLink != "" {
-			heading = "## [" + itemTitle + "](" + resolvedLink + ")"
+			heading = "## [" + safeItemTitle + "](" + resolvedLink + ")"
 		}
 		parts := []string{heading}
 		if pubDate != "" {
-			parts = append(parts, "*"+pubDate+"*")
+			safePubDate := strings.ReplaceAll(escapeDeclMarkdownBrackets(pubDate), "*", `\*`)
+			parts = append(parts, "*"+safePubDate+"*")
 		}
 		if bodyMD != "" {
 			parts = append(parts, bodyMD)
@@ -2184,9 +2349,20 @@ func FormatDelimitedTableToMarkdown(raw, sep, titleHint string) *FormattedPayloa
 		}
 	}
 
+	safeTitle := SanitizeScrapedMetadataField(title, 512)
+	if safeTitle == "" {
+		if delimiter == '\t' {
+			safeTitle = "Tabular Dataset (TSV)"
+		} else {
+			safeTitle = "Tabular Dataset (CSV)"
+		}
+	}
+
+	formatRawCell := func(rawCell string) string {
+		return SanitizeScrapedMeta(rawCell)
+	}
 	formatCell := func(rawCell string) string {
-		s := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(rawCell)
-		s = reSpaceRun.ReplaceAllString(strings.TrimSpace(s), " ")
+		s := escapeDeclMarkdownBrackets(formatRawCell(rawCell))
 		return strings.ReplaceAll(s, "|", `\|`)
 	}
 	padRow := func(r []string) []string {
@@ -2200,9 +2376,14 @@ func FormatDelimitedTableToMarkdown(raw, sep, titleHint string) *FormattedPayloa
 	}
 
 	headerCells := padRow(rows[0])
+	rawHeaderCells := make([]string, colCount)
 	for i := range headerCells {
+		if i < len(rows[0]) {
+			rawHeaderCells[i] = formatRawCell(rows[0][i])
+		}
 		if headerCells[i] == "" {
 			headerCells[i] = "col_" + strconv.Itoa(i+1)
+			rawHeaderCells[i] = headerCells[i]
 		}
 	}
 	previewLim := colCount
@@ -2211,7 +2392,7 @@ func FormatDelimitedTableToMarkdown(raw, sep, titleHint string) *FormattedPayloa
 	}
 	previewCols := make([]string, previewLim)
 	for i := 0; i < previewLim; i++ {
-		previewCols[i] = "`" + headerCells[i] + "`"
+		previewCols[i] = "`" + sanitizeDeclInlineCodeVal(escapeDeclMarkdownBrackets(rawHeaderCells[i])) + "`"
 	}
 	ellipsis := ""
 	if colCount > 8 {
@@ -2234,7 +2415,7 @@ func FormatDelimitedTableToMarkdown(raw, sep, titleHint string) *FormattedPayloa
 		tableLines = append(tableLines, "| "+strings.Join(padRow(r), " | ")+" |")
 	}
 
-	blocks := []string{"# " + title, summaryLine, strings.Join(tableLines, "\n")}
+	blocks := []string{"# " + escapeDeclMarkdownBrackets(safeTitle), summaryLine, strings.Join(tableLines, "\n")}
 	if dataRowCount > len(renderedDataRows) {
 		fmtKind := "CSV"
 		if delimiter == '\t' {
@@ -2244,8 +2425,8 @@ func FormatDelimitedTableToMarkdown(raw, sep, titleHint string) *FormattedPayloa
 	}
 
 	return &FormattedPayloadDoc{
-		Title:       title,
-		Description: summaryLine,
+		Title:       safeTitle,
+		Description: SanitizeScrapedMetadataField(summaryLine, 512),
 		Markdown:    strings.Join(blocks, "\n\n"),
 		Structured: map[string]any{
 			"rowCount":    dataRowCount,
@@ -2495,7 +2676,7 @@ func formatParsedJupyterNotebookFmtGo(parsed any, fallbackTitle string) *Formatt
 
 	title := ""
 	if mt, ok := meta["title"].(string); ok && strings.TrimSpace(mt) != "" {
-		title = strings.TrimSpace(mt)
+		title = SanitizeScrapedMetadataField(mt, 512)
 	}
 	description := ""
 	var blocks []string
@@ -2513,7 +2694,10 @@ func formatParsedJupyterNotebookFmtGo(parsed any, fallbackTitle string) *Formatt
 
 		switch cellType {
 		case "markdown":
-			trimmedMD := strings.TrimSpace(src)
+			trimmedMD := SanitizeMarkdownWithOptions(strings.TrimSpace(src), "", false)
+			if trimmedMD == "" {
+				continue
+			}
 			blocks = append(blocks, trimmedMD)
 			for _, line := range strings.Split(trimmedMD, "\n") {
 				tl := strings.TrimSpace(line)
@@ -2521,9 +2705,9 @@ func formatParsedJupyterNotebookFmtGo(parsed any, fallbackTitle string) *Formatt
 					continue
 				}
 				if title == "" && strings.HasPrefix(tl, "# ") {
-					title = strings.TrimSpace(tl[2:])
+					title = SanitizeScrapedMetadataField(tl[2:], 512)
 				} else if description == "" && !strings.HasPrefix(tl, "#") && !strings.HasPrefix(tl, "```") && len(tl) >= 20 {
-					description = truncateUTF8SafeFullDocGo(stripMarkdownLinksToLabelsLinearFmtGo(tl), 280)
+					description = SanitizeScrapedMetadataField(stripMarkdownLinksToLabelsLinearFmtGo(tl), 280)
 				}
 			}
 		case "code":
@@ -2549,7 +2733,9 @@ func formatParsedJupyterNotebookFmtGo(parsed any, fallbackTitle string) *Formatt
 					mdOut := strings.TrimSpace(joinIpynbLinesFmtGo(dataMap["text/markdown"]))
 					plainOut := strings.TrimSpace(joinIpynbLinesFmtGo(dataMap["text/plain"]))
 					if mdOut != "" {
-						outSnippets = append(outSnippets, truncateUTF8SafeFullDocGo(mdOut, 1600))
+						if cleanMdOut := SanitizeMarkdownWithOptions(truncateUTF8SafeFullDocGo(mdOut, 1600), "", false); cleanMdOut != "" {
+							outSnippets = append(outSnippets, cleanMdOut)
+						}
 					} else if plainOut != "" && !reFigureSizePlainFmtGo.MatchString(plainOut) {
 						outSnippets = append(outSnippets, MakeSafeCodeFence(truncateUTF8SafeFullDocGo(plainOut, 1600), "text", false))
 					}
@@ -2579,15 +2765,15 @@ func formatParsedJupyterNotebookFmtGo(parsed any, fallbackTitle string) *Formatt
 	}
 	finalTitle := title
 	if finalTitle == "" {
-		finalTitle = fallbackTitle
+		finalTitle = SanitizeScrapedMetadataField(fallbackTitle, 512)
 	}
 	fullMD := strings.Join(blocks, "\n\n")
 	if finalTitle != "" && !strings.HasPrefix(blocks[0], "# ") {
-		fullMD = "# " + finalTitle + "\n\n" + fullMD
+		fullMD = "# " + escapeDeclMarkdownBrackets(finalTitle) + "\n\n" + fullMD
 	}
 	return &FormattedPayloadDoc{
 		Title:       finalTitle,
-		Description: description,
+		Description: SanitizeScrapedMetadataField(description, 280),
 		Markdown:    fullMD,
 		Structured:  parsed,
 	}
@@ -2648,13 +2834,16 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 	rawDesc = strings.TrimSpace(rawDesc)
 	cleanSummaryDesc := truncateUTF8SafeFullDocGo(strings.Join(strings.Fields(stripMarkdownLinksToLabelsLinearFmtGo(rawDesc)), " "), 300)
 
-	h1 := "# " + rawTitle + " (" + specBadge + ")"
-	if apiVer != "" {
-		h1 = "# " + rawTitle + " (v" + apiVer + " — " + specBadge + ")"
+	safeTitle := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(rawTitle))
+	safeApiVer := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(apiVer))
+	safeSpecBadge := escapeDeclMarkdownBrackets(SanitizeScrapedMeta(specBadge))
+	h1 := "# " + safeTitle + " (" + safeSpecBadge + ")"
+	if safeApiVer != "" {
+		h1 = "# " + safeTitle + " (v" + safeApiVer + " — " + safeSpecBadge + ")"
 	}
 	sections := []string{h1}
 	if rawDesc != "" {
-		sections = append(sections, rawDesc)
+		sections = append(sections, escapeDeclMarkdownBlock(rawDesc))
 	}
 
 	// Servers (`OpenAPI 3.x` `servers[]` or `Swagger 2.0` `host` + `basePath`)
@@ -2670,9 +2859,9 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 			d, _ := sMap["description"].(string)
 			d = strings.TrimSpace(d)
 			if u != "" {
-				line := "- `" + u + "`"
+				line := "- `" + sanitizeDeclInlineCodeVal(u) + "`"
 				if d != "" {
-					line += " — " + d
+					line += " — " + escapeDeclMarkdownBrackets(d)
 				}
 				srvLines = append(srvLines, line)
 			}
@@ -2688,7 +2877,7 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 			}
 		}
 		bp, _ := spec["basePath"].(string)
-		sections = append(sections, "## Servers\n\n- `"+scheme+"://"+strings.TrimSpace(hostStr)+bp+"`")
+		sections = append(sections, "## Servers\n\n- `"+sanitizeDeclInlineCodeVal(scheme+"://"+strings.TrimSpace(hostStr)+bp)+"`")
 	}
 
 	// Security Schemes
@@ -2715,12 +2904,12 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 			t, _ := sv["type"].(string)
 			sch := ""
 			if schemeVal, ok := sv["scheme"].(string); ok && schemeVal != "" {
-				sch = " (" + schemeVal + ")"
+				sch = " (" + escapeDeclMarkdownBrackets(schemeVal) + ")"
 			} else if inVal, ok := sv["in"].(string); ok && inVal != "" {
 				nmVal, _ := sv["name"].(string)
-				sch = " (in " + inVal + ": " + nmVal + ")"
+				sch = " (in " + escapeDeclMarkdownBrackets(inVal) + ": " + escapeDeclMarkdownBrackets(nmVal) + ")"
 			}
-			secLines = append(secLines, "- **"+secName+"**: `"+t+"`"+sch)
+			secLines = append(secLines, "- **"+escapeDeclMarkdownBrackets(secName)+"**: `"+sanitizeDeclInlineCodeVal(t)+"`"+sch)
 		}
 		if len(secLines) > 0 {
 			sections = append(sections, "## Authentication\n\n"+strings.Join(secLines, "\n"))
@@ -2782,19 +2971,19 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 				}
 			}
 			summary := strings.ReplaceAll(strings.Join(strings.Fields(rawSummary), " "), "|", `\|`)
-			summary = truncateUTF8SafeFullDocGo(summary, 120)
+			summary = escapeDeclMarkdownBrackets(truncateUTF8SafeFullDocGo(summary, 120))
 			opID, _ := opRec["operationId"].(string)
 			opID = strings.TrimSpace(opID)
 
 			if opCount <= 150 {
 				opIDCell := ""
 				if opID != "" {
-					opIDCell = "`" + opID + "`"
+					opIDCell = "`" + sanitizeDeclInlineCodeVal(opID) + "`"
 				}
-				tableRows = append(tableRows, "| `"+upperM+"` | `"+strings.ReplaceAll(routePath, "|", `\|`)+"` | "+summary+" | "+opIDCell+" |")
+				tableRows = append(tableRows, "| `"+upperM+"` | `"+sanitizeDeclInlineCodeVal(routePath)+"` | "+summary+" | "+opIDCell+" |")
 			}
 			if opCount <= 60 {
-				hLine := "### `" + upperM + " " + routePath + "`"
+				hLine := "### `" + upperM + " " + sanitizeDeclInlineCodeVal(routePath) + "`"
 				if summary != "" {
 					hLine += " — " + summary
 				}
@@ -2828,9 +3017,9 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 					}
 					typeLabel := ""
 					if pType != "" {
-						typeLabel = ": " + pType
+						typeLabel = ": " + escapeDeclMarkdownBrackets(pType)
 					}
-					paramBits = append(paramBits, "`"+pName+"` ("+loc+typeLabel+req+")")
+					paramBits = append(paramBits, "`"+sanitizeDeclInlineCodeVal(pName)+"` ("+escapeDeclMarkdownBrackets(loc)+typeLabel+req+")")
 				}
 				if len(paramBits) > 0 {
 					lines = append(lines, "- **Parameters**: "+strings.Join(paramBits, ", "))
@@ -2859,7 +3048,7 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 					}
 					schemaLabel := "JSON"
 					if rbSchema != "" {
-						schemaLabel = "`" + rbSchema + "`"
+						schemaLabel = "`" + sanitizeDeclInlineCodeVal(rbSchema) + "`"
 					}
 					lines = append(lines, "- **Request Body**"+reqTag+": "+schemaLabel)
 				}
@@ -2886,12 +3075,12 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 							schemaTarget = rRec["schema"]
 						}
 						rSchema := formatSchemaRef(schemaTarget)
-						bit := "`" + code + "`"
+						bit := "`" + sanitizeDeclInlineCodeVal(code) + "`"
 						if rSchema != "" {
-							bit += " → `" + rSchema + "`"
+							bit += " → `" + sanitizeDeclInlineCodeVal(rSchema) + "`"
 						}
 						if rDesc != "" {
-							bit += " (" + rDesc + ")"
+							bit += " (" + escapeDeclMarkdownBrackets(rDesc) + ")"
 						}
 						respBits = append(respBits, bit)
 					}
@@ -2934,7 +3123,7 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 			if pMap, isPMap := sv["properties"].(map[string]any); isPMap {
 				propNames = orderedKeysWithFallbackFmtGo(jsonBytes, append(append([]string(nil), schemaPath...), sName, "properties"), pMap)
 			}
-			line := "- **`" + sName + "`**"
+			line := "- **`" + sanitizeDeclInlineCodeVal(sName) + "`**"
 			if len(propNames) > 0 {
 				shown := propNames
 				ellipsis := ""
@@ -2942,7 +3131,11 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 					shown = shown[:10]
 					ellipsis = ", …"
 				}
-				line += ": `" + strings.Join(shown, "`, `") + "`" + ellipsis
+				safeProps := make([]string, len(shown))
+				for idx, pn := range shown {
+					safeProps[idx] = sanitizeDeclInlineCodeVal(pn)
+				}
+				line += ": `" + strings.Join(safeProps, "`, `") + "`" + ellipsis
 			}
 			schemaLines = append(schemaLines, line)
 		}
@@ -2952,9 +3145,9 @@ func formatParsedOpenAPISpecFmtGo(parsed any, jsonBytes []byte) *FormattedPayloa
 	}
 
 	return &FormattedPayloadDoc{
-		Title:       rawTitle,
-		Description: cleanSummaryDesc,
-		Markdown:    strings.Join(sections, "\n\n"),
+		Title:       SanitizeScrapedMetadataField(rawTitle, 512),
+		Description: SanitizeScrapedMetadataField(cleanSummaryDesc, 300),
+		Markdown:    SanitizeScrapedMarkdown(strings.Join(sections, "\n\n")),
 		Structured:  parsed,
 	}
 }
@@ -3046,7 +3239,7 @@ func TryParseJSONPayloadForScrape(raw, urlStr string) *FormattedPayloadDoc {
 		fence := MakeSafeCodeFence(preview, "json", false)
 		md := fence
 		if cleanTitle != "" {
-			md = "# " + cleanTitle + "\n\n" + fence
+			md = "# " + escapeDeclMarkdownBrackets(cleanTitle) + "\n\n" + fence
 		}
 		return &FormattedPayloadDoc{
 			Title:       cleanTitle,
@@ -3105,7 +3298,7 @@ func TryParseJSONPayloadForScrape(raw, urlStr string) *FormattedPayloadDoc {
 	fence := MakeSafeCodeFence(pretty, "json", false)
 	md := fence
 	if cleanTitle != "" {
-		md = "# " + cleanTitle + "\n\n" + fence
+		md = "# " + escapeDeclMarkdownBrackets(cleanTitle) + "\n\n" + fence
 	}
 	return &FormattedPayloadDoc{
 		Title:       cleanTitle,
@@ -3160,32 +3353,137 @@ func formatDurationSecondsFmtGo(totalSec int) string {
 	return fmt.Sprintf("%ds", s)
 }
 
+// sanitizeYouTubeWatchUntrustedFieldGo strips HTML comments/tags (including split/nested tags),
+// pre-escapes any residual `<` (e.g., unclosed tags), and escapes line-leading code fences so
+// untrusted YouTube videoDetails scalars cannot form raw-HTML fenced code blocks while preserving `\n`.
+func sanitizeYouTubeWatchUntrustedFieldGo(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	s := normalizeMarkdownLineEndings(stripInvisibleSmugglingCharsGo(trimmed))
+	if strings.Contains(s, "<!--") {
+		s = stripHtmlCommentsLinearGo(s, false)
+	}
+	if strings.IndexByte(s, '<') >= 0 && strings.IndexByte(s, '>') >= 0 {
+		s = stripDangerousHTMLSubtreesGo(s)
+		for pass := 0; pass < 4 && strings.IndexByte(s, '<') >= 0 && strings.IndexByte(s, '>') >= 0; pass++ {
+			next := stripHTMLTagsQuoteAwareSchemaGo(s, " ", maxSanitizeMarkdownScanBytes)
+			if next == s {
+				break
+			}
+			s = next
+		}
+	}
+	if strings.IndexByte(s, '<') >= 0 {
+		s = strings.ReplaceAll(s, "<", "&lt;")
+	}
+	s = escapePostStripProseFencesGo(s)
+	return SanitizeScrapedMarkdown(s)
+}
+
+func isValidYouTubeVideoIDFmtGo(id string) bool {
+	if len(id) == 0 || len(id) > 32 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // ExtractYouTubeWatchMetadataFromHTML extracts `ytInitialPlayerResponse.videoDetails` metadata and clean Markdown
 // from a YouTube watch page HTML document without launching a browser.
 func ExtractYouTubeWatchMetadataFromHTML(rawHTML, urlStr string) *YouTubeWatchMeta {
-	vdIdx := strings.Index(rawHTML, `"videoDetails":{`)
-	if vdIdx < 0 {
+	vdObjStart := -1
+	searchFrom := 0
+	for searchFrom < len(rawHTML) {
+		rel := strings.Index(rawHTML[searchFrom:], `"videoDetails"`)
+		if rel < 0 {
+			break
+		}
+		k := searchFrom + rel + len(`"videoDetails"`)
+		for k < len(rawHTML) && (rawHTML[k] == ' ' || rawHTML[k] == '\t' || rawHTML[k] == '\n' || rawHTML[k] == '\r') {
+			k++
+		}
+		if k < len(rawHTML) && rawHTML[k] == ':' {
+			k++
+			for k < len(rawHTML) && (rawHTML[k] == ' ' || rawHTML[k] == '\t' || rawHTML[k] == '\n' || rawHTML[k] == '\r') {
+				k++
+			}
+			if k < len(rawHTML) && rawHTML[k] == '{' {
+				vdObjStart = k
+				break
+			}
+		}
+		searchFrom = searchFrom + rel + len(`"videoDetails"`)
+	}
+	if vdObjStart < 0 {
 		return nil
 	}
-	endIdx := vdIdx + 24000
-	if endIdx > len(rawHTML) {
-		endIdx = len(rawHTML)
+	balanced, _, okBalanced := ExtractBalancedJSONAt(rawHTML, vdObjStart, 256_000)
+	if !okBalanced {
+		return nil
 	}
-	slice := rawHTML[vdIdx:endIdx]
-
-	title := matchJSONStringFieldInSliceFmtGo(slice, "title")
+	var vdMap map[string]any
+	if err := json.Unmarshal([]byte(balanced), &vdMap); err != nil || vdMap == nil {
+		return nil
+	}
+	strField := func(k string) string {
+		if v, ok := vdMap[k].(string); ok {
+			return strings.TrimSpace(v)
+		}
+		return ""
+	}
+	rawTitle := strField("title")
+	if rawTitle == "" {
+		return nil
+	}
+	title := escapeMarkdownBracketsOnlyGo(sanitizeYouTubeWatchUntrustedFieldGo(rawTitle))
 	if title == "" {
 		return nil
 	}
-	videoID := matchJSONStringFieldInSliceFmtGo(slice, "videoId")
-	author := matchJSONStringFieldInSliceFmtGo(slice, "author")
-	lengthSeconds, _ := strconv.Atoi(matchJSONStringFieldInSliceFmtGo(slice, "lengthSeconds"))
-	viewCountRaw := matchJSONStringFieldInSliceFmtGo(slice, "viewCount")
-	shortDesc := matchJSONStringFieldInSliceFmtGo(slice, "shortDescription")
+	videoID := strField("videoId")
+	if !isValidYouTubeVideoIDFmtGo(videoID) {
+		videoID = ""
+	}
+	author := escapeMarkdownBracketsOnlyGo(sanitizeYouTubeWatchUntrustedFieldGo(strField("author")))
+	lengthSeconds := 0
+	if lsStr := strField("lengthSeconds"); lsStr != "" {
+		lengthSeconds, _ = strconv.Atoi(lsStr)
+	} else if lsFloat, okF := vdMap["lengthSeconds"].(float64); okF && lsFloat >= 0 {
+		lengthSeconds = int(lsFloat)
+	}
+	viewCountRaw := strField("viewCount")
+	if viewCountRaw == "" {
+		if vcFloat, okVC := vdMap["viewCount"].(float64); okVC && vcFloat >= 0 {
+			viewCountRaw = strconv.FormatInt(int64(vcFloat), 10)
+		}
+	}
+	shortDesc := sanitizeYouTubeWatchUntrustedFieldGo(strField("shortDescription"))
+
+	collapseRenderedSingleLine := func(s string) string {
+		if s == "" {
+			return ""
+		}
+		collapsed := strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
+		collapsed = strings.Join(strings.Fields(collapsed), " ")
+		bs := 0
+		for i := len(collapsed) - 1; i >= 0 && collapsed[i] == '\\'; i-- {
+			bs++
+		}
+		if bs%2 == 1 {
+			collapsed += `\`
+		}
+		return collapsed
+	}
 
 	var metaBullets []string
 	if author != "" {
-		metaBullets = append(metaBullets, "- **Channel**: "+author)
+		metaBullets = append(metaBullets, "- **Channel**: "+collapseRenderedSingleLine(author))
 	}
 	dur := formatDurationSecondsFmtGo(lengthSeconds)
 	if dur != "" {
@@ -3199,7 +3497,7 @@ func ExtractYouTubeWatchMetadataFromHTML(rawHTML, urlStr string) *YouTubeWatchMe
 		}
 	}
 
-	parts := []string{"# " + title}
+	parts := []string{"# " + collapseRenderedSingleLine(title)}
 	if len(metaBullets) > 0 {
 		parts = append(parts, strings.Join(metaBullets, "\n"))
 	}
@@ -3211,6 +3509,7 @@ func ExtractYouTubeWatchMetadataFromHTML(rawHTML, urlStr string) *YouTubeWatchMe
 	if canonical == "" && videoID != "" {
 		canonical = "https://www.youtube.com/watch?v=" + videoID
 	}
+	cleanMarkdown := SanitizeMarkdownWithOptions(strings.Join(parts, "\n\n"), canonical, false)
 	return &YouTubeWatchMeta{
 		VideoID:       videoID,
 		Title:         title,
@@ -3220,7 +3519,7 @@ func ExtractYouTubeWatchMetadataFromHTML(rawHTML, urlStr string) *YouTubeWatchMe
 		LengthSeconds: lengthSeconds,
 		ViewCount:     viewCount,
 		URL:           canonical,
-		Markdown:      strings.Join(parts, "\n\n"),
+		Markdown:      cleanMarkdown,
 	}
 }
 

@@ -663,7 +663,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         liedRowCount: 0,
         bombRowCount: 0,
         expiredBlobSha: 'ee'.repeat(32),
-        derivedPipelineVersion: 34,
+        derivedPipelineVersion: 37,
         derivedR2Text: 'Verified stored article payload!',
         unverifiedDeriveStatus: 'unverified',
         capacityStopStatus: 'capacity_reached',
@@ -789,7 +789,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const liveScrapeJson = await liveScrapeRes.json();
       assert.equal(liveScrapeJson.ok, true);
       assert.equal(liveScrapeJson.cached, false);
-      assert.equal(liveScrapeJson.pipelineVersion, 34);
+      assert.equal(liveScrapeJson.pipelineVersion, 37);
       assert.equal(liveScrapeJson.llms?.found, true);
       assert.deepEqual(liveScrapeJson.json, { name: 'Rear Axle', torqueNm: 35 });
       assert.match(liveScrapeJson.markdown, /# Torque Guide/);
@@ -809,7 +809,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(cachedScrapeRes.headers.get('x-crawler-via'), 'cache:r2-d1');
       const cachedScrapeJson = await cachedScrapeRes.json();
       assert.equal(cachedScrapeJson.cached, true);
-      assert.equal(cachedScrapeJson.pipelineVersion, 34);
+      assert.equal(cachedScrapeJson.pipelineVersion, 37);
       assert.match(cachedScrapeJson.markdown, /35 Nm/);
       assert.equal(scrapeAgentDispatches, 1);
 
@@ -997,6 +997,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         'read_artifact',
         'jobs',
         'find_extractors',
+        'company',
+        'salaries',
         'catalog',
         'agent',
         'discover_mcps',
@@ -2348,7 +2350,7 @@ test('F15.4 workerd E2E: /v1/ingest-tab CORS & Auth + OAuth 2.1 PKCE S256 Full L
     });
     assert.equal(mcpRes.status, 200);
     const mcpJson = await mcpRes.json();
-    assert.equal(mcpJson.result.tools.length, 17);
+    assert.equal(mcpJson.result.tools.length, 19);
 
     // Revoke access_token via /oauth/revoke -> subsequent /mcp call returns 401
     const revokeRes = await mf.dispatchFetch(`${ORIGIN}/oauth/revoke`, {

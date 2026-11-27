@@ -1,0 +1,249 @@
+# Shared Go + TypeScript Declarative Site Adapter: NHTSA vPIC VIN Decode, Recalls & Complaints
+id: nhtsa-vpic-recalls
+name: NHTSA vPIC & Safety Recalls API
+category: public-records
+description: "Formats keyless vpic.nhtsa.dot.gov VIN decode and api.nhtsa.gov vehicle recalls & complaints JSON endpoints into structured Markdown tables (respecting HTTP 403/robots.txt without bypass)."
+domains:
+  - vpic.nhtsa.dot.gov
+  - api.nhtsa.gov
+exampleUrls:
+  - "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/1HGCM82633A004352?format=json"
+  - "https://api.nhtsa.gov/recalls/recallsByVehicle?make=honda&model=accord&modelYear=2020"
+
+routes:
+  # Route 1: vPIC VIN Decode (decodevinvalues / decodevinvaluesextended)
+  - match:
+      hosts:
+        - vpic.nhtsa.dot.gov
+      exactSegments: true
+      pathSegments:
+        - api
+        - vehicles
+        - param: endpoint
+          allowValues:
+            - decodevinvalues
+            - decodevinvaluesextended
+        - param: vin
+          charset: alnum
+          minLen: 3
+          maxLen: 32
+    twin:
+      fetchUrl: "https://vpic.nhtsa.dot.gov/api/vehicles/{endpoint}/{vin}?format=json"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - Results
+        - Message
+      vars:
+        vinOut:
+          paths:
+            - Results.0.VIN
+          fallbackTemplate: "{vin}"
+        make:
+          paths:
+            - Results.0.Make
+          trim: true
+        model:
+          paths:
+            - Results.0.Model
+          trim: true
+        modelYear:
+          paths:
+            - Results.0.ModelYear
+          trim: true
+        vehicleType:
+          paths:
+            - Results.0.VehicleType
+          trim: true
+        bodyClass:
+          paths:
+            - Results.0.BodyClass
+          trim: true
+        plantCountry:
+          paths:
+            - Results.0.PlantCountry
+          trim: true
+        engineCylinders:
+          paths:
+            - Results.0.EngineCylinders
+          trim: true
+        displacementL:
+          paths:
+            - Results.0.DisplacementL
+          trim: true
+        fuelType:
+          paths:
+            - Results.0.FuelTypePrimary
+          trim: true
+        errorCode:
+          paths:
+            - Results.0.ErrorCode
+          trim: true
+        errorText:
+          paths:
+            - Results.0.ErrorText
+          trim: true
+        message:
+          paths:
+            - Message
+          trim: true
+      titleTemplate: "{modelYear} {make} {model} — VIN {vinOut}"
+      titleWhenVar: make
+      titleFallbackTemplate: "NHTSA vPIC VIN Decode ({vinOut})"
+      bullets:
+        - label: VIN
+          template: "`{vinOut}`"
+        - label: Make
+          template: "{make}"
+          whenVar: make
+        - label: Model
+          template: "{model}"
+          whenVar: model
+        - label: Model Year
+          template: "{modelYear}"
+          whenVar: modelYear
+        - label: Vehicle Type
+          template: "{vehicleType}"
+          whenVar: vehicleType
+        - label: Body Class
+          template: "{bodyClass}"
+          whenVar: bodyClass
+        - label: Plant Country
+          template: "{plantCountry}"
+          whenVar: plantCountry
+        - label: Engine Cylinders
+          template: "{engineCylinders}"
+          whenVar: engineCylinders
+        - label: Displacement (L)
+          template: "{displacementL}"
+          whenVar: displacementL
+        - label: Fuel Type
+          template: "{fuelType}"
+          whenVar: fuelType
+        - label: Error Code
+          template: "`{errorCode}`"
+          whenVar: errorCode
+        - label: Error Text
+          template: "{errorText}"
+          whenVar: errorText
+        - label: Message
+          template: "{message}"
+          whenVar: message
+
+  # Route 2: NHTSA Recalls by Vehicle
+  - match:
+      hosts:
+        - api.nhtsa.gov
+      pathEquals:
+        - /recalls/recallsByVehicle
+        - /recalls/recallsByVehicle/
+    twin:
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - results
+        - Results
+      vars:
+        count:
+          paths:
+            - Count
+            - count
+          format: int_comma
+          default: "0"
+        message:
+          paths:
+            - Message
+            - message
+          trim: true
+      titleTemplate: "NHTSA Vehicle Recalls ({count} found)"
+      introVar: message
+      sections:
+        - heading: Recalls
+          arrayPath: results
+          limit: 50
+          emptyText: No recalls found.
+          columns:
+            - header: Campaign
+              paths:
+                - NHTSACampaignNumber
+              code: true
+            - header: Date
+              paths:
+                - ReportReceivedDate
+            - header: Component
+              paths:
+                - Component
+            - header: Summary
+              paths:
+                - Summary
+              sliceMax: 240
+            - header: Consequence
+              paths:
+                - Consequence
+              sliceMax: 240
+            - header: Remedy
+              paths:
+                - Remedy
+              sliceMax: 240
+
+  # Route 3: NHTSA Complaints by Vehicle
+  - match:
+      hosts:
+        - api.nhtsa.gov
+      pathEquals:
+        - /complaints/complaintsByVehicle
+        - /complaints/complaintsByVehicle/
+    twin:
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+      maxBytes: 4194304
+    extract:
+      requireAnyFields:
+        - results
+        - Results
+      vars:
+        count:
+          paths:
+            - count
+            - Count
+          format: int_comma
+          default: "0"
+        message:
+          paths:
+            - message
+            - Message
+          trim: true
+      titleTemplate: "NHTSA Vehicle Complaints ({count} found)"
+      introVar: message
+      sections:
+        - heading: Complaints
+          arrayPath: results
+          limit: 50
+          emptyText: No complaints found.
+          columns:
+            - header: ODI Number
+              paths:
+                - odiNumber
+              code: true
+            - header: Date
+              paths:
+                - dateOfIncident
+            - header: Components
+              paths:
+                - components
+            - header: Summary
+              paths:
+                - summary
+              sliceMax: 240
+            - header: Crash
+              paths:
+                - crash
+            - header: Fire
+              paths:
+                - fire

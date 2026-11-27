@@ -7,16 +7,51 @@ import (
 )
 
 func normalizeCanonicalAshbyURL(rawURL any, fallbackOrg, jobID string) string {
+	encOrg := EncodeURIComponent(fallbackOrg)
+	fallback := "https://jobs.ashbyhq.com/" + encOrg
+	if jobID != "" {
+		fallback = fallback + "/" + EncodeURIComponent(jobID)
+	}
 	if s, ok := rawURL.(string); ok && strings.TrimSpace(s) != "" {
 		if parsed, okP := parseStrictURL(strings.TrimSpace(s)); okP && strings.EqualFold(parsed.Scheme, "https") {
-			return canonicalWhatwgURLString(parsed)
+			return sanitizeATSHttpsURL(canonicalWhatwgURLString(parsed), fallback)
+		}
+		return sanitizeATSHttpsURL(s, fallback)
+	}
+	return sanitizeATSHttpsURL(fallback, "")
+}
+
+func hasASCIIControlOrNUL(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x1F || s[i] == 0x7F {
+			return true
 		}
 	}
-	encOrg := EncodeURIComponent(fallbackOrg)
-	if jobID != "" {
-		return "https://jobs.ashbyhq.com/" + encOrg + "/" + EncodeURIComponent(jobID)
+	return false
+}
+
+func isSafeWorkdayPathSegment(seg string) bool {
+	if seg == "" || seg == "." || seg == ".." || hasASCIIControlOrNUL(seg) || reWorkdayBadPct.MatchString(seg) {
+		return false
 	}
-	return "https://jobs.ashbyhq.com/" + encOrg
+	if strings.Contains(strings.ToLower(seg), "%25") {
+		return false
+	}
+	cur := seg
+	for pass := 0; pass < 4; pass++ {
+		if reWorkdayBadPct.MatchString(cur) {
+			return false
+		}
+		dec, ok := DecodeURIComponent(cur)
+		if !ok || dec == "" || dec == "." || dec == ".." || hasASCIIControlOrNUL(dec) || strings.Contains(dec, "..") || strings.ContainsAny(dec, "/\\") {
+			return false
+		}
+		if dec == cur {
+			break
+		}
+		cur = dec
+	}
+	return true
 }
 
 func splitCleanPathSegments(escapedPath string) []string {
@@ -115,9 +150,18 @@ func ResolveATSPreFetchSpec(urlStr string) *ATSPreFetchSpec {
 				rest = parts[idx+1:]
 			}
 		}
-		if site != "" && !strings.EqualFold(site, "wday") && reWorkdaySiteIdent.MatchString(site) {
+		if isSafeWorkdayPathSegment(tenant) && reWorkdaySiteIdent.MatchString(tenant) &&
+			site != "" && !strings.EqualFold(site, "wday") && isSafeWorkdayPathSegment(site) && reWorkdaySiteIdent.MatchString(site) {
 			if len(rest) >= 2 && rest[0] == "job" {
+				for _, seg := range rest[1:] {
+					if !isSafeWorkdayPathSegment(seg) {
+						return nil
+					}
+				}
 				extPath := strings.Join(rest[1:], "/")
+				if !reWorkdaySafeExtPath.MatchString("job/" + extPath) {
+					return nil
+				}
 				return &ATSPreFetchSpec{
 					ID:       "workday-job",
 					FetchURL: "https://" + host + "/wday/cxs/" + tenant + "/" + site + "/job/" + extPath,
@@ -128,6 +172,11 @@ func ResolveATSPreFetchSpec(urlStr string) *ATSPreFetchSpec {
 					org:      tenant,
 					site:     site,
 					jobID:    extPath,
+				}
+			}
+			for _, seg := range rest {
+				if !isSafeWorkdayPathSegment(seg) {
+					return nil
 				}
 			}
 			searchText := strings.TrimSpace(firstNonEmpty(q.Get("q"), q.Get("searchText"), q.Get("search")))
@@ -217,15 +266,20 @@ func ResolveATSPreFetchSpec(urlStr string) *ATSPreFetchSpec {
 			if host == "jobs.eu.lever.co" {
 				id = "lever-eu-board"
 			}
+			// Page server-side: a large company's full postings list runs to several MB (one live board: 305 postings,
+			// 5.9 MB), over the fetch body cap, which silently degraded the board to an HTML scrape with no jobs.
+			reqOffset := parseNonNegOffset(q.Get("offset"))
 			return &ATSPreFetchSpec{
-				ID:        id,
-				FetchURL:  "https://" + leverAPIHost + "/v0/postings/" + EncodeURIComponent(co) + "?mode=json",
-				Method:    "GET",
-				Kind:      "json",
-				Accept:    "application/json",
-				host:      host,
-				org:       co,
-				reqOffset: parseNonNegOffset(q.Get("offset")),
+				ID: id,
+				FetchURL: "https://" + leverAPIHost + "/v0/postings/" + EncodeURIComponent(co) + "?mode=json&skip=" +
+					strconv.Itoa(reqOffset) + "&limit=" + strconv.Itoa(LeverBoardPageSize),
+				Method:      "GET",
+				Kind:        "json",
+				Accept:      "application/json",
+				host:        host,
+				org:         co,
+				reqOffset:   reqOffset,
+				serverPaged: true,
 			}
 		}
 		if len(parts) >= 2 && reLeverJobID.MatchString(parts[1]) {

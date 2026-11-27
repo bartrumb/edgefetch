@@ -34,6 +34,19 @@ import {
   type HubSettingsStore,
 } from '../../src/dev-telemetry';
 import {
+  ACCESS_POLICY_SQLITE_SCHEMA,
+  createSqliteAccessPolicyStore,
+  type AccessPolicyRuleRow,
+  type AccessPolicyStore,
+  type McpServerShareRow,
+} from '../../src/access-policy';
+import {
+  createSqliteHubSecretsStore,
+  HUB_SECRETS_SQLITE_SCHEMA,
+  type HubSecretRow,
+  type HubSecretsStore,
+} from '../../src/hub-secrets';
+import {
   createSqliteMcpVaultStore,
   MCP_VAULT_SQLITE_SCHEMA,
   type McpVaultStore,
@@ -359,6 +372,8 @@ export class LocalAgentHubCoordinator {
   public readonly mcpVault: McpVaultStore;
   public readonly activity: ActivityStore;
   public readonly settings: HubSettingsStore;
+  public readonly hubSecrets: HubSecretsStore;
+  public readonly accessPolicy: AccessPolicyStore;
 
   constructor(sqlitePath: string) {
     if (sqlitePath !== ':memory:') mkdirSync(dirname(resolve(sqlitePath)), { recursive: true });
@@ -377,6 +392,8 @@ export class LocalAgentHubCoordinator {
       ${MCP_VAULT_SQLITE_SCHEMA}
       ${ACTIVITY_SQLITE_SCHEMA}
       ${HUB_SETTINGS_SQLITE_SCHEMA}
+      ${HUB_SECRETS_SQLITE_SCHEMA}
+      ${ACCESS_POLICY_SQLITE_SCHEMA}
     `);
 
     const sqlLike: SqlStorageLike = {
@@ -458,6 +475,8 @@ export class LocalAgentHubCoordinator {
     this.mcpVault = createSqliteMcpVaultStore(sqlLike);
     this.activity = createSqliteActivityStore(sqlLike);
     this.settings = createSqliteHubSettingsStore(sqlLike);
+    this.hubSecrets = createSqliteHubSecretsStore(sqlLike);
+    this.accessPolicy = createSqliteAccessPolicyStore(sqlLike);
   }
 
   connectMockAgent(params: {
@@ -609,6 +628,17 @@ export class LocalAgentHubCoordinator {
       vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => this.mcpVault.putOAuthState(row),
       vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) => this.mcpVault.consumeOAuthState(stateHash, userId, now),
       getHubSetting: (k: string) => this.settings.getSetting(k),
+      // AgentHubDO parity: hub_secrets + access policy RPCs (same names as the HubSecretsStore/AccessPolicyStore ports).
+      listHubSecretRows: async () => this.hubSecrets.listHubSecretRows(),
+      putHubSecretRow: async (row: HubSecretRow) => this.hubSecrets.putHubSecretRow(row),
+      deleteHubSecretRow: async (name: string) => this.hubSecrets.deleteHubSecretRow(name),
+      listAccessPolicyRules: async () => this.accessPolicy.listAccessPolicyRules(),
+      putAccessPolicyRule: async (row: AccessPolicyRuleRow) => this.accessPolicy.putAccessPolicyRule(row),
+      deleteAccessPolicyRule: async (subject: string, resource: string) => this.accessPolicy.deleteAccessPolicyRule(subject, resource),
+      listMcpServerShares: async () => this.accessPolicy.listMcpServerShares(),
+      putMcpServerShare: async (row: McpServerShareRow) => this.accessPolicy.putMcpServerShare(row),
+      deleteMcpServerShare: async (ownerUserId: string, slug: string, subject: string) =>
+        this.accessPolicy.deleteMcpServerShare(ownerUserId, slug, subject),
       setHubSetting: (k: string, v: string) => this.settings.setSetting(k, v),
     };
     return { idFromName: (name: string) => name, get: () => stub };

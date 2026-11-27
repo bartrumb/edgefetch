@@ -8,11 +8,11 @@
     "url": "https://github.com/bartrumb/edgefetch",
     "source": "github"
   },
-  "version": "2.8.12",
+  "version": "2.8.13",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/bartrumb/edgefetch-agent:2.8.12",
+      "identifier": "ghcr.io/bartrumb/edgefetch-agent:2.8.13",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"

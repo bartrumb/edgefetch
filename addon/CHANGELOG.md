@@ -2,6 +2,27 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.13] - 2026-11-27
+
+### Added
+- **Adapter expansion (85 declarative manifests: 29 new, 5 updated):**
+  - Keyless twins: Zendesk help centers, Federal Register, CPSC recalls (bounded saferproducts.gov), eCFR via govinfo, EUR-Lex, Terraform Registry, Docker Hub, Maven Central, NuGet, Homebrew, OSV/GHSA, Wikidata/Open Library.
+  - Commerce: Shopify collection and WooCommerce category upgrades, plus new Squarespace, BigCommerce, SFCC/Demandware and Shopware/Magento engines.
+  - Forums and docs: XenForo threads, SRAM docs, Bosch eBike help (HTML/SSR only).
+  - ATS and public APIs: Workday CXS and iCIMS hardening, UKG/Paylocity/Dover, NHTSA vPIC/recalls, FCC ID.
+  - Log-mined adapters: NFPA (Sitecore JSS), Giant/Liv, bumm.de, Bicycle Retailer, Cornell LII, SRAM models, TQ eBike, a YouTube watch fast-path, and a Next.js RSC spec-table parser. Hosts behind robots rules, paywalls or WAFs fail closed and are documented in `docs/LOG-MINING-2026-11.md` (#104).
+- **Go core:** microdata/spec-table product fallback for pages without JSON-LD, relative `product.url` resolution, bounded companion and HTML modes, and sanitizer hardening (#104).
+
+### Fixed
+- **L-01..L-05 audit follow-ups:**
+  - the `jsonFilter` cache key;
+  - `edgeBudgetExceeded`;
+  - `>4 MiB` `rawBase64` / `parsers: []` inline hydration up to the wire budget, with an `artifactId` fallback;
+  - product-record backfill;
+  - `maxInlineBodyBytes` on renders.
+
+  Robots, SSRF, `isTrustedTwinRedirectUrl` and `MAX_WASM_INPUT_BYTES` guards apply to every new adapter (#104).
+
 ## [2.8.12] - 2026-11-26
 
 ### Added

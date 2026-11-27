@@ -11,7 +11,7 @@
 import { buildCanonicalMcpToolSchemas, MCP_TOOL_SCHEMAS, TEXT_ACCEPTS } from './mcp';
 
 export const DEFAULT_OPENAPI_ORIGIN = 'https://edgefetch.dev';
-export const DEFAULT_OPENAPI_VERSION = '2.8.17';
+export const DEFAULT_OPENAPI_VERSION = '2.8.18';
 
 export interface BuildOpenApiOptions {
   origin?: string;

@@ -25,6 +25,17 @@ jobs:
           "$EDGEFETCH_CHROME_BIN" --version
           chromium-browser --version || true
 
+      - name: Warm up Chrome once before live-browser tests
+        # A fresh runner's first Chrome start does one-time per-user setup (fontconfig cache, NSS db, profile/crash dirs).
+        # When the live-Chromium tests cold-start four browsers at once, all four sat in that setup together and hit their
+        # 30-35 s render deadlines, while every later launch in the same run took 3-10 s. Pay the cost once, timed, here.
+        run: |
+          for pass in cold warm; do
+            start=$(date +%s%N)
+            timeout 90 "$EDGEFETCH_CHROME_BIN" --headless=new --no-first-run --disable-gpu --dump-dom 'data:text/html,<p>warm</p>' > /dev/null
+            echo "chrome ${pass} start+render: $(( ($(date +%s%N) - start) / 1000000 )) ms"
+          done
+
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.27.x'
@@ -106,6 +117,17 @@ jobs:
         working-directory: hub
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Warm up Chrome once before live-browser tests
+        # A fresh runner's first Chrome start does one-time per-user setup (fontconfig cache, NSS db, profile/crash dirs).
+        # When the live-Chromium tests cold-start four browsers at once, all four sat in that setup together and hit their
+        # 30-35 s render deadlines, while every later launch in the same run took 3-10 s. Pay the cost once, timed, here.
+        working-directory: .
+        run: |
+          for pass in cold warm; do
+            start=$(date +%s%N)
+            timeout 90 "$EDGEFETCH_CHROME_BIN" --headless=new --no-first-run --disable-gpu --dump-dom 'data:text/html,<p>warm</p>' > /dev/null
+            echo "chrome ${pass} start+render: $(( ($(date +%s%N) - start) / 1000000 )) ms"
+          done
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.27.x'

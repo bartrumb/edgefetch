@@ -2,6 +2,14 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.9] - 2026-11-26
+
+### Changed
+- **`search` enrichment spreads its budget across hosts:** nodes fetch same-host URLs one at a time behind the per-host politeness floor (about 2.5-4 s per page), so results clustered on one docs site used up the 15 s budget and still came back without `rawContent`. Extract gains an optional `maxFetchPerHost`, and `search` passes 2. Further same-host results are served from the 1 h scrape cache when fresh, and otherwise keep their search snippet (`failedResults` `error: "host_fetch_cap"`) (#95).
+
+### Fixed
+- **`fetch_batch` misread docs pages as JSON:** an `/api/` segment anywhere in the path inferred `kind: json`, so pages such as MDN's `/docs/Web/API/*` failed with `not JSON (text/html)` and stopped the rest of that host's batch. JSON is now inferred only for a leading `/api` segment or a versioned `/api/v<N>` (#95).
+
 ## [2.8.8] - 2026-11-26
 
 ### Fixed

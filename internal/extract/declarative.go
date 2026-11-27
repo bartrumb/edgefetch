@@ -5360,8 +5360,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 			itemMap["index1"] = strconv.Itoa(idx + 1)
 			rowVisiting := make(map[string]bool, len(sec.ItemVars))
 			var rowLookup func(string) string
-			var isRowComposed func(string) bool
-			isRowComposed = func(k string) bool {
+			isRowComposed := func(k string) bool {
 				if _, isRowVar := itemMap[k]; isRowVar {
 					return itemComposed[k]
 				}

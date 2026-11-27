@@ -3328,10 +3328,6 @@ func decodeMarkdownEntitiesRawGo(input string) string {
 	return decodeMarkdownEntitiesRawImplGo(input, false)
 }
 
-func decodeMarkdownEntitiesRawEscapingBracketsGo(input string) string {
-	return decodeMarkdownEntitiesRawImplGo(input, true)
-}
-
 func writeDecodedEntityValueGo(sb *strings.Builder, val string, escapeBrackets bool, trailingBackslashes *int) {
 	if !escapeBrackets {
 		sb.WriteString(val)

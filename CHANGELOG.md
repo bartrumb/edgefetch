@@ -2,6 +2,25 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.16] - 2026-11-27
+
+### Added
+- `jobs`: direct-first company search. The company's Greenhouse, Ashby, Lever and SmartRecruiters boards are probed before any web search, and a board that lists jobs skips the search step (#110).
+- `jobs`: known-boards index (META D1 `jobs_known_boards`). Boards that returned jobs for a company in an earlier search are probed first for 30 days, so Workday companies skip the web search after their first lookup (#110).
+- `jobs`: ATS JSON APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday) are fetched from the Cloudflare edge instead of home nodes. Up to 3 fetches run at once per ATS API host. A failed edge fetch retries once via the nodes, and `JOBS_EDGE_ATS_FETCH=off` disables edge fetching (#110).
+- `jobs`: ATS board responses are cached for 10 minutes across calls (R2 behind a D1 index) (#110).
+- Declarative adapters: new `preferWhere` option, which picks an array element by field value. Wikidata population and dates use the preferred-rank claim (#110).
+
+### Fixed
+- `jobs`: once a company search has read the board, posting detail fetches are capped at 2× the remaining result slots. The time-budget note no longer tells company-scoped callers to add `company` (#110).
+- Titles and descriptions decode the full HTML5 named-entity set (`&Eacute;` → `É`) without unescaping `<` or `>` (#110).
+- Favicons prefer `rel=icon`, ignore `apple-touch-icon href="/"` and other origin-root candidates, and resolve protocol-relative URLs (#110).
+- A browser-rendered app shell with no main content is re-extracted full-page, with hidden subtrees stripped, instead of returning empty Markdown (#110).
+- Inline `jobs[]` respects `maxChars`, the same as `records[]` (#110).
+
+### Changed
+- `SCRAPE_PIPELINE_VERSION` is now 37 (#110).
+
 ## [2.8.15] - 2026-11-27
 
 ### Added

@@ -347,6 +347,66 @@ test('A.2: dns_not_found returns non-retryable NXDOMAIN error (never robots_unre
   assert.equal((mcpTrunc.summary as { byOutcome: Record<string, number> }).byOutcome.dns_not_found, 1);
 });
 
+test('R14: cold public scrapes never issue a blind R2 GET on the options cache (index row gates it); warm ones still hit', async () => {
+  const inner = createMemoryR2Bucket();
+  const cacheGets: string[] = [];
+  const bucket = new Proxy(inner, {
+    get(target, prop, receiver) {
+      if (prop === 'get') {
+        return async (key: string, ...rest: unknown[]) => {
+          if (String(key).includes('/scrape-cache/')) cacheGets.push(String(key));
+          return (target as unknown as { get: (...a: unknown[]) => unknown }).get(key, ...rest);
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const metaDb = createSqliteD1(META_SQL);
+  let fetchCalls = 0;
+  const hub = async () => {
+    fetchCalls++;
+    return {
+      status: 200,
+      via: 'agent:site-1',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://r14.example.com/doc',
+            finalUrl: 'https://r14.example.com/doc',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html; charset=utf-8',
+            body: '<!doctype html><html><head><title>R14</title></head><body><main><h1>R14</h1><p>Body text for the index test.</p></main></body></html>',
+          },
+        ],
+      }),
+    };
+  };
+  const env = { ARTIFACTS: bucket as unknown as R2Bucket, META: metaDb };
+
+  const cold = await executeScrapeCall({ payload: { url: 'https://r14.example.com/doc', maxAgeMs: 60_000 }, env, executeHubFetch: hub });
+  assert.equal(cold.status, 200);
+  assert.equal(cold.body.cached, false);
+  assert.deepEqual(cacheGets, [], 'a cold scrape must not GET a scrape-cache key that was never written');
+
+  const warm = await executeScrapeCall({ payload: { url: 'https://r14.example.com/doc', maxAgeMs: 60_000 }, env, executeHubFetch: hub });
+  assert.equal(warm.body.cached, true, 'the write upserted the index row, so the next lookup reads R2 and hits');
+  assert.equal(fetchCalls, 1);
+  assert.equal(cacheGets.length, 1);
+
+  // A different, never-written option set is again gated without touching R2.
+  cacheGets.length = 0;
+  const otherOpts = await executeScrapeCall({
+    payload: { url: 'https://r14.example.com/doc', onlyMainContent: false, maxAgeMs: 60_000 },
+    env,
+    executeHubFetch: hub,
+  });
+  assert.equal(otherOpts.body.cached, false);
+  assert.deepEqual(cacheGets, []);
+});
+
 test('A.3: scrape cache key includes output-affecting options and preserves consistent response schema', async () => {
   const bucket = createMemoryR2Bucket();
   const metaDb = createSqliteD1(META_SQL);

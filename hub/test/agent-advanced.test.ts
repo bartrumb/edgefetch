@@ -102,6 +102,7 @@ import {
   executeSearchCall,
   extractEdgeMapDomains,
   resetSearchProviderPacingForTests,
+  SEARCH_ENRICH_BUDGET_MS,
 } from '../src/web-search';
 
 function createMockOAuthStore() {
@@ -5498,3 +5499,85 @@ test('AGENT-22: M1-C Iter3 final line & branch closure across jobs.ts and map-cr
   });
   assert.equal(budgetDrainRes.status, 200);
 });
+
+test('R11: search enrichment runs under a wall-clock budget (capped node dispatches, no late browser-auto renders)', async () => {
+  const thinSpa = `<html><body>${'<script>1</script>'.repeat(5)}<div id="root"></div></body></html>`;
+  type Dispatch = { src: string; maxSeconds?: number; timeoutMs?: number };
+  const makeHub = (dispatches: Dispatch[], primaryDelayMs = 0) =>
+    async (_t: string, bodyText: string, _s?: string, src?: string) => {
+      const parsed = JSON.parse(bodyText) as {
+        maxSeconds?: number;
+        options?: { timeoutMs?: number };
+        requests?: Array<{ id?: string; url?: string }>;
+      };
+      dispatches.push({ src: src ?? '', maxSeconds: parsed.maxSeconds, timeoutMs: parsed.options?.timeoutMs });
+      const reqs = parsed.requests ?? [];
+      if (src?.endsWith(':browser-auto')) {
+        return {
+          status: 200,
+          via: 'agent',
+          bodyText: JSON.stringify({
+            results: [{ id: reqs[0]?.id, url: reqs[0]?.url, status: 200, outcome: 'ok', contentType: 'text/html', body: '<html><body><main><h1>Rendered</h1><p>Fully rendered single page application content with enough words to count.</p></main></body></html>' }],
+          }),
+        };
+      }
+      if (primaryDelayMs > 0) await new Promise((r) => setTimeout(r, primaryDelayMs));
+      return {
+        status: 200,
+        via: 'cf',
+        bodyText: JSON.stringify({
+          results: reqs.map((r) => ({ id: r.id, url: r.url, status: 200, outcome: 'ok', contentType: 'text/html', body: thinSpa })),
+        }),
+      };
+    };
+  const extractPayload = { urls: ['https://auto.example.com/spa'], allowExternalUrls: true, renderMode: 'auto', ephemeral: true, query: 'spa' };
+
+  // A. Unbudgeted standalone extract keeps its existing limits (35 s ephemeral batch, 40 s browser-auto render).
+  const unbudgeted: Dispatch[] = [];
+  const a = await executeExtractCall({ payload: extractPayload as never, env: {}, executeHubFetch: makeHub(unbudgeted) });
+  assert.equal(a.status, 200);
+  assert.equal(unbudgeted[0]?.maxSeconds, 35);
+  const autoA = unbudgeted.find((d) => d.src.endsWith(':browser-auto'));
+  assert.ok(autoA, 'unbudgeted thin SPA still gets a browser-auto render');
+  assert.equal(autoA.maxSeconds, 40);
+
+  // B. Budget with time left: every dispatch (including the render) is clamped inside the budget.
+  const roomy: Dispatch[] = [];
+  const b = await executeExtractCall({ payload: extractPayload as never, env: {}, executeHubFetch: makeHub(roomy), budgetMs: 15_000 });
+  assert.equal(b.status, 200);
+  assert.ok((roomy[0]?.maxSeconds ?? 99) <= 15, `primary batch capped, got ${roomy[0]?.maxSeconds}`);
+  const autoB = roomy.find((d) => d.src.endsWith(':browser-auto'));
+  assert.ok(autoB, 'render still runs when the budget allows it');
+  assert.ok((autoB.maxSeconds ?? 99) <= 15);
+  assert.ok((autoB.timeoutMs ?? 99_999) <= 14_000);
+  assert.ok((b.body.results as Array<Record<string, unknown>>).some((r) => r.renderedVia === 'browser-auto'));
+
+  // C. Budget nearly spent by the batch: the optional render is skipped and the thin result still comes back.
+  const tight: Dispatch[] = [];
+  const startedC = Date.now();
+  const c = await executeExtractCall({ payload: extractPayload as never, env: {}, executeHubFetch: makeHub(tight, 300), budgetMs: 5_000 });
+  assert.equal(c.status, 200);
+  assert.equal(tight[0]?.maxSeconds, 5);
+  assert.equal(tight.filter((d) => d.src.endsWith(':browser-auto')).length, 0, 'no render once < 6 s remain');
+  assert.equal((c.body.results as unknown[]).length, 1);
+  assert.ok(Date.now() - startedC < 5_000);
+
+  // D. End to end: search include_raw_content passes SEARCH_ENRICH_BUDGET_MS, so no dispatch can exceed it.
+  assert.equal(SEARCH_ENRICH_BUDGET_MS, 15_000);
+  resetSearchProviderPacingForTests();
+  const searchDispatches: Dispatch[] = [];
+  const s = await executeSearchCall({
+    payload: { query: 'budgeted spa search', mode: 'serper', max_results: 3, include_raw_content: true, noCache: true },
+    env: { SERPER_API_KEY: 'serper-budget' } as never,
+    executeHubFetch: makeHub(searchDispatches) as never,
+    providerFetchFn: async () =>
+      Response.json({ organic: [{ title: 'SPA', link: 'https://auto.example.com/spa', snippet: 'A single page app' }] }),
+  });
+  assert.equal(s.status, 200);
+  const enrichDispatches = searchDispatches.filter((d) => d.src.includes(':enrich'));
+  assert.ok(enrichDispatches.length >= 1, 'enrichment dispatched to the nodes');
+  for (const d of enrichDispatches) {
+    assert.ok((d.maxSeconds ?? 99) <= SEARCH_ENRICH_BUDGET_MS / 1_000, `${d.src} maxSeconds ${d.maxSeconds} exceeds budget`);
+  }
+});
+

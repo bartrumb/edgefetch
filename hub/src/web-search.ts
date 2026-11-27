@@ -810,6 +810,13 @@ function countDomainFilteredHits(
   return seen.size;
 }
 
+/**
+ * Wall-clock budget for `include_raw_content` enrichment. Live traces showed the unbounded extract fan-out (35 s batch,
+ * 25 s HTML retry, then serial 40 s browser-auto renders per thin page) holding `search` calls open for 11-79 s while
+ * the SERP itself returned in ~1 s. Pages that miss the budget keep their SERP snippet and simply omit `rawContent`.
+ */
+export const SEARCH_ENRICH_BUDGET_MS = 15_000;
+
 export async function executeSearchCall(params: {
   payload: SearchRequestPayload;
   env: SearchBindings;
@@ -1516,6 +1523,7 @@ export async function executeSearchCall(params: {
       env,
       executeHubFetch,
       source: `${source}:enrich`,
+      budgetMs: SEARCH_ENRICH_BUDGET_MS,
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (extractOut.status === 200 && Array.isArray(extractOut.body.results)) {

@@ -32,7 +32,7 @@ const htmlFragToMd = (frag: string, baseUrl?: string) => {
 };
 
 test('Tier 1A: Universal Schema.org JSON-LD extracts FAQPage, QAPage, DiscussionForumPosting, ItemList, Article, Event, SoftwareApplication & Dataset without false zeros', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 35);
+  assert.equal(SCRAPE_PIPELINE_VERSION, 36);
 
   // 1. FAQPage hydrates thin shell directly without triggering browser auto-render
   const faqHtml = `<!doctype html><html><head><title>Pricing FAQ</title>

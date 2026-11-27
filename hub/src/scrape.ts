@@ -4929,6 +4929,18 @@ export async function executeScrapeCall(params: {
           formatted.author ? (redactPii ? redactPiiText(formatted.author) : formatted.author) : undefined,
           256,
         );
+        // Adapter output goes through the same Go content-state classifier as normal scrapes, so an adapter that
+        // formatted a soft-404 / login / closed-posting page is labelled accordingly instead of always `active`.
+        const twinContentState = classifyContentState({
+          status: typeof twinItem.status === 'number' ? twinItem.status : 200,
+          url: normalizedUrl,
+          finalUrl: typeof twinItem.finalUrl === 'string' && twinItem.finalUrl ? twinItem.finalUrl : normalizedUrl,
+          title: formatted.title ?? '',
+          markdown: twinShapedFull.markdown,
+          rendered: false,
+          ...(twinJobPosting?.validThrough ? { validThrough: twinJobPosting.validThrough } : {}),
+          nowMs: Date.now(),
+        });
         const twinSafeJobPosting = twinJobPosting
           ? redactPii
             ? redactPiiDeep(sanitizeRecordUrlsDeep(twinJobPosting))
@@ -4950,7 +4962,8 @@ export async function executeScrapeCall(params: {
             extractorId: registryTwin.id,
             detected: twinDetectedWithAdapter,
             rendered: false,
-            contentState: 'active' as const,
+            contentState: twinContentState.state,
+            ...(twinContentState.reason ? { contentStateReason: twinContentState.reason } : {}),
             ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
             ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
             ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
@@ -7402,7 +7415,9 @@ export async function executeScrapeCall(params: {
       (hydratedFromUniversalSchema ? universalSchemaDoc?.markdown : undefined) ||
       structuredTextFormatted?.markdown ||
       (isHtmlBody ? extracted?.markdown : undefined) ||
-      (typeof item.markdown === 'string' && item.markdown) ||
+      // Node-supplied Markdown for an HTML body comes from a legacy extractor that can leak script text and hidden
+      // (display:none) content; when the hub's own HTML extraction is empty, never fall back to it for HTML bodies.
+      (!isHtmlBody && typeof item.markdown === 'string' && item.markdown) ||
       extracted?.markdown ||
       (isHtmlBody ? '' : rawBodyStr);
   if (cdpJsonDistilled?.markdown && countTextWords(markdown) < 80 && !alternateMarkdownBody && !customShopifyDoc) {
@@ -8328,6 +8343,8 @@ export async function executeScrapeCall(params: {
     payload.ephemeral !== true &&
     !Boolean(payload.noCache) &&
     item.truncated !== true &&
+    // Transient "temporarily unavailable" pages (maintenance / "try again later") are never cached as content.
+    contentStateCheck.state !== 'temporarily_unavailable' &&
     env.ARTIFACTS &&
     rawCleanMarkdown
   ) {

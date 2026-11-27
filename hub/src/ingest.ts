@@ -886,9 +886,14 @@ export async function executeIngestPipeline(
                   if (mdObj) mdText = await mdObj.text();
                 }
                 if (mdText !== undefined) {
-                  // R4: Never pollute SEARCH D1 FTS5 collections with soft-404 ("Page Not Found") or sign-in login-wall pages!
+                  // R4: Never pollute SEARCH D1 FTS5 collections with soft-404 ("Page Not Found"), sign-in login-wall, or
+                  // transient temporarily-unavailable (maintenance / "try again later") pages!
                   const stateCheck = classifyContentState({ status: 200, title: deriveRes.title ?? '', markdown: mdText });
-                  if (stateCheck.state !== 'soft_404' && stateCheck.state !== 'login_wall') {
+                  if (
+                    stateCheck.state !== 'soft_404' &&
+                    stateCheck.state !== 'login_wall' &&
+                    stateCheck.state !== 'temporarily_unavailable'
+                  ) {
                     for (const pg of pagesForSha) {
                       const safeMdText = sanitizeInlineHtmlInMarkdown(mdText, pg.url).trim();
                       if (!safeMdText) continue;

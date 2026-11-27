@@ -37,7 +37,15 @@ export interface WafClassification {
   summary: string;
 }
 
-export type ContentState = 'active' | 'closed_posting' | 'soft_404' | 'login_wall' | 'empty_shell';
+// `temporarily_unavailable` is a transient state (maintenance / "try again later" pages): never cached or indexed as
+// content, retry later. Classified in Go (`internal/classify`), surfaced here via WASM.
+export type ContentState =
+  | 'active'
+  | 'closed_posting'
+  | 'soft_404'
+  | 'login_wall'
+  | 'empty_shell'
+  | 'temporarily_unavailable';
 
 export interface ContentStateResult {
   state: ContentState;

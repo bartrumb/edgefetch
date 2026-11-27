@@ -57,6 +57,10 @@ func (h *RouteHandler) executeJobsVerify(
 			scOut["status"] == http.StatusNotFound || scOut["status"] == http.StatusGone ||
 			cState == "closed_posting" || cState == "soft_404":
 			item["status"] = "closed"
+		case cState == "temporarily_unavailable":
+			// A maintenance page says nothing about the posting itself; report unknown so callers retry later.
+			item["status"] = "unknown"
+			item["reason"] = "temporarily_unavailable"
 		case st == http.StatusOK && boolField(scOut["ok"]) && cState != "empty_shell":
 			item["status"] = "live"
 			if title != "" {

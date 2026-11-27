@@ -2,7 +2,7 @@
 id: maven-central
 name: Maven Central
 category: developer
-description: "Upgrades central.sonatype.com/artifact/<group>/<artifact>[/<version>] pages to the keyless search.maven.org Solr JSON API with Maven/Gradle coordinates and artifact metadata."
+description: "Upgrades central.sonatype.com/artifact/<group>/<artifact>[/<version>] pages to the keyless Maven Central Solr JSON API (central.sonatype.com for versioned artifacts, search.maven.org for artifact summaries) with Maven/Gradle coordinates and artifact metadata."
 domains:
   - central.sonatype.com
 exampleUrls:
@@ -34,7 +34,9 @@ routes:
           minLen: 1
           maxLen: 80
     twin:
-      fetchUrl: "https://search.maven.org/solrsearch/select?q=g:{g}+AND+a:{a}+AND+v:{v}&core=gav&rows=20&wt=json"
+      # search.maven.org's Solr index stopped receiving new releases; the same
+      # Solr API on central.sonatype.com (this adapter's own host) is current.
+      fetchUrl: "https://central.sonatype.com/solrsearch/select?q=g:{g}+AND+a:{a}+AND+v:{v}&core=gav&rows=20&wt=json"
       kind: json
       accept: application/json
       maxBytes: 4194304
@@ -58,10 +60,6 @@ routes:
         packaging:
           paths:
             - p
-        versionCount:
-          paths:
-            - versionCount
-          format: int_comma
         published:
           paths:
             - timestamp
@@ -88,9 +86,6 @@ routes:
         - label: Published
           template: "{published}"
           whenVar: published
-        - label: Versions
-          template: "{versionCount}"
-          whenVar: versionCount
         - label: Classifiers / Files
           template: "{artifacts}"
           whenVar: artifacts

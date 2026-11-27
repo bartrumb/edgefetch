@@ -675,6 +675,16 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 	lineStart := 0
 	linesScanned := 0
 	for lineStart < len(combinedRSC) && linesScanned < 3_000 {
+		// Length-framed `<id>:T<hexlen>,<bytes>` rows carry no trailing newline, so slice exactly
+		// `hexlen` bytes instead of reading to `\n` (which would swallow the following rows).
+		if tID, tBody, tNext, tOK := scanFlightTextRowHydrateGo(combinedRSC, lineStart); tOK {
+			lineStart = tNext
+			linesScanned++
+			flightChunksByID[tID] = tBody
+			recordPILeaf(tBody)
+			addProseCandidate(tBody, 30)
+			continue
+		}
 		nlRel := strings.IndexByte(combinedRSC[lineStart:], '\n')
 		lineEnd := len(combinedRSC)
 		if nlRel >= 0 {
@@ -818,6 +828,14 @@ func ExtractNextRSCFlight(rawHTML, baseURL string, htmlToMD func(frag, base stri
 	if len(resolvedFlightObjects) > 0 {
 		distilledRecords = distillRecordsWithMetaHydrateGo(resolvedFlightObjects, baseURL, 250)
 		shimanoSpecsMD, shimanoSpecRecords = extractShimanoRSCSpecsHydrateGo(resolvedFlightObjects)
+		if typedMD, typedRecords := extractShimanoTypenameSpecTableHydrateGo(resolvedFlightObjects, flightChunksByID); typedMD != "" {
+			if shimanoSpecsMD != "" {
+				shimanoSpecsMD += "\n\n" + typedMD
+			} else {
+				shimanoSpecsMD = typedMD
+			}
+			shimanoSpecRecords = append(shimanoSpecRecords, typedRecords...)
+		}
 	}
 
 	proseJoined := strings.TrimSpace(strings.Join(rscBlocks, "\n\n"))
@@ -1090,6 +1108,205 @@ func extractShimanoRSCSpecsHydrateGo(nodes []any) (string, []map[string]any) {
 		if len(rows) > 0 {
 			sections = append(sections, "## "+SanitizeSchemaPlainField(catName, 200)+"\n\n"+formatDeclarativeGFMTable([]string{"Specification", "Value"}, rows))
 		}
+	}
+	return strings.Join(sections, "\n\n"), records
+}
+
+// extractShimanoTypenameSpecTableHydrateGo renders GraphQL-typed spec tables of the shape
+// `{"__typename":"TableSpecContents","models":[{"modelName","modelValueSet"}],"attributes":[{"attributeId","attributeKey1".."3"}]}`
+// as one GFM table per spec object (one column per model). `$` references left unresolved by the
+// depth-bounded resolver are followed through table. A model's value set may be an index-aligned
+// scalar array, an array of objects keyed by `attributeId`, or a map keyed by attributeId.
+func extractShimanoTypenameSpecTableHydrateGo(nodes []any, table map[string]any) (string, []map[string]any) {
+	deref := func(v any) any {
+		for hops := 0; hops < 6; hops++ {
+			str, ok := v.(string)
+			if !ok {
+				return v
+			}
+			refID, okR := parseFlightDollarRefHydrateGo(str, table)
+			if !okR {
+				return v
+			}
+			v = table[refID]
+		}
+		return v
+	}
+	scalar := func(v any) string {
+		return strings.TrimSpace(jsonScalarToString(deref(v)))
+	}
+
+	var specTables []map[string]any
+	visited := 0
+	var walk func(val any, depth int)
+	walk = func(val any, depth int) {
+		if val == nil || depth > 64 || visited > 20_000 || len(specTables) >= 20 {
+			return
+		}
+		visited++
+		switch v := val.(type) {
+		case []any:
+			for _, el := range v {
+				walk(el, depth+1)
+			}
+		case map[string]any:
+			if jsonScalarToString(v["__typename"]) == "TableSpecContents" {
+				if _, okM := deref(v["models"]).([]any); okM {
+					if _, okA := deref(v["attributes"]).([]any); okA {
+						specTables = append(specTables, v)
+						return
+					}
+				}
+			}
+			for _, k := range sortedMapKeysSchemaGo(v) {
+				if unsafeObjectKeysHydrateGo[k] {
+					continue
+				}
+				walk(v[k], depth+1)
+			}
+		}
+	}
+	for _, n := range nodes {
+		walk(n, 0)
+	}
+	if len(specTables) == 0 {
+		return "", nil
+	}
+
+	valueOf := func(v any) string {
+		v = deref(v)
+		if obj, ok := v.(map[string]any); ok {
+			for _, key := range []string{"value", "attributeValue", "displayValue", "valueText", "text", "label"} {
+				if s := scalar(obj[key]); s != "" {
+					return s
+				}
+			}
+			return ""
+		}
+		return scalar(v)
+	}
+	cellFor := func(set any, attrIdx int, attrID string) string {
+		switch vs := set.(type) {
+		case []any:
+			if attrID != "" {
+				for _, el := range vs {
+					if eo, ok := deref(el).(map[string]any); ok && scalar(eo["attributeId"]) == attrID {
+						return valueOf(eo)
+					}
+				}
+			}
+			if attrIdx < len(vs) {
+				if _, isObj := deref(vs[attrIdx]).(map[string]any); !isObj {
+					return valueOf(vs[attrIdx])
+				}
+			}
+		case map[string]any:
+			if attrID != "" {
+				if cell, ok := vs[attrID]; ok {
+					return valueOf(cell)
+				}
+			}
+		}
+		return ""
+	}
+
+	seen := make(map[string]bool)
+	var sections []string
+	var records []map[string]any
+	for _, st := range specTables {
+		models, _ := deref(st["models"]).([]any)
+		attrs, _ := deref(st["attributes"]).([]any)
+		if len(models) > 40 {
+			models = models[:40]
+		}
+		if len(attrs) > 500 {
+			attrs = attrs[:500]
+		}
+		catName := ""
+		for _, key := range []string{"categoryName", "title", "tableTitle", "heading"} {
+			if c := scalar(st[key]); c != "" {
+				catName = c
+				break
+			}
+		}
+		if catName == "" {
+			catName = "Specifications"
+		}
+		safeCat := SanitizeSchemaPlainField(catName, 200)
+
+		headers := []string{"Specification"}
+		var modelNames []string
+		var valueSets []any
+		for _, m := range models {
+			mo, ok := deref(m).(map[string]any)
+			if !ok {
+				continue
+			}
+			name := SanitizeSchemaPlainField(scalar(mo["modelName"]), 120)
+			if name == "" {
+				name = "Model " + strconv.Itoa(len(modelNames)+1)
+			}
+			modelNames = append(modelNames, name)
+			headers = append(headers, name)
+			valueSets = append(valueSets, deref(mo["modelValueSet"]))
+		}
+		if len(modelNames) == 0 {
+			continue
+		}
+
+		var rows [][]string
+		var tableRecords []map[string]any
+		for ai, a := range attrs {
+			ao, ok := deref(a).(map[string]any)
+			if !ok {
+				continue
+			}
+			var keyParts []string
+			for _, key := range []string{"attributeKey1", "attributeKey2", "attributeKey3"} {
+				if kp := SanitizeSchemaPlainField(scalar(ao[key]), 200); kp != "" {
+					keyParts = append(keyParts, kp)
+				}
+			}
+			if len(keyParts) == 0 {
+				continue
+			}
+			specName := strings.Join(keyParts, " / ")
+			attrID := scalar(ao["attributeId"])
+			row := []string{specName}
+			hasValue := false
+			var rowRecords []map[string]any
+			for mi, set := range valueSets {
+				cell := SanitizeSchemaPlainField(cellFor(set, ai, attrID), 400)
+				row = append(row, cell)
+				if cell != "" {
+					hasValue = true
+					rowRecords = append(rowRecords, map[string]any{
+						"category": safeCat,
+						"name":     specName,
+						"model":    modelNames[mi],
+						"value":    cell,
+					})
+				}
+			}
+			if !hasValue {
+				continue
+			}
+			rows = append(rows, row)
+			tableRecords = append(tableRecords, rowRecords...)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		section := "## " + safeCat + "\n\n" + formatDeclarativeGFMTable(headers, rows)
+		if seen[section] {
+			continue
+		}
+		seen[section] = true
+		sections = append(sections, section)
+		records = append(records, tableRecords...)
+	}
+	if len(sections) == 0 {
+		return "", nil
 	}
 	return strings.Join(sections, "\n\n"), records
 }
@@ -2108,6 +2325,82 @@ func isFlightChunkIDHydrateGo(s string) bool {
 		}
 	}
 	return true
+}
+
+// scanFlightTextRowHydrateGo parses a length-framed React Flight text row `<id>:T<hexlen>,<bytes>`
+// starting at pos (after optional leading whitespace). The body is exactly hexlen bytes of the
+// already-decoded string. The row is accepted only when the framed end lands on a row boundary
+// (see isFlightRowBoundaryHydrateGo); one trailing `\n` is consumed. Linear in the row length.
+func scanFlightTextRowHydrateGo(s string, pos int) (id, body string, next int, ok bool) {
+	p := pos
+	for p < len(s) && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n') {
+		p++
+	}
+	idStart := p
+	for p < len(s) && p-idStart <= 12 && s[p] != ':' {
+		p++
+	}
+	if p >= len(s) || s[p] != ':' || p == idStart || !isFlightChunkIDHydrateGo(s[idStart:p]) {
+		return "", "", 0, false
+	}
+	id = s[idStart:p]
+	p++
+	if p >= len(s) || s[p] != 'T' {
+		return "", "", 0, false
+	}
+	p++
+	hexStart := p
+	n := 0
+	for p < len(s) && p-hexStart < 8 {
+		d := hexDigitValueHydrateGo(s[p])
+		if d < 0 {
+			break
+		}
+		n = n*16 + d
+		p++
+	}
+	if p == hexStart || p >= len(s) || s[p] != ',' {
+		return "", "", 0, false
+	}
+	p++
+	end := p + n
+	if end > len(s) || !isFlightRowBoundaryHydrateGo(s, end) {
+		return "", "", 0, false
+	}
+	body = s[p:end]
+	next = end
+	if next < len(s) && s[next] == '\n' {
+		next++
+	}
+	return id, body, next, true
+}
+
+func hexDigitValueHydrateGo(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
+}
+
+// isFlightRowBoundaryHydrateGo reports whether pos is the end of input, a line break, or the
+// start of another `<id>:` Flight row.
+func isFlightRowBoundaryHydrateGo(s string, pos int) bool {
+	if pos >= len(s) {
+		return true
+	}
+	if s[pos] == '\n' || s[pos] == '\r' {
+		return true
+	}
+	p := pos
+	for p < len(s) && p-pos <= 12 && s[p] != ':' {
+		p++
+	}
+	return p < len(s) && s[p] == ':' && p > pos && isFlightChunkIDHydrateGo(s[pos:p])
 }
 
 func parseFlightDollarRefHydrateGo(s string, table map[string]any) (string, bool) {

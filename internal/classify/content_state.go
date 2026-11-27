@@ -92,7 +92,12 @@ var (
 	reNotFoundHeadingCSGo  = newLazyRegexp(`(?i)\b(?:404\b|page\s+not\s+found|job\s+not\s+found|post(?:ing)?\s+not\s+found|couldn['’]t\s+find\s+(?:that|this)\s+page|page\s+doesn['’]t\s+exist)\b`)
 	reNotFoundBodyCSGo     = newLazyRegexp(`(?i)\b(?:the\s+page\s+you\s+(?:requested|are\s+looking\s+for)\s+(?:could\s+not\s+be\s+found|does\s+not\s+exist)|error\s+404|we\s+can['’]t\s+seem\s+to\s+find\s+the\s+page)\b`)
 	reLoginGateHeadingCSGo = newLazyRegexp(`(?i)^(?:sign\s+in|log\s*in|authentication\s+required|members\s+only)(?:\s+to\s+\S+|\s*[-|–]\s*.*)?$`)
-	reLoginGateCopyCSGo    = newLazyRegexp(`(?i)\b(?:sign\s+in\s+to\s+(?:view|read|continue|access)|log\s+in\s+to\s+(?:view|read|continue|access)|please\s+(?:sign|log)\s+in\s+to\s+continue|create\s+a\s+free\s+account\s+to\s+continue\s+reading)\b`)
+	// Present-tense site maintenance notice. The subject must be the site/service itself (or "we"), so news about a
+	// bridge or road "down for maintenance" and how-to maintenance articles do not match; future-tense notices
+	// ("will undergo maintenance on Saturday") never match because a present-tense verb is required.
+	reMaintenanceStatusCSGo = newLazyRegexp(`(?i)(?:\b(?:(?:this|our|the)\s+)?(?:site|website|web\s+site|page|service|store|shop|app|application|server|platform|portal)\s+(?:is|are)|\bwe['’]re|\bwe\s+are)\s+(?:currently\s+)?(?:(?:down\s+for|undergoing|under)\s+(?:some\s+)?(?:scheduled\s+|planned\s+)?maintenance\b|temporarily\s+unavailable\b)|\bbe\s+right\s+back\b`)
+	reMaintenanceRetryCSGo  = newLazyRegexp(`(?i)\b(?:check\s+back|try\s+again|back\s+(?:soon|shortly|online)|return\s+shortly)\b`)
+	reLoginGateCopyCSGo     = newLazyRegexp(`(?i)\b(?:sign\s+in\s+to\s+(?:view|read|continue|access)|log\s+in\s+to\s+(?:view|read|continue|access)|please\s+(?:sign|log)\s+in\s+to\s+continue|create\s+a\s+free\s+account\s+to\s+continue\s+reading)\b`)
 
 	reDNSNotFoundCSGo            = newLazyRegexp(`(?i)\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist`)
 	reSchemeDowngradeCSGo        = newLazyRegexp(`(?is)(?:scheme_downgrade|https?-to-http|scheme\s+downgrade|(?:disallowed_url|redirect).{0,140}?(?:only\s+https://|scheme\s+must\s+be\s+https|to\s+http://))`)
@@ -981,7 +986,8 @@ func hasPasswordInputLinearCSGo(cleanVisibleHTML string) bool {
 	return found
 }
 
-// ClassifyContentState classifies a response into `"active"`, `"closed_posting"`, `"soft_404"`, `"login_wall"`, or `"empty_shell"`
+// ClassifyContentState classifies a response into `"active"`, `"closed_posting"`, `"soft_404"`, `"temporarily_unavailable"`,
+// `"login_wall"`, or `"empty_shell"`
 // while applying word-count and structural vetoes so technical articles discussing HTTP 404 or authentication stay `"active"`.
 func ClassifyContentState(status int, rawHTML, markdown, finalURL, title string) ContentStateResult {
 	if status == 0 {
@@ -1059,6 +1065,23 @@ func ClassifyContentState(status int, rawHTML, markdown, finalURL, title string)
 				State:      "soft_404",
 				Reason:     "HTTP 200 response contains a Page Not Found (soft-404) body.",
 				Confidence: 0.90,
+			}
+		}
+	}
+
+	// 2b. Temporary maintenance page (HTTP 2xx, < 250 words, present-tense site maintenance notice AND a retry
+	// phrase, and no Article/Product/JobPosting-class JSON-LD).
+	if status >= 200 && status < 300 && words < 250 {
+		scan := title + "\n" + capStringBytesUTF8CSGo(proseOnly, 8_000)
+		if words == 0 && cleanVisibleHTML != "" {
+			scan += "\n" + stripTagsQuoteAwareCSGo(capStringBytesUTF8CSGo(cleanVisibleHTML, 64_000), 64_000)
+		}
+		if reMaintenanceStatusCSGo.MatchString(scan) && reMaintenanceRetryCSGo.MatchString(scan) &&
+			!hasRichSchemaJSONLDCSGo(capStringBytesUTF8CSGo(rawHTML, maxHTMLScanCharsCSGo)) {
+			return ContentStateResult{
+				State:      "temporarily_unavailable",
+				Reason:     "HTTP 2xx response is a temporary maintenance / unavailable notice; retry later.",
+				Confidence: 0.85,
 			}
 		}
 	}

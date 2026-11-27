@@ -195,8 +195,8 @@ function assertNoActiveHtmlOrJsLinksOutsideCode(md: string, contextLabel: string
 }
 
 async function runRound6StreamASubtests(t: TestContext): Promise<void> {
-await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 35', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 35);
+await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 36', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 36);
 
   // 1. Indented fence dedent & top-level 1..3 space fence normalization (`r6A/h1.mjs`, `r6A/h1diff.mjs`)
   const h1IndentJs = fin(' ```\nx\n ```\n[k](javascript:alert(1))');
@@ -2285,9 +2285,9 @@ function buildGeneratedAdversarialMarkdownCorpus(): Array<{ id: string; md: stri
   return corpus;
 }
 
-test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 35 single source & readArtifactPage NEVER falls back to < v35 cached Markdown', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 35);
-  assert.equal(STORAGE_PIPELINE_VERSION, 35);
+test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 36 single source & readArtifactPage NEVER falls back to < v36 cached Markdown', async () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 36);
+  assert.equal(STORAGE_PIPELINE_VERSION, 36);
   assert.equal(SCRAPE_PIPELINE_VERSION, STORAGE_PIPELINE_VERSION);
 
   const bucket = new MemoryR2Bucket();
@@ -2365,11 +2365,11 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 35 single source & readArtifactPa
   if (rederivedRes.ok) {
     assert.equal(rederivedRes.page.content, `Re-derived v33 from ${rawBytes.byteLength}B raw: &lt;svg onload=1>`);
   }
-  const persistedV33 = await bucket.get(`derived/35/markdown/${written.contentSha256}`);
-  assert.ok(persistedV33, 're-derived v35 Markdown must be persisted at derived/35/markdown/<sha>');
+  const persistedV33 = await bucket.get(`derived/36/markdown/${written.contentSha256}`);
+  assert.ok(persistedV33, 're-derived v36 Markdown must be persisted at derived/36/markdown/<sha>');
 
-  // 1. `executeScrapeCall` with `maxAgeMs: 60_000` MUST ignore v30 cached document and fetch fresh v35!
-  await bucket.delete(`derived/35/markdown/${written.contentSha256}`);
+  // 1. `executeScrapeCall` with `maxAgeMs: 60_000` MUST ignore v30 cached document and fetch fresh v36!
+  await bucket.delete(`derived/36/markdown/${written.contentSha256}`);
   let liveFetched = 0;
   const scrapeRes = await executeScrapeCall({
     payload: { url: 'https://cache-v30.example.com/', maxAgeMs: 60_000 },
@@ -2388,13 +2388,13 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 35 single source & readArtifactPa
     },
   });
   assert.equal(scrapeRes.status, 200);
-  assert.equal(liveFetched, 1, 'v30 scrape cache entry MUST be invalidated after bump to v35');
-  assert.equal(scrapeRes.body.pipelineVersion, 35);
+  assert.equal(liveFetched, 1, 'v30 scrape cache entry MUST be invalidated after bump to v36');
+  assert.equal(scrapeRes.body.pipelineVersion, 36);
 
-  // 2. `readArtifactPage` sanitizes unhardened `v35` document on cache miss and caches per sha!
+  // 2. `readArtifactPage` sanitizes unhardened `v36` document on cache miss and caches per sha!
   await bucket.put(
-    `derived/35/markdown/${written.contentSha256}`,
-    '> ```html\n<img src=x onerror=1>\n> ```\n\nfresh v35 <img src=x onerror=1> and `Vec<T>`',
+    `derived/36/markdown/${written.contentSha256}`,
+    '> ```html\n<img src=x onerror=1>\n> ```\n\nfresh v36 <img src=x onerror=1> and `Vec<T>`',
   );
   const hitV33 = await readArtifactPage({
     bucket: bucket as unknown as R2Bucket,
@@ -2404,7 +2404,7 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 35 single source & readArtifactPa
   assert.equal(hitV33.ok, true);
   if (hitV33.ok) {
     auditZeroLiveXssAcrossSixMarkdownDialects(hitV33.page.content, 'readArtifactPage:wholeDocResanitize');
-    assert.ok(hitV33.page.content.endsWith('fresh v35 &lt;img src=x onerror=1> and `Vec&lt;T>`'));
+    assert.ok(hitV33.page.content.endsWith('fresh v36 &lt;img src=x onerror=1> and `Vec&lt;T>`'));
   }
 });
 
@@ -4269,9 +4269,9 @@ test('Round 9 (H2 & Mediums): Destination <10ms up to 1MiB, Storage v32 clamping
     assert.ok(neutralized.startsWith('[download](#)'), `Expected oversized destination neutralized`);
   }
 
-  // 2. Storage `SCRAPE_PIPELINE_VERSION === 35`, clamping `pipelineVersion < 35`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
-  assert.equal(SCRAPE_PIPELINE_VERSION, 35);
-  assert.equal(STORAGE_PIPELINE_VERSION, 35);
+  // 2. Storage `SCRAPE_PIPELINE_VERSION === 36`, clamping `pipelineVersion < 36`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
+  assert.equal(SCRAPE_PIPELINE_VERSION, 36);
+  assert.equal(STORAGE_PIPELINE_VERSION, 36);
 
   const bucket = new MemoryR2Bucket();
   const staleSha = 'a'.repeat(64);
@@ -4776,9 +4776,9 @@ function assertStrictS1ProseSafety(sanitizedMd: string, label: string, allowPdfM
   }
 }
 
-test('Round 10 (S1): < restorer removed, SCRAPE_PIPELINE_VERSION === 35, every prose < escaped, and 512 KiB `<a>` runs in < 25 ms', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 35);
-  assert.equal(STORAGE_PIPELINE_VERSION, 35);
+test('Round 10 (S1): < restorer removed, SCRAPE_PIPELINE_VERSION === 36, every prose < escaped, and 512 KiB `<a>` runs in < 25 ms', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 36);
+  assert.equal(STORAGE_PIPELINE_VERSION, 36);
 
   // 1. Confirm `escapeResidualLtPreservingSafeCodeSpansLinear` and false dialect-agreement comment are completely gone
   assert.equal('escapeResidualLtPreservingSafeCodeSpansLinear' in scrapeAdvancedExports, false);

@@ -4614,7 +4614,7 @@
         "federalregister.gov"
       ],
       "exampleUrls": [
-        "https://www.federalregister.gov/documents/2024/05/07/2024-09145/non-compete-clause-rule"
+        "https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule"
       ],
       "match": {
         "exactSegments": false,
@@ -4683,6 +4683,15 @@
             "paths": [
               "publication_date"
             ]
+          },
+          "urlDate": {
+            "template": "{yyyy}-{mm}-{dd}"
+          },
+          "pubDateMatchesUrl": {
+            "paths": [
+              "publication_date"
+            ],
+            "equalsVar": "urlDate"
           },
           "effectiveOn": {
             "paths": [
@@ -4797,6 +4806,12 @@
             "label": "Published",
             "template": "{pubDate}",
             "whenVar": "pubDate"
+          },
+          {
+            "label": "Warning",
+            "template": "Publication date {pubDate} does not match the URL date {urlDate}; the URL may point to a different document than its date suggests.",
+            "whenVar": "pubDate",
+            "unlessVar": "pubDateMatchesUrl"
           },
           {
             "label": "Effective On",
@@ -8038,7 +8053,7 @@
       "id": "maven-central",
       "name": "Maven Central",
       "category": "developer",
-      "description": "Upgrades central.sonatype.com/artifact/<group>/<artifact>[/<version>] pages to the keyless search.maven.org Solr JSON API with Maven/Gradle coordinates and artifact metadata.",
+      "description": "Upgrades central.sonatype.com/artifact/<group>/<artifact>[/<version>] pages to the keyless Maven Central Solr JSON API (central.sonatype.com for versioned artifacts, search.maven.org for artifact summaries) with Maven/Gradle coordinates and artifact metadata.",
       "domains": [
         "central.sonatype.com"
       ],
@@ -8080,7 +8095,7 @@
             ]
           },
           "twin": {
-            "fetchUrl": "https://search.maven.org/solrsearch/select?q=g:{g}+AND+a:{a}+AND+v:{v}&core=gav&rows=20&wt=json",
+            "fetchUrl": "https://central.sonatype.com/solrsearch/select?q=g:{g}+AND+a:{a}+AND+v:{v}&core=gav&rows=20&wt=json",
             "kind": "json",
             "accept": "application/json",
             "maxBytes": 4194304
@@ -8113,12 +8128,6 @@
                 "paths": [
                   "p"
                 ]
-              },
-              "versionCount": {
-                "paths": [
-                  "versionCount"
-                ],
-                "format": "int_comma"
               },
               "published": {
                 "paths": [
@@ -8159,11 +8168,6 @@
                 "label": "Published",
                 "template": "{published}",
                 "whenVar": "published"
-              },
-              {
-                "label": "Versions",
-                "template": "{versionCount}",
-                "whenVar": "versionCount"
               },
               {
                 "label": "Classifiers / Files",
@@ -17512,6 +17516,101 @@
                 "itemWrap": "`",
                 "join": ", "
               },
+              "instanceOf": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P31"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 8
+              },
+              "sexOrGender": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P21"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 3
+              },
+              "citizenship": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P27"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 5
+              },
+              "occupation": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P106"
+                },
+                "subField": "mainsnak.datavalue.value.id",
+                "itemWrap": "`",
+                "join": ", ",
+                "limit": 8
+              },
+              "birthDate": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P569.0.mainsnak.datavalue.value.time"
+                },
+                "stripPrefix": "+",
+                "stripSuffix": "T00:00:00Z",
+                "replaceAll": {
+                  "from": "-00",
+                  "to": ""
+                },
+                "sliceMax": 10
+              },
+              "deathDate": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P570.0.mainsnak.datavalue.value.time"
+                },
+                "stripPrefix": "+",
+                "stripSuffix": "T00:00:00Z",
+                "replaceAll": {
+                  "from": "-00",
+                  "to": ""
+                },
+                "sliceMax": 10
+              },
+              "inception": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P571.0.mainsnak.datavalue.value.time"
+                },
+                "stripPrefix": "+",
+                "stripSuffix": "T00:00:00Z",
+                "replaceAll": {
+                  "from": "-00",
+                  "to": ""
+                },
+                "sliceMax": 10
+              },
+              "officialWebsite": {
+                "dynamicKeyPath": {
+                  "base": "entities",
+                  "keyVar": "qid",
+                  "subPath": "claims.P856.0.mainsnak.datavalue.value"
+                },
+                "trim": true,
+                "requireHttpPrefix": true
+              },
               "enwikiSlug": {
                 "dynamicKeyPath": {
                   "base": "entities",
@@ -17558,6 +17657,46 @@
                 "whenVar": "modified"
               },
               {
+                "label": "Instance Of",
+                "template": "{instanceOf}",
+                "whenVar": "instanceOf"
+              },
+              {
+                "label": "Sex or Gender",
+                "template": "{sexOrGender}",
+                "whenVar": "sexOrGender"
+              },
+              {
+                "label": "Country of Citizenship",
+                "template": "{citizenship}",
+                "whenVar": "citizenship"
+              },
+              {
+                "label": "Occupation",
+                "template": "{occupation}",
+                "whenVar": "occupation"
+              },
+              {
+                "label": "Date of Birth",
+                "template": "{birthDate}",
+                "whenVar": "birthDate"
+              },
+              {
+                "label": "Date of Death",
+                "template": "{deathDate}",
+                "whenVar": "deathDate"
+              },
+              {
+                "label": "Inception",
+                "template": "{inception}",
+                "whenVar": "inception"
+              },
+              {
+                "label": "Official Website",
+                "template": "{officialWebsite}",
+                "whenVar": "officialWebsite"
+              },
+              {
                 "label": "Claim Properties",
                 "template": "{claimProps}",
                 "whenVar": "claimProps"
@@ -17575,7 +17714,8 @@
             ],
             "linksVars": [
               "wikidataUrl",
-              "enwikiUrl"
+              "enwikiUrl",
+              "officialWebsite"
             ]
           }
         },
@@ -17660,6 +17800,20 @@
                 "join": ", ",
                 "limit": 8
               },
+              "byStatement": {
+                "paths": [
+                  "by_statement"
+                ],
+                "trim": true,
+                "sliceMax": 200
+              },
+              "authorLine": {
+                "template": "{byStatement}",
+                "whenVars": [
+                  "byStatement"
+                ],
+                "fallbackVar": "contributions"
+              },
               "authors": {
                 "paths": [
                   "authors"
@@ -17710,7 +17864,7 @@
             },
             "titleTemplate": "{title}",
             "descriptionVar": "descShort",
-            "authorVar": "contributions",
+            "authorVar": "authorLine",
             "publishedTimeVar": "publishDate",
             "bullets": [
               {
@@ -17742,6 +17896,11 @@
                 "label": "Pages",
                 "template": "{pages}",
                 "whenVar": "pages"
+              },
+              {
+                "label": "By",
+                "template": "{byStatement}",
+                "whenVar": "byStatement"
               },
               {
                 "label": "Contributors",

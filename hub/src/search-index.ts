@@ -1463,7 +1463,8 @@ export async function executeExtractCall(params: {
           hit.contentState === 'closed_posting' ||
           hit.contentState === 'soft_404' ||
           hit.contentState === 'login_wall' ||
-          hit.contentState === 'empty_shell'
+          hit.contentState === 'empty_shell' ||
+          hit.contentState === 'temporarily_unavailable'
             ? hit.contentState
             : undefined;
         const validRenderedVia: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
@@ -2482,6 +2483,8 @@ export async function executeExtractCall(params: {
       entry.contentSource !== 'wayback' &&
       entry.status >= 200 &&
       entry.status < 300 &&
+      // Transient "temporarily unavailable" pages are treated like a non-2xx fetch: never cached as content.
+      entry.contentState !== 'temporarily_unavailable' &&
       safeIndexMarkdown &&
       payload.ephemeral !== true
     ) {
@@ -2509,7 +2512,15 @@ export async function executeExtractCall(params: {
         }).catch(() => undefined);
       }
     }
-    if (isPrivateExtract && !entry.cached && safeIndexMarkdown && payload.ephemeral !== true && collectionId && env.SEARCH) {
+    if (
+      isPrivateExtract &&
+      !entry.cached &&
+      entry.contentState !== 'temporarily_unavailable' &&
+      safeIndexMarkdown &&
+      payload.ephemeral !== true &&
+      collectionId &&
+      env.SEARCH
+    ) {
       const idx = new D1FtsSearchIndex(env.SEARCH);
       const privPageId = `pg_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${u}`)).slice(0, 32)}`;
       const privDocId = `pdoc_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${safeIndexMarkdown}`)).slice(0, 32)}`;

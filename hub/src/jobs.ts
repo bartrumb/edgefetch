@@ -2391,6 +2391,8 @@ export async function executeJobsCall(params: {
           }
 
           const cState = typeof sc.body.contentState === 'string' ? sc.body.contentState : undefined;
+          // A maintenance page says nothing about the board: skip it without marking the board closed.
+          if (cState === 'temporarily_unavailable') continue;
           if (cState === 'closed_posting' || cState === 'soft_404' || cState === 'login_wall') {
             if (discEntry) {
               discEntry.boardStatus = classifyAtsBoardStatus({
@@ -2772,6 +2774,8 @@ export async function executeJobsCall(params: {
             if (dropIdx >= 0) collected.splice(dropIdx, 1);
             continue;
           }
+          // Keep the listing, but don't enrich it from a maintenance page.
+          if (detState === 'temporarily_unavailable') continue;
           if (det.status !== 200 || det.body?.ok !== true) continue;
           const detHtml =
             typeof det.body.rawHtml === 'string' ? det.body.rawHtml : typeof det.body.html === 'string' ? det.body.html : '';

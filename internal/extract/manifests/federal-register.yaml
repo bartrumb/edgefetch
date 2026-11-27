@@ -7,7 +7,7 @@ domains:
   - www.federalregister.gov
   - federalregister.gov
 exampleUrls:
-  - "https://www.federalregister.gov/documents/2024/05/07/2024-09145/non-compete-clause-rule"
+  - "https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule"
 
 match:
   exactSegments: false
@@ -57,6 +57,14 @@ extract:
     pubDate:
       paths:
         - publication_date
+    # The URL date segments are cosmetic to federalregister.gov routing (the document number alone
+    # resolves), so a mismatch means the link points at a different document than it claims.
+    urlDate:
+      template: "{yyyy}-{mm}-{dd}"
+    pubDateMatchesUrl:
+      paths:
+        - publication_date
+      equalsVar: urlDate
     effectiveOn:
       paths:
         - effective_on
@@ -134,6 +142,10 @@ extract:
     - label: Published
       template: "{pubDate}"
       whenVar: pubDate
+    - label: Warning
+      template: "Publication date {pubDate} does not match the URL date {urlDate}; the URL may point to a different document than its date suggests."
+      whenVar: pubDate
+      unlessVar: pubDateMatchesUrl
     - label: Effective On
       template: "{effectiveOn}"
       whenVar: effectiveOn

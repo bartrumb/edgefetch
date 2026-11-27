@@ -66,6 +66,11 @@ var (
 	reIcimsPageOfDeclHTML       = newLazyRegexp(`(?i)\bPage\s+(\d+)\s+of\s+(\d+)\b`)
 	reIcimsCareerSuffixDeclHTML = newLazyRegexp(`(?i)\s*Career\s+Listings\s*$`)
 	reIcimsIframeShellDeclHTML  = newLazyRegexp(`(?i)\bicims_content_iframe\b`)
+	// Portal chrome headings that iCIMS templates render in h1.iCIMS_Header / <h1> instead of the
+	// job title or company name; they must never be used as either.
+	reIcimsGenericHeadingDeclHTML = newLazyRegexp(`(?i)^\s*(?:job\s+details?|job\s+description|job\s+info(?:rmation)?|job\s+posting|careers?(?:\s+(?:home|portal|site|page|center|opportunities))?|career\s+opportunities|search\s+(?:jobs|results|openings|positions|careers)|job\s+search(?:\s+results)?|jobs?|job\s+listings?|job\s+openings|current\s+openings|open\s+positions|search|home|welcome|apply(?:\s+now)?|join\s+our\s+team|icims|log\s*in|sign\s+in)\s*[:.!]?\s*$`)
+	reIcimsTitleSepDeclHTML       = newLazyRegexp(`\s*\|\s*|\s+[-\x{2013}\x{2014}]\s+`)
+	reIcimsTitleAtCompanyDeclHTML = newLazyRegexp(`(?i)^(?:.*\s)?(?:at|@)\s+(.+)$`)
 
 	reShopifyPathDeclHTML         = newLazyRegexp(`(?i)/products/[^/]+`)
 	reShopifyDomainDeclHTML       = newLazyRegexp(`(?i)[a-z0-9-]\.myshopify\.com\b`)
@@ -1493,6 +1498,41 @@ func stripQueryParamDeclHTML(u *url.URL, key string) string {
 	return cloned.String()
 }
 
+// isIcimsGenericHeadingDeclHTML reports whether a heading is empty or iCIMS portal chrome
+// ("Job Details", "Careers", "Search Jobs", ...) rather than a job title or company name.
+func isIcimsGenericHeadingDeclHTML(raw string) bool {
+	clean := strings.TrimSpace(stripTagsInlineLinear(raw))
+	return clean == "" || reIcimsGenericHeadingDeclHTML.MatchString(clean)
+}
+
+// icimsCompanyFallbackDeclHTML derives a company label when JSON-LD hiringOrganization and the
+// portal heading are absent or generic: og:site_name, then a "<...> at <Company>" segment of
+// og:title / <title>, then the portal subdomain slug.
+func icimsCompanyFallbackDeclHTML(doc *HTMLDoc, hostSlug string) string {
+	accept := func(raw string) string {
+		clean := strings.TrimSpace(stripTagsInlineLinear(raw))
+		if isIcimsGenericHeadingDeclHTML(clean) || strings.EqualFold(clean, "iCIMS") {
+			return ""
+		}
+		return sliceRunesMax(clean, 120)
+	}
+	if doc != nil {
+		if site := accept(doc.AttrOf(`meta[property="og:site_name"]`, "content")); site != "" {
+			return site
+		}
+		for _, rawTitle := range []string{doc.AttrOf(`meta[property="og:title"]`, "content"), doc.Text("title")} {
+			for _, part := range reIcimsTitleSepDeclHTML.Split(sliceRunesMax(strings.TrimSpace(rawTitle), 300), 8) {
+				if m := reIcimsTitleAtCompanyDeclHTML.FindStringSubmatch(strings.TrimSpace(part)); len(m) == 2 {
+					if name := accept(m[1]); name != "" {
+						return name
+					}
+				}
+			}
+		}
+	}
+	return hostSlug
+}
+
 func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, base string) (string, []string), extractorID string) *DeclarativePostFetchResult {
 	u, err := url.Parse(origURL)
 	if err != nil || u.Hostname() == "" {
@@ -1528,11 +1568,17 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 				rawTitle = stripTagsInlineLinear(tStr)
 			}
 		}
-		if rawTitle == "" {
-			rawTitle = doc.Text("h1.iCIMS_Header")
-		}
-		if rawTitle == "" {
-			rawTitle = doc.Text("h1")
+		if isIcimsGenericHeadingDeclHTML(rawTitle) {
+			rawTitle = ""
+		titleScan:
+			for _, sel := range []string{"h1.iCIMS_Header", "h1", "h2.iCIMS_Header"} {
+				for _, h := range doc.Select(sel, 10) {
+					if cand := strings.TrimSpace(h.Text()); !isIcimsGenericHeadingDeclHTML(cand) {
+						rawTitle = cand
+						break titleScan
+					}
+				}
+			}
 		}
 		title := SanitizeScrapedMeta(rawTitle)
 		if title == "" {
@@ -1550,8 +1596,8 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 				}
 			}
 		}
-		if rawCompany == "" {
-			rawCompany = hostSlug
+		if isIcimsGenericHeadingDeclHTML(rawCompany) {
+			rawCompany = icimsCompanyFallbackDeclHTML(doc, hostSlug)
 		}
 		company := SanitizeScrapedMeta(rawCompany)
 
@@ -1822,11 +1868,14 @@ func parseIcimsPortalHTMLDeclHTML(rawHTML, origURL string, htmlToMD func(frag, b
 	hasMorePages := curPage < totalPages || (totalPages == 1 && hasNextRel)
 
 	portalHeading := doc.Text("h1.iCIMS_Header")
-	rawCompLabel := hostSlug
+	rawCompLabel := ""
 	if portalHeading != "" {
-		if stripped := strings.TrimSpace(reIcimsCareerSuffixDeclHTML.ReplaceAllString(portalHeading, "")); stripped != "" {
+		if stripped := strings.TrimSpace(reIcimsCareerSuffixDeclHTML.ReplaceAllString(portalHeading, "")); !isIcimsGenericHeadingDeclHTML(stripped) {
 			rawCompLabel = stripped
 		}
+	}
+	if rawCompLabel == "" {
+		rawCompLabel = icimsCompanyFallbackDeclHTML(doc, hostSlug)
 	}
 	companyLabel := SanitizeScrapedMeta(rawCompLabel)
 

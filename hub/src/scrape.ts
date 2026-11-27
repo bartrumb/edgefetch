@@ -1049,6 +1049,24 @@ function r2PublicOptionsScrapeCacheKey(pipelineVersion: number, cacheKeySha256: 
   return `derived/${pipelineVersion}/scrape-cache/${cacheKeySha256}.json`;
 }
 
+// Public options-cache index in META D1. A lookup checks this row before reading R2, because a blind GET on a missing key
+// is an R2 `NoSuchKey`, which Workers Observability logs as an error-level `r2_get` span on every cold scrape. Writes
+// upsert the row. `pages` cannot be the gate: inline (non-artifact) scrapes write this cache without a `pages` row.
+const SCRAPE_CACHE_INDEX_DDL =
+  'CREATE TABLE IF NOT EXISTS scrape_cache_index (r2_key TEXT PRIMARY KEY, last_fetched_at INTEGER NOT NULL)';
+const scrapeCacheIndexReady = new WeakSet<object>();
+async function ensureScrapeCacheIndex(metaDb: D1Database): Promise<boolean> {
+  const key = metaDb as unknown as object;
+  if (scrapeCacheIndexReady.has(key)) return true;
+  try {
+    await metaDb.prepare(SCRAPE_CACHE_INDEX_DDL).run();
+    scrapeCacheIndexReady.add(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function lookupOptionsScrapeCache(params: {
   bucket: R2Bucket;
   isPrivate: boolean;
@@ -1066,6 +1084,16 @@ async function lookupOptionsScrapeCache(params: {
   const r2Key = isPrivate
     ? r2PrivateScrapeCacheKey(userId, pipelineVersion, combinedHash)
     : r2PublicOptionsScrapeCacheKey(pipelineVersion, combinedHash);
+  if (!isPrivate && metaDb && (await ensureScrapeCacheIndex(metaDb))) {
+    const indexRow = await metaDb
+      .prepare('SELECT last_fetched_at FROM scrape_cache_index WHERE r2_key = ? LIMIT 1')
+      .bind(r2Key)
+      .first<{ last_fetched_at: number | null }>()
+      .catch(() => undefined);
+    // `null` = no index row, so no entry was written: skip R2. `undefined` (query failed) falls through to the R2 read.
+    if (indexRow === null) return null;
+    if (indexRow && typeof indexRow.last_fetched_at === 'number' && now - indexRow.last_fetched_at > maxAgeMs) return null;
+  }
   const obj = await bucket.get(r2Key).catch(() => null);
   if (!obj) return null;
   try {
@@ -1106,8 +1134,9 @@ async function writeOptionsScrapeCache(params: {
   userId: string;
   optionsHash: string;
   record: PrivateCachedScrapeRecord;
+  metaDb?: D1Database;
 }): Promise<void> {
-  const { bucket, isPrivate, userId, optionsHash, record } = params;
+  const { bucket, isPrivate, userId, optionsHash, record, metaDb } = params;
   const combinedHash = await sha256HexString(`${record.url}|${optionsHash}`);
   const r2Key = isPrivate
     ? r2PrivateScrapeCacheKey(userId, record.pipelineVersion, combinedHash)
@@ -1123,6 +1152,16 @@ async function writeOptionsScrapeCache(params: {
         }
       : {}),
   });
+  if (!isPrivate && metaDb && (await ensureScrapeCacheIndex(metaDb))) {
+    await metaDb
+      .prepare(
+        `INSERT INTO scrape_cache_index (r2_key, last_fetched_at) VALUES (?, ?)
+         ON CONFLICT(r2_key) DO UPDATE SET last_fetched_at = excluded.last_fetched_at`,
+      )
+      .bind(r2Key, record.lastFetchedAt)
+      .run()
+      .catch(() => undefined);
+  }
 }
 
 export async function lookupPrivateCachedScrape(params: {
@@ -4797,6 +4836,7 @@ export async function executeScrapeCall(params: {
           isPrivate: isPrivateScrape,
           userId,
           optionsHash: scrapeOptionsHash,
+          ...(env.META ? { metaDb: env.META } : {}),
           record: { ...optRevalCandidate, lastFetchedAt: now },
         }).catch(() => undefined);
       } else if (d1RevalCandidate && parsedWikiArticle && env.ARTIFACTS && payload.ephemeral !== true) {
@@ -4805,6 +4845,7 @@ export async function executeScrapeCall(params: {
           isPrivate: isPrivateScrape,
           userId,
           optionsHash: scrapeOptionsHash,
+          ...(env.META ? { metaDb: env.META } : {}),
           record: {
             url: normalizedUrl,
             finalUrl: normalizedUrl,
@@ -7101,6 +7142,7 @@ export async function executeScrapeCall(params: {
       isPrivate: isPrivateScrape,
       userId,
       optionsHash: scrapeOptionsHash,
+      ...(env.META ? { metaDb: env.META } : {}),
       record: {
         url: normalizedUrl,
         finalUrl,

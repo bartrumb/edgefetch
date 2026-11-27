@@ -1294,4 +1294,3 @@ func firstPlausibleGTINGo(candidates ...string) string {
 	}
 	return ""
 }
-

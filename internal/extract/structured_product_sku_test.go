@@ -549,13 +549,13 @@ func specValueGo(specs any, key string) any {
 
 func TestPlausibleGTINGo(t *testing.T) {
 	cases := map[string]string{
-		"012345678905":      "012345678905",  // UPC-A / GTIN-12
-		"4006381333931":     "4006381333931", // EAN-13
-		"978-0-14-032872-1": "9780140328721", // ISBN-13 with hyphens
-		"9650 1234":         "96501234",      // GTIN-8 with a space
+		"012345678905":      "012345678905",   // UPC-A / GTIN-12
+		"4006381333931":     "4006381333931",  // EAN-13
+		"978-0-14-032872-1": "9780140328721",  // ISBN-13 with hyphens
+		"9650 1234":         "96501234",       // GTIN-8 with a space
 		"10012345678902":    "10012345678902", // GTIN-14
-		"a897fe39b1053632":  "",              // hex store ID
-		"0140328726":        "",              // ISBN-10 is not a GTIN
+		"a897fe39b1053632":  "",               // hex store ID
+		"0140328726":        "",               // ISBN-10 is not a GTIN
 		"12345":             "",
 		"":                  "",
 		"SKU-123456789012":  "",
@@ -569,4 +569,3 @@ func TestPlausibleGTINGo(t *testing.T) {
 		t.Errorf("firstPlausibleGTINGo skipped to the wrong candidate: %q", got)
 	}
 }
-

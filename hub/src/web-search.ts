@@ -72,6 +72,15 @@ export interface SearchBindings extends OptionalStorageBindings {
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
   SEARCH_DISABLE_BRAVE?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  /** API token with Account > Workers AI > Read and Account > AI Gateway > Read (REST path). */
+  CLOUDFLARE_WEBSEARCH_API_TOKEN?: string;
+  CLOUDFLARE_AI_GATEWAY_ID?: string;
+  /** `ceramic` (default) | `exa` | `linkup`. */
+  CLOUDFLARE_WEBSEARCH_PROVIDER?: string;
+  CLOUDFLARE_WEBSEARCH_BYOK_ALIAS?: string;
+  /** Ceramic.ai Search API key (direct; https://api.ceramic.ai/search). */
+  CERAMIC_API_KEY?: string;
 }
 
 export interface SearchResultEntry {
@@ -291,7 +300,7 @@ async function runWithProviderPoliteness<T>(
 
 async function runWithProviderSpan<T>(params: {
   tracer?: RequestTracer | null;
-  provider: 'serper' | 'brave' | 'tavily' | 'searxng';
+  provider: 'serper' | 'brave' | 'tavily' | 'searxng' | 'cloudflare' | 'ceramic';
   method: 'GET' | 'POST';
   requestUrl: string;
   fn: (span?: ActiveSpanHandle) => Promise<T>;
@@ -684,6 +693,176 @@ async function queryTavilyWebSearch(params: {
   });
 }
 
+const CF_WEBSEARCH_PROVIDERS = new Set(['ceramic', 'exa', 'linkup']);
+
+/** True when the Cloudflare Web Search API is configured (Workers AI binding, or account id + API token for REST). */
+export function hasCloudflareWebSearch(env: SearchBindings): boolean {
+  return (
+    typeof env.AI?.websearch === 'function' ||
+    Boolean(env.CLOUDFLARE_ACCOUNT_ID?.trim() && env.CLOUDFLARE_WEBSEARCH_API_TOKEN?.trim())
+  );
+}
+
+/**
+ * Cloudflare Web Search API (AI Gateway; Ceramic.ai by default, or Exa / Linkup). Returns at most 10 results with
+ * `{url, title, description}`; it documents no domain filter, date filter or `site:` operator support, so callers only
+ * use it for unscoped queries. Billed via AI Gateway credits unless a BYOK alias is configured on the gateway.
+ */
+export async function queryCloudflareWebSearch(params: {
+  env: SearchBindings;
+  query: string;
+  count: number;
+  fetchFn: typeof fetch;
+  tracer?: RequestTracer | null;
+}): Promise<RawSearchHit[]> {
+  const { env, query, count, fetchFn, tracer } = params;
+  const rawProvider = (env.CLOUDFLARE_WEBSEARCH_PROVIDER ?? '').trim().toLowerCase();
+  const provider = CF_WEBSEARCH_PROVIDERS.has(rawProvider) ? rawProvider : 'ceramic';
+  const gatewayId = (env.CLOUDFLARE_AI_GATEWAY_ID ?? '').trim() || 'default';
+  const byokAlias = (env.CLOUDFLARE_WEBSEARCH_BYOK_ALIAS ?? '').trim();
+  const body: Record<string, unknown> = {
+    query: query.slice(0, 1024),
+    provider,
+    limit: Math.min(10, Math.max(1, count)),
+    ...(byokAlias && /^[A-Za-z0-9_-]{1,64}$/.test(byokAlias) ? { byokAlias } : {}),
+  };
+  const accountId = (env.CLOUDFLARE_ACCOUNT_ID ?? '').trim();
+  const useBinding = typeof env.AI?.websearch === 'function';
+  if (!useBinding && !/^[0-9a-f]{32}$/i.test(accountId)) throw new Error('cloudflare_websearch_invalid_account_id');
+  const endpoint = useBinding
+    ? 'binding:AI.websearch'
+    : `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/websearch/`;
+
+  return runWithProviderSpan({
+    tracer,
+    provider: 'cloudflare',
+    method: 'POST',
+    requestUrl: endpoint,
+    fn: async (span) => {
+      const resp = useBinding
+        ? await env.AI!.websearch!({ ...body, gatewayId })
+        : await fetchFn(endpoint, {
+            method: 'POST',
+            headers: {
+              accept: 'application/json',
+              authorization: `Bearer ${env.CLOUDFLARE_WEBSEARCH_API_TOKEN!.trim()}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ ...body, options: { gateway: { id: gatewayId } } }),
+            signal: AbortSignal.timeout(15_000),
+          });
+      span?.setAttribute('http.response.status_code', resp.status);
+      span?.setAttribute('search.cloudflare.provider', provider);
+      if (resp.status === 429) {
+        const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SearchProviderRateLimitError('cloudflare', retryMs);
+      }
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new Error(`cloudflare_websearch_http_${resp.status}`);
+      }
+      const json = (await resp.json()) as {
+        items?: Array<{ url?: string; title?: string; description?: string }>;
+        result?: { items?: Array<{ url?: string; title?: string; description?: string }> };
+      };
+      const items = json.items ?? json.result?.items ?? [];
+      const out: RawSearchHit[] = [];
+      for (const r of items) {
+        if (typeof r.url !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.url);
+        if (!canon) continue;
+        const fetchUrl = searchResultFetchUrl(r.url, canon);
+        out.push({
+          url: canon,
+          ...(fetchUrl ? { fetchUrl } : {}),
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          // Ceramic descriptions run to ~8,000 chars; keep snippets bounded like other providers.
+          snippet: cleanProviderText(typeof r.description === 'string' ? r.description.slice(0, 2_000) : undefined),
+        });
+      }
+      span?.setAttribute('search.result_count', out.length);
+      return out;
+    },
+  });
+}
+
+/** Ceramic accepts 1–50 words per query (whitespace-separated). */
+export function clampCeramicQueryWords(query: string): string {
+  return query.trim().split(/\s+/).filter(Boolean).slice(0, 50).join(' ');
+}
+
+/**
+ * Ceramic.ai Search API (direct). Own index of 40B+ pages built for agents; up to 20 results with long descriptions.
+ * Documents no domain/date filters or `site:` support (request schema rejects unknown fields), so callers only use it
+ * for unscoped queries. Billed per query on the caller's Ceramic account.
+ */
+export async function queryCeramicSearch(params: {
+  apiKey: string;
+  query: string;
+  count: number;
+  fetchFn: typeof fetch;
+  tracer?: RequestTracer | null;
+}): Promise<RawSearchHit[]> {
+  const { apiKey, query, count, fetchFn, tracer } = params;
+  const endpoint = 'https://api.ceramic.ai/search';
+  const q = clampCeramicQueryWords(query);
+  if (!q) return [];
+  return runWithProviderSpan({
+    tracer,
+    provider: 'ceramic',
+    method: 'POST',
+    requestUrl: endpoint,
+    fn: async (span) => {
+      const resp = await fetchFn(endpoint, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ query: q, maxResults: Math.min(20, Math.max(1, count)), maxDescriptionLength: 2000 }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      span?.setAttribute('http.response.status_code', resp.status);
+      if (resp.status === 429) {
+        let retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+        try {
+          const errBody = (await resp.json()) as { retry_after_seconds?: unknown };
+          if (typeof errBody.retry_after_seconds === 'number' && errBody.retry_after_seconds > 0) {
+            retryMs = Math.min(300_000, Math.round(errBody.retry_after_seconds * 1000));
+          }
+        } catch {
+          // keep header-derived value
+        }
+        throw new SearchProviderRateLimitError('ceramic', retryMs);
+      }
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new Error(`ceramic_http_${resp.status}`);
+      }
+      const json = (await resp.json()) as {
+        result?: { results?: Array<{ url?: string; title?: string; description?: string }> };
+      };
+      const out: RawSearchHit[] = [];
+      for (const r of json.result?.results ?? []) {
+        if (typeof r.url !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.url);
+        if (!canon) continue;
+        const fetchUrl = searchResultFetchUrl(r.url, canon);
+        out.push({
+          url: canon,
+          ...(fetchUrl ? { fetchUrl } : {}),
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: cleanProviderText(typeof r.description === 'string' ? r.description.slice(0, 2_000) : undefined),
+        });
+      }
+      span?.setAttribute('search.result_count', out.length);
+      return out;
+    },
+  });
+}
+
 async function querySearxngSearch(params: {
   searxngBaseUrl: string;
   query: string;
@@ -976,7 +1155,27 @@ export async function executeSearchCall(params: {
     rawMode !== 'serper' &&
     (explicitProviders === null || explicitProviders.has('tavily'));
   const hasSearxng = Boolean(env.SEARXNG_URL?.trim()) && (explicitProviders === null || explicitProviders.has('searxng'));
-  const hasExternalProvider = hasSerper || hasBrave || hasTavily || hasSearxng;
+  // Cloudflare Web Search documents no domain/date filters or `site:` support: only offer it for unscoped queries.
+  const hasCloudflare =
+    hasCloudflareWebSearch(env) &&
+    (explicitProviders === null || explicitProviders.has('cloudflare')) &&
+    rawMode !== 'serper' &&
+    includeDomains.length === 0 &&
+    !/\bsite:/i.test(query) &&
+    !timeRange;
+  // Ceramic.ai direct: same unscoped-only rule as Cloudflare Web Search (no documented domain/date filters).
+  const hasCeramic =
+    Boolean(env.CERAMIC_API_KEY?.trim()) &&
+    (explicitProviders === null || explicitProviders.has('ceramic')) &&
+    rawMode !== 'serper' &&
+    includeDomains.length === 0 &&
+    !/\bsite:/i.test(query) &&
+    !timeRange;
+  // Cloudflare Web Search defaults to the Ceramic engine; skip it when Ceramic is called directly unless it is set to
+  // a different engine (Exa / Linkup) or the direct call fails.
+  const cloudflareEngine = (env.CLOUDFLARE_WEBSEARCH_PROVIDER ?? '').trim().toLowerCase() || 'ceramic';
+  const cloudflareDuplicatesCeramic = hasCeramic && cloudflareEngine === 'ceramic';
+  const hasExternalProvider = hasSerper || hasBrave || hasTavily || hasSearxng || hasCloudflare || hasCeramic;
   const hasD1Search = Boolean(env.SEARCH);
 
   // Always consult the Edge-crawled default D1 FTS5 collection at $0 when SEARCH D1 is bound unless disabled/overridden.
@@ -1184,6 +1383,8 @@ export async function executeSearchCall(params: {
     if (!hasExternalProvider) return;
     const now = Date.now();
     const activeProviderSig = [
+      hasCeramic ? 'ceramic' : '',
+      hasCloudflare ? 'cloudflare' : '',
       hasSerper ? 'serper' : '',
       hasBrave ? 'brave' : '',
       hasSearxng ? 'searxng' : '',
@@ -1235,6 +1436,45 @@ export async function executeSearchCall(params: {
     const freshExternal: Array<{ provider: string; items: RawSearchHit[] }> = [];
     const minSatisfiedHits = Math.min(3, maxResults);
     const providerTracer = getActiveRequestTracer() ?? activeTracer;
+
+    let ceramicFailed = false;
+    const callCeramic = async () => {
+      if (!hasCeramic || isWikipediaResolver) return;
+      try {
+        const items = await runWithProviderPoliteness('ceramic', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
+          queryCeramicSearch({
+            apiKey: env.CERAMIC_API_KEY!.trim(),
+            query: effectiveSerpQuery,
+            count: maxResults * 2,
+            fetchFn: providerFetchFn,
+            tracer: providerTracer,
+          }),
+        );
+        freshExternal.push({ provider: 'ceramic', items });
+      } catch (e) {
+        ceramicFailed = true;
+        providerErrors.push({ provider: 'ceramic', error: e instanceof Error ? e.message : String(e) });
+      }
+    };
+
+    const callCloudflare = async () => {
+      if (!hasCloudflare || isWikipediaResolver) return;
+      if (cloudflareDuplicatesCeramic && !ceramicFailed) return;
+      try {
+        const items = await runWithProviderPoliteness('cloudflare', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
+          queryCloudflareWebSearch({
+            env,
+            query: effectiveSerpQuery,
+            count: maxResults * 2,
+            fetchFn: providerFetchFn,
+            tracer: providerTracer,
+          }),
+        );
+        freshExternal.push({ provider: 'cloudflare', items });
+      } catch (e) {
+        providerErrors.push({ provider: 'cloudflare', error: e instanceof Error ? e.message : String(e) });
+      }
+    };
 
     const callSerper = async () => {
       if (!hasSerper) return;
@@ -1294,7 +1534,14 @@ export async function executeSearchCall(params: {
     };
 
     if (waterfallMode) {
-      await callSerper();
+      // Cheapest first (Ceramic ~$0.25 / 1k, zero data retention); Serper fills in when results are thin.
+      await callCeramic();
+      if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
+        await callCloudflare();
+      }
+      if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
+        await callSerper();
+      }
       if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
         await callSearxng();
       }
@@ -1302,7 +1549,8 @@ export async function executeSearchCall(params: {
         await callBrave();
       }
     } else {
-      await Promise.all([callSerper(), callBrave(), callSearxng()]);
+      await Promise.all([callCeramic(), callSerper(), callBrave(), callSearxng()]);
+      await callCloudflare();
     }
 
     // Tavily (`basic` = 1 credit) acts as automatic fallback when primary APIs are unconfigured or return thin/failed hits!

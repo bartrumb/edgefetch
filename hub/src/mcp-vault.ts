@@ -1648,3 +1648,54 @@ export async function completeDownstreamMcpOAuthCallback(params: {
   await params.vaultStore.upsertServer(row);
   return { ok: true, server: row };
 }
+
+/**
+ * Generic HKDF-SHA256 -> AES-256-GCM seal for other Go-built envelopes (e.g. `hub_secrets`, see
+ * `hub/src/hub-secrets.ts`). `hkdfInfo`/`aad`/`plaintext` MUST come from a Go WASM prepare op; this only runs WebCrypto.
+ */
+export async function sealWithVaultKeyAead(params: {
+  cleanKey: string;
+  hkdfInfo: string;
+  aad: string;
+  plaintext: string;
+}): Promise<{ saltB64: string; ivB64: string; ctB64: string }> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await deriveVaultAesGcmKey(params.cleanKey, salt, params.hkdfInfo);
+  const encryptedBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource, additionalData: vaultTextEncoder.encode(params.aad) },
+    aesKey,
+    vaultTextEncoder.encode(params.plaintext),
+  );
+  return {
+    saltB64: bytesToBase64Url(salt),
+    ivB64: bytesToBase64Url(iv),
+    ctB64: bytesToBase64Url(new Uint8Array(encryptedBuf)),
+  };
+}
+
+/** Counterpart of `sealWithVaultKeyAead`; returns `null` on any AEAD/UTF-8 failure. */
+export async function openWithVaultKeyAead(params: {
+  cleanKey: string;
+  hkdfInfo: string;
+  aad: string;
+  saltB64: string;
+  ivB64: string;
+  ctB64: string;
+}): Promise<string | null> {
+  try {
+    const aesKey = await deriveVaultAesGcmKey(params.cleanKey, base64UrlToBytes(params.saltB64), params.hkdfInfo);
+    const plainBuf = await crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv: base64UrlToBytes(params.ivB64) as BufferSource,
+        additionalData: vaultTextEncoder.encode(params.aad),
+      },
+      aesKey,
+      base64UrlToBytes(params.ctB64) as BufferSource,
+    );
+    return new TextDecoder('utf-8', { fatal: true }).decode(plainBuf);
+  } catch {
+    return null;
+  }
+}

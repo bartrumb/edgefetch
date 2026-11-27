@@ -77,6 +77,9 @@ const suiteSpecs = [
   ['test/m2-adapters.test.ts', 'm2-adapters.test.mjs'],
   ['test/m3-adapters.test.ts', 'm3-adapters.test.mjs'],
   ['test/m4-adapters.test.ts', 'm4-adapters.test.mjs'],
+  ['test/hub-secrets-policy.test.ts', 'hub-secrets-policy.test.mjs'],
+  ['test/hub-policy-integration.test.ts', 'hub-policy-integration.test.mjs'],
+  ['test/vertical-tools.test.ts', 'vertical-tools.test.mjs'],
 ];
 
 try {

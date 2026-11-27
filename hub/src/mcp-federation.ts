@@ -23,6 +23,12 @@ import {
   type StoredMcpServerRow,
   type VaultSecretPayload,
 } from './mcp-vault';
+import {
+  listCallableServersForCaller,
+  listSharedServersFor,
+  resolveMcpServerForCaller,
+  type AccessPolicyStore,
+} from './access-policy';
 import { getActiveCallerAuthContext } from './oauth';
 import { callCoreWasm, callCoreWasmRaw } from './wasm-bridge';
 
@@ -1040,9 +1046,37 @@ async function resolveDecryptedServerSecret(params: {
   return { ok: true, secret: unsealed.payload };
 }
 
-export async function executeFederatedMcpQuery(params: {
+/**
+ * A member calling a server SHARED with them must never learn its URL/origin: replace every occurrence of the owner's
+ * remote URL/origin in the outgoing body with an opaque `shared-mcp:<owner>/<slug>` label and drop `domains`.
+ */
+function redactSharedServerBody(body: Record<string, unknown>, row: StoredMcpServerRow): Record<string, unknown> {
+  const label = `shared-mcp:${row.userId}/${row.slug}`;
+  let text = JSON.stringify(body);
+  for (const needle of [row.remoteUrl, row.remoteOrigin].filter((v) => typeof v === 'string' && v.length >= 8)) {
+    text = text.split(JSON.stringify(needle).slice(1, -1)).join(label);
+  }
+  const out = JSON.parse(text) as Record<string, unknown>;
+  delete out.domains;
+  out.sharedBy = row.userId;
+  return out;
+}
+
+export async function executeFederatedMcpQuery(
+  params: Parameters<typeof executeFederatedMcpQueryImpl>[1],
+): Promise<QueryMcpCallOutput> {
+  const sharedCtx: { row: StoredMcpServerRow | null } = { row: null };
+  const out = await executeFederatedMcpQueryImpl(sharedCtx, params);
+  if (!sharedCtx.row) return out;
+  return { ...out, body: redactSharedServerBody(out.body as Record<string, unknown>, sharedCtx.row) as QueryMcpCallOutput['body'] };
+}
+
+async function executeFederatedMcpQueryImpl(sharedCtx: { row: StoredMcpServerRow | null }, params: {
   userId: string;
   input: QueryMcpCallInput;
+  /** Hub access policy: enables using servers other users shared with `userId` (credentials stay with the owner). */
+  accessPolicy?: AccessPolicyStore;
+  accessPolicyCacheKey?: string | object;
   allowedMcpTools?: ReadonlyArray<string> | ReadonlySet<string>;
   baseUrlOverride?: string;
   vaultStore: McpVaultStore;
@@ -1104,6 +1138,16 @@ export async function executeFederatedMcpQuery(params: {
       lastVerifiedAt: s.lastVerifiedAt,
     }));
     const serversSan = sanitizeConnectorStructuredValue(rawServers);
+    const sharedRaw = params.accessPolicy
+      ? (
+          await listSharedServersFor(params.userId, {
+            store: params.accessPolicy,
+            vaultStore: params.vaultStore,
+            ...(params.accessPolicyCacheKey !== undefined ? { cacheKey: params.accessPolicyCacheKey } : {}),
+          })
+        ).map((s) => ({ ref: s.ref, sharedBy: s.ownerUserId, slug: s.slug, name: s.name, enabled: s.enabled, toolCount: s.toolCount }))
+      : [];
+    const sharedSan = sharedRaw.length > 0 ? sanitizeConnectorStructuredValue(sharedRaw) : null;
     return {
       status: 200,
       body: {
@@ -1112,9 +1156,10 @@ export async function executeFederatedMcpQuery(params: {
         visibility: 'private',
         userId: params.userId,
         count: summaries.length,
-        sanitized: serversSan.sanitized,
-        fullySanitized: serversSan.fullySanitized,
+        sanitized: serversSan.sanitized || Boolean(sharedSan?.sanitized),
+        fullySanitized: serversSan.fullySanitized && (sharedSan ? sharedSan.fullySanitized : true),
         servers: serversSan.value,
+        ...(sharedSan ? { shared: sharedSan.value } : {}),
       },
     };
   }
@@ -1134,9 +1179,35 @@ export async function executeFederatedMcpQuery(params: {
     };
   }
 
-  const serverRow = await params.vaultStore.getServer(params.userId, serverRef);
+  // Own server first; with an access policy store, fall back to servers shared with this caller. A shared row is the
+  // OWNER's row, so every vault read/write below uses rowOwnerId and unsealing stays bound to the owner's user id.
+  const resolved = params.accessPolicy
+    ? await resolveMcpServerForCaller({
+        store: params.accessPolicy,
+        vaultStore: params.vaultStore,
+        callerUserId: params.userId,
+        ref: serverRef,
+        ...(params.accessPolicyCacheKey !== undefined ? { cacheKey: params.accessPolicyCacheKey } : {}),
+      })
+    : null;
+  const directRow = resolved ? null : await params.vaultStore.getServer(params.userId, serverRef);
   const serverRefNorm = serverRef.toLowerCase();
-  if (!serverRow || (serverRow.id.toLowerCase() !== serverRefNorm && serverRow.slug.toLowerCase() !== serverRefNorm)) {
+  const serverRow = resolved
+    ? resolved.ok
+      ? resolved.server
+      : null
+    : directRow && (directRow.id.toLowerCase() === serverRefNorm || directRow.slug.toLowerCase() === serverRefNorm)
+      ? directRow
+      : null;
+  if (resolved?.ok && resolved.shared && serverRow) sharedCtx.row = serverRow;
+  const rowOwnerId = serverRow?.userId ?? params.userId;
+  if (resolved && !resolved.ok && resolved.status === 409) {
+    return {
+      status: 409,
+      body: { ok: false, visibility: 'private', error: resolved.error, message: resolved.message, sanitized: true, fullySanitized: true },
+    };
+  }
+  if (!serverRow) {
     const refSan = sanitizeConnectorText(serverRef, 80);
     return {
       status: 404,
@@ -1317,7 +1388,7 @@ export async function executeFederatedMcpQuery(params: {
         };
       }
 
-      const latestRow = (await params.vaultStore.getServer(params.userId, serverRow.slug)) ?? serverRow;
+      const latestRow = (await params.vaultStore.getServer(rowOwnerId, serverRow.slug)) ?? serverRow;
       const liveToolsSan = sanitizeConnectorStructuredValue(listed.tools, {
         baseUrl: serverRow.remoteOrigin,
         redactSecret: activeSecret,
@@ -1588,6 +1659,9 @@ export async function tryScrapeViaConnectedMcp(params: {
   requireExplicitReadOnlyHint?: boolean;
   vaultStore: McpVaultStore;
   vaultMasterKey: string | undefined;
+  /** Hub access policy: lets scrape auto-routing use servers shared with `userId`. */
+  accessPolicy?: AccessPolicyStore;
+  accessPolicyCacheKey?: string | object;
   fetchFn?: typeof fetch;
   selfHost?: string;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> } | null> {
@@ -1607,7 +1681,14 @@ export async function tryScrapeViaConnectedMcp(params: {
     return null;
   }
 
-  const allRows = await params.vaultStore.listServers(params.userId);
+  const callable = params.accessPolicy
+    ? await listCallableServersForCaller(params.userId, {
+        store: params.accessPolicy,
+        vaultStore: params.vaultStore,
+        ...(params.accessPolicyCacheKey !== undefined ? { cacheKey: params.accessPolicyCacheKey } : {}),
+      })
+    : { rows: await params.vaultStore.listServers(params.userId), refBySlug: null as Map<string, string> | null };
+  const allRows = callable.rows;
   if (allRows.length === 0) return null;
 
   const { plan } = callCoreWasm<{
@@ -1637,9 +1718,11 @@ export async function tryScrapeViaConnectedMcp(params: {
 
   const out = await executeFederatedMcpQuery({
     userId: params.userId,
+    ...(params.accessPolicy ? { accessPolicy: params.accessPolicy } : {}),
+    ...(params.accessPolicyCacheKey !== undefined ? { accessPolicyCacheKey: params.accessPolicyCacheKey } : {}),
     input: {
       action: 'call_tool',
-      server: plan.serverSlug,
+      server: callable.refBySlug?.get(plan.serverSlug.toLowerCase()) ?? plan.serverSlug,
       tool: plan.toolName,
       arguments: plan.toolArguments ?? {},
     },

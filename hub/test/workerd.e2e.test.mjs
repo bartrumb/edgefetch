@@ -997,6 +997,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         'read_artifact',
         'jobs',
         'find_extractors',
+        'company',
+        'salaries',
         'catalog',
         'agent',
         'discover_mcps',
@@ -2348,7 +2350,7 @@ test('F15.4 workerd E2E: /v1/ingest-tab CORS & Auth + OAuth 2.1 PKCE S256 Full L
     });
     assert.equal(mcpRes.status, 200);
     const mcpJson = await mcpRes.json();
-    assert.equal(mcpJson.result.tools.length, 17);
+    assert.equal(mcpJson.result.tools.length, 19);
 
     // Revoke access_token via /oauth/revoke -> subsequent /mcp call returns 401
     const revokeRes = await mf.dispatchFetch(`${ORIGIN}/oauth/revoke`, {

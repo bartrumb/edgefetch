@@ -1498,7 +1498,7 @@ function assertOpenApiSourceAndSchemaContract(params: {
 
   // 3. Verify ALL 17 canonical MCP tool schemas match `McpTool_*Input` AND shared REST request schemas!
   const mcpTools = params.mcpTools ?? buildCanonicalMcpToolSchemas();
-  assert.equal(mcpTools.length, 17);
+  assert.equal(mcpTools.length, 19);
   for (const tool of mcpTools) {
     const pascal = tool.name
       .split('_')

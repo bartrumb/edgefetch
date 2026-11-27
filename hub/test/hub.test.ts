@@ -1626,7 +1626,7 @@ test('V2-9: Worker Hub serves /health, /admin, /v1/capabilities, and /mcp over n
     );
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 17);
+    assert.equal(mcpJson.result.tools.length, 19);
   } finally {
     coord.close();
     metaDb.close();
@@ -13014,9 +13014,9 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
     );
   }
 
-  // Also verify zero-drift sharing with all 17 canonical MCP tool schemas
+  // Also verify zero-drift sharing with all 19 canonical MCP tool schemas
   const canonicalTools = buildCanonicalMcpToolSchemas();
-  assert.equal(canonicalTools.length, 17);
+  assert.equal(canonicalTools.length, 19);
   assert.deepEqual(components.schemas.ScrapeRequest, MCP_TOOL_SCHEMAS.scrape);
   assert.deepEqual(components.schemas.ExtractRequest, MCP_TOOL_SCHEMAS.extract);
   assert.deepEqual(components.schemas.InteractRequest, MCP_TOOL_SCHEMAS.interact);

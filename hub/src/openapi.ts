@@ -961,6 +961,48 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           },
         },
       },
+      '/v1/company': {
+        post: {
+          tags: ['Vertical Intelligence'],
+          operationId: 'getCompanyProfile',
+          summary: 'Build a sourced company profile',
+          description:
+            'Merges the company website (schema.org Organization), Wikidata, SEC EDGAR, GitHub, the official ATS job board, and (when connected) Google Maps place details into one profile with per-field source attribution.',
+          security: authFetchSecurity(),
+          requestBody: {
+            required: true,
+            content: jsonContent(schemaRef('CompanyRequest')),
+          },
+          responses: {
+            '200': {
+              description: 'Company profile with `fieldSources`, `sources`, and a Markdown summary.',
+              content: jsonContent(schemaRef('GenericOkResponse')),
+            },
+            ...standardAuthErrorResponses(),
+          },
+        },
+      },
+      '/v1/salaries': {
+        post: {
+          tags: ['Vertical Intelligence'],
+          operationId: 'aggregateSalaries',
+          summary: 'Aggregate employer-posted pay ranges for a job title',
+          description:
+            'Percentiles and breakdowns (seniority, location, company) over pay ranges employers posted on official ATS boards, with sample postings. Runs a fresh jobs search when data is thin or `refresh` is true.',
+          security: authFetchSecurity(),
+          requestBody: {
+            required: true,
+            content: jsonContent(schemaRef('SalariesRequest')),
+          },
+          responses: {
+            '200': {
+              description: 'Salary report (stats, breakdowns, sample, notes, Markdown).',
+              content: jsonContent(schemaRef('GenericOkResponse')),
+            },
+            ...standardAuthErrorResponses(),
+          },
+        },
+      },
       '/v1/catalog/{catalogId}': {
         get: {
           tags: ['Vertical Intelligence'],
@@ -1213,6 +1255,23 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           responses: {
             '200': {
               description: 'Normalized dual-source MCP registry search results.',
+              content: jsonContent(schemaRef('GenericOkResponse')),
+            },
+            ...standardAuthErrorResponses(),
+          },
+        },
+      },
+      '/v1/mcp/shared': {
+        get: {
+          tags: ['Coordinator & MCP'],
+          operationId: 'listSharedMcpServers',
+          summary: 'List MCP servers other hub users shared with the caller',
+          description:
+            'Returns name, slug, and cached tools of connected MCP servers shared with the caller via the hub access policy. Remote URLs, auth summaries, and credentials are never returned; call tools through `POST /v1/mcp/query` with `server: "<ownerUserId>/<slug>"`.',
+          security: authReadSecurity(),
+          responses: {
+            '200': {
+              description: 'Servers shared with the caller.',
               content: jsonContent(schemaRef('GenericOkResponse')),
             },
             ...standardAuthErrorResponses(),
@@ -1493,6 +1552,8 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
         SearchRequest: MCP_TOOL_SCHEMAS.search!,
         JobsRequest: MCP_TOOL_SCHEMAS.jobs!,
         CatalogRequest: MCP_TOOL_SCHEMAS.catalog!,
+        CompanyRequest: MCP_TOOL_SCHEMAS.company!,
+        SalariesRequest: MCP_TOOL_SCHEMAS.salaries!,
         BatchScrapeRequest: {
           type: 'object',
           properties: {

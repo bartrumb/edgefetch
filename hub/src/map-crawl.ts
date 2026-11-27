@@ -3,6 +3,7 @@
  * signed HMAC-SHA256 webhook delivery, and Markdown change-tracking diffs (`PR V2-2`).
  */
 
+import { applyHubSecretOverlayFromBinding } from './hub-secrets';
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { parseExactRetryAfterMs } from './agent-hub';
 import { getActiveCallerAuthContext } from './oauth';
@@ -2740,7 +2741,8 @@ export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, C
           rootUrl: event.payload.rootUrl,
           options: event.payload.options!,
           ...(resolvedUserId ? { userId: resolvedUserId } : {}),
-          env: this.env,
+          // Admin-managed provider-key overrides (vault) apply to workflow runs too.
+          env: await applyHubSecretOverlayFromBinding(this.env),
           ...(event.payload.selfHost ? { selfHost: event.payload.selfHost } : {}),
           executeHubFetch: async (_target, body) => {
             const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7 (bot@edgefetch.dev)', event.payload.selfHost ?? 'localhost');

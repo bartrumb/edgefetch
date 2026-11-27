@@ -970,7 +970,7 @@ test('B.5 & B.6: fetch_batch maps 404->not_found vs 410->gone, normalizes SSRF r
   });
 });
 
-test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8.18, subscriptions/listen ends gracefully, all 17 tool descriptions are jargon-free, and search inputSchema is deduplicated', async () => {
+test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8.18, subscriptions/listen ends gracefully, all 19 tool descriptions are jargon-free, and search inputSchema is deduplicated', async () => {
   assert.equal(HUB_VERSION, '2.8.18');
   const mcpDeps: McpServerDeps = {
     serverName: 'edgefetch-mcp',
@@ -1049,9 +1049,9 @@ test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8
   assert.equal(listenMsgs[1]!.result.resultType, 'complete');
   assert.equal(listenMsgs[1]!.result._meta['io.modelcontextprotocol/subscriptionId'], 'listen-1');
 
-  // Verify all 17 tool descriptions are plain English and free of internal infra jargon
+  // Verify all 19 tool descriptions are plain English and free of internal infra jargon
   const tools = buildCanonicalMcpToolSchemas();
-  assert.equal(tools.length, 17);
+  assert.equal(tools.length, 19);
   const bannedJargonRe = /\b(?:META D1|SEARCH D1|D1 FTS5|R2|HAOS|Home Assistant OS|edgefetch_fat|Serper waterfall|edge-map)\b/i;
   for (const t of tools) {
     assert.equal(

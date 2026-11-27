@@ -587,14 +587,16 @@ func handlePhase2McpRPC(op string, payload json.RawMessage) (any, bool, error) {
 		var p struct {
 			Official []mcpfed.NormalizedMCPRegistryEntry `json:"official"`
 			Glama    []mcpfed.NormalizedMCPRegistryEntry `json:"glama"`
+			Query    string                              `json:"query"`
 		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, true, err
 		}
-		return map[string]any{"entries": mcpfed.FuseRegistryEntries(p.Official, p.Glama)}, true, nil
+		fused := mcpfed.FuseRegistryEntries(p.Official, p.Glama)
+		return map[string]any{"entries": mcpfed.PrependFirstPartyPresets(fused, p.Query)}, true, nil
 
 	default:
-		return nil, false, nil
+		return handleHubPolicyRPC(op, payload)
 	}
 }
 

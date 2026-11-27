@@ -33,6 +33,7 @@ import {
   type McpVaultStore,
   type StoredMcpServerRow,
 } from './mcp-vault';
+import { listCallableServersForCaller, type AccessPolicyStore } from './access-policy';
 import { getActiveCallerAuthContext } from './oauth';
 import {
   completeLlmTurn,
@@ -351,6 +352,9 @@ export async function startOrExecuteAgentCall(params: {
   userId?: string;
   sessionSigningSecret?: string;
   vaultStore?: McpVaultStore;
+  /** Hub access policy: lets the run use MCP servers other users shared with the caller (owner keeps credentials). */
+  accessPolicy?: AccessPolicyStore;
+  accessPolicyCacheKey?: string | object;
   waitUntil?: (p: Promise<unknown>) => void;
   wantSseStream?: boolean;
   llmFetchFn?: typeof fetch;
@@ -373,6 +377,24 @@ export async function startOrExecuteAgentCall(params: {
   } = params;
   const effectiveUserId = params.userId ?? resolveCallerUserId({ principal });
   const userId = effectiveUserId;
+  const federationPolicyOpts = params.accessPolicy
+    ? {
+        accessPolicy: params.accessPolicy,
+        ...(params.accessPolicyCacheKey !== undefined ? { accessPolicyCacheKey: params.accessPolicyCacheKey } : {}),
+      }
+    : {};
+  /** Own rows plus rows shared with the caller; shared rows carry an opaque remote URL so the run never sees it. */
+  const listRunnableMcpServers = async (store: McpVaultStore): Promise<StoredMcpServerRow[]> => {
+    if (!params.accessPolicy) return await store.listServers(effectiveUserId);
+    const { rows } = await listCallableServersForCaller(effectiveUserId, { store: params.accessPolicy, vaultStore: store, ...(params.accessPolicyCacheKey !== undefined ? { cacheKey: params.accessPolicyCacheKey } : {}) });
+    return rows.map((r) =>
+      r.userId === effectiveUserId
+        ? r
+        : { ...r, remoteUrl: `shared-mcp:${r.userId}/${r.slug}`, remoteOrigin: `shared-mcp:${r.userId}/${r.slug}`, encryptedCredentials: null },
+    );
+  };
+  const federatedServerRef = (row: { userId: string; slug: string }): string =>
+    row.userId === effectiveUserId ? row.slug : `${row.userId}/${row.slug}`;
   const agentTracer = getActiveRequestTracer(params.tracer);
 
   const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
@@ -557,7 +579,7 @@ export async function startOrExecuteAgentCall(params: {
     const routerStart = Date.now();
     const userConnectedMcps =
       vaultStore && wantsConnectedMcps && canInvokeFederatedMcp
-        ? (await vaultStore.listServers(effectiveUserId))
+        ? (await listRunnableMcpServers(vaultStore))
             .filter(
               (s) =>
                 s.enabled &&
@@ -1082,7 +1104,7 @@ export async function startOrExecuteAgentCall(params: {
                 }),
               };
             }
-            const resolvedVaultRow = await vaultStore.getServer(effectiveUserId, matchedAllowedServer.slug);
+            const resolvedVaultRow = await vaultStore.getServer(matchedAllowedServer.userId, matchedAllowedServer.slug);
             if (
               !resolvedVaultRow ||
               !resolvedVaultRow.enabled ||
@@ -1135,7 +1157,7 @@ export async function startOrExecuteAgentCall(params: {
 
             const qInput: QueryMcpCallInput = {
               action: 'call_tool',
-              server: canonicalAllowedServer.slug,
+              server: federatedServerRef(canonicalAllowedServer),
               tool: permittedCachedTool.name,
               ...(args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)
                 ? { arguments: args.arguments as Record<string, unknown> }
@@ -1146,6 +1168,7 @@ export async function startOrExecuteAgentCall(params: {
               input: qInput,
               allowedMcpTools: allowedMcpToolSet,
               vaultStore,
+              ...federationPolicyOpts,
               vaultMasterKey: env.VAULT_MASTER_KEY,
               fetchFn: env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch,
               selfHost,
@@ -1226,6 +1249,7 @@ export async function startOrExecuteAgentCall(params: {
               allowedMcpTools: allowedMcpToolSet,
               requireExplicitReadOnlyHint: true,
               vaultStore,
+              ...federationPolicyOpts,
               vaultMasterKey: env.VAULT_MASTER_KEY,
               fetchFn: env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch,
               selfHost,

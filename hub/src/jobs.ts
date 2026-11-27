@@ -2008,42 +2008,6 @@ export async function executeJobsCall(params: {
       }).ok;
     };
 
-    if (!resumeState && coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
-      const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
-      const searchCandidateCap =
-        postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(40, Math.max(30, limit * 2));
-      const searchResponses = await Promise.all(
-        scopedQueries.map((sq) =>
-          executeSearch({
-            query: sq,
-            maxResults: searchMaxResults,
-            ...(env?.SERPER_API_KEY ? { mode: 'serper' } : {}),
-          }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
-        ),
-      );
-
-      let addedSearchHits = 0;
-      for (const sr of searchResponses) {
-        const webResults = Array.isArray(sr.body?.results) ? (sr.body.results as Array<Record<string, unknown>>) : [];
-        for (const hit of webResults) {
-          const u = typeof hit.url === 'string' ? hit.url.trim() : '';
-          if (u.startsWith('https://') && candidateUrls.size < searchCandidateCap) {
-            let hitHost = '';
-            try {
-              hitHost = new URL(u).hostname.toLowerCase().replace(/\.+$/, '');
-            } catch {
-              hitHost = '';
-            }
-            if (hitHost && isKnownMultiTenantAtsHost(hitHost) && matchesScopedAtsCandidateUrl(u)) {
-              candidateUrls.add(u);
-              addedSearchHits++;
-            }
-          }
-        }
-      }
-      if (addedSearchHits > 0) sourcesUsed.add('ats_search');
-    }
-
     const companyWordsLower = companyFilter
       ? normalizeDottedCorporateAbbreviations(companyFilter).toLowerCase().match(/[a-z0-9]+/g) ?? []
       : [];
@@ -2098,6 +2062,83 @@ export async function executeJobsCall(params: {
       }
       return outUrls;
     };
+
+    /** Scrape args for a candidate board/posting URL; shared by the direct-first probe and the candidate wave so the
+     * wave reuses the probe's cached response instead of fetching the board twice. */
+    const boardScrapeArgs = (u: string, scrapeUrl: string): Record<string, unknown> => {
+      const srBoard = isSmartRecruitersBoardUrl(u);
+      const info = classifyFullBoardKey(u);
+      const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
+      const isGhBoard = Boolean(info?.platform.startsWith('greenhouse') && info.isBoard);
+      return {
+        url: scrapeUrl,
+        renderMode: srBoard ? 'off' : 'auto',
+        discoverLlmsTxt: false,
+        preferOriginMarkdown: false,
+        ephemeral: true,
+        ...(isGhBoard ? { atsLiteBoard: true } : {}),
+        formats: needLinks ? ['markdown', 'links'] : ['markdown'],
+        ...(payload.target ? { target: payload.target } : {}),
+        ...(payload.site ? { site: payload.site } : {}),
+      };
+    };
+
+    // Direct-first: for a company search, probe the company's own Greenhouse / Ashby / Lever / SmartRecruiters boards
+    // before any web search. A board that lists jobs is authoritative (it holds every opening), so the SERP step is
+    // skipped: no search-provider dependency and ~4 s saved. Companies without a probeable board (e.g. Workday) still
+    // fall through to the SERP discovery below.
+    let directFirstHit = false;
+    if (!resumeState && companyFilter && domainsInput.length === 0 && primaryCompanySlug && boardStartOffset === 0) {
+      const probeUrls = buildDirectCompanyProbeUrls();
+      const probeOut = await Promise.all(
+        probeUrls.map((u) => executeScrape(boardScrapeArgs(u, u)).catch(() => null)),
+      );
+      for (let pi = 0; pi < probeUrls.length; pi++) {
+        const res = probeOut[pi];
+        const jobsArr = res?.status === 200 && res.body?.ok === true ? res.body.jobs : undefined;
+        if (Array.isArray(jobsArr) && jobsArr.length > 0) {
+          candidateUrls.add(probeUrls[pi]!);
+          directFirstHit = true;
+        }
+      }
+      if (directFirstHit) sourcesUsed.add('ats_direct');
+    }
+
+    if (!resumeState && !directFirstHit && coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
+      const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
+      const searchCandidateCap =
+        postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(40, Math.max(30, limit * 2));
+      const searchResponses = await Promise.all(
+        scopedQueries.map((sq) =>
+          executeSearch({
+            query: sq,
+            maxResults: searchMaxResults,
+            ...(env?.SERPER_API_KEY ? { mode: 'serper' } : {}),
+          }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
+        ),
+      );
+
+      let addedSearchHits = 0;
+      for (const sr of searchResponses) {
+        const webResults = Array.isArray(sr.body?.results) ? (sr.body.results as Array<Record<string, unknown>>) : [];
+        for (const hit of webResults) {
+          const u = typeof hit.url === 'string' ? hit.url.trim() : '';
+          if (u.startsWith('https://') && candidateUrls.size < searchCandidateCap) {
+            let hitHost = '';
+            try {
+              hitHost = new URL(u).hostname.toLowerCase().replace(/\.+$/, '');
+            } catch {
+              hitHost = '';
+            }
+            if (hitHost && isKnownMultiTenantAtsHost(hitHost) && matchesScopedAtsCandidateUrl(u)) {
+              candidateUrls.add(u);
+              addedSearchHits++;
+            }
+          }
+        }
+      }
+      if (addedSearchHits > 0) sourcesUsed.add('ats_search');
+    }
 
     if (companyFilter && domainsInput.length === 0 && primaryCompanySlug) {
       const normSlug = primaryCompanySlug.toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -2352,19 +2393,7 @@ export async function executeJobsCall(params: {
                 scrapeUrl = u;
               }
             }
-            const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
-            const isGhBoard = Boolean(info?.platform.startsWith('greenhouse') && info.isBoard);
-            return executeScrape({
-              url: scrapeUrl,
-              renderMode: srBoard ? 'off' : 'auto',
-              discoverLlmsTxt: false,
-              preferOriginMarkdown: false,
-              ephemeral: true,
-              ...(isGhBoard ? { atsLiteBoard: true } : {}),
-              formats: needLinks ? ['markdown', 'links'] : ['markdown'],
-              ...(payload.target ? { target: payload.target } : {}),
-              ...(payload.site ? { site: payload.site } : {}),
-            }).catch(() => null);
+            return executeScrape(boardScrapeArgs(u, scrapeUrl)).catch(() => null);
           }),
         );
 

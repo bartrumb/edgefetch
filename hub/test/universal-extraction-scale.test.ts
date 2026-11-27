@@ -32,7 +32,7 @@ const htmlFragToMd = (frag: string, baseUrl?: string) => {
 };
 
 test('Tier 1A: Universal Schema.org JSON-LD extracts FAQPage, QAPage, DiscussionForumPosting, ItemList, Article, Event, SoftwareApplication & Dataset without false zeros', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 36);
+  assert.equal(SCRAPE_PIPELINE_VERSION, 37);
 
   // 1. FAQPage hydrates thin shell directly without triggering browser auto-render
   const faqHtml = `<!doctype html><html><head><title>Pricing FAQ</title>
@@ -2258,8 +2258,10 @@ test('R1 & bun.sh Regression Suite: Vercel Greenhouse board promotion, Hippocrat
   assert.equal(allstateBoardOut.jobs?.[0]?.postedAt, null);
   assert.equal(allstateBoardOut.jobs?.[0]?.postedLabel, '30+ days ago');
 
+  // Per-host concurrency (the invariant this guards). Direct-first company probes run against different ATS hosts in
+  // parallel, so a global counter would no longer measure same-host serialization.
   let maxSameHostActive = 0;
-  let curSameHostActive = 0;
+  const activeByHost = new Map<string, number>();
   const allstateJobsRes = await executeJobsCall({
     payload: { company: 'allstate', query: 'Engineer', remote: true, limit: 5 },
     env: {},
@@ -2268,10 +2270,12 @@ test('R1 & bun.sh Regression Suite: Vercel Greenhouse board promotion, Hippocrat
       body: { results: [{ url: 'https://allstate.wd5.myworkdayjobs.com/allstate_careers' }] },
     }),
     executeScrape: async (args) => {
-      curSameHostActive++;
-      if (curSameHostActive > maxSameHostActive) maxSameHostActive = curSameHostActive;
+      const host = new URL(String(args.url ?? '')).hostname;
+      const nowActive = (activeByHost.get(host) ?? 0) + 1;
+      activeByHost.set(host, nowActive);
+      if (nowActive > maxSameHostActive) maxSameHostActive = nowActive;
       await new Promise((r) => setTimeout(r, 5));
-      curSameHostActive--;
+      activeByHost.set(host, (activeByHost.get(host) ?? 1) - 1);
       const u = String(args.url ?? '');
       if (u.includes('AI-Cloud-Platform-Engineer_R35902')) {
         const jSpec = resolveAtsPreFetchSpec(u)!;

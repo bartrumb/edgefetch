@@ -5810,3 +5810,53 @@ test('R18: broad jobs searches return results in chunks with a continueCursor th
   assert.ok(!scraped.slice(before).some((u) => u.includes('evil.example.com')), 'non-ATS cursor URLs are dropped');
 });
 
+test('R20: company jobs searches probe the company ATS boards directly before any web search', async () => {
+  resetJobsCacheForTests();
+  let searchCalls = 0;
+  const executeSearch = async () => {
+    searchCalls++;
+    return { status: 200, body: { ok: true, results: [] } };
+  };
+  const scraped: string[] = [];
+  const boardJob = { title: 'Solutions Engineer', url: 'https://boards.greenhouse.io/acmeco/jobs/101', company: 'acmeco', locations: ['Remote'] };
+  const executeScrape = async (args: Record<string, unknown>) => {
+    const u = String(args.url);
+    scraped.push(u);
+    if (/boards\.greenhouse\.io\/acmeco\/?$/i.test(u)) {
+      return { status: 200, body: { ok: true, url: u, extractorId: 'greenhouse-board', total: 1, jobs: [boardJob], links: [boardJob.url] } };
+    }
+    return { status: 404, body: { ok: false, status: 404 } };
+  };
+
+  // A. Board found directly: no web search at all, the board is fetched once (the wave reuses the probe), job returned.
+  const hit = await executeJobsCall({
+    payload: { query: 'Solutions Engineer', company: 'acmeco', includeBuiltIn: false, limit: 10 },
+    env: { SERPER_API_KEY: 'k' } as never,
+    executeSearch,
+    executeScrape,
+  });
+  assert.equal(hit.status, 200, JSON.stringify(hit.body).slice(0, 400));
+  assert.equal(searchCalls, 0, 'direct board hit must skip the web search');
+  assert.ok((hit.body.sourcesUsed as string[]).includes('ats_direct'));
+  assert.ok(((hit.body.jobs as Array<{ url: string }>) ?? []).some((j) => j.url === boardJob.url));
+  assert.equal(scraped.filter((u) => /boards\.greenhouse\.io\/acmeco\/?$/i.test(u)).length, 1, 'board fetched once');
+
+  // B. No probeable board (e.g. a Workday-only company): falls through to the web-search discovery as before.
+  resetJobsCacheForTests();
+  searchCalls = 0;
+  const miss = await executeJobsCall({
+    payload: { query: 'Solutions Engineer', company: 'otherco', includeBuiltIn: false, limit: 10 },
+    env: { SERPER_API_KEY: 'k' } as never,
+    executeSearch,
+    executeScrape,
+  });
+  assert.equal(miss.status, 200);
+  assert.ok(searchCalls > 0, 'without a direct board hit the web search still runs');
+  assert.ok(!(miss.body.sourcesUsed as string[]).includes('ats_direct'));
+
+  // C. Broad searches (no company) never probe.
+  resetJobsCacheForTests();
+  const before = scraped.length;
+  await executeJobsCall({ payload: { query: 'Solutions Engineer', includeBuiltIn: false, limit: 10 }, env: { SERPER_API_KEY: 'k' } as never, executeSearch, executeScrape });
+  assert.ok(!scraped.slice(before).some((u) => /greenhouse\.io\/solutions|ashbyhq\.com\/solutions/i.test(u)));
+});

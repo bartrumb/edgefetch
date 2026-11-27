@@ -399,6 +399,8 @@ export function extractHtmlDocument(
         includeImages?: boolean;
         includeTags?: readonly string[];
         excludeTags?: readonly string[];
+        /** Strip hidden subtrees even with `onlyMainContent: false` (Go `StripHiddenSubtrees`). */
+        stripHiddenSubtrees?: boolean;
       }
     | string = {},
 ): ExtractedDocument {
@@ -415,6 +417,7 @@ export function extractHtmlDocument(
     includeImages = true,
     includeTags,
     excludeTags,
+    stripHiddenSubtrees = false,
   } = optsObj;
 
   const rawDoc = callCoreWasmRaw<{
@@ -452,6 +455,7 @@ export function extractHtmlDocument(
       ...(includeTags && includeTags.length > 0 ? { includeTags: [...includeTags] } : {}),
       ...(excludeTags && excludeTags.length > 0 ? { excludeTags: [...excludeTags] } : {}),
       redactPii: Boolean(redactPii),
+      ...(stripHiddenSubtrees ? { stripHiddenSubtrees: true } : {}),
     },
     String(rawHtml ?? ''),
   ).doc;
@@ -7420,6 +7424,21 @@ export async function executeScrapeCall(params: {
       (!isHtmlBody && typeof item.markdown === 'string' && item.markdown) ||
       extracted?.markdown ||
       (isHtmlBody ? '' : rawBodyStr);
+  // A browser-rendered DOM whose content lives entirely in header/aside/footer (small app shells) yields no main
+  // content. Rather than return nothing, re-extract that rendered DOM with the hub's own extractor without main-content
+  // stripping (scripts and hidden subtrees are still removed). Static HTML keeps the meta-description fallback, since
+  // its non-main content is usually just navigation.
+  if (
+    isHtmlBody &&
+    !markdown.trim() &&
+    (item.rendered === true || renderedViaOut !== undefined) &&
+    onlyMainContent &&
+    includeTags.length === 0 &&
+    excludeTags.length === 0
+  ) {
+    const fullPage = extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: false, stripHiddenSubtrees: true, redactPii, includeImages });
+    if (fullPage.markdown.trim()) markdown = fullPage.markdown;
+  }
   if (cdpJsonDistilled?.markdown && countTextWords(markdown) < 80 && !alternateMarkdownBody && !customShopifyDoc) {
     markdown = [markdown.trim(), cdpJsonDistilled.markdown].filter(Boolean).join('\n\n');
   } else if (

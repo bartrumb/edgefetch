@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -160,6 +161,29 @@ var markdownNamedEntities = map[string]string{
 	"lsqb":                  "[",
 	"rsqb":                  "]",
 	"grave":                 "`",
+}
+
+// lookupHTML5NamedEntityNonASCIIGo resolves a named reference `&name;` against the full HTML5
+// named-character-reference set (via `html.UnescapeString`) when the curated `markdownNamedEntities`
+// table misses, e.g. `&Eacute;` -> `É` or `&ccedil;` -> `ç`. Only results made entirely of non-ASCII,
+// non-control, non-format runes are accepted: anything that would decode to ASCII (markup or Markdown
+// syntax such as `&nvlt;`, `&lowbar;`, `&lbrack;`, or a legacy prefix match like `&notit;`) or to an
+// invisible format character stays literal, so downstream `<` / bracket escaping guarantees are unchanged.
+func lookupHTML5NamedEntityNonASCIIGo(name string) (string, bool) {
+	if name == "" || len(name) > 32 {
+		return "", false
+	}
+	ref := "&" + name + ";"
+	dec := html.UnescapeString(ref)
+	if dec == "" || dec == ref {
+		return "", false
+	}
+	for _, r := range dec {
+		if r < 0x80 || r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return "", false
+		}
+	}
+	return dec, true
 }
 
 // SanitizeScrapedMeta strips NUL/smuggling code points, control newlines, raw HTML tags,
@@ -3427,6 +3451,12 @@ func decodeMarkdownEntitiesRawImplGo(input string, escapeDecodedBrackets bool) s
 				}
 				if mapped, ok := markdownNamedEntities[asciiLowerExtractString(rawName)]; ok {
 					writeDecodedEntityValueGo(&sb, mapped, escapeDecodedBrackets, &trailingBackslashes)
+					i = p + 1
+					continue
+				}
+				if mapped, ok := lookupHTML5NamedEntityNonASCIIGo(rawName); ok {
+					sb.WriteString(mapped)
+					trailingBackslashes = 0
 					i = p + 1
 					continue
 				}

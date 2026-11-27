@@ -233,12 +233,20 @@ export interface DeclarativeFindInArray {
   valueField: string;
 }
 
+export interface DeclarativePreferWhere {
+  path: string;
+  equals: string;
+  fallbackEquals?: string;
+  fallbackLast?: boolean;
+}
+
 export interface DeclarativeVarSpec {
   paths?: string[];
   dynamicKeyPath?: DeclarativeDynamicKeyPath;
   nestedSubValues?: DeclarativeNestedSubValuesSpec;
   tocHeading?: string;
   findInArrayLang?: DeclarativeFindInArray;
+  preferWhere?: DeclarativePreferWhere;
   template?: string;
   whenVars?: string[];
   whenAnyVars?: string[];

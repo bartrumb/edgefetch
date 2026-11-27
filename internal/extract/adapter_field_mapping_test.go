@@ -122,8 +122,8 @@ func TestWikidataCuratedClaims(t *testing.T) {
 	}
 	city := `{"entities":{"Q64":{"id":"Q64","labels":{"en":{"language":"en","value":"Berlin"}},"descriptions":{"en":{"language":"en","value":"capital of Germany"}},"claims":{
 		"P31":[{"mainsnak":{"datavalue":{"value":{"entity-type":"item","id":"Q1901835"},"type":"wikibase-entityid"}},"rank":"normal"},{"mainsnak":{"datavalue":{"value":{"entity-type":"item","id":"Q515"},"type":"wikibase-entityid"}},"rank":"normal"}],
-		"P571":[{"mainsnak":{"datavalue":{"value":{"time":"+1244-00-00T00:00:00Z","precision":9},"type":"time"}},"rank":"normal"}],
-		"P1082":[{"mainsnak":{"datavalue":{"value":{"amount":"+1200","unit":"1"},"type":"quantity"}},"rank":"normal"},{"mainsnak":{"datavalue":{"value":{"amount":"+3755251","unit":"1"},"type":"quantity"}},"rank":"preferred"}],
+		"P571":[{"mainsnak":{"datavalue":{"value":{"time":"+1100-00-00T00:00:00Z","precision":9},"type":"time"}},"rank":"deprecated"},{"mainsnak":{"datavalue":{"value":{"time":"+1244-00-00T00:00:00Z","precision":9},"type":"time"}},"rank":"normal"}],
+		"P1082":[{"mainsnak":{"datavalue":{"value":{"amount":"+1200","unit":"1"},"type":"quantity"}},"rank":"normal"},{"mainsnak":{"datavalue":{"value":{"amount":"+3400000","unit":"1"},"type":"quantity"}},"rank":"normal"},{"mainsnak":{"datavalue":{"value":{"amount":"+3755251","unit":"1"},"type":"quantity"}},"rank":"preferred"},{"mainsnak":{"datavalue":{"value":{"amount":"+3600000","unit":"1"},"type":"quantity"}},"rank":"normal"}],
 		"P856":[{"mainsnak":{"datavalue":{"value":"https://www.berlin.de/","type":"string"}},"rank":"normal"}]
 	}}}}`
 	doc, ok := twin.Format(city)
@@ -133,15 +133,19 @@ func TestWikidataCuratedClaims(t *testing.T) {
 	for _, want := range []string{
 		"- **Instance Of**: `Q1901835`, `Q515`",
 		"- **Inception**: 1244",
+		"- **Population**: 3,755,251",
 		"- **Official Website**: https://www.berlin.de/",
 	} {
 		if !strings.Contains(doc.Markdown, want) {
 			t.Fatalf("expected %q in wikidata markdown, got:\n%s", want, doc.Markdown)
 		}
 	}
-	// Population is never emitted from the historic-first claim array.
-	if strings.Contains(doc.Markdown, "1200") || strings.Contains(doc.Markdown, "Population") {
-		t.Fatalf("expected no population output, got:\n%s", doc.Markdown)
+	// The preferred-rank population wins over the historic-first and later normal-rank claims,
+	// and a deprecated-rank inception is never emitted.
+	for _, absent := range []string{"1,200", "3,400,000", "3,600,000", "1100"} {
+		if strings.Contains(doc.Markdown, absent) {
+			t.Fatalf("expected non-preferred claim value %q to be omitted, got:\n%s", absent, doc.Markdown)
+		}
 	}
 	for _, absent := range []string{"Sex or Gender", "Country of Citizenship", "Occupation", "Date of Birth", "Date of Death"} {
 		if strings.Contains(doc.Markdown, absent) {
@@ -286,5 +290,78 @@ func TestIcimsGenericHeadingAndCompanyFallback(t *testing.T) {
 	}
 	if len(doc.Records) != 1 || doc.Records[0]["company"] != "Acme Robotics" {
 		t.Fatalf("expected record company Acme Robotics, got: %+v", doc.Records)
+	}
+}
+
+func TestSelectPreferWhereElement(t *testing.T) {
+	arr := []any{
+		map[string]any{"rank": "normal", "v": "a"},
+		map[string]any{"rank": "deprecated", "v": "b"},
+		map[string]any{"rank": "normal", "v": "c"},
+		map[string]any{"rank": "preferred", "v": "d"},
+		map[string]any{"rank": "normal", "v": "e"},
+	}
+	pick := func(arr []any, pw *DeclarativePreferWhereSpec) string {
+		el := selectPreferWhereElement(arr, pw)
+		if el == nil {
+			return ""
+		}
+		return jsonScalarToString(getByDotPath(el, "v"))
+	}
+	if got := pick(arr, &DeclarativePreferWhereSpec{Path: "rank", Equals: "preferred"}); got != "d" {
+		t.Fatalf("preferred match: got %q", got)
+	}
+	noPref := []any{arr[0], arr[1], arr[2], arr[4]}
+	if got := pick(noPref, &DeclarativePreferWhereSpec{Path: "rank", Equals: "preferred", FallbackEquals: "normal"}); got != "a" {
+		t.Fatalf("first normal fallback: got %q", got)
+	}
+	if got := pick(noPref, &DeclarativePreferWhereSpec{Path: "rank", Equals: "preferred", FallbackEquals: "normal", FallbackLast: true}); got != "e" {
+		t.Fatalf("last normal fallback: got %q", got)
+	}
+	if got := pick(noPref, &DeclarativePreferWhereSpec{Path: "rank", Equals: "preferred"}); got != "" {
+		t.Fatalf("no fallback configured should resolve empty, got %q", got)
+	}
+	if got := pick([]any{arr[1], "scalar", nil}, &DeclarativePreferWhereSpec{Path: "rank", Equals: "preferred", FallbackEquals: "normal"}); got != "" {
+		t.Fatalf("deprecated-only should resolve empty, got %q", got)
+	}
+
+	// Through formatExtractedJSONValue: subField resolves on the picked element, then format applies.
+	spec := DeclarativeVarSpec{
+		PreferWhere: &DeclarativePreferWhereSpec{Path: "rank", Equals: "preferred"},
+		SubField:    "amount",
+		Format:      "int_comma",
+	}
+	raw := []any{map[string]any{"rank": "normal", "amount": "+1200"}, map[string]any{"rank": "preferred", "amount": "+3755251"}}
+	if got := formatExtractedJSONValue(raw, spec, ""); got != "3,755,251" {
+		t.Fatalf("formatExtractedJSONValue preferWhere: got %q", got)
+	}
+	if got := formatExtractedJSONValue(map[string]any{"rank": "preferred"}, spec, ""); got != "" {
+		t.Fatalf("non-array input should resolve empty, got %q", got)
+	}
+}
+
+func TestWikidataPreferredRankFallbacks(t *testing.T) {
+	twin, ok := ResolveDeclarativeTwin("https://www.wikidata.org/wiki/Q1")
+	if !ok {
+		t.Fatal("expected wikidata twin")
+	}
+	payload := `{"entities":{"Q1":{"id":"Q1","labels":{"en":{"language":"en","value":"Sample Town"}},"claims":{
+		"P1082":[{"mainsnak":{"datavalue":{"value":{"amount":"+900","unit":"1"}}},"rank":"normal"},{"mainsnak":{"datavalue":{"value":{"amount":"+5000","unit":"1"}}},"rank":"deprecated"},{"mainsnak":{"datavalue":{"value":{"amount":"+12345","unit":"1"}}},"rank":"normal"}],
+		"P569":[{"mainsnak":{"datavalue":{"value":{"time":"+1950-01-01T00:00:00Z"}}},"rank":"normal"},{"mainsnak":{"datavalue":{"value":{"time":"+1952-03-11T00:00:00Z"}}},"rank":"preferred"}],
+		"P570":[{"mainsnak":{"datavalue":{"value":{"time":"+2000-01-01T00:00:00Z"}}},"rank":"deprecated"}]
+	}}}}`
+	doc, ok := twin.Format(payload)
+	if !ok || doc == nil {
+		t.Fatal("expected wikidata doc to format")
+	}
+	for _, want := range []string{"- **Population**: 12,345", "- **Date of Birth**: 1952-03-11"} {
+		if !strings.Contains(doc.Markdown, want) {
+			t.Fatalf("expected %q, got:\n%s", want, doc.Markdown)
+		}
+	}
+	for _, absent := range []string{"5,000", "1950-01-01", "Date of Death"} {
+		if strings.Contains(doc.Markdown, absent) {
+			t.Fatalf("expected %q to be omitted, got:\n%s", absent, doc.Markdown)
+		}
 	}
 }

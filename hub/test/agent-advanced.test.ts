@@ -6116,3 +6116,46 @@ test('R26: Cloudflare Web Search API provider (REST + Workers AI binding), skipp
   assert.equal(bindingCalls[0]!.provider, 'ceramic', 'defaults to ceramic');
   assert.equal(calls.filter((c) => c.url.includes('/ai/websearch/')).length, 0, 'binding path issues no REST call');
 });
+
+test('R27: direct Ceramic.ai search provider (word-clamped query, result.results), skips site: queries and avoids a duplicate Cloudflare/Ceramic call', async () => {
+  resetSearchProviderPacingForTests();
+  const calls: Array<{ url: string; auth: string | null; body: Record<string, unknown> }> = [];
+  const providerFetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const u = String(input);
+    calls.push({ url: u, auth: new Headers(init?.headers).get('authorization'), body: JSON.parse(String(init?.body ?? '{}')) });
+    if (u === 'https://api.ceramic.ai/search') {
+      return Response.json({
+        requestId: 'req-1',
+        result: {
+          results: [{ title: 'Edge compute primer', url: 'https://example.org/edge-primer', description: 'Edge compute explained.' }],
+          searchMetadata: { executionTime: 0.09 },
+          totalResults: 1,
+        },
+      });
+    }
+    if (u.includes('/ai/websearch/')) return Response.json({ items: [] });
+    return new Response('{}', { status: 404 });
+  }) as unknown as typeof fetch;
+  const executeHubFetch = async () => ({ status: 200, via: 'cf', bodyText: JSON.stringify({ results: [] }) });
+  const env = {
+    CERAMIC_API_KEY: 'ceramic-test-key',
+    CLOUDFLARE_ACCOUNT_ID: 'b'.repeat(32),
+    CLOUDFLARE_WEBSEARCH_API_TOKEN: 'cf-token',
+  };
+  const longQuery = Array.from({ length: 70 }, (_, i) => `w${i}`).join(' ');
+
+  const res = await executeSearchCall({ payload: { query: longQuery }, env: env as never, executeHubFetch, providerFetchFn });
+  assert.equal(res.status, 200, JSON.stringify(res.body).slice(0, 300));
+  const ceramic = calls.find((c) => c.url === 'https://api.ceramic.ai/search')!;
+  assert.ok(ceramic, 'Ceramic called directly');
+  assert.equal(ceramic.auth, 'Bearer ceramic-test-key');
+  assert.equal(String(ceramic.body.query).split(' ').length, 50, 'query clamped to Ceramic 50-word limit');
+  assert.ok((ceramic.body.maxResults as number) <= 20);
+  assert.ok(((res.body.results as Array<{ url: string }>) ?? []).some((r) => r.url === 'https://example.org/edge-primer'));
+  assert.equal(calls.filter((c) => c.url.includes('/ai/websearch/')).length, 0, 'Cloudflare (default Ceramic engine) not called twice for the same engine');
+
+  calls.length = 0;
+  resetSearchProviderPacingForTests();
+  await executeSearchCall({ payload: { query: 'site:jobs.ashbyhq.com engineer' }, env: env as never, executeHubFetch, providerFetchFn });
+  assert.equal(calls.filter((c) => c.url === 'https://api.ceramic.ai/search').length, 0, 'site: queries never go to Ceramic');
+});

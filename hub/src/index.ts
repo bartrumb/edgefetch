@@ -245,6 +245,7 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   CLOUDFLARE_AI_GATEWAY_ID?: string;
   CLOUDFLARE_WEBSEARCH_PROVIDER?: string;
   CLOUDFLARE_WEBSEARCH_BYOK_ALIAS?: string;
+  CERAMIC_API_KEY?: string;
   WEBHOOK_SECRET?: string;
   EDGEFETCH_PUBLIC_ORIGIN?: string;
   EDGEFETCH_DISABLE_UPDATE_CHECK?: string;

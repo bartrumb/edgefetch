@@ -385,6 +385,7 @@ export function buildCapabilities(
     SEARXNG_URL?: string;
     CLOUDFLARE_ACCOUNT_ID?: string;
     CLOUDFLARE_WEBSEARCH_API_TOKEN?: string;
+    CERAMIC_API_KEY?: string;
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
@@ -402,6 +403,7 @@ export function buildCapabilities(
   ) {
     searchProviders.push('cloudflare');
   }
+  if (env.CERAMIC_API_KEY?.trim()) searchProviders.push('ceramic');
   const spaFallbacks = listConfiguredSpaFallbacks(env);
 
   const hasWebProvider = Boolean(
@@ -409,7 +411,8 @@ export function buildCapabilities(
       env.BRAVE_API_KEY?.trim() ||
       env.TAVILY_API_KEY?.trim() ||
       env.SEARXNG_URL?.trim() ||
-      searchProviders.includes('cloudflare'),
+      searchProviders.includes('cloudflare') ||
+      searchProviders.includes('ceramic'),
   );
   return {
     version,

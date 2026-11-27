@@ -19,10 +19,10 @@ import { executeScrapeCall } from '../src/scrape';
 import { r2ArtifactKey } from '../src/storage';
 import { NodeFsR2Bucket, NodeSqliteD1Database } from './stubs/cf-storage-mocks';
 
-// `scrapeOptionsHash` of a default `{ url, maxAgeMs }` markdown scrape (unchanged since v2.8.2 except the pipeline v35 bump).
+// `scrapeOptionsHash` of a default `{ url, maxAgeMs }` markdown scrape (unchanged since v2.8.2 except the pipeline v35 and v36 bumps).
 // Requests without `jsonFilter` must keep this exact value so the release invalidates no existing cache entry.
 // Pinned for SCRAPE_PIPELINE_VERSION 35 (v2.8.14 bump): the hash includes the pipeline version, so it changes only on a deliberate bump.
-const V282_DEFAULT_OPTIONS_HASH = '40ea6bad57d8d0bf712486b7647a8406c0c09f1452668c917eec9983f476e71d';
+const V282_DEFAULT_OPTIONS_HASH = '23fcf877d8ee44cd86abd56626d2416f4a8b4682239ebc3f33651dc83fe257ed';
 
 const JSON_URL = 'https://api.example.com/roles.json';
 const RECORDS = [

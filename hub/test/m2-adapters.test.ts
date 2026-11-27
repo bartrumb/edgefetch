@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { KNOWN_TELEMETRY_ADAPTER_IDS } from '../src/dev-telemetry';
 import { DECLARATIVE_SITE_ADAPTERS } from '../src/extractors/declarative';
 import { listRegisteredAdapters, resolveSiteExtractorTwin } from '../src/extractors/registry';
 import { executeScrapeCall, extractHtmlDocument, isTrustedTwinRedirectUrl } from '../src/scrape';
+import { executeExtractCall } from '../src/search-index';
 import { resetIsolateBudgetForTests } from '../src/wasm-bridge';
+import { NodeFsR2Bucket } from './stubs/cf-storage-mocks';
 
 const simpleHtmlToMd = (frag: string, base?: string) => {
   const doc = extractHtmlDocument(`<!doctype html><html><body>${frag}</body></html>`, {
@@ -757,4 +762,231 @@ test('M2-8: Regression fixes for cpsc guard bypasses, zendesk script leak, cpsc 
   );
   assert.ok(hbDoc);
   assert.equal(hbDoc.title, 'jq (Homebrew Formula)');
+});
+
+test('M2-FIX-1: HTML body with empty hub extraction never falls back to node-supplied legacy Markdown', async () => {
+  resetIsolateBudgetForTests();
+  const pageUrl = 'https://legacy-leak.example.com/blank';
+  const leakMarker = 'NODE_LEGACY_SCRIPT_LEAK_7f3a';
+  const res = await executeScrapeCall({
+    payload: { url: pageUrl, formats: ['markdown', 'text'], renderMode: 'off' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const req = JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> };
+      const r0 = req.requests[0]!;
+      return {
+        status: 200,
+        via: 'agent:test',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: r0.id,
+              url: r0.url,
+              finalUrl: r0.url,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              body: `<!doctype html><html><head><title></title></head><body><script>window.x = "${leakMarker}";</script><div style="display:none">${leakMarker} hidden</div></body></html>`,
+              // Legacy node extractor output that leaked script text and display:none content.
+              markdown: `${leakMarker} hidden copy from the legacy node extractor`,
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(
+    JSON.stringify(res.body).includes(leakMarker),
+    false,
+    `node Markdown for an HTML body must not be used as the fallback: ${JSON.stringify(res.body).slice(0, 600)}`,
+  );
+});
+
+test('M2-FIX-1b: non-HTML body keeps the node-supplied Markdown fallback', async () => {
+  resetIsolateBudgetForTests();
+  const pageUrl = 'https://node-md.example.com/notes.bin';
+  const nodeMarker = 'NODE_NON_HTML_MARKDOWN_OK_91c2';
+  const res = await executeScrapeCall({
+    payload: { url: pageUrl, formats: ['markdown'], renderMode: 'off' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const req = JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> };
+      const r0 = req.requests[0]!;
+      return {
+        status: 200,
+        via: 'agent:test',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: r0.id,
+              url: r0.url,
+              finalUrl: r0.url,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/x-edgefetch-test',
+              body: 'raw opaque payload',
+              markdown: `# Notes\n\n${nodeMarker} converted on the node for a non-HTML document.`,
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body).slice(0, 600));
+  assert.match(String(res.body.markdown ?? ''), new RegExp(nodeMarker));
+});
+
+test('M2-FIX-2: registry-twin adapter output is labelled by the Go content-state classifier, not hardcoded active', async () => {
+  resetIsolateBudgetForTests();
+  const articleUrl = 'https://acme.zendesk.com/hc/en-us/articles/4408886858139-Missing';
+  const zendeskFetch =
+    (article: { title: string; body: string }) =>
+    async (_target: unknown, rawBody: string) => {
+      const req = JSON.parse(rawBody) as { requests: Array<{ url: string }> };
+      const u = req.requests[0]!.url;
+      if (u.includes('/attachments.json')) {
+        return {
+          status: 200,
+          via: 'agent:test',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: 'att',
+                url: u,
+                finalUrl: u,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'application/json',
+                body: JSON.stringify({ article_attachments: [] }),
+              },
+            ],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'agent:test',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'zd',
+              url: u,
+              finalUrl: u,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/json',
+              body: JSON.stringify({
+                article: { ...article, updated_at: '2026-02-01T00:00:00Z', html_url: articleUrl, draft: false },
+              }),
+            },
+          ],
+        }),
+      };
+    };
+
+  const soft404Res = await executeScrapeCall({
+    payload: { url: articleUrl, formats: ['markdown'] },
+    env: {},
+    executeHubFetch: zendeskFetch({
+      title: 'Page Not Found',
+      body: '<p>The page you requested could not be found.</p>',
+    }),
+  });
+  assert.equal(soft404Res.status, 200);
+  assert.equal(soft404Res.body.extractorId, 'zendesk-hc');
+  assert.equal(soft404Res.body.contentState, 'soft_404');
+  assert.equal(typeof soft404Res.body.contentStateReason, 'string');
+
+  resetIsolateBudgetForTests();
+  const activeRes = await executeScrapeCall({
+    payload: { url: articleUrl, formats: ['markdown'] },
+    env: {},
+    executeHubFetch: zendeskFetch({
+      title: 'Battery Care',
+      body: '<p>Follow the safety guidelines when charging and storing the battery pack.</p>',
+    }),
+  });
+  assert.equal(activeRes.status, 200);
+  assert.equal(activeRes.body.extractorId, 'zendesk-hc');
+  assert.equal(activeRes.body.contentState, 'active');
+  assert.equal(activeRes.body.contentStateReason, undefined);
+});
+
+test('M2-FIX-3: private /v1/extract cache hit preserves the transient temporarily_unavailable content state', async () => {
+  resetIsolateBudgetForTests();
+  const dir = mkdtempSync(join(tmpdir(), 'ef-m2-tu-'));
+  try {
+    const bucket = new NodeFsR2Bucket(join(dir, 'r2'));
+    const env = { ARTIFACTS: bucket as unknown as R2Bucket };
+    const pageUrl = 'https://tu-cache.example.com/status';
+    const missRes = await executeExtractCall({
+      payload: { urls: [pageUrl], visibility: 'private', maxAgeMs: 600_000, renderMode: 'off' },
+      env,
+      executeHubFetch: async (_t, rawBody) => {
+        const parsed = JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> };
+        const r0 = parsed.requests[0]!;
+        return {
+          status: 200,
+          via: 'agent:static',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: r0.id,
+                url: r0.url,
+                finalUrl: r0.url,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'text/html; charset=utf-8',
+                body: '<html><head><title>Service Status</title></head><body><main><h1>Service Status</h1><p>All regional systems are reporting normal operation this week across every data center.</p></main></body></html>',
+              },
+            ],
+          }),
+        };
+      },
+    });
+    assert.equal(missRes.status, 200);
+    const missItem = (missRes.body.results as Array<Record<string, unknown>>)[0]!;
+    assert.equal(missItem.cached, false);
+
+    // Rewrite the stored private cache record's state, as written by a classifier that knows the new state.
+    const files: string[] = [];
+    const walk = (p: string) => {
+      for (const ent of readdirSync(p, { withFileTypes: true })) {
+        const full = join(p, ent.name);
+        if (ent.isDirectory()) walk(full);
+        else files.push(full);
+      }
+    };
+    walk(join(dir, 'r2'));
+    let rewritten = 0;
+    for (const f of files) {
+      const txt = readFileSync(f, 'utf8');
+      if (!txt.startsWith('{')) continue;
+      let rec: Record<string, unknown>;
+      try {
+        rec = JSON.parse(txt) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (rec.url !== pageUrl || typeof rec.markdown !== 'string') continue;
+      rec.contentState = 'temporarily_unavailable';
+      writeFileSync(f, JSON.stringify(rec));
+      rewritten++;
+    }
+    assert.ok(rewritten >= 1, 'expected a private extract cache record to rewrite');
+
+    const hitRes = await executeExtractCall({
+      payload: { urls: [pageUrl], visibility: 'private', maxAgeMs: 600_000, renderMode: 'off' },
+      env,
+      executeHubFetch: async () => {
+        throw new Error('private cache hit must not call executeHubFetch');
+      },
+    });
+    assert.equal(hitRes.status, 200);
+    const hitItem = (hitRes.body.results as Array<Record<string, unknown>>)[0]!;
+    assert.equal(hitItem.cached, true);
+    assert.equal(hitItem.contentState, 'temporarily_unavailable');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

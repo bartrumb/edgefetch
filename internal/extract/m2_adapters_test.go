@@ -101,11 +101,11 @@ func TestM2Tier1AdaptersResolutionAndFormatting(t *testing.T) {
 	if _, ok := ResolveDeclarativeTwin("https://www.federalregister.gov/documents/current"); ok {
 		t.Fatalf("expected disallowed /documents/current NOT to match federal-register")
 	}
-	frTwin, ok := ResolveDeclarativeTwin("https://www.federalregister.gov/documents/2024/05/07/2024-09145/non-compete-clause-rule")
-	if !ok || frTwin.FetchURL != "https://www.federalregister.gov/api/v1/documents/2024-09145.json" {
+	frTwin, ok := ResolveDeclarativeTwin("https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule")
+	if !ok || frTwin.FetchURL != "https://www.federalregister.gov/api/v1/documents/2024-09171.json" {
 		t.Fatalf("unexpected federal-register match: ok=%v twin=%+v", ok, frTwin)
 	}
-	frPayload := `{"title":"Non-Compete Clause Rule","document_number":"2024-09145","type":"Rule","citation":"89 FR 38342","publication_date":"2024-05-07","effective_on":"2024-09-04","agencies":[{"name":"Federal Trade Commission"}],"cfr_references":[{"title":16,"part":910,"chapter":"I"},{"title":16,"part":1500}],"abstract":"Final rule banning non-compete clauses.","pdf_url":"https://www.govinfo.gov/content/pkg/FR-2024-05-07/pdf/2024-09145.pdf","html_url":"https://www.federalregister.gov/documents/2024/05/07/2024-09145/non-compete-clause-rule"}`
+	frPayload := `{"title":"Non-Compete Clause Rule","document_number":"2024-09171","type":"Rule","citation":"89 FR 38342","publication_date":"2024-05-07","effective_on":"2024-09-04","agencies":[{"name":"Federal Trade Commission"}],"cfr_references":[{"title":16,"part":910,"chapter":"I"},{"title":16,"part":1500}],"abstract":"Final rule banning non-compete clauses.","pdf_url":"https://www.govinfo.gov/content/pkg/FR-2024-05-07/pdf/2024-09171.pdf","html_url":"https://www.federalregister.gov/documents/2024/05/07/2024-09171/non-compete-clause-rule"}`
 	frDoc, ok := frTwin.Format(frPayload)
 	if !ok || !strings.Contains(frDoc.Markdown, "16 CFR Part 910; 16 CFR Part 1500") {
 		t.Fatalf("expected numeric subFieldsJoin '16 CFR Part 910; 16 CFR Part 1500' in federal-register markdown, got: %+v", frDoc)
@@ -198,7 +198,7 @@ func TestM2Tier3AndTier4AdaptersResolutionAndFormatting(t *testing.T) {
 		t.Fatalf("expected Solr query injection attempt NOT to match maven-central")
 	}
 	mvTwin, ok := ResolveDeclarativeTwin("https://central.sonatype.com/artifact/com.fasterxml.jackson.core/jackson-databind/2.18.2")
-	if !ok || mvTwin.FetchURL != "https://search.maven.org/solrsearch/select?q=g:com.fasterxml.jackson.core+AND+a:jackson-databind+AND+v:2.18.2&core=gav&rows=20&wt=json" {
+	if !ok || mvTwin.FetchURL != "https://central.sonatype.com/solrsearch/select?q=g:com.fasterxml.jackson.core+AND+a:jackson-databind+AND+v:2.18.2&core=gav&rows=20&wt=json" {
 		t.Fatalf("unexpected maven-central match: ok=%v twin=%+v", ok, mvTwin)
 	}
 	mvDoc, ok := mvTwin.Format(`{"response":{"numFound":1,"docs":[{"id":"com.fasterxml.jackson.core:jackson-databind:2.18.2","g":"com.fasterxml.jackson.core","a":"jackson-databind","v":"2.18.2","p":"jar","timestamp":1744651522422,"ec":[".jar","-sources.jar"]}]}}`)

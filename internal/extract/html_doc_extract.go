@@ -4009,6 +4009,39 @@ func cleanMediaWikiMarkdownFullDocGo(rawMD string) string {
 	return strings.TrimSpace(collapseExcessBlankLinesGo(strings.Join(out, "\n")))
 }
 
+// sanitizeHTMLLangAttrFullDocGo returns the `<html lang>` value only when it has a BCP 47 shape
+// (`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`, at most 35 bytes); otherwise "". Templating leaks such as
+// `{lang}`, `[locale]`, or `<%= locale %>` are rejected. Linear scan, no regexp.
+func sanitizeHTMLLangAttrFullDocGo(raw string) string {
+	v := strings.TrimSpace(raw)
+	if len(v) < 2 || len(v) > 35 {
+		return ""
+	}
+	isAlpha := func(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+	isAlnum := func(c byte) bool { return isAlpha(c) || (c >= '0' && c <= '9') }
+	i := 0
+	for i < len(v) && isAlpha(v[i]) {
+		i++
+	}
+	if i < 2 || i > 3 {
+		return ""
+	}
+	for i < len(v) {
+		if v[i] != '-' {
+			return ""
+		}
+		i++
+		start := i
+		for i < len(v) && isAlnum(v[i]) {
+			i++
+		}
+		if n := i - start; n < 2 || n > 8 {
+			return ""
+		}
+	}
+	return v
+}
+
 // ExtractHTMLDocumentFull extracts clean GFM Markdown, metadata, links, images, branding,
 // structured JSON-LD data, and optional paginated slices from raw HTML without external DOM dependencies.
 func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedDocumentFull {
@@ -4090,7 +4123,7 @@ func ExtractHTMLDocumentFull(rawHTML string, opts FullExtractOptions) ExtractedD
 				switch tag.tagNameLower {
 				case "html":
 					if language == "" {
-						language = strings.TrimSpace(parseTagAttrsFullDocGo(tag.attrs)["lang"])
+						language = sanitizeHTMLLangAttrFullDocGo(parseTagAttrsFullDocGo(tag.attrs)["lang"])
 					}
 				case "meta":
 					attrs := parseTagAttrsFullDocGo(tag.attrs)

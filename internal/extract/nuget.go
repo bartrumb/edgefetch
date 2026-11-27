@@ -121,11 +121,13 @@ func formatNuGetRegistrationJSONGo(rawBytes []byte, params map[string]string, or
 	// Branch 1: Inlined catalogEntry leaves exist.
 	if len(entries) > 0 {
 		var selected map[string]any
+		selectedIdx := -1
 		if requestedVer != "" {
 			for i := len(entries) - 1; i >= 0; i-- {
 				v := strings.TrimSpace(jsonScalarToString(entries[i].entry["version"]))
 				if strings.EqualFold(v, requestedVer) {
 					selected = entries[i].entry
+					selectedIdx = i
 					break
 				}
 			}
@@ -133,14 +135,39 @@ func formatNuGetRegistrationJSONGo(rawBytes []byte, params map[string]string, or
 				return nil, false
 			}
 		} else {
+			// Registration leaves are ordered oldest -> newest. Prefer the newest
+			// listed STABLE release (what nuget.org shows as "latest"), then the
+			// newest listed release of any kind, then the newest leaf.
 			for i := len(entries) - 1; i >= 0; i-- {
-				if entries[i].listed {
-					selected = entries[i].entry
+				if entries[i].listed && !isNuGetPrerelease(jsonScalarToString(entries[i].entry["version"])) {
+					selectedIdx = i
 					break
 				}
 			}
-			if selected == nil {
-				selected = entries[len(entries)-1].entry
+			if selectedIdx < 0 {
+				for i := len(entries) - 1; i >= 0; i-- {
+					if entries[i].listed {
+						selectedIdx = i
+						break
+					}
+				}
+			}
+			if selectedIdx < 0 {
+				selectedIdx = len(entries) - 1
+			}
+			selected = entries[selectedIdx].entry
+		}
+
+		// A listed prerelease published after the selected version is surfaced
+		// separately so callers see both the stable line and the preview line.
+		latestPre := ""
+		if requestedVer == "" {
+			for i := len(entries) - 1; i > selectedIdx; i-- {
+				pv := strings.TrimSpace(jsonScalarToString(entries[i].entry["version"]))
+				if entries[i].listed && isNuGetPrerelease(pv) {
+					latestPre = pv
+					break
+				}
 			}
 		}
 
@@ -177,6 +204,9 @@ func formatNuGetRegistrationJSONGo(rawBytes []byte, params map[string]string, or
 		var bullets []string
 		bullets = append(bullets, "- **Install**: "+formatNuGetInlineCode("dotnet add package "+pkgIDClean+" --version "+verClean))
 		bullets = append(bullets, "- **Version**: "+formatNuGetInlineCode(verClean))
+		if latestPre != "" && !strings.EqualFold(latestPre, ver) {
+			bullets = append(bullets, "- **Latest Prerelease**: "+formatNuGetInlineCode(SanitizeScrapedMeta(latestPre)))
+		}
 		if authors != "" {
 			bullets = append(bullets, fmt.Sprintf("- **Authors**: %s", escapeDeclMarkdownBrackets(SanitizeScrapedMeta(authors))))
 		}
@@ -315,7 +345,13 @@ func formatNuGetRegistrationJSONGo(rawBytes []byte, params map[string]string, or
 		bullets = append(bullets, "- **Install**: "+formatNuGetInlineCode("dotnet add package "+pkgDisplay))
 	}
 	if latestUpper != "" {
-		bullets = append(bullets, "- **Latest Version**: "+formatNuGetInlineCode(latestUpper))
+		// Page bounds are SemVer-ordered, so a prerelease upper bound is the
+		// newest preview, not necessarily the newest stable release.
+		label := "Latest Version"
+		if isNuGetPrerelease(latestUpper) {
+			label = "Latest Prerelease"
+		}
+		bullets = append(bullets, "- **"+label+"**: "+formatNuGetInlineCode(latestUpper))
 	}
 	if totalVersions > 0 {
 		bullets = append(bullets, fmt.Sprintf("- **Total Versions**: %s", formatIntComma(totalVersions)))
@@ -387,4 +423,16 @@ func formatNuGetStringOrArray(raw any, limit int) string {
 	default:
 		return ""
 	}
+}
+
+// isNuGetPrerelease reports whether a NuGet (SemVer 2.0) version carries a
+// prerelease label, i.e. a "-" suffix on the version core. Build metadata
+// ("+sha") is ignored and does not make a version a prerelease.
+func isNuGetPrerelease(version string) bool {
+	v := strings.TrimSpace(version)
+	if plus := strings.IndexByte(v, '+'); plus >= 0 {
+		v = v[:plus]
+	}
+	dash := strings.IndexByte(v, '-')
+	return dash > 0 && dash < len(v)-1
 }

@@ -119,6 +119,86 @@ routes:
           limit: 25
           itemWrap: "`"
           join: ", "
+        # Curated claims (first values only, emitted only when present). Item-valued claims are
+        # rendered as Wikidata QIDs because entity JSON carries no labels for referenced items.
+        # P1082 (population) is intentionally omitted: its claim array is historic-first (e.g. the
+        # first Berlin value is from 1200) and the engine cannot select the preferred-rank claim.
+        instanceOf:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P31
+          subField: mainsnak.datavalue.value.id
+          itemWrap: "`"
+          join: ", "
+          limit: 8
+        sexOrGender:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P21
+          subField: mainsnak.datavalue.value.id
+          itemWrap: "`"
+          join: ", "
+          limit: 3
+        citizenship:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P27
+          subField: mainsnak.datavalue.value.id
+          itemWrap: "`"
+          join: ", "
+          limit: 5
+        occupation:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P106
+          subField: mainsnak.datavalue.value.id
+          itemWrap: "`"
+          join: ", "
+          limit: 8
+        birthDate:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P569.0.mainsnak.datavalue.value.time
+          stripPrefix: "+"
+          stripSuffix: "T00:00:00Z"
+          replaceAll:
+            from: "-00"
+            to: ""
+          sliceMax: 10
+        deathDate:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P570.0.mainsnak.datavalue.value.time
+          stripPrefix: "+"
+          stripSuffix: "T00:00:00Z"
+          replaceAll:
+            from: "-00"
+            to: ""
+          sliceMax: 10
+        inception:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P571.0.mainsnak.datavalue.value.time
+          stripPrefix: "+"
+          stripSuffix: "T00:00:00Z"
+          replaceAll:
+            from: "-00"
+            to: ""
+          sliceMax: 10
+        officialWebsite:
+          dynamicKeyPath:
+            base: entities
+            keyVar: qid
+            subPath: claims.P856.0.mainsnak.datavalue.value
+          trim: true
+          requireHttpPrefix: true
         enwikiSlug:
           dynamicKeyPath:
             base: entities
@@ -150,6 +230,30 @@ routes:
         - label: Modified
           template: "{modified}"
           whenVar: modified
+        - label: Instance Of
+          template: "{instanceOf}"
+          whenVar: instanceOf
+        - label: Sex or Gender
+          template: "{sexOrGender}"
+          whenVar: sexOrGender
+        - label: Country of Citizenship
+          template: "{citizenship}"
+          whenVar: citizenship
+        - label: Occupation
+          template: "{occupation}"
+          whenVar: occupation
+        - label: Date of Birth
+          template: "{birthDate}"
+          whenVar: birthDate
+        - label: Date of Death
+          template: "{deathDate}"
+          whenVar: deathDate
+        - label: Inception
+          template: "{inception}"
+          whenVar: inception
+        - label: Official Website
+          template: "{officialWebsite}"
+          whenVar: officialWebsite
         - label: Claim Properties
           template: "{claimProps}"
           whenVar: claimProps
@@ -162,6 +266,7 @@ routes:
       linksVars:
         - wikidataUrl
         - enwikiUrl
+        - officialWebsite
 
   # Route 2: Open Library ISBN /isbn/<isbn> (never /api/*)
   - match:
@@ -221,6 +326,17 @@ routes:
             - contributions
           join: ", "
           limit: 8
+        byStatement:
+          paths:
+            - by_statement
+          trim: true
+          sliceMax: 200
+        authorLine:
+          # by_statement names the author as printed; contributions can list illustrators/translators first.
+          template: "{byStatement}"
+          whenVars:
+            - byStatement
+          fallbackVar: contributions
         authors:
           paths:
             - authors
@@ -258,7 +374,7 @@ routes:
           sliceMax: 260
       titleTemplate: "{title}"
       descriptionVar: descShort
-      authorVar: contributions
+      authorVar: authorLine
       publishedTimeVar: publishDate
       bullets:
         - label: Subtitle
@@ -279,6 +395,9 @@ routes:
         - label: Pages
           template: "{pages}"
           whenVar: pages
+        - label: By
+          template: "{byStatement}"
+          whenVar: byStatement
         - label: Contributors
           template: "{contributions}"
           whenVar: contributions

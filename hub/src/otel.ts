@@ -36,6 +36,28 @@ export interface OtlpSpanInput {
 }
 
 export type OtlpSpanRecord = OtlpSpanInput;
+
+/**
+ * Receives each finished span at flush time so the host can re-emit it into the platform's native tracing (on
+ * Cloudflare: `tracing.enterSpan`, see `cf-native-spans.ts`). Native spans cannot be backdated, so the sink gets the
+ * real start/end in `OtlpSpanInput` and carries them as attributes.
+ */
+export type NativeSpanSink = (span: OtlpSpanInput) => void;
+
+/** Upper bound on native spans emitted per flush (one request), so a pathological request cannot flood tracing. */
+export const MAX_NATIVE_SPANS_PER_FLUSH = 128;
+
+function emitNativeSpans(sink: NativeSpanSink | undefined, batch: OtlpSpanInput[]): void {
+  if (!sink) return;
+  const n = Math.min(batch.length, MAX_NATIVE_SPANS_PER_FLUSH);
+  for (let i = 0; i < n; i++) {
+    try {
+      sink(batch[i]!);
+    } catch {
+      // Native tracing is best-effort; never let it break the request or the OTLP flush.
+    }
+  }
+}
 export type SpanAttributes = Record<string, string | number | boolean | undefined>;
 
 export interface OtelEnvConfig extends DevTelemetryEnvConfig {
@@ -1015,6 +1037,8 @@ export class RequestTracer {
     fetchFn?: typeof fetch;
     devTelemetrySetting?: string | boolean | null;
     ctx?: { waitUntil?: (p: Promise<unknown>) => void };
+    /** Also re-emit every flushed span into native platform tracing (same sampling/auth gates as OTLP). */
+    nativeSpanSink?: NativeSpanSink;
   }): Promise<boolean> {
     const batch = this.state.spans.splice(0, this.state.spans.length);
     if (batch.length === 0 || this.state.suppressed || !this.sampled) {
@@ -1026,6 +1050,8 @@ export class RequestTracer {
     if (authClass === 'unauth_rejected') {
       return false;
     }
+    // Native spans stay inside the platform (no outbound request), so they are not rate-budgeted like OTLP.
+    emitNativeSpans(params.nativeSpanSink, batch);
     const allowOtlp =
       authClass === 'authenticated'
         ? true

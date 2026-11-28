@@ -825,7 +825,7 @@ export function scrubSpanToDevErrorReport(
   }
 
   const detected = detectRuntimeEnvironment();
-  const version = normalizeSafeVersion(meta?.version ?? (typeof hubPkg?.version === 'string' ? hubPkg.version : '2.8.21'));
+  const version = normalizeSafeVersion(meta?.version ?? (typeof hubPkg?.version === 'string' ? hubPkg.version : '2.8.22'));
   const runtime = meta?.runtime && VALID_RUNTIMES.has(meta.runtime) ? meta.runtime : detected.runtime;
   const os = meta?.os ? meta.os.trim().toLowerCase() : detected.os;
   const arch = meta?.arch ? meta.arch.trim().toLowerCase() : detected.arch;

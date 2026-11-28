@@ -2,6 +2,11 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.22] - 2026-11-27
+
+### Changed
+- `search` waterfall order is now Serper, then Brave, and each later provider runs only when results are still thin. We compared providers head to head on recent, how-to, local and news queries. Ceramic's index was stale, and it returned confident off-topic results that the sparse-results waterfall never fell back from, so default search got worse after v2.8.18. Ceramic, and Cloudflare Web Search on its default Ceramic engine, now run only when named in `providers`. A Cloudflare engine an operator picked (`CLOUDFLARE_WEBSEARCH_PROVIDER=exa` or `linkup`) stays in the default chain after Brave (#121).
+
 ## [2.8.21] - 2026-11-27
 
 ### Fixed

@@ -2,6 +2,34 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.19] - 2026-11-27
+
+### Added
+- **`company` tool** and `POST /v1/company` (#114).
+  - Builds a sourced company profile from: the company website (schema.org Organization, socials); Wikidata, accepted only when its official website matches the company domain; SEC EDGAR (legal name, SIC code, latest annual revenue); GitHub; the official ATS hiring board; and, when a Google Maps MCP is connected, Google Maps place details.
+  - Every field carries its source.
+- **`salaries` tool** and `POST /v1/salaries` (#114).
+  - Every `jobs` search records the employer-posted pay ranges it returns.
+  - Ranges are aggregated by title family, seniority, location and company: p10, p25, median, p75 and p90, with sample postings.
+  - When data is thin, it tops up with a live jobs search.
+- **Google Maps (official MCP):** Google's hosted Maps MCP (`mapstools.googleapis.com/mcp`, `X-Goog-Api-Key`) is a first-party preset in MCP discovery (#114).
+- **New search providers** (#114):
+  - **Cloudflare Web Search API:** Workers AI binding or REST; Ceramic by default, or Exa or Linkup.
+  - **Ceramic.ai direct:** `CERAMIC_API_KEY`.
+  - In waterfall mode both run before Serper, the cheapest first. Neither is used for `site:`-scoped or time-range queries.
+- **Admin-managed secrets** (#114):
+  - Provider keys can be set, rotated and cleared in the admin UI as vault-encrypted overrides on top of the deployed env.
+  - Secret values are shown only as fingerprints. Bootstrap secrets stay deploy-only.
+  - Overrides apply to requests and to the crawl and ingest workflows.
+- **Access policy** (#114):
+  - Global and per-user allow/deny rules for MCP tools and `/v1` routes, including the `/v2` and compat aliases.
+  - Owners bypass tool and route policy, so the hub can't be locked out. Members fail closed if the policy store is unavailable.
+- **MCP server sharing:** connected MCP servers can be shared with everyone or with named users. Credentials stay in the owner's vault, and members never see the URL or keys. New route: `GET /v1/mcp/shared` (#114).
+- **Admin UI:** new cards for secrets and provider keys, access policy, and MCP server sharing (#114).
+
+### Security
+- `search` is a `crawl:read` tool, but its `site:` crawl, Wikipedia title guess and `include_raw_content` extraction fetched sites chosen by the caller. Those live fetches now require `crawl:fetch`, the same as `/v1/map`. A `crawl:read` token gets results from stored collections and search providers only, and the skipped options are listed in `unhonoredOptions` (#103).
+
 ## [2.8.18] - 2026-11-27
 
 ### Fixed

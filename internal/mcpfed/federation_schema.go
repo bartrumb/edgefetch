@@ -219,6 +219,13 @@ func RebuildSafeMCPInputSchema(rawNode any, depth int) (OrderedObject, bool) {
 
 // SanitizeRemoteMCPToolDefs validates and sanitizes a downstream tools/list array under a 16 KiB raw schema ceiling (H3).
 func SanitizeRemoteMCPToolDefs(rawToolsJSON []byte) SanitizedToolDefsResult {
+	return SanitizeRemoteMCPToolDefsForOrigin(rawToolsJSON, "")
+}
+
+// SanitizeRemoteMCPToolDefsForOrigin is SanitizeRemoteMCPToolDefs with the raw ceiling chosen by ToolSchemaLimitForOrigin:
+// 16 KiB (H3) for every server except verified first-party preset origins.
+func SanitizeRemoteMCPToolDefsForOrigin(rawToolsJSON []byte, origin string) SanitizedToolDefsResult {
+	maxBytes := ToolSchemaLimitForOrigin(origin)
 	parsedAny, err := ParseOrderedJSON(rawToolsJSON, 32)
 	if err != nil {
 		return SanitizedToolDefsResult{Tools: []CachedMCPToolSchema{}, PromptInjectionScrubbed: false}
@@ -229,7 +236,7 @@ func SanitizeRemoteMCPToolDefs(rawToolsJSON []byte) SanitizedToolDefsResult {
 	}
 
 	compactTotal, err := MarshalUnescapedJSON(arr)
-	if err != nil || len(compactTotal) > MaxMCPToolSchemaBytes {
+	if err != nil || len(compactTotal) > maxBytes {
 		return SanitizedToolDefsResult{Tools: []CachedMCPToolSchema{}, PromptInjectionScrubbed: false, OversizedRejected: true}
 	}
 
@@ -246,7 +253,7 @@ func SanitizeRemoteMCPToolDefs(rawToolsJSON []byte) SanitizedToolDefsResult {
 			continue
 		}
 		itemBytes, err := MarshalUnescapedJSON(tObj)
-		if err != nil || len(itemBytes) > MaxMCPToolSchemaBytes {
+		if err != nil || len(itemBytes) > maxBytes {
 			return SanitizedToolDefsResult{Tools: []CachedMCPToolSchema{}, PromptInjectionScrubbed: false, OversizedRejected: true}
 		}
 

@@ -52,6 +52,39 @@ func firstPartyPresets() []firstPartyPreset {
 	}
 }
 
+// FirstPartyMaxToolSchemaBytes is the raw tools/list ceiling for verified first-party preset origins. Vendor-hosted
+// servers such as Google's Maps MCP publish richer schemas than the 16 KiB default allows; sanitization still caps
+// every stored description and rebuilds every input schema from the allowlist, so only parse work grows.
+const FirstPartyMaxToolSchemaBytes = 128 * 1024
+
+// IsFirstPartyMCPOrigin reports whether origin (scheme://host[:port]) is the remote origin of a first-party preset.
+func IsFirstPartyMCPOrigin(origin string) bool {
+	o := strings.TrimRight(strings.ToLower(strings.TrimSpace(origin)), "/")
+	if o == "" {
+		return false
+	}
+	for _, p := range firstPartyPresets() {
+		for _, r := range p.entry.Remotes {
+			u := strings.ToLower(r.URL)
+			if idx := strings.Index(u[len("https://"):], "/"); strings.HasPrefix(u, "https://") && idx >= 0 {
+				if u[:len("https://")+idx] == o {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// ToolSchemaLimitForOrigin is the raw tools/list byte ceiling for a remote origin: FirstPartyMaxToolSchemaBytes for
+// verified first-party presets, MaxMCPToolSchemaBytes (16 KiB, H3) for every other server.
+func ToolSchemaLimitForOrigin(origin string) int {
+	if IsFirstPartyMCPOrigin(origin) {
+		return FirstPartyMaxToolSchemaBytes
+	}
+	return MaxMCPToolSchemaBytes
+}
+
 // FirstPartyRegistryEntries returns every first-party preset (for listings and tests).
 func FirstPartyRegistryEntries() []NormalizedMCPRegistryEntry {
 	presets := firstPartyPresets()

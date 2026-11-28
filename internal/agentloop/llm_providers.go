@@ -123,6 +123,13 @@ func nonNilMap(m map[string]any) map[string]any {
 	return m
 }
 
+// IsClaudeModelID reports whether an OpenAI-compatible model id routes to Anthropic Claude (e.g. OpenRouter
+// "anthropic/claude-haiku-5.5"). Such requests omit temperature, which current Claude models reject.
+func IsClaudeModelID(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "anthropic/") || strings.HasPrefix(m, "claude-") || strings.Contains(m, "/claude-")
+}
+
 // BuildWorkersAIInput constructs the input payload for Cloudflare Workers AI env.AI.run(model, inputs).
 func BuildWorkersAIInput(params LLMProviderTurnParams) map[string]any {
 	temp := 0.1
@@ -220,11 +227,12 @@ func BuildProviderHTTPRequest(params LLMProviderTurnParams) (*ProviderHTTPReques
 				})
 			}
 		}
+		// No sampling params: current Claude models reject non-default temperature/top_p/top_k with a 400
+		// ("`temperature` is deprecated for this model."), and newer API versions reject them on every model.
 		bodyMap := map[string]any{
-			"model":       cfg.Model,
-			"max_tokens":  maxTok,
-			"temperature": temp,
-			"messages":    anthMsgs,
+			"model":      cfg.Model,
+			"max_tokens": maxTok,
+			"messages":   anthMsgs,
 		}
 		if len(sysParts) > 0 {
 			bodyMap["system"] = strings.Join(sysParts, "\n\n")
@@ -381,7 +389,9 @@ func BuildProviderHTTPRequest(params LLMProviderTurnParams) (*ProviderHTTPReques
 				bodyMap["format"] = "json"
 			}
 		} else {
-			bodyMap["temperature"] = temp
+			if !IsClaudeModelID(cfg.Model) {
+				bodyMap["temperature"] = temp
+			}
 			bodyMap["max_tokens"] = maxTok
 			if params.JSONMode && len(params.Tools) == 0 {
 				bodyMap["response_format"] = map[string]any{"type": "json_object"}

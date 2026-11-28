@@ -38,6 +38,8 @@ export const MAX_MCP_BLOCK_TEXT_CHARS = 64 * 1024;
 export const MAX_MCP_LINK_LABEL_CHARS = 512;
 export const MAX_MCP_LINK_TARGET_CHARS = 2048;
 export const MAX_MCP_TOOL_SCHEMA_BYTES = 16 * 1024;
+/** Absolute raw tools/list pre-check ceiling; Go applies the per-origin limit (16 KiB except first-party presets). */
+const MAX_FIRST_PARTY_MCP_TOOL_SCHEMA_BYTES = 128 * 1024;
 export const REMOTE_MCP_TIMEOUT_MS = 25_000;
 export const MAX_CONCURRENT_MCP_CALLS_PER_USER = 8;
 export const MAX_STRUCTURED_SANITIZE_DEPTH = 12;
@@ -333,7 +335,11 @@ export function rebuildSafeMcpInputSchema(
   });
 }
 
-export function sanitizeRemoteMcpToolDefs(rawTools: unknown): {
+export function sanitizeRemoteMcpToolDefs(
+  rawTools: unknown,
+  /** Pinned remote origin; verified first-party preset origins (Go `IsFirstPartyMCPOrigin`) get a 128 KiB ceiling. */
+  origin?: string,
+): {
   tools: CachedMcpToolSchema[];
   promptInjectionScrubbed: boolean;
   oversizedRejected?: boolean;
@@ -345,14 +351,14 @@ export function sanitizeRemoteMcpToolDefs(rawTools: unknown): {
   } catch {
     return { tools: [], promptInjectionScrubbed: false, oversizedRejected: true };
   }
-  if (serialized.length > MAX_MCP_TOOL_SCHEMA_BYTES) {
+  if (serialized.length > (origin ? MAX_FIRST_PARTY_MCP_TOOL_SCHEMA_BYTES : MAX_MCP_TOOL_SCHEMA_BYTES)) {
     return { tools: [], promptInjectionScrubbed: false, oversizedRejected: true };
   }
   return callCoreWasmRaw<{
     tools: CachedMcpToolSchema[];
     promptInjectionScrubbed: boolean;
     oversizedRejected?: boolean;
-  }>('mcp_fed_sanitize_tool_defs', {}, serialized);
+  }>('mcp_fed_sanitize_tool_defs', origin ? { origin } : {}, serialized);
 }
 
 async function readBoundedBytes(
@@ -934,7 +940,7 @@ export async function testAndListRemoteMcpTools(params: {
 
   const resultObj =
     listRes.rpc?.result && typeof listRes.rpc.result === 'object' ? (listRes.rpc.result as Record<string, unknown>) : {};
-  const { tools, promptInjectionScrubbed, oversizedRejected } = sanitizeRemoteMcpToolDefs(resultObj.tools);
+  const { tools, promptInjectionScrubbed, oversizedRejected } = sanitizeRemoteMcpToolDefs(resultObj.tools, urlCheck.origin);
   if (oversizedRejected) {
     return {
       ok: false,

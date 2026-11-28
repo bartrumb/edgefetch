@@ -684,7 +684,13 @@ func handlePhase2McpRawRPC(op string, meta json.RawMessage, rawStr string) (any,
 		}), true, nil
 
 	case "mcp_fed_sanitize_tool_defs":
-		return mcpfed.SanitizeRemoteMCPToolDefs([]byte(rawStr)), true, nil
+		var m struct {
+			Origin string `json:"origin"`
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &m)
+		}
+		return mcpfed.SanitizeRemoteMCPToolDefsForOrigin([]byte(rawStr), m.Origin), true, nil
 
 	case "mcp_fed_parse_sse_rpc":
 		var m struct {

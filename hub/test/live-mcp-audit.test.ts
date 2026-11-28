@@ -970,8 +970,8 @@ test('B.5 & B.6: fetch_batch maps 404->not_found vs 410->gone, normalizes SSRF r
   });
 });
 
-test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8.22, subscriptions/listen ends gracefully, all 19 tool descriptions are jargon-free, and search inputSchema is deduplicated', async () => {
-  assert.equal(HUB_VERSION, '2.8.22');
+test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged: false + 2.8.23, subscriptions/listen ends gracefully, all 19 tool descriptions are jargon-free, and search inputSchema is deduplicated', async () => {
+  assert.equal(HUB_VERSION, '2.8.23');
   const mcpDeps: McpServerDeps = {
     serverName: 'edgefetch-mcp',
     serverVersion: HUB_VERSION,

@@ -2,6 +2,15 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.21] - 2026-11-27
+
+### Fixed
+- `agent` failed on every call with Claude Haiku 5.5 ("`temperature` is deprecated for this model."). Anthropic requests no longer send `temperature`, and neither do OpenAI-compatible requests for Claude model ids such as OpenRouter `anthropic/*`. Other models still send it (#119).
+- The Google Maps MCP preset can now connect. Its `tools/list` exceeded the 16 KiB schema ceiling, so first-party preset origins (an exact `https://` origin match) now get 128 KiB. Every other remote MCP server keeps the 16 KiB limit, and descriptions and schemas are still sanitized (#119).
+
+### Changed
+- The `search` tool's `providers` enum now lists `cloudflare` and `ceramic` (#119).
+
 ## [2.8.20] - 2026-11-27
 
 ### Fixed

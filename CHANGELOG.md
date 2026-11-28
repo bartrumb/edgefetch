@@ -2,6 +2,12 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.20] - 2026-11-27
+
+### Fixed
+- LLM default models: the Anthropic default was the retired `claude-3-5-haiku-latest`, so every `agent` call failed when only `ANTHROPIC_API_KEY` was set. Anthropic now defaults to `claude-haiku-5-5`, and OpenRouter to `anthropic/claude-haiku-5.5`. Set `EDGEFETCH_LLM_MODEL` to override either (#117).
+- `GOOGLE_MAPS_API_KEY` (admin-managed secret) now works. When the caller has no Google Maps MCP connected, `company` uses it to call Google Places API (New) Text Search for headquarters details. A connected Maps MCP still takes precedence (#117).
+
 ## [2.8.19] - 2026-11-27
 
 ### Added

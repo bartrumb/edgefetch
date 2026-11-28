@@ -2,6 +2,14 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.23] - 2026-11-27
+
+### Added
+- EdgeFetch's own tracer spans now reach Cloudflare Workers native tracing. That covers search providers, the search cache, the agent router, MCP federation and the rest. Until now only `edgefetch.dispatch` used `tracing.enterSpan`, so every other span was exported only over OTLP and was dropped when no endpoint was configured. Each flushed span is re-emitted under the same sampling and unauthenticated-rejection gates as OTLP, capped at 128 per request. Native spans start when they are emitted, so the real timing is in the `edgefetch.span.start_ms` and `edgefetch.span.duration_ms` attributes. Set `EDGEFETCH_CF_NATIVE_SPANS=off` to disable (#123).
+
+### Changed
+- Direct searches now default to `rrf` when both Serper and Brave are configured: the MCP `search` tool, `/v1/search`, and the Firecrawl and Tavily compat search endpoints. Both providers run in parallel and the rankings are fused. In live tests this beat either provider alone and recovered official pages that one provider had dropped. The agent loop and `jobs` keep the Serper-first waterfall, so they never queue behind Brave's 1 request per second pacing. An explicit `mode`, `providers` or `federate` still wins, and `SEARCH_DEFAULT_MODE=waterfall` restores the waterfall everywhere (#123).
+
 ## [2.8.22] - 2026-11-27
 
 ### Changed

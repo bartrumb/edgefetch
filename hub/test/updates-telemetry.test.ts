@@ -157,7 +157,7 @@ test('Pillar 4 & 5: /admin Update Pill + POST /admin/api/telemetry CSRF toggle +
     };
     assert.equal(st0.devTelemetry?.enabled, false);
     assert.equal(st0.devTelemetry?.source, 'default_off');
-    assert.ok(st0.updateStatus?.pillLabel.includes('v2.8.22'));
+    assert.ok(st0.updateStatus?.pillLabel.includes('v2.8.23'));
 
     // POST /admin/api/telemetry without CSRF -> 403
     const badCsrf = await hubWorker.fetch(

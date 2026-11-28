@@ -82,7 +82,7 @@ import {
   type CatalogCallPayload,
   type CatalogHubFetchFn,
 } from './catalog';
-import { executeCompanyCall, type CompanyToolPayload } from './company';
+import { executeCompanyCall, searchPlacesWithApiKey, type CompanyToolPayload } from './company';
 import { executeSalariesCall, type SalariesToolPayload } from './salaries';
 /** Slug of Google's official hosted Maps MCP preset (Go `mcpfed.GoogleMapsMCPSlug`). */
 const GOOGLE_MAPS_MCP_SLUG = 'google-maps';
@@ -246,6 +246,8 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   CLOUDFLARE_WEBSEARCH_PROVIDER?: string;
   CLOUDFLARE_WEBSEARCH_BYOK_ALIAS?: string;
   CERAMIC_API_KEY?: string;
+  /** Google Maps Platform key for Places API (New) Text Search in the `company` tool (admin-managed secret). */
+  GOOGLE_MAPS_API_KEY?: string;
   WEBHOOK_SECRET?: string;
   EDGEFETCH_PUBLIC_ORIGIN?: string;
   EDGEFETCH_DISABLE_UPDATE_CHECK?: string;
@@ -1953,7 +1955,7 @@ export default {
         const activeScopes = getActiveCallerAuthContext()?.scopes ?? [];
         // Google Maps enrichment calls the caller's own connected Maps MCP, so it needs the same `mcp:call` scope.
         const mayCallMcp = activeScopes.length === 0 || activeScopes.includes('mcp:call');
-        const callMapsPlaces = mayCallMcp
+        const viaMapsMcp = mayCallMcp
           ? async (query: string): Promise<string | null> => {
               const listed = await executeFederatedMcpQuery({
                 userId: callerUserId,
@@ -1990,6 +1992,17 @@ export default {
               return JSON.stringify(res);
             }
           : undefined;
+        // A connected Google Maps MCP wins; otherwise the hub's own GOOGLE_MAPS_API_KEY (admin-managed secret) calls
+        // Places API (New) Text Search directly.
+        const mapsApiKey = typeof env.GOOGLE_MAPS_API_KEY === 'string' ? env.GOOGLE_MAPS_API_KEY.trim() : '';
+        const callMapsPlaces =
+          viaMapsMcp || mapsApiKey
+            ? async (query: string): Promise<string | null> => {
+                const fromMcp = viaMapsMcp ? await viaMapsMcp(query).catch(() => null) : null;
+                if (fromMcp) return fromMcp;
+                return mapsApiKey ? searchPlacesWithApiKey({ apiKey: mapsApiKey, query, fetchFn: safePublicFetch }) : null;
+              }
+            : undefined;
         return {
           company: (args: Record<string, unknown>) =>
             executeCompanyCall({

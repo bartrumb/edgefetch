@@ -182,6 +182,55 @@ function summarizeHiring(body: Record<string, unknown>): Record<string, unknown>
   };
 }
 
+const PLACES_TEXT_SEARCH_URL = 'https://places.googleapis.com/v1/places:searchText';
+const PLACES_FIELD_MASK = [
+  'places.displayName',
+  'places.formattedAddress',
+  'places.location',
+  'places.googleMapsUri',
+  'places.nationalPhoneNumber',
+  'places.internationalPhoneNumber',
+  'places.rating',
+  'places.userRatingCount',
+  'places.websiteUri',
+  'places.types',
+].join(',');
+
+/**
+ * Google Places API (New) Text Search with the hub's own `GOOGLE_MAPS_API_KEY` (admin-managed secret). Used by the
+ * `company` tool when the caller has no Google Maps MCP connected. Returns the raw `{places:[...]}` JSON text (the
+ * shape Go `company.Merge` parses), or null on any failure. Billed to the key's Google Cloud project.
+ */
+export async function searchPlacesWithApiKey(params: {
+  apiKey: string;
+  query: string;
+  fetchFn: typeof fetch;
+  timeoutMs?: number;
+}): Promise<string | null> {
+  const query = params.query.trim().slice(0, 300);
+  if (!query || !params.apiKey.trim()) return null;
+  try {
+    const resp = await params.fetchFn(PLACES_TEXT_SEARCH_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-goog-api-key': params.apiKey.trim(),
+        'x-goog-fieldmask': PLACES_FIELD_MASK,
+      },
+      body: JSON.stringify({ textQuery: query, pageSize: 5 }),
+      signal: AbortSignal.timeout(params.timeoutMs ?? 10_000),
+    });
+    if (!resp.ok) {
+      await resp.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    const text = await readTextBounded(resp, 2 * 1024 * 1024);
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function executeCompanyCall(params: {
   payload: CompanyToolPayload;
   deps: CompanyDeps;

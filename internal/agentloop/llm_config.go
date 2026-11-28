@@ -37,8 +37,8 @@ var defaultModels = map[LLMProvider]string{
 	ProviderOllama:     "qwen2.5:7b",
 	ProviderLMStudio:   "local-model",
 	ProviderVLLM:       "Qwen/Qwen2.5-7B-Instruct",
-	ProviderOpenRouter: "openai/gpt-4o-mini",
-	ProviderAnthropic:  "claude-3-5-haiku-latest",
+	ProviderOpenRouter: "anthropic/claude-haiku-5.5",
+	ProviderAnthropic:  "claude-haiku-5-5",
 	ProviderGemini:     "gemini-2.5-flash",
 	ProviderWorkersAI:  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
 }

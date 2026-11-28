@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 
-import { executeCompanyCall } from '../src/company';
+import { executeCompanyCall, searchPlacesWithApiKey } from '../src/company';
 import { executeJobsCall, resetJobsCacheForTests } from '../src/jobs';
 import { executeSalariesCall, recordSalaryObservations } from '../src/salaries';
 import { NodeSqliteD1Database } from './stubs/cf-storage-mocks';
@@ -203,4 +203,46 @@ test('VERT-3: executeJobsCall records pay observations for salaries', async () =
     metaDb.close();
     rmSync(workDir, { recursive: true, force: true });
   }
+});
+
+test('VERT-4: GOOGLE_MAPS_API_KEY calls Places API (New) Text Search and the place lands in the company profile', async () => {
+  const seen: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const u = String(input);
+    seen.push({ url: u, headers: new Headers(init?.headers), body: JSON.parse(String(init?.body ?? '{}')) });
+    if (u === 'https://places.googleapis.com/v1/places:searchText') {
+      return Response.json({
+        places: [
+          { displayName: { text: 'Acme Widgets HQ' }, formattedAddress: '1 Widget Way, Springfield, IL', websiteUri: 'https://www.acmewidgets.com/', googleMapsUri: 'https://maps.google.com/?cid=7', rating: 4.6, userRatingCount: 88 },
+        ],
+      });
+    }
+    return new Response('not found', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const text = await searchPlacesWithApiKey({ apiKey: 'maps-test-key', query: 'Acme Widgets headquarters', fetchFn });
+  assert.ok(text && text.includes('Acme Widgets HQ'));
+  const call = seen[0]!;
+  assert.equal(call.url, 'https://places.googleapis.com/v1/places:searchText');
+  assert.equal(call.headers.get('x-goog-api-key'), 'maps-test-key');
+  assert.match(String(call.headers.get('x-goog-fieldmask')), /places\.formattedAddress/);
+  assert.equal(call.body.textQuery, 'Acme Widgets headquarters');
+  assert.equal(call.body.pageSize, 5);
+
+  const res = await executeCompanyCall({
+    payload: { name: 'Acme Widgets', domain: 'acmewidgets.com', includeHiring: false },
+    deps: {
+      scrapePage: async () => ({ status: 404, body: { ok: false } }),
+      fetchFn,
+      callMapsPlaces: (q) => searchPlacesWithApiKey({ apiKey: 'maps-test-key', query: q, fetchFn }),
+    },
+  });
+  assert.equal(res.status, 200);
+  const p = res.body as Record<string, any>;
+  assert.equal(p.googleMaps, 'used');
+  assert.equal(p.place?.name, 'Acme Widgets HQ');
+
+  // Failures (bad key / quota) degrade to no place, never an error.
+  const failing = (async () => new Response('denied', { status: 403 })) as unknown as typeof fetch;
+  assert.equal(await searchPlacesWithApiKey({ apiKey: 'bad', query: 'x', fetchFn: failing }), null);
 });

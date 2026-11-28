@@ -6109,7 +6109,16 @@ test('R26: Cloudflare Web Search API provider (REST + Workers AI binding), skipp
     },
     CLOUDFLARE_AI_GATEWAY_ID: 'my-gateway',
   };
-  const viaBinding = await executeSearchCall({ payload: { query: 'edge compute basics' }, env: bindingEnv as never, executeHubFetch, providerFetchFn });
+  // With the default (Ceramic) engine, Cloudflare Web Search is opt-in: a plain query never calls it.
+  await executeSearchCall({ payload: { query: 'edge compute basics' }, env: bindingEnv as never, executeHubFetch, providerFetchFn });
+  assert.equal(bindingCalls.length, 0, 'default-engine Cloudflare Web Search is not in the default waterfall');
+  resetSearchProviderPacingForTests();
+  const viaBinding = await executeSearchCall({
+    payload: { query: 'edge compute basics', providers: ['cloudflare'] },
+    env: bindingEnv as never,
+    executeHubFetch,
+    providerFetchFn,
+  });
   assert.equal(viaBinding.status, 200);
   assert.equal(bindingCalls.length, 1);
   assert.equal(bindingCalls[0]!.gatewayId, 'my-gateway');
@@ -6117,7 +6126,7 @@ test('R26: Cloudflare Web Search API provider (REST + Workers AI binding), skipp
   assert.equal(calls.filter((c) => c.url.includes('/ai/websearch/')).length, 0, 'binding path issues no REST call');
 });
 
-test('R27: direct Ceramic.ai search provider (word-clamped query, result.results), skips site: queries and avoids a duplicate Cloudflare/Ceramic call', async () => {
+test('R27: direct Ceramic.ai search provider is opt-in (word-clamped query, result.results), skips site: queries and avoids a duplicate Cloudflare/Ceramic call', async () => {
   resetSearchProviderPacingForTests();
   const calls: Array<{ url: string; auth: string | null; body: Record<string, unknown> }> = [];
   const providerFetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -6144,7 +6153,12 @@ test('R27: direct Ceramic.ai search provider (word-clamped query, result.results
   };
   const longQuery = Array.from({ length: 70 }, (_, i) => `w${i}`).join(' ');
 
-  const res = await executeSearchCall({ payload: { query: longQuery }, env: env as never, executeHubFetch, providerFetchFn });
+  // Not in the default waterfall: a query without `providers` never calls Ceramic (or Cloudflare's Ceramic engine).
+  await executeSearchCall({ payload: { query: 'edge compute basics' }, env: env as never, executeHubFetch, providerFetchFn });
+  assert.equal(calls.length, 0, 'Ceramic and default-engine Cloudflare are opt-in');
+  resetSearchProviderPacingForTests();
+
+  const res = await executeSearchCall({ payload: { query: longQuery, providers: ['ceramic', 'cloudflare'] }, env: env as never, executeHubFetch, providerFetchFn });
   assert.equal(res.status, 200, JSON.stringify(res.body).slice(0, 300));
   const ceramic = calls.find((c) => c.url === 'https://api.ceramic.ai/search')!;
   assert.ok(ceramic, 'Ceramic called directly');
@@ -6156,6 +6170,47 @@ test('R27: direct Ceramic.ai search provider (word-clamped query, result.results
 
   calls.length = 0;
   resetSearchProviderPacingForTests();
-  await executeSearchCall({ payload: { query: 'site:jobs.ashbyhq.com engineer' }, env: env as never, executeHubFetch, providerFetchFn });
+  await executeSearchCall({ payload: { query: 'site:jobs.ashbyhq.com engineer', providers: ['ceramic'] }, env: env as never, executeHubFetch, providerFetchFn });
   assert.equal(calls.filter((c) => c.url === 'https://api.ceramic.ai/search').length, 0, 'site: queries never go to Ceramic');
+});
+
+test('R28: default waterfall is Serper -> Brave (only when Serper is thin); Ceramic never runs without providers', async () => {
+  resetSearchProviderPacingForTests();
+  let serperHits = 4;
+  const calls: string[] = [];
+  const providerFetchFn = (async (input: RequestInfo | URL) => {
+    const u = String(input);
+    calls.push(u);
+    if (u.startsWith('https://google.serper.dev/search')) {
+      return Response.json({
+        organic: Array.from({ length: serperHits }, (_, i) => ({ link: `https://serper.example/r${i}`, title: `S${i}`, snippet: 's' })),
+      });
+    }
+    if (u.startsWith('https://api.search.brave.com/')) {
+      return Response.json({ web: { results: [{ url: 'https://brave.example/r0', title: 'B0', description: 'b' }] } });
+    }
+    if (u === 'https://api.ceramic.ai/search') {
+      return Response.json({ result: { results: [{ url: 'https://ceramic.example/r0', title: 'C0', description: 'c' }] } });
+    }
+    return new Response('{}', { status: 404 });
+  }) as unknown as typeof fetch;
+  const executeHubFetch = async () => ({ status: 200, via: 'cf', bodyText: JSON.stringify({ results: [] }) });
+  const env = { SERPER_API_KEY: 'serper-k', BRAVE_API_KEY: 'brave-k', CERAMIC_API_KEY: 'ceramic-k' };
+  const hit = (prefix: string) => calls.filter((c) => c.startsWith(prefix)).length;
+
+  const full = await executeSearchCall({ payload: { query: 'go release notes' }, env: env as never, executeHubFetch, providerFetchFn });
+  assert.equal(full.status, 200, JSON.stringify(full.body).slice(0, 300));
+  assert.equal(full.via, 'serper');
+  assert.ok(((full.body.results as Array<{ url: string }>) ?? []).every((r) => r.url.startsWith('https://serper.example/')));
+  assert.equal(hit('https://google.serper.dev/'), 1, 'Serper is primary');
+  assert.equal(hit('https://api.search.brave.com/'), 0, 'Brave not called when Serper satisfies');
+  assert.equal(hit('https://api.ceramic.ai/'), 0, 'Ceramic not in the default waterfall');
+
+  calls.length = 0;
+  serperHits = 0;
+  resetSearchProviderPacingForTests();
+  await executeSearchCall({ payload: { query: 'rare long tail query', noCache: true }, env: env as never, executeHubFetch, providerFetchFn });
+  assert.equal(hit('https://google.serper.dev/'), 1);
+  assert.equal(hit('https://api.search.brave.com/'), 1, 'Brave fills in when Serper is thin');
+  assert.equal(hit('https://api.ceramic.ai/'), 0, 'still no Ceramic without providers');
 });

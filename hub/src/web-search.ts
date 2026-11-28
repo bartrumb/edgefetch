@@ -1165,24 +1165,29 @@ export async function executeSearchCall(params: {
     (explicitProviders === null || explicitProviders.has('tavily'));
   const hasSearxng = Boolean(env.SEARXNG_URL?.trim()) && (explicitProviders === null || explicitProviders.has('searxng'));
   // Cloudflare Web Search documents no domain/date filters or `site:` support: only offer it for unscoped queries.
+  // With its default Ceramic engine it is opt-in only (`providers: ["cloudflare"]`), like direct Ceramic below. An
+  // operator-chosen engine (CLOUDFLARE_WEBSEARCH_PROVIDER=exa / linkup) stays in the default fallback chain.
+  const cloudflareEngine = (env.CLOUDFLARE_WEBSEARCH_PROVIDER ?? '').trim().toLowerCase() || 'ceramic';
   const hasCloudflare =
     hasCloudflareWebSearch(env) &&
-    (explicitProviders === null || explicitProviders.has('cloudflare')) &&
+    (explicitProviders === null ? cloudflareEngine !== 'ceramic' : explicitProviders.has('cloudflare')) &&
     rawMode !== 'serper' &&
     includeDomains.length === 0 &&
     !/\bsite:/i.test(query) &&
     !timeRange;
-  // Ceramic.ai direct: same unscoped-only rule as Cloudflare Web Search (no documented domain/date filters).
+  // Ceramic.ai direct: opt-in only (`providers: ["ceramic"]`). In a head-to-head on recent, how-to, local and news
+  // queries its index was stale and it returned confident off-topic hits, which the sparse-results waterfall never
+  // falls back from. Same unscoped-only rule as Cloudflare Web Search (no documented domain/date filters).
   const hasCeramic =
     Boolean(env.CERAMIC_API_KEY?.trim()) &&
-    (explicitProviders === null || explicitProviders.has('ceramic')) &&
+    explicitProviders !== null &&
+    explicitProviders.has('ceramic') &&
     rawMode !== 'serper' &&
     includeDomains.length === 0 &&
     !/\bsite:/i.test(query) &&
     !timeRange;
   // Cloudflare Web Search defaults to the Ceramic engine; skip it when Ceramic is called directly unless it is set to
   // a different engine (Exa / Linkup) or the direct call fails.
-  const cloudflareEngine = (env.CLOUDFLARE_WEBSEARCH_PROVIDER ?? '').trim().toLowerCase() || 'ceramic';
   const cloudflareDuplicatesCeramic = hasCeramic && cloudflareEngine === 'ceramic';
   const hasExternalProvider = hasSerper || hasBrave || hasTavily || hasSearxng || hasCloudflare || hasCeramic;
   const hasD1Search = Boolean(env.SEARCH);
@@ -1549,20 +1554,15 @@ export async function executeSearchCall(params: {
     };
 
     if (waterfallMode) {
-      // Cheapest first (Ceramic ~$0.25 / 1k, zero data retention); Serper fills in when results are thin.
-      await callCeramic();
-      if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
-        await callCloudflare();
-      }
-      if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
-        await callSerper();
-      }
-      if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
-        await callSearxng();
-      }
-      if (countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits) {
-        await callBrave();
-      }
+      // Quality first: Serper (freshest, best on news), then Brave (close second, richer snippets), then the opt-in
+      // Ceramic / Cloudflare engines and SearXNG, each only when results are still thin.
+      const thin = () =>
+        countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains, edgeMapSpec.sitePrefixes) < minSatisfiedHits;
+      await callSerper();
+      if (thin()) await callBrave();
+      if (thin()) await callCeramic();
+      if (thin()) await callCloudflare();
+      if (thin()) await callSearxng();
     } else {
       await Promise.all([callCeramic(), callSerper(), callBrave(), callSearxng()]);
       await callCloudflare();

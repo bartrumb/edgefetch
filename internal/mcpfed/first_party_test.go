@@ -1,6 +1,9 @@
 package mcpfed
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPrependFirstPartyPresetsGoogleMaps(t *testing.T) {
 	community := NormalizedMCPRegistryEntry{
@@ -37,5 +40,32 @@ func TestPrependFirstPartyPresetsGoogleMaps(t *testing.T) {
 	}
 	if len(FirstPartyRegistryEntries()) == 0 {
 		t.Fatal("expected at least one first-party preset")
+	}
+}
+
+func TestToolSchemaLimitForOrigin(t *testing.T) {
+	if got := ToolSchemaLimitForOrigin("https://mapstools.googleapis.com"); got != FirstPartyMaxToolSchemaBytes {
+		t.Fatalf("first-party origin limit = %d", got)
+	}
+	for _, o := range []string{"", "https://evil.example.com", "https://mapstools.googleapis.com.evil.example", "http://mapstools.googleapis.com", "https://maps.googleapis.com"} {
+		if got := ToolSchemaLimitForOrigin(o); got != MaxMCPToolSchemaBytes {
+			t.Fatalf("origin %q must keep the 16 KiB H3 limit, got %d", o, got)
+		}
+	}
+}
+
+func TestSanitizeRemoteToolDefsFirstPartyLargeSchema(t *testing.T) {
+	// ~40 KiB tools/list: rejected for any server, accepted for the first-party Maps origin, and still sanitized.
+	desc := strings.Repeat("Search for places by text query. ", 600)
+	raw := []byte(`[{"name":"search_places","description":"` + desc + `","inputSchema":{"type":"object","properties":{"textQuery":{"type":"string"}},"required":["textQuery"]}}]`)
+	if r := SanitizeRemoteMCPToolDefsForOrigin(raw, "https://other.example.com"); !r.OversizedRejected {
+		t.Fatal("non-first-party origin must reject > 16 KiB")
+	}
+	r := SanitizeRemoteMCPToolDefsForOrigin(raw, "https://mapstools.googleapis.com")
+	if r.OversizedRejected || len(r.Tools) != 1 || r.Tools[0].Name != "search_places" {
+		t.Fatalf("first-party origin must accept and sanitize, got %+v", r)
+	}
+	if len(r.Tools[0].Description) > 260 {
+		t.Fatalf("description must still be capped by sanitization, got %d chars", len(r.Tools[0].Description))
 	}
 }

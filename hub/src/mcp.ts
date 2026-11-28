@@ -967,7 +967,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           providers: {
             type: 'array',
-            items: { type: 'string', enum: ['serper', 'brave', 'searxng', 'tavily'] },
+            items: { type: 'string', enum: ['serper', 'brave', 'searxng', 'tavily', 'cloudflare', 'ceramic'] },
             description: 'Optional allowlist of search providers to use.',
           },
           collectionId: { type: 'string', description: 'Optional indexed collection ID to merge into search results.' },

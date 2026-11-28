@@ -4747,7 +4747,9 @@
                 "serper",
                 "brave",
                 "searxng",
-                "tavily"
+                "tavily",
+                "cloudflare",
+                "ceramic"
               ]
             },
             "description": "Optional allowlist of search providers to use."
@@ -7161,7 +7163,9 @@
                 "serper",
                 "brave",
                 "searxng",
-                "tavily"
+                "tavily",
+                "cloudflare",
+                "ceramic"
               ]
             },
             "description": "Optional allowlist of search providers to use."

@@ -11,6 +11,8 @@
  *    host ZERO inbound endpoints.
  */
 import { DurableObject, tracing } from 'cloudflare:workers';
+
+import { cloudflareNativeSpanSink } from './cf-native-spans';
 import {
   ACTIVITY_SQLITE_SCHEMA,
   buildCrawlActivityEvents,
@@ -246,6 +248,8 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
   CLOUDFLARE_WEBSEARCH_PROVIDER?: string;
   CLOUDFLARE_WEBSEARCH_BYOK_ALIAS?: string;
   CERAMIC_API_KEY?: string;
+  /** `off` stops re-emitting EdgeFetch tracer spans into Cloudflare native tracing (`cf-native-spans.ts`). */
+  EDGEFETCH_CF_NATIVE_SPANS?: string;
   /** Google Maps Platform key for Places API (New) Text Search in the `company` tool (admin-managed secret). */
   GOOGLE_MAPS_API_KEY?: string;
   WEBHOOK_SECRET?: string;
@@ -1366,7 +1370,8 @@ export default {
 
     const flushTracerWithTelemetry = async (tracer: RequestTracer): Promise<boolean> => {
       const devTelemetrySetting = await getCachedDevTelemetrySetting();
-      return tracer.flush({ env, fetchFn: env.SAFE_FETCH, devTelemetrySetting });
+      const nativeSpanSink = cloudflareNativeSpanSink(env);
+      return tracer.flush({ env, fetchFn: env.SAFE_FETCH, devTelemetrySetting, ...(nativeSpanSink ? { nativeSpanSink } : {}) });
     };
 
     const trackedCtx: ExecutionContext | undefined = ctx
@@ -2488,6 +2493,7 @@ export default {
               env,
               executeHubFetch,
               source: `mcp-search:${principal ?? 'client'}`,
+              defaultMode: 'rrf',
               userId,
               // search is a crawl:read tool, but its site crawl and raw-content extraction fetch caller-chosen sites,
               // which every other route requires crawl:fetch for. Unknown scopes = no live fetch.
@@ -4036,6 +4042,7 @@ export default {
             env,
             executeHubFetch,
             source: `search:${auth.principal}`,
+            defaultMode: 'rrf',
             userId: auth.userId,
             // crawl:read may search; only crawl:fetch may make the hub fetch caller-chosen sites (as /v1/map requires).
             allowLiveFetch: auth.scopes.includes('crawl:fetch'),

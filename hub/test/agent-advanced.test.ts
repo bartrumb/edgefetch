@@ -93,7 +93,8 @@ import {
   validateCrawlPathPatterns,
 } from '../src/map-crawl';
 import { createSqliteOAuthStore, OAUTH_SQLITE_SCHEMA } from '../src/oauth';
-import { RequestTracer } from '../src/otel';
+import { cloudflareNativeSpanSink, nativeSpanAttributes } from '../src/cf-native-spans';
+import { MAX_NATIVE_SPANS_PER_FLUSH, RequestTracer, type OtlpSpanInput } from '../src/otel';
 import { executeScrapeCall } from '../src/scrape';
 import {
   bm25RankToScore,
@@ -6213,4 +6214,88 @@ test('R28: default waterfall is Serper -> Brave (only when Serper is thin); Cera
   assert.equal(hit('https://google.serper.dev/'), 1);
   assert.equal(hit('https://api.search.brave.com/'), 1, 'Brave fills in when Serper is thin');
   assert.equal(hit('https://api.ceramic.ai/'), 0, 'still no Ceramic without providers');
+});
+
+test('R29: direct-search defaultMode rrf fuses Serper + Brave; explicit mode, providers, env override and missing Brave keep the waterfall', async () => {
+  const calls: string[] = [];
+  const providerFetchFn = (async (input: RequestInfo | URL) => {
+    const u = String(input);
+    calls.push(u);
+    if (u.startsWith('https://google.serper.dev/search')) {
+      return Response.json({ organic: Array.from({ length: 4 }, (_, i) => ({ link: `https://serper.example/r${i}`, title: `S${i}`, snippet: 's' })) });
+    }
+    if (u.startsWith('https://api.search.brave.com/')) {
+      return Response.json({ web: { results: [{ url: 'https://brave.example/r0', title: 'B0', description: 'b' }] } });
+    }
+    return new Response('{}', { status: 404 });
+  }) as unknown as typeof fetch;
+  const executeHubFetch = async () => ({ status: 200, via: 'cf', bodyText: JSON.stringify({ results: [] }) });
+  const both = { SERPER_API_KEY: 'serper-k', BRAVE_API_KEY: 'brave-k' };
+  const hit = (prefix: string) => calls.filter((c) => c.startsWith(prefix)).length;
+  const run = async (payload: Record<string, unknown>, env: Record<string, string>, defaultMode?: 'rrf' | 'waterfall') => {
+    calls.length = 0;
+    resetSearchProviderPacingForTests();
+    return await executeSearchCall({
+      payload: { noCache: true, ...payload } as never,
+      env: env as never,
+      executeHubFetch,
+      providerFetchFn,
+      ...(defaultMode ? { defaultMode } : {}),
+    });
+  };
+
+  const fused = await run({ query: 'q one' }, both, 'rrf');
+  assert.equal(fused.status, 200, JSON.stringify(fused.body).slice(0, 300));
+  assert.equal(hit('https://google.serper.dev/'), 1);
+  assert.equal(hit('https://api.search.brave.com/'), 1, 'rrf default queries Brave in parallel even when Serper satisfies');
+  assert.ok(((fused.body.results as Array<{ url: string }>) ?? []).some((r) => r.url === 'https://brave.example/r0'), 'Brave hit fused in');
+
+  await run({ query: 'q two', mode: 'waterfall' }, both, 'rrf');
+  assert.equal(hit('https://api.search.brave.com/'), 0, 'explicit mode wins over defaultMode');
+  await run({ query: 'q three', providers: ['serper'] }, both, 'rrf');
+  assert.equal(hit('https://api.search.brave.com/'), 0, 'explicit providers win over defaultMode');
+  await run({ query: 'q four' }, { ...both, SEARCH_DEFAULT_MODE: 'waterfall' }, 'rrf');
+  assert.equal(hit('https://api.search.brave.com/'), 0, 'SEARCH_DEFAULT_MODE=waterfall forces the waterfall');
+  await run({ query: 'q five' }, { SERPER_API_KEY: 'serper-k' }, 'rrf');
+  assert.equal(hit('https://google.serper.dev/'), 1, 'Serper-only hubs are unaffected');
+  await run({ query: 'q six' }, both);
+  assert.equal(hit('https://api.search.brave.com/'), 0, 'internal callers (no defaultMode) keep the Serper-first waterfall');
+});
+
+test('N1: flushed tracer spans are re-emitted into native tracing with real timing attributes; unauth rejections and the kill switch emit nothing', async () => {
+  const emitted: OtlpSpanInput[] = [];
+  const sink = (s: OtlpSpanInput) => {
+    emitted.push(s);
+  };
+  const tracer = RequestTracer.fromContext({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), sampled: true });
+  const span = tracer.startSpan('edgefetch.search.provider', { startTimeMs: 1_000, attributes: { 'search.provider': 'serper' } });
+  span.setStatus(false, 'upstream 503');
+  span.end(1_250);
+  await tracer.flush({ env: {}, nativeSpanSink: sink });
+  assert.equal(emitted.length, 1);
+  const attrs = nativeSpanAttributes(emitted[0]!);
+  assert.equal(attrs['edgefetch.span.duration_ms'], 250);
+  assert.equal(attrs['edgefetch.span.start_ms'], 1_000);
+  assert.equal(attrs['edgefetch.span.status'], 'error');
+  assert.equal(attrs['edgefetch.trace_id'], 'a'.repeat(32));
+  assert.equal(attrs['search.provider'], 'serper');
+  assert.ok(String(attrs['edgefetch.span.error'] ?? '').includes('503'));
+
+  // A throwing sink never breaks the flush, and at most MAX_NATIVE_SPANS_PER_FLUSH spans are emitted per flush.
+  const many = RequestTracer.fromContext({ traceId: 'c'.repeat(32), spanId: 'd'.repeat(16), sampled: true });
+  for (let i = 0; i < MAX_NATIVE_SPANS_PER_FLUSH + 20; i++) many.startSpan(`s${i}`).end();
+  let n = 0;
+  await many.flush({ env: {}, nativeSpanSink: () => { n++; throw new Error('boom'); } });
+  assert.equal(n, MAX_NATIVE_SPANS_PER_FLUSH);
+
+  // Unauthenticated 401 gate rejections emit no native spans (same gate as OTLP).
+  const rejected = RequestTracer.fromRequest(new Request('https://hub.example.com/v1/scrape'));
+  const http = rejected.startSpan('edgefetch.http', { kind: 2, attributes: { 'http.response.status_code': 401 } });
+  http.end();
+  emitted.length = 0;
+  await rejected.flush({ env: {}, nativeSpanSink: sink });
+  assert.equal(emitted.length, 0);
+
+  assert.equal(cloudflareNativeSpanSink({ EDGEFETCH_CF_NATIVE_SPANS: 'off' }), undefined);
+  assert.equal(typeof cloudflareNativeSpanSink({}), 'function');
 });

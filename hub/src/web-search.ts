@@ -72,6 +72,8 @@ export interface SearchBindings extends OptionalStorageBindings {
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
   SEARCH_DISABLE_BRAVE?: string;
+  /** `waterfall` overrides callers' `defaultMode: 'rrf'` (Serper-first everywhere). */
+  SEARCH_DEFAULT_MODE?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
   /** API token with Account > Workers AI > Read and Account > AI Gateway > Read (REST path). */
   CLOUDFLARE_WEBSEARCH_API_TOKEN?: string;
@@ -1048,6 +1050,13 @@ export async function executeSearchCall(params: {
    * crawl:read token reached the same fetches /v1/map refuses without crawl:fetch.
    */
   allowLiveFetch?: boolean;
+  /**
+   * Strategy when the payload names no `mode`, `federate` or `providers`. Direct search surfaces (MCP `search`,
+   * `/v1/search`, compat search) pass `'rrf'`: Serper and Brave in parallel, fused, which scored best in a live
+   * head-to-head. Internal fan-out (agent loop, jobs) keeps the Serper-first waterfall so it never queues behind
+   * Brave's 1 req/s pacing. `SEARCH_DEFAULT_MODE=waterfall` forces the waterfall everywhere.
+   */
+  defaultMode?: 'waterfall' | 'rrf';
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runSearchCall = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
@@ -1084,7 +1093,7 @@ export async function executeSearchCall(params: {
     typeof rawChunksPer === 'number' && Number.isFinite(rawChunksPer) ? Math.min(10, Math.max(1, Math.floor(rawChunksPer))) : 3;
   const wantsAnswer = Boolean(payload.include_answer ?? payload.includeAnswer);
 
-  const rawMode = typeof payload.mode === 'string' ? payload.mode.trim().toLowerCase() : '';
+  const requestedMode = typeof payload.mode === 'string' ? payload.mode.trim().toLowerCase() : '';
   const explicitProviders: Set<string> | null = Array.isArray(payload.providers)
     ? new Set(
         payload.providers
@@ -1093,8 +1102,20 @@ export async function executeSearchCall(params: {
           .filter(Boolean),
       )
     : null;
-  // Default to `'waterfall'` (Serper runs alone first; Brave only runs as fallback if Serper returns <3 hits).
+  // Without an explicit strategy, direct search surfaces fuse Serper + Brave (`defaultMode: 'rrf'`) when both are
+  // configured; everything else uses `'waterfall'` (Serper alone first; Brave only when Serper returns <3 hits).
   // Pass `mode: "rrf"` (or `federate: true`) to fuse providers in parallel, or `mode: "serper"` / `providers: ["serper"]` to skip Brave completely.
+  const rrfDefaultApplies =
+    requestedMode === '' &&
+    payload.federate === undefined &&
+    explicitProviders === null &&
+    params.defaultMode === 'rrf' &&
+    (env.SEARCH_DEFAULT_MODE ?? '').trim().toLowerCase() !== 'waterfall' &&
+    Boolean(env.SERPER_API_KEY?.trim()) &&
+    Boolean(env.BRAVE_API_KEY?.trim()) &&
+    env.SEARCH_DISABLE_BRAVE !== 'true' &&
+    env.SEARCH_DISABLE_BRAVE !== '1';
+  const rawMode = rrfDefaultApplies ? 'rrf' : requestedMode;
   const waterfallMode = payload.federate !== true && rawMode !== 'rrf';
   const braveDisabled =
     env.SEARCH_DISABLE_BRAVE === 'true' ||

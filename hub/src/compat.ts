@@ -500,6 +500,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       userId: callerUserId,
       source: 'compat:firecrawl:search',
+      defaultMode: 'rrf',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     const isPrivateSearch = (out.body as { visibility?: string }).visibility === 'private' || isPrivateSearchReq;
@@ -703,6 +704,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       userId: callerUserId,
       source: 'compat:tavily:search',
+      defaultMode: 'rrf',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     const isPrivOut = isPrivateTavily || (out.body as { visibility?: string }).visibility === 'private';

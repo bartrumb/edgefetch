@@ -7,6 +7,7 @@
  * record filtering to Go WASM (`internal/catalog/`).
  */
 
+import { cloudflareNativeSpanSink } from './cf-native-spans';
 import { getCatalogAdapter, type CatalogRecord, type CatalogSpec, type CatalogVariantRecord } from './extractors/registry';
 import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
 import { getActiveCallerAuthContext } from './oauth';
@@ -1861,8 +1862,14 @@ export async function executeCatalogCall(params: {
             typeof params.devTelemetrySetting === 'function'
               ? await Promise.resolve(params.devTelemetrySetting()).catch(() => null)
               : params.devTelemetrySetting;
+          const nativeSpanSink = cloudflareNativeSpanSink(env as { EDGEFETCH_CF_NATIVE_SPANS?: string });
           await activeTracer
-            .flush({ env: otelEnv, devTelemetrySetting: resolvedDevTel, ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}) })
+            .flush({
+              env: otelEnv,
+              devTelemetrySetting: resolvedDevTel,
+              ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}),
+              ...(nativeSpanSink ? { nativeSpanSink } : {}),
+            })
             .catch(() => false);
         }
       });

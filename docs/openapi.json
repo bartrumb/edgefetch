@@ -4736,8 +4736,7 @@
               "rrf",
               "serper"
             ],
-            "default": "waterfall",
-            "description": "Provider strategy: \"waterfall\" (default) queries the primary search provider first and falls back only when results are sparse; \"rrf\" queries configured providers in parallel; \"serper\" uses only Serper."
+            "description": "Provider strategy. Default: \"rrf\" when both Serper and Brave are configured (queries them in parallel and fuses the rankings), otherwise \"waterfall\". \"waterfall\" queries Serper first and falls back to Brave and others only when results are sparse; \"serper\" uses only Serper."
           },
           "providers": {
             "type": "array",
@@ -7152,8 +7151,7 @@
               "rrf",
               "serper"
             ],
-            "default": "waterfall",
-            "description": "Provider strategy: \"waterfall\" (default) queries the primary search provider first and falls back only when results are sparse; \"rrf\" queries configured providers in parallel; \"serper\" uses only Serper."
+            "description": "Provider strategy. Default: \"rrf\" when both Serper and Brave are configured (queries them in parallel and fuses the rankings), otherwise \"waterfall\". \"waterfall\" queries Serper first and falls back to Brave and others only when results are sparse; \"serper\" uses only Serper."
           },
           "providers": {
             "type": "array",
